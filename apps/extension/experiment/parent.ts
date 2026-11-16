@@ -1,4 +1,4 @@
-import { namespace, type HarAnytimeApi, type ToolboxState } from "./contract.ts";
+import { namespace, type Environment, type HarAnytimeApi, type ToolboxState } from "./contract.ts";
 
 const nativeTab = (context: ExtensionContext, tabId: number): NativeTab | undefined => {
   try {
@@ -28,8 +28,9 @@ const toolboxState = (context: ExtensionContext, tabId: number): ToolboxState =>
 
 class HarAnytimeParent extends ExtensionAPI {
   override getAPI(context: ExtensionContext) {
+    // TypeScript skips the excess property check on a returned object unless the return type is written out.
     const api = {
-      getEnvironment: async (tabId) => ({
+      getEnvironment: async (tabId): Promise<Environment> => ({
         browser: {
           name: Services.appinfo.name,
           version: Services.appinfo.version,
