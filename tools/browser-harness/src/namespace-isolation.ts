@@ -174,6 +174,7 @@ export async function runNamespacedSuites(packageDir: string): Promise<Namespace
       ? {
           outcome: "passed",
           summary: result.output
+            .replaceAll(/\u001b\[[0-9;]*m/gu, "")
             .split("\n")
             .filter((line) => /^\s*(Test Files|Tests)\s/u.test(line))
             .join("\n"),
