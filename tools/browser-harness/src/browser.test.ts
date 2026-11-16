@@ -12,6 +12,7 @@ import {
   launchBrowser,
   liveProfileRoots,
   prepareProfile,
+  readExtensionId,
   renderUserJs,
 } from "./browser.ts";
 import { currentPlatformName } from "./owned-process.ts";
@@ -174,6 +175,8 @@ describe("browser profile", () => {
     expect(proxy).toBe(unpacked);
 
     const xpi = await makeXpi("packed@one-click-har");
+    expect(await readExtensionId(unpacked)).toBe("unpacked@one-click-har");
+    expect(await readExtensionId(xpi)).toBe("packed@one-click-har");
     const packedProfile = await prepareProfile(xpi);
     directories.push(packedProfile);
     const copied = await NodeFSP.stat(
@@ -192,10 +195,11 @@ describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
       const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-fake-"));
       directories.push(scratch);
       const argsFile = NodePath.join(scratch, "args");
+      const prefsFile = NodePath.join(scratch, "user.js");
       const binary = NodePath.join(scratch, "browser");
       await NodeFSP.writeFile(
         binary,
-        `#!/bin/sh\nprintf '%s\\n' "$@" > '${argsFile}'\necho "fake browser refused to start" >&2\nexit 3\n`,
+        `#!/bin/sh\nprintf '%s\\n' "$@" > '${argsFile}'\ncp "$4/user.js" '${prefsFile}' 2>/dev/null || true\necho "fake browser refused to start" >&2\nexit 3\n`,
         { mode: 0o755 },
       );
       await expect(
@@ -208,14 +212,17 @@ describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
         }),
       ).rejects.toThrow(/browser exited with code 3[\s\S]*fake browser refused to start/);
       const args = (await NodeFSP.readFile(argsFile, "utf8")).trim().split("\n");
+      const prefs = await NodeFSP.readFile(prefsFile, "utf8");
       expect(args[0]).toBe("-headless");
       expect(args).toContain("-no-remote");
       if (protocol === "bidi") {
         expect(args).toContain("--remote-debugging-port");
         expect(args).not.toContain("-marionette");
+        expect(prefs).not.toContain("marionette.port");
       } else {
         expect(args).toContain("-marionette");
         expect(args).not.toContain("--remote-debugging-port");
+        expect(prefs).toMatch(/user_pref\("marionette\.port", \d+\);/);
       }
       const profile = args[args.indexOf("-profile") + 1] ?? "";
       expect(profile.startsWith(NodeOS.tmpdir())).toBe(true);

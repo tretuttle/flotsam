@@ -3,6 +3,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import { createLaunchLease, reapOrphanedLaunches } from "./orphan-lease.ts";
 import {
   killOwnedTree,
   currentPlatformName,
@@ -59,10 +60,16 @@ export type BrowserIdentity = {
 export type BrowserSession = AsyncDisposable & {
   readonly spawnedPid: number;
   readonly browserPid: number;
+  readonly profileDir: string;
   readonly identity: BrowserIdentity;
   readonly openTab: (url: string) => Promise<string>;
+  readonly navigateTab: (context: string, url: string) => Promise<void>;
+  readonly reloadTab: (context: string) => Promise<void>;
   readonly evaluate: (context: string, expression: string) => Promise<string>;
+  readonly evaluateChrome: (script: string, args?: readonly unknown[]) => Promise<unknown>;
+  readonly takeChromeScreenshot: (selector?: string) => Promise<Buffer>;
   readonly closeTab: (context: string) => Promise<void>;
+  readonly quit: () => Promise<void>;
 };
 
 type LiveRootBase = "HOME" | "APPDATA" | "LOCALAPPDATA" | "XDG_CONFIG_HOME" | "XDG_CACHE_HOME";
@@ -129,8 +136,10 @@ export const BROWSER_PLATFORMS: Readonly<Record<ProcessPlatformName, BrowserPlat
 };
 
 export function renderUserJs(prefs: readonly Pref[]): string {
-  return `${prefs
-    .map((pref) => `user_pref(${JSON.stringify(pref.name)}, ${JSON.stringify(pref.value)});`)
+  const merged = new Map<string, Pref["value"]>();
+  for (const pref of prefs) merged.set(pref.name, pref.value);
+  return `${[...merged.entries()]
+    .map(([name, value]) => `user_pref(${JSON.stringify(name)}, ${JSON.stringify(value)});`)
     .join("\n")}\n`;
 }
 
@@ -178,34 +187,42 @@ function foldsCase(platform: ProcessPlatformName): boolean {
   return platform === "darwin" || platform === "win32";
 }
 
-export async function prepareProfile(
-  extensionPath: string | null,
-  extraPrefs: readonly Pref[] = [],
-): Promise<string> {
+function assertSafeProfileDirectory(directory: string): void {
   const platform = currentPlatformName();
   const row = BROWSER_PLATFORMS[platform];
   const roots = liveProfileRoots(platform, process.env, NodeOS.homedir());
-  const directory = NodeOS.tmpdir();
   assertOutsideLiveProfiles(directory, roots, row.path, foldsCase(platform));
   assertOutsideLiveProfiles(
-    NodeFS.realpathSync(directory),
+    realpathIfPresent(directory),
     roots.map(realpathIfPresent),
     row.path,
     foldsCase(platform),
   );
+}
+
+export async function prepareProfile(
+  extensionPath: string | null,
+  extraPrefs: readonly Pref[] = [],
+): Promise<string> {
+  const directory = NodeOS.tmpdir();
+  assertSafeProfileDirectory(directory);
   const profile = await NodeFSP.mkdtemp(NodePath.join(directory, "one-click-har-browser-"));
   try {
-    await NodeFSP.writeFile(
-      NodePath.join(profile, "user.js"),
-      renderUserJs([...LAUNCH_PREFS, ...extraPrefs]),
-      "utf8",
-    );
+    await writeProfilePrefs(profile, extraPrefs);
     if (extensionPath !== null) await installExtension(profile, extensionPath);
     return profile;
   } catch (error) {
     await NodeFSP.rm(profile, { recursive: true, force: true });
     throw error;
   }
+}
+
+async function writeProfilePrefs(profile: string, extraPrefs: readonly Pref[]): Promise<void> {
+  await NodeFSP.writeFile(
+    NodePath.join(profile, "user.js"),
+    renderUserJs([...LAUNCH_PREFS, ...extraPrefs]),
+    "utf8",
+  );
 }
 
 const REMOTE_LAUNCH: Record<
@@ -224,14 +241,30 @@ export async function launchBrowser(request: {
   readonly extensionPath: string | null;
   readonly display: BrowserDisplay;
   readonly protocol?: RemoteProtocol;
+  readonly profileDir?: string;
+  readonly extraPrefs?: readonly Pref[];
+  readonly allowSystemAccess?: boolean;
   readonly signal: AbortSignal;
 }): Promise<BrowserSession> {
   const protocol = request.protocol ?? "bidi";
+  await reapOrphanedLaunches(assertSafeProfileDirectory);
   await using stack = new AsyncDisposableStack();
   const port = await freePort();
   const remoteLaunch = REMOTE_LAUNCH[protocol](port);
-  const directory = await prepareProfile(request.extensionPath, remoteLaunch.prefs);
-  stack.defer(() => removeDirectoryBounded(directory));
+  const prefs = [...remoteLaunch.prefs, ...(request.extraPrefs ?? [])];
+  const ownProfile = request.profileDir === undefined;
+  let directory: string;
+  if (ownProfile) {
+    directory = await prepareProfile(request.extensionPath, prefs);
+    stack.defer(() => removeDirectoryBounded(directory));
+  } else {
+    directory = request.profileDir;
+    assertSafeProfileDirectory(directory);
+    await writeProfilePrefs(directory, prefs);
+    if (request.extensionPath !== null) await installExtension(directory, request.extensionPath);
+  }
+  const lease = await createLaunchLease(directory);
+  stack.defer(() => lease.remove());
   const args = [
     ...(request.display === "headless" ? ["-headless"] : []),
     "-no-remote",
@@ -240,10 +273,17 @@ export async function launchBrowser(request: {
     ...remoteLaunch.args,
     ...BROWSER_PLATFORMS[currentPlatformName()].launcherArgs,
   ];
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    MOZ_CRASHREPORTER_DISABLE: "1",
+    MOZ_DISABLE_AUTO_UPDATE: "1",
+    ...(request.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
+  };
   const spawned = spawnOwned(request.binaryPath, args, {
     stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1", MOZ_DISABLE_AUTO_UPDATE: "1" },
+    env,
   });
+  await lease.setSpawnedPid(spawned.pid);
   let browserPid: number | null = null;
   stack.defer(() => killOwnedTree(spawned.pid, browserPid === null ? [] : [browserPid]));
   let stderrTail = "";
@@ -264,6 +304,7 @@ export async function launchBrowser(request: {
   return {
     spawnedPid: spawned.pid,
     browserPid: remote.browserPid,
+    profileDir: directory,
     identity: {
       binaryPath: request.binaryPath,
       name: remote.browserName,
@@ -274,10 +315,38 @@ export async function launchBrowser(request: {
       headless: request.display === "headless",
     },
     openTab: (url) => remote.openTab(url),
+    navigateTab: (context, url) => remote.navigateTab(context, url),
+    reloadTab: (context) => remote.reloadTab(context),
     evaluate: (context, expression) => remote.evaluate(context, expression),
+    evaluateChrome: (script, scriptArgs) => remote.evaluateChrome(script, scriptArgs),
+    takeChromeScreenshot: (selector) => remote.takeChromeScreenshot(selector),
     closeTab: (context) => remote.closeTab(context),
+    quit: async () => {
+      const exited = waitForChildExit(spawned.child, 10_000);
+      await remote.quit();
+      await exited;
+    },
     [Symbol.asyncDispose]: () => owned.disposeAsync(),
   };
+}
+
+function waitForChildExit(
+  child: {
+    exitCode: number | null;
+    signalCode: string | null;
+    once: (event: "exit", cb: () => void) => void;
+  },
+  timeoutMs: number,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    timer.unref();
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 function exitStatus(child: { exitCode: number | null; signalCode: string | null }): string | null {
@@ -303,23 +372,25 @@ function assertOwnedBrowser(browserPid: number, spawnedPid: number): void {
   }
 }
 
+export async function readExtensionId(extensionPath: string): Promise<string> {
+  const absolute = NodePath.resolve(extensionPath);
+  const stat = await NodeFSP.stat(absolute);
+  const manifest: unknown = stat.isDirectory()
+    ? JSON.parse(await NodeFSP.readFile(NodePath.join(absolute, "manifest.json"), "utf8"))
+    : JSON.parse((await readZipEntry(absolute, "manifest.json")).toString("utf8"));
+  return readGeckoId(manifest);
+}
+
 async function installExtension(profileDir: string, extensionPath: string): Promise<void> {
   const absolute = NodePath.resolve(extensionPath);
   const stat = await NodeFSP.stat(absolute);
   const extensionsDir = NodePath.join(profileDir, "extensions");
   await NodeFSP.mkdir(extensionsDir, { recursive: true });
+  const id = await readExtensionId(absolute);
   if (stat.isDirectory()) {
-    const manifest: unknown = JSON.parse(
-      await NodeFSP.readFile(NodePath.join(absolute, "manifest.json"), "utf8"),
-    );
-    const id = readGeckoId(manifest);
     await NodeFSP.writeFile(NodePath.join(extensionsDir, id), absolute, "utf8");
     return;
   }
-  const manifest: unknown = JSON.parse(
-    (await readZipEntry(absolute, "manifest.json")).toString("utf8"),
-  );
-  const id = readGeckoId(manifest);
   await NodeFSP.copyFile(absolute, NodePath.join(extensionsDir, `${id}.xpi`));
 }
 

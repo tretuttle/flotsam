@@ -14,8 +14,13 @@ export type RemoteControl = {
   readonly buildId: string;
   readonly userAgent: string;
   readonly openTab: (url: string) => Promise<string>;
+  readonly navigateTab: (context: string, url: string) => Promise<void>;
+  readonly reloadTab: (context: string) => Promise<void>;
   readonly evaluate: (context: string, expression: string) => Promise<string>;
+  readonly evaluateChrome: (script: string, args?: readonly unknown[]) => Promise<unknown>;
+  readonly takeChromeScreenshot: (selector?: string) => Promise<Buffer>;
   readonly closeTab: (context: string) => Promise<void>;
+  readonly quit: () => Promise<void>;
   readonly dispose: () => void;
 };
 
@@ -69,6 +74,12 @@ async function openBidi(port: number): Promise<RemoteControl> {
         await bidi.call("browsingContext.navigate", { context, url, wait: "complete" });
         return context;
       },
+      navigateTab: async (context, url) => {
+        await bidi.call("browsingContext.navigate", { context, url, wait: "complete" });
+      },
+      reloadTab: async (context) => {
+        await bidi.call("browsingContext.reload", { context, wait: "complete" });
+      },
       evaluate: async (context, expression) =>
         readBidiString(
           await bidi.call("script.evaluate", {
@@ -77,8 +88,14 @@ async function openBidi(port: number): Promise<RemoteControl> {
             target: { context },
           }),
         ),
+      evaluateChrome: () => Promise.reject(new Error("chrome evaluation requires marionette")),
+      takeChromeScreenshot: () =>
+        Promise.reject(new Error("chrome screenshot requires marionette")),
       closeTab: async (context) => {
         await bidi.call("browsingContext.close", { context });
+      },
+      quit: async () => {
+        await bidi.call("browser.close", {}).catch(() => undefined);
       },
       dispose: () => bidi.close(),
     };
@@ -129,6 +146,14 @@ async function openMarionette(port: number): Promise<RemoteControl> {
         await marionette.call("WebDriver:Navigate", { url });
         return handle;
       },
+      navigateTab: async (context, url) => {
+        await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
+        await marionette.call("WebDriver:Navigate", { url });
+      },
+      reloadTab: async (context) => {
+        await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
+        await marionette.call("WebDriver:Refresh", {});
+      },
       evaluate: async (context, expression) => {
         await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
         const value = await marionette.call("WebDriver:ExecuteAsyncScript", {
@@ -137,10 +162,57 @@ async function openMarionette(port: number): Promise<RemoteControl> {
         });
         return readMarionetteString(value);
       },
+      evaluateChrome: async (script, args = []) => {
+        await marionette.call("Marionette:SetContext", { value: "chrome" });
+        try {
+          const result = await marionette.call("WebDriver:ExecuteAsyncScript", {
+            script,
+            args: [...args],
+          });
+          return unwrapMarionette(result);
+        } finally {
+          await marionette
+            .call("Marionette:SetContext", { value: "content" })
+            .catch(() => undefined);
+        }
+      },
+      takeChromeScreenshot: async (selector) => {
+        await marionette.call("Marionette:SetContext", { value: "chrome" });
+        try {
+          const params: Record<string, unknown> =
+            selector === undefined
+              ? { full: false, hash: false }
+              : {
+                  id: readMarionetteElementId(
+                    await marionette.call("WebDriver:FindElement", {
+                      using: "css selector",
+                      value: selector,
+                    }),
+                  ),
+                  hash: false,
+                };
+          const result = unwrapMarionette(
+            await marionette.call("WebDriver:TakeScreenshot", params),
+          );
+          if (typeof result !== "string") {
+            throw new Error(`WebDriver:TakeScreenshot returned ${JSON.stringify(result)}`);
+          }
+          return Buffer.from(result, "base64");
+        } finally {
+          await marionette
+            .call("Marionette:SetContext", { value: "content" })
+            .catch(() => undefined);
+        }
+      },
       closeTab: async (context) => {
         await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
         await marionette.call("WebDriver:CloseWindow", {});
         await marionette.call("WebDriver:SwitchToWindow", { handle: initialWindow, focus: true });
+      },
+      quit: async () => {
+        await marionette
+          .call("Marionette:Quit", { flags: ["eAttemptQuit"] })
+          .catch(() => undefined);
       },
       dispose: () => marionette.close(),
     };
@@ -415,6 +487,15 @@ function readMarionetteHandle(value: unknown): string {
     throw new Error(`WebDriver:GetWindowHandle returned ${JSON.stringify(value)}`);
   }
   return handle;
+}
+
+function readMarionetteElementId(value: unknown): string {
+  const unwrapped = unwrapMarionette(value);
+  if (isRecord(unwrapped)) {
+    const first = Object.values(unwrapped)[0];
+    if (typeof first === "string" && first.length > 0) return first;
+  }
+  throw new Error(`WebDriver:FindElement returned ${JSON.stringify(value)}`);
 }
 
 function unwrapMarionette(value: unknown): unknown {
