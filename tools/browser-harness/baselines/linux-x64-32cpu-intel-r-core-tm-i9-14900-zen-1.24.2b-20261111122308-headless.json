@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-11-16T06:34:52.866Z",
+  "capturedAt": "2026-11-16T11:28:00.632Z",
   "extension": null,
   "page": {
     "resourceCount": 200,
@@ -16,104 +16,104 @@
   "samples": [
     {
       "run": 1,
-      "lastResourceFinishedMs": 61,
-      "parentWorkingSetBytes": 572071936,
-      "parentCpuMs": 200,
-      "wallMs": 112.915483,
+      "lastResourceFinishedMs": 54,
+      "parentWorkingSetBytes": 589660160,
+      "parentCpuMs": 230,
+      "wallMs": 145.749825,
       "requestCount": 201
     },
     {
       "run": 2,
-      "lastResourceFinishedMs": 108,
-      "parentWorkingSetBytes": 610197504,
-      "parentCpuMs": 190,
-      "wallMs": 128.481352,
+      "lastResourceFinishedMs": 66,
+      "parentWorkingSetBytes": 593784832,
+      "parentCpuMs": 130,
+      "wallMs": 92.7226,
       "requestCount": 201
     },
     {
       "run": 3,
-      "lastResourceFinishedMs": 69,
-      "parentWorkingSetBytes": 607567872,
-      "parentCpuMs": 160,
-      "wallMs": 112.705476,
+      "lastResourceFinishedMs": 60,
+      "parentWorkingSetBytes": 601055232,
+      "parentCpuMs": 130,
+      "wallMs": 108.424452,
       "requestCount": 201
     },
     {
       "run": 4,
-      "lastResourceFinishedMs": 62,
-      "parentWorkingSetBytes": 607821824,
-      "parentCpuMs": 160,
-      "wallMs": 102.754656,
+      "lastResourceFinishedMs": 64,
+      "parentWorkingSetBytes": 598831104,
+      "parentCpuMs": 130,
+      "wallMs": 104.639774,
       "requestCount": 201
     },
     {
       "run": 5,
-      "lastResourceFinishedMs": 72,
-      "parentWorkingSetBytes": 620969984,
-      "parentCpuMs": 160,
-      "wallMs": 107.730057,
+      "lastResourceFinishedMs": 71,
+      "parentWorkingSetBytes": 594849792,
+      "parentCpuMs": 190,
+      "wallMs": 116.725735,
       "requestCount": 201
     },
     {
       "run": 6,
-      "lastResourceFinishedMs": 65,
-      "parentWorkingSetBytes": 617934848,
-      "parentCpuMs": 130,
-      "wallMs": 102.244355,
+      "lastResourceFinishedMs": 66,
+      "parentWorkingSetBytes": 596803584,
+      "parentCpuMs": 120,
+      "wallMs": 105.040266,
       "requestCount": 201
     },
     {
       "run": 7,
-      "lastResourceFinishedMs": 62,
-      "parentWorkingSetBytes": 630935552,
-      "parentCpuMs": 150,
-      "wallMs": 100.546924,
+      "lastResourceFinishedMs": 59,
+      "parentWorkingSetBytes": 601698304,
+      "parentCpuMs": 130,
+      "wallMs": 104.504995,
       "requestCount": 201
     },
     {
       "run": 8,
-      "lastResourceFinishedMs": 63,
-      "parentWorkingSetBytes": 672120832,
-      "parentCpuMs": 130,
-      "wallMs": 98.861365,
+      "lastResourceFinishedMs": 67,
+      "parentWorkingSetBytes": 602963968,
+      "parentCpuMs": 150,
+      "wallMs": 102.990464,
       "requestCount": 201
     },
     {
       "run": 9,
-      "lastResourceFinishedMs": 64,
-      "parentWorkingSetBytes": 674312192,
-      "parentCpuMs": 120,
-      "wallMs": 102.544423,
+      "lastResourceFinishedMs": 71,
+      "parentWorkingSetBytes": 610336768,
+      "parentCpuMs": 140,
+      "wallMs": 111.442456,
       "requestCount": 201
     },
     {
       "run": 10,
-      "lastResourceFinishedMs": 44,
-      "parentWorkingSetBytes": 679841792,
-      "parentCpuMs": 120,
-      "wallMs": 69.941145,
+      "lastResourceFinishedMs": 57,
+      "parentWorkingSetBytes": 616615936,
+      "parentCpuMs": 160,
+      "wallMs": 88.982794,
       "requestCount": 201
     }
   ],
   "lastResourceFinishedMs": {
-    "median": 63.5,
-    "spread": 64,
-    "min": 44,
-    "max": 108,
+    "median": 65,
+    "spread": 17,
+    "min": 54,
+    "max": 71,
     "runCount": 10
   },
   "parentWorkingSetBytes": {
-    "median": 619452416,
-    "spread": 107769856,
-    "min": 572071936,
-    "max": 679841792,
+    "median": 599943168,
+    "spread": 26955776,
+    "min": 589660160,
+    "max": 616615936,
     "runCount": 10
   },
-  "wallTimeMs": 1038.725236,
-  "browserCpuMs": 1520,
-  "limiter": "The browser parent used 146 percent of one core while runs were timed, so parent CPU is on the critical path. A timed region runs from opening the tab to the page reporting its last resource finished. Process inspection happens outside it. Each run loaded 200 uncached localhost resources.",
+  "wallTimeMs": 1081.2233609999998,
+  "browserCpuMs": 1510,
+  "limiter": "The browser parent used 140 percent of one core while runs were timed, so parent CPU is on the critical path. A timed region runs from opening the tab to the page reporting its last resource finished. Process inspection happens outside it. Each run loaded 200 uncached localhost resources.",
   "browser": {
-    "binaryPath": "/tmp/och-pr6/stable/zen/zen",
+    "binaryPath": "/tmp/och-pr6-rename/stable/zen/zen",
     "name": "zen",
     "version": "1.24.2b",
     "buildId": "20261111122308",
@@ -131,12 +131,12 @@
   },
   "load": {
     "before": {
-      "cpuBusyPercent": 3.6,
-      "loadAverage": [1.66, 1.4, 0.92]
+      "cpuBusyPercent": 2.8,
+      "loadAverage": [1.94, 1.36, 1.03]
     },
     "after": {
-      "cpuBusyPercent": 2.7,
-      "loadAverage": [1.66, 1.4, 0.92]
+      "cpuBusyPercent": 2,
+      "loadAverage": [2.03, 1.39, 1.04]
     }
   }
 }
