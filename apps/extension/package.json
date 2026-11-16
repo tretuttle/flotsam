@@ -1,0 +1,26 @@
+{
+  "name": "@har-anytime/extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/write-icons.ts && node scripts/build-experiment.ts public && extension dev --browser zen --no-telemetry",
+    "build": "node scripts/write-icons.ts && extension build --browser firefox --no-addon-lint --no-telemetry && node scripts/build-experiment.ts dist/firefox",
+    "pack": "vp run build && node scripts/pack.ts",
+    "test": "vp test run --config ../../vite.config.ts --dir .",
+    "typecheck": "effect-tsgo tsrs --noEmit && effect-tsgo tsrs --noEmit -p experiment",
+    "verify:zen": "node scripts/verify-zen.ts"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/firefox-webext-browser": "143.0.1",
+    "@types/node": "catalog:",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "extension": "4.1.39",
+    "fflate": "0.8.3",
+    "vite-plus": "catalog:"
+  }
+}

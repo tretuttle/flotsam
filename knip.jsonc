@@ -3,6 +3,10 @@
   // Exported types are part of our contracts even before they have consumers.
   "rules": { "types": "off", "nsTypes": "off" },
   "workspaces": {
+    "apps/extension": {
+      // extension.js builds the pages src/manifest.json names, and scripts/build-experiment.ts bundles the parent script.
+      "entry": ["src/*/main.tsx", "experiment/parent.ts", "scripts/*.ts", "extension.config.js"],
+    },
     "packages/*": {
       // These workspace packages are private to this monorepo.
       "includeEntryExports": true,
