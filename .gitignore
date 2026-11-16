@@ -1,0 +1,16 @@
+node_modules/
+.DS_Store
+*.log
+*.tsbuildinfo
+dist/
+build/
+.env*
+!.env.example
+.t3
+.plans/
+.vitest-*
+.pnpm-store/
+scratch/
+
+# pstack keeps its local program state here.
+/notes.md
