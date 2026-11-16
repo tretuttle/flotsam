@@ -309,7 +309,6 @@ describe("archive names", () => {
     expect(parseArchiveName(logSegmentPath(segment))).toEqual({
       kind: "log",
       dir: "example.com",
-      site: s,
       segment: "example.com/mhz01-3",
       run,
       seq: 3,
@@ -323,7 +322,6 @@ describe("archive names", () => {
     expect(parseArchiveName(logSummaryPath(segment))).toEqual({
       kind: "summary",
       dir: "example.com",
-      site: s,
       segment,
       run,
     });
@@ -331,7 +329,6 @@ describe("archive names", () => {
     expect(parseArchiveName(packPath(pack))).toEqual({
       kind: "pack",
       dir: "example.com",
-      site: s,
       pack,
       run,
       seq: 0,
@@ -347,14 +344,12 @@ describe("archive names", () => {
     expect(parseArchiveName(bodyFilePath(s, id))).toEqual({
       kind: "body",
       dir: "example.com",
-      site: s,
       id,
       run,
     });
     expect(parseArchiveName(["sites", "example.com"])).toEqual({
       kind: "site-dir",
       dir: "example.com",
-      site: s,
     });
   });
 
@@ -368,19 +363,19 @@ describe("archive names", () => {
       kind: "tmp",
       of: "summary",
       dir: "example.com",
-      site: s,
       segment,
       run,
     });
   });
 
-  it("a site whose name was cut keeps its directory, with no site", () => {
+  it("a site whose name was cut is named by its directory, like every other site", () => {
     const longSite = `${"a".repeat(60)}.example` as Site;
-    const name = parseArchiveName(logSegmentPath(logSegmentId(longSite, run, 0)));
-    expect(name).toMatchObject({
+    const dir = "a".repeat(55);
+    expect(siteDirName(longSite)).toMatch(new RegExp(`^${dir}~[0-9a-f]{8}$`));
+    expect(parseArchiveName(logSegmentPath(logSegmentId(longSite, run, 0)))).toEqual({
       kind: "log",
       dir: siteDirName(longSite),
-      site: null,
+      segment: `${siteDirName(longSite)}/${run}-0`,
       run,
       seq: 0,
     });

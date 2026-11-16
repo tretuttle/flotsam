@@ -9,18 +9,18 @@ export interface SourceMutation {
   readonly to: string;
 }
 
+const SRC = NodePath.resolve(import.meta.dirname, "..", "src");
+
 /**
- * Imports a copy of a module from src/ with one planted change. The change must match exactly once, so a refactor
- * that moves the text fails loudly instead of planting nothing. The module may import only types from its siblings.
+ * Imports a module from a copy of src/ with one planted change, so the module's sibling imports resolve to the real
+ * code. The change must match exactly once, so a refactor that moves the text fails loudly instead of planting nothing.
  */
 export async function importMutated<T>(file: string, mutation: SourceMutation): Promise<T> {
-  const source = NodeFS.readFileSync(
-    NodePath.resolve(import.meta.dirname, "..", "src", file),
-    "utf8",
-  );
+  const source = NodeFS.readFileSync(NodePath.join(SRC, file), "utf8");
   const hits = source.split(mutation.from).length - 1;
   if (hits !== 1) throw new Error(`${mutation.id}: matched ${hits} times in ${file}`);
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), `och-${mutation.id}-`));
+  NodeFS.cpSync(SRC, dir, { recursive: true });
   const copy = NodePath.join(dir, file);
   NodeFS.writeFileSync(copy, source.replace(mutation.from, mutation.to));
   try {

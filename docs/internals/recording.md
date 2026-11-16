@@ -26,7 +26,7 @@ The rules that keep the archive consistent across crashes:
 
 `planReconcile` reads a directory snapshot and returns steps; the store executes them. Every step is derived from what is on disk and removes its own trigger, so planning again after the steps, or after a crash part way through them, converges. The tests hold it to the 20-row crash table, to the sketch's seven planted rule mutations, and to generated runs: random store operations stopped at a random step (sometimes mid-write), plus zero-filled summaries for a power loss, then recovery interrupted at random and run again. After every recovery the second plan is empty, every line whose append finished is still in its segment, and every body such a line names still exists. Removing any one planner rule fails the generated test.
 
-A site name over 64 characters is cut with a hash (`siteDirName`), so `parseSiteDir` cannot read it back and `parseArchiveName` returns `site: null` for files under it. The snapshot builder must name such a directory's site, from `excludedSites` or from a line in it, before handing files to the planner; a file left with `site: null` counts as a live site's file and is never deleted as excluded.
+A site name over 64 characters is cut with a hash (`siteDirName`), so `parseSiteDir` cannot read it back. Recovery therefore never asks a file for its `Site`. A file belongs to a site by the directory its name carries, the planner finds each excluded site's directory with `siteDirName`, and a log's entry carries its own lines, so a snapshot cannot list a segment apart from its file. Round 1 linked them by `Site`, dropped a cut site's segments, and deleted that site's committed bodies as orphans.
 
 ## Retention stops at a pin
 

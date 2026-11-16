@@ -305,10 +305,12 @@ export function bodyFilePath(site: Site, id: ExchangeId): readonly string[] {
   return [LAYOUT.sitesDir, siteDirName(site), LAYOUT.bodyDir, `${id}.body`];
 }
 
-/** The site directory a name lives in. `site` is null only for a directory name siteDirName cut to length. */
+/**
+ * The site directory a name lives in. It is the file's link to its site: a directory name siteDirName cut to length
+ * cannot be read back as a Site, so no name carries one.
+ */
 interface InSite {
   readonly dir: SiteDir;
-  readonly site: Site | null;
 }
 
 export type ArchiveName =
@@ -352,9 +354,9 @@ function exchangeIn(stem: string | null): { readonly id: ExchangeId; readonly ru
 }
 
 function siteDir(dir: string): InSite | null {
-  const site = parseSiteDir(dir);
-  if (site !== null) return { dir: dir as SiteDir, site };
-  return /^[a-z0-9._-]{55}~[0-9a-f]{8}$/.test(dir) ? { dir: dir as SiteDir, site: null } : null;
+  return parseSiteDir(dir) !== null || /^[a-z0-9._-]{55}~[0-9a-f]{8}$/.test(dir)
+    ? { dir: dir as SiteDir }
+    : null;
 }
 
 function scopedId(raw: string): string | null {

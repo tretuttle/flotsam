@@ -2,43 +2,47 @@
 // what the previous run meant to do, and every step removes the condition that triggers it, so a second plan over
 // the result is empty. test/reconcile tests prove that over the crash table and over generated crashes.
 
-import type { ExchangeId, LogSegmentId, RunId, Site } from "./ids.ts";
+import type { ExchangeId, LogSegmentId, RunId, Site, SiteDir } from "./ids.ts";
+import { logSummaryPath, siteDirName, type ArchiveName } from "./layout.ts";
 
-export interface SnapshotFile {
+type Named<K extends ArchiveName["kind"]> = Extract<ArchiveName, { readonly kind: K }>;
+
+/** A parseable name on disk other than a log or a summary, as parseArchiveName read it. */
+export interface FileEntry {
   readonly path: string;
-  readonly bytes: number;
-  readonly kind: "site-dir" | "log" | "summary" | "pack" | "part" | "body" | "tmp" | "other";
-  /** null for settings.json.tmp, which belongs to no run. */
-  readonly run: RunId | null;
-  readonly site: Site | null;
-  readonly segment: LogSegmentId | null;
-  readonly id: ExchangeId | null;
+  readonly name: Exclude<ArchiveName, Named<"log" | "summary">>;
 }
-
-export interface SnapshotSegment {
-  readonly segment: LogSegmentId;
-  readonly site: Site;
-  readonly run: RunId;
+/** A log carries what its whole lines say, so a segment cannot be listed apart from its file. */
+export interface LogEntry {
+  readonly path: string;
+  readonly name: Named<"log">;
   readonly bytes: number;
   /** Bytes up to and including the last newline. Less than `bytes` when the last append was torn. */
   readonly validBytes: number;
   /** Body files named by the segment's whole lines. */
   readonly namesBodies: readonly ExchangeId[];
 }
-
-export interface SnapshotSummary {
-  readonly segment: LogSegmentId;
-  /** decodeSummary succeeded and its `bytes` equals the segment's current size. */
+export interface SummaryEntry {
+  readonly path: string;
+  readonly name: Named<"summary">;
+  /** decodeSummary succeeded and its `bytes` equals its log's current size; false when the log is gone. */
   readonly valid: boolean;
 }
+/**
+ * Every site-scoped name carries its directory, and a file belongs to a site by that directory. Recovery never needs
+ * the Site itself, which a cut directory name cannot give back.
+ */
+export type SnapshotEntry = FileEntry | LogEntry | SummaryEntry;
+
+const isLog = (e: SnapshotEntry): e is LogEntry => e.name.kind === "log";
+const isSummary = (e: SnapshotEntry): e is SummaryEntry => e.name.kind === "summary";
 
 export interface DirSnapshot {
   readonly current: RunId;
+  /** settings.excludedSites. The planner finds each one's directory with siteDirName. */
   readonly excluded: readonly Site[];
   /** Every parseable name. Unparseable names are absent and never touched. */
-  readonly files: readonly SnapshotFile[];
-  readonly segments: readonly SnapshotSegment[];
-  readonly summaries: readonly SnapshotSummary[];
+  readonly entries: readonly SnapshotEntry[];
   /** Unfinished export jobs from exports.jsonl. The path is the parent's; it never came from an extension page. */
   readonly unfinishedExports: readonly string[];
 }
@@ -55,6 +59,7 @@ export type ReconcileStep =
 
 const isOld = (snapshot: DirSnapshot, run: RunId | null): boolean =>
   run === null || run !== snapshot.current;
+const dirOf = (name: ArchiveName): SiteDir | null => ("dir" in name ? name.dir : null);
 
 /**
  * Each step kind and what triggers it, in the order a plan lists them. summarize-log is last, so a crash during
@@ -73,115 +78,100 @@ export const RECONCILE_STEPS: { readonly [K in ReconcileStep["kind"]]: string } 
   "summarize-log": "an old run's segment without a valid summary",
 };
 
-/** Files of `current` are never in the plan. Recovery runs first on the store's write chain, before this run writes. */
+/**
+ * Files of `current` are never in the plan. Recovery runs first on the store's write chain, before this run writes.
+ * Every other step skips an excluded site's directory: delete-excluded-site removes it whole.
+ */
 export function planReconcile(snapshot: DirSnapshot): readonly ReconcileStep[] {
-  const excluded = new Set(snapshot.excluded);
+  const gone = new Set(snapshot.excluded.map(siteDirName));
   const steps: ReconcileStep[] = [];
-  const alive = (site: Site | null): boolean => site === null || !excluded.has(site);
+  const live = snapshot.entries.filter((e) => {
+    const dir = dirOf(e.name);
+    return dir === null || !gone.has(dir);
+  });
 
   for (const site of snapshot.excluded) {
-    if (snapshot.files.some((f) => f.site === site))
+    const dir = siteDirName(site);
+    if (snapshot.entries.some((e) => dirOf(e.name) === dir))
       steps.push({ kind: "delete-excluded-site", site });
   }
-  for (const f of snapshot.files) {
-    if (f.kind === "part" && isOld(snapshot, f.run))
-      steps.push({ kind: "delete-part", path: f.path });
+  for (const e of live) {
+    if (e.name.kind === "part" && isOld(snapshot, e.name.run))
+      steps.push({ kind: "delete-part", path: e.path });
   }
-  for (const f of snapshot.files) {
-    if (f.kind === "tmp" && alive(f.site) && isOld(snapshot, f.run))
-      steps.push({ kind: "delete-tmp", path: f.path });
+  for (const e of live) {
+    if (e.name.kind === "tmp" && isOld(snapshot, e.name.of === "settings" ? null : e.name.run))
+      steps.push({ kind: "delete-tmp", path: e.path });
   }
-  const named = new Set(
-    snapshot.segments.filter((s) => alive(s.site)).flatMap((s) => s.namesBodies),
+  const logs = live.filter(isLog);
+  const summaries = live.filter(isSummary);
+  const named = new Set(logs.flatMap((e) => e.namesBodies));
+  for (const e of live) {
+    if (e.name.kind === "body" && isOld(snapshot, e.name.run) && !named.has(e.name.id))
+      steps.push({ kind: "delete-orphan-body", path: e.path });
+  }
+  for (const e of summaries) {
+    if (!e.valid) steps.push({ kind: "delete-invalid-summary", segment: e.name.segment });
+  }
+  const summarized = new Set(summaries.filter((e) => e.valid).map((e) => e.name.segment));
+  const oldUnsummarized = logs.filter(
+    (e) => isOld(snapshot, e.name.run) && !summarized.has(e.name.segment),
   );
-  for (const f of snapshot.files) {
-    if (
-      f.kind === "body" &&
-      alive(f.site) &&
-      isOld(snapshot, f.run) &&
-      f.id !== null &&
-      !named.has(f.id)
-    ) {
-      steps.push({ kind: "delete-orphan-body", path: f.path });
-    }
-  }
-  const validSummary = new Set(snapshot.summaries.filter((s) => s.valid).map((s) => s.segment));
-  for (const s of snapshot.summaries) {
-    const seg = snapshot.segments.find((g) => g.segment === s.segment);
-    if (!s.valid && (seg === undefined || alive(seg.site)))
-      steps.push({ kind: "delete-invalid-summary", segment: s.segment });
-  }
-  const oldUnsummarized = snapshot.segments.filter(
-    (s) => alive(s.site) && isOld(snapshot, s.run) && !validSummary.has(s.segment),
-  );
-  for (const s of oldUnsummarized) {
-    if (s.validBytes < s.bytes)
-      steps.push({ kind: "truncate-log", segment: s.segment, toBytes: s.validBytes });
+  for (const e of oldUnsummarized) {
+    if (e.validBytes < e.bytes)
+      steps.push({ kind: "truncate-log", segment: e.name.segment, toBytes: e.validBytes });
   }
   for (const path of snapshot.unfinishedExports) steps.push({ kind: "delete-export-part", path });
-  for (const s of oldUnsummarized) steps.push({ kind: "summarize-log", segment: s.segment });
+  for (const e of oldUnsummarized) steps.push({ kind: "summarize-log", segment: e.name.segment });
   return steps;
 }
 
 /** The plan's effect on a snapshot, as the store's executor performs it on disk: planReconcile(applyPlan(s, plan)) is []. */
 export function applyPlan(snapshot: DirSnapshot, steps: readonly ReconcileStep[]): DirSnapshot {
-  let files = snapshot.files;
-  let segments = snapshot.segments;
-  let summaries = snapshot.summaries;
+  let entries = snapshot.entries;
   let unfinishedExports = snapshot.unfinishedExports;
   for (const step of steps) {
     switch (step.kind) {
-      case "delete-excluded-site":
-        files = files.filter((f) => f.site !== step.site);
-        summaries = summaries.filter(
-          (s) => segments.find((g) => g.segment === s.segment)?.site !== step.site,
-        );
-        segments = segments.filter((s) => s.site !== step.site);
+      case "delete-excluded-site": {
+        const dir = siteDirName(step.site);
+        entries = entries.filter((e) => dirOf(e.name) !== dir);
         break;
+      }
       case "delete-part":
       case "delete-tmp":
       case "delete-orphan-body":
-        files = files.filter((f) => f.path !== step.path);
+        entries = entries.filter((e) => e.path !== step.path);
         break;
       case "delete-invalid-summary":
-        files = files.filter((f) => !(f.kind === "summary" && f.segment === step.segment));
-        summaries = summaries.filter((s) => s.segment !== step.segment);
+        entries = entries.filter((e) => !(isSummary(e) && e.name.segment === step.segment));
         break;
       case "truncate-log":
-        segments = segments.map((s) =>
-          s.segment === step.segment ? { ...s, bytes: step.toBytes, validBytes: step.toBytes } : s,
-        );
-        files = files.map((f) =>
-          f.kind === "log" && f.segment === step.segment ? { ...f, bytes: step.toBytes } : f,
+        entries = entries.map((e) =>
+          isLog(e) && e.name.segment === step.segment
+            ? { ...e, bytes: step.toBytes, validBytes: step.toBytes }
+            : e,
         );
         break;
       case "delete-export-part":
         unfinishedExports = unfinishedExports.filter((p) => p !== step.path);
         break;
       case "summarize-log": {
-        const seg = segments.find((s) => s.segment === step.segment);
-        if (seg === undefined) break;
-        summaries = [
-          ...summaries.filter((s) => s.segment !== step.segment),
-          { segment: step.segment, valid: true },
-        ];
-        files = [
-          ...files.filter((f) => !(f.kind === "summary" && f.segment === step.segment)),
+        const log = entries.filter(isLog).find((e) => e.name.segment === step.segment);
+        if (log === undefined) break;
+        const { dir, run, segment } = log.name;
+        entries = [
+          ...entries.filter((e) => !(isSummary(e) && e.name.segment === segment)),
           {
-            path: `${String(step.segment)}.summary.json`,
-            bytes: 1,
-            kind: "summary",
-            run: seg.run,
-            site: seg.site,
-            segment: step.segment,
-            id: null,
+            path: logSummaryPath(segment).join("/"),
+            name: { kind: "summary", dir, segment, run },
+            valid: true,
           },
         ];
         break;
       }
     }
   }
-  return { ...snapshot, files, segments, summaries, unfinishedExports };
+  return { ...snapshot, entries, unfinishedExports };
 }
 
 /** What an exchange reads as after recovery, for the crash table's last column. Bytes are those the segment keeps. */

@@ -39,42 +39,48 @@ const crashRowsFailing = (planner: Planner): readonly number[] =>
     return JSON.stringify(plan.map((s) => s.kind)) !== JSON.stringify(row.plan) || again.length > 0;
   }).map((row) => row.n);
 
-// The sketch's seven mutations of the rules (checks/crash-table.mjs), against this file's formatting.
+// The sketch's seven mutations of the rules (checks/crash-table.mjs), against this file's formatting, and one for
+// each rule round 1's verifier found missing.
 const SKETCH_MUTATIONS: readonly SourceMutation[] = [
   {
     id: "no-invalid-summary-step",
-    from: "if (!s.valid && (seg === undefined || alive(seg.site)))",
-    to: "if (false)",
+    from: "if (!e.valid) steps.push(",
+    to: "if (false) steps.push(",
   },
   {
     id: "summary-presence-means-summarized",
-    from: "snapshot.summaries.filter((s) => s.valid)",
-    to: "snapshot.summaries",
+    from: "summaries.filter((e) => e.valid).map",
+    to: "summaries.map",
   },
   {
     id: "summarize-before-truncate",
-    from: "  for (const s of oldUnsummarized) {\n    if (s.validBytes < s.bytes)",
-    to: '  for (const s of oldUnsummarized) steps.push({ kind: "summarize-log", segment: s.segment });\n  for (const s of oldUnsummarized) {\n    if (s.validBytes < s.bytes)',
+    from: "  for (const e of oldUnsummarized) {\n    if (e.validBytes < e.bytes)",
+    to: '  for (const e of oldUnsummarized) steps.push({ kind: "summarize-log", segment: e.name.segment });\n  for (const e of oldUnsummarized) {\n    if (e.validBytes < e.bytes)',
   },
   {
     id: "deletes-current-run-parts",
-    from: 'if (f.kind === "part" && isOld(snapshot, f.run))',
-    to: 'if (f.kind === "part")',
+    from: 'if (e.name.kind === "part" && isOld(snapshot, e.name.run))',
+    to: 'if (e.name.kind === "part")',
   },
   {
     id: "keeps-tmp-files",
-    from: 'if (f.kind === "tmp" && alive(f.site) && isOld(snapshot, f.run))',
+    from: 'if (e.name.kind === "tmp" && isOld(snapshot, e.name.of === "settings" ? null : e.name.run))',
     to: "if (false)",
   },
   {
     id: "seal-pack-step-back",
     from: "  for (const path of snapshot.unfinishedExports)",
-    to: '  for (const f of snapshot.files) if (f.kind === "pack" && isOld(snapshot, f.run)) steps.push({ kind: "seal-pack", path: f.path } as never);\n  for (const path of snapshot.unfinishedExports)',
+    to: '  for (const e of snapshot.entries) if (e.name.kind === "pack" && isOld(snapshot, e.name.run)) steps.push({ kind: "seal-pack", path: e.path } as never);\n  for (const path of snapshot.unfinishedExports)',
   },
   {
     id: "orphan-check-ignores-exclusion",
-    from: 'f.kind === "body" &&\n      alive(f.site) &&',
-    to: 'f.kind === "body" &&',
+    from: '  for (const e of live) {\n    if (e.name.kind === "body"',
+    to: '  for (const e of snapshot.entries) {\n    if (e.name.kind === "body"',
+  },
+  {
+    id: "summary-check-ignores-exclusion",
+    from: "const summaries = live.filter(isSummary);",
+    to: "const summaries = snapshot.entries.filter(isSummary);",
   },
 ];
 
@@ -112,7 +118,7 @@ function misplanned(plan: readonly reconcile.ReconcileStep[], disk: Disk): strin
     if (step.kind === "delete-excluded-site") continue;
     const target = "path" in step ? step.path : logSegmentPath(step.segment).join("/");
     if (gone.some((dir) => target.startsWith(`${dir}/`)))
-      return `${step.kind} plans ${target}, a file of an excluded site`;
+      return `${step.kind} plans ${"path" in step ? step.path : step.segment}, a file of an excluded site`;
   }
   return null;
 }

@@ -33,12 +33,7 @@ import {
   summarize,
   type LogLine,
 } from "../src/log.ts";
-import type {
-  DirSnapshot,
-  ReconcileStep,
-  SnapshotFile,
-  SnapshotSegment,
-} from "../src/reconcile.ts";
+import type { DirSnapshot, ReconcileStep, SnapshotEntry } from "../src/reconcile.ts";
 import { DEFAULT_USER_SETTINGS, parseStoredSettings } from "../src/settings.ts";
 import { request, response, stop } from "./fixtures.ts";
 import type { random } from "./random.ts";
@@ -406,101 +401,33 @@ export function wholeLines(text: string): {
   };
 }
 
-/** What the store's startup scan builds: every parseable name, each segment's whole lines, each summary's validity. */
+/** What the store's startup scan builds: every parseable name, each log's whole lines, each summary's validity. */
 export function snapshotOf(disk: Disk, current: RunId): DirSnapshot {
-  const excluded = excludedOn(disk);
-  const siteOf = (dir: string, site: Site | null): Site | null =>
-    site ?? excluded.find((s) => siteDirName(s) === dir) ?? null;
-  const files: SnapshotFile[] = [];
-  const segments: SnapshotSegment[] = [];
-  const summaries: { segment: LogSegmentId; valid: boolean }[] = [];
-  const base = { run: null, site: null, segment: null, id: null };
+  const entries: SnapshotEntry[] = [];
   for (const dir of disk.siteDirs) {
     const name = parseArchiveName(dir.split("/"));
-    if (name?.kind === "site-dir")
-      files.push({
-        ...base,
-        path: dir,
-        bytes: 0,
-        kind: "site-dir",
-        site: siteOf(name.dir, name.site),
-      });
+    if (name?.kind === "site-dir") entries.push({ path: dir, name });
   }
   for (const [path, text] of disk.files) {
     const name = parseArchiveName(path.split("/"));
     if (name === null) continue;
-    const file = { ...base, path, bytes: text.length };
-    switch (name.kind) {
-      case "part":
-        files.push({ ...file, kind: "part", run: name.run, id: name.id });
-        break;
-      case "tmp":
-        files.push(
-          name.of === "settings"
-            ? { ...file, kind: "tmp" }
-            : {
-                ...file,
-                kind: "tmp",
-                run: name.run,
-                site: siteOf(name.dir, name.site),
-                segment: name.segment,
-              },
-        );
-        break;
-      case "body":
-        files.push({
-          ...file,
-          kind: "body",
-          run: name.run,
-          site: siteOf(name.dir, name.site),
-          id: name.id,
-        });
-        break;
-      case "pack":
-        files.push({ ...file, kind: "pack", run: name.run, site: siteOf(name.dir, name.site) });
-        break;
-      case "summary": {
-        files.push({
-          ...file,
-          kind: "summary",
-          run: name.run,
-          site: siteOf(name.dir, name.site),
-          segment: name.segment,
-        });
-        const log = disk.files.get(join(logSegmentPath(name.segment)));
-        summaries.push({
-          segment: name.segment,
-          valid: log !== undefined && decodeSummary(text, log.length as ByteCount) !== null,
-        });
-        break;
-      }
-      case "log": {
-        const site = siteOf(name.dir, name.site);
-        files.push({ ...file, kind: "log", run: name.run, site, segment: name.segment });
-        const { decoded, validBytes } = wholeLines(text);
-        const namesBodies = decoded.flatMap((l) =>
-          l.exchange.kind === "answered" &&
-          l.exchange.body.kind === "stored" &&
-          l.exchange.body.at.kind === "file"
-            ? [l.exchange.body.at.id]
-            : [],
-        );
-        if (site !== null)
-          segments.push({
-            segment: name.segment,
-            site,
-            run: name.run,
-            bytes: text.length,
-            validBytes,
-            namesBodies,
-          });
-        break;
-      }
-      case "site-dir":
-        break;
-    }
+    if (name.kind === "log") {
+      const { decoded, validBytes } = wholeLines(text);
+      const namesBodies = decoded.flatMap((l) =>
+        l.exchange.kind === "answered" &&
+        l.exchange.body.kind === "stored" &&
+        l.exchange.body.at.kind === "file"
+          ? [l.exchange.body.at.id]
+          : [],
+      );
+      entries.push({ path, name, bytes: text.length, validBytes, namesBodies });
+    } else if (name.kind === "summary") {
+      const log = disk.files.get(join(logSegmentPath(name.segment)));
+      const valid = log !== undefined && decodeSummary(text, log.length as ByteCount) !== null;
+      entries.push({ path, name, valid });
+    } else entries.push({ path, name });
   }
-  return { current, excluded, files, segments, summaries, unfinishedExports: [...disk.journal] };
+  return { current, excluded: excludedOn(disk), entries, unfinishedExports: [...disk.journal] };
 }
 
 /** The store's executor for each step, as primitive writes a crash can interrupt too. Unknown kinds do nothing. */
