@@ -11,6 +11,8 @@ import {
 import { decodeSummary } from "../src/log.ts";
 import * as reconcile from "../src/reconcile.ts";
 import {
+  cloneDisk,
+  cloneTruth,
   Crash,
   emptyDisk,
   emptyTruth,
@@ -25,6 +27,7 @@ import {
 } from "./archive-model.ts";
 import { CRASH_ROWS } from "./crash-rows.ts";
 import { importMutated, type SourceMutation } from "./mutate.ts";
+import { generatedSites } from "./generated-sites.ts";
 import { random } from "./random.ts";
 
 type Planner = Pick<typeof reconcile, "planReconcile" | "applyPlan">;
@@ -95,8 +98,24 @@ describe("the crash table", () => {
   });
 });
 
-const SITES = ["a.example", "b.example", "c.example"] as Site[];
 const dirOf = (site: Site) => `${LAYOUT.sitesDir}/${siteDirName(site)}`;
+type Random = ReturnType<typeof random>;
+
+/** Seeds per family. OCH_RECOVERY_CASES raises the main family for a long local run; CI keeps the default. */
+const CASES = Number(process.env["OCH_RECOVERY_CASES"] ?? 1500);
+const EXCLUSION_SEEDS = Math.ceil(CASES / 10);
+
+/** A plan touches an excluded site only through delete-excluded-site: its files are going, whatever their state. */
+function misplanned(plan: readonly reconcile.ReconcileStep[], disk: Disk): string | null {
+  const gone = excludedOn(disk).map(dirOf);
+  for (const step of plan) {
+    if (step.kind === "delete-excluded-site") continue;
+    const target = "path" in step ? step.path : logSegmentPath(step.segment).join("/");
+    if (gone.some((dir) => target.startsWith(`${dir}/`)))
+      return `${step.kind} plans ${target}, a file of an excluded site`;
+  }
+  return null;
+}
 
 /**
  * What recovery must leave, checked against the disk and the model's own record, never against the plan: nothing of
@@ -160,8 +179,10 @@ function broken(
 }
 
 /** Recovery at the start of `current`, interrupted part way at random, then run again to the end. */
-function recover(planner: Planner, disk: Disk, current: RunId, r: ReturnType<typeof random>): void {
+function recover(planner: Planner, disk: Disk, current: RunId, r: Random): string | null {
   const first = planner.planReconcile(snapshotOf(disk, current));
+  const wrong = misplanned(first, disk);
+  if (wrong !== null) return wrong;
   try {
     execute(
       disk,
@@ -170,21 +191,20 @@ function recover(planner: Planner, disk: Disk, current: RunId, r: ReturnType<typ
         r.chance(0.4) ? r.int(8) : Number.POSITIVE_INFINITY,
         r.chance(0.5) ? r.int(1000) / 1000 : null,
       ),
+      r,
     );
-    return;
+    return null;
   } catch (error) {
     if (!(error instanceof Crash)) throw error;
   }
-  execute(
-    disk,
-    planner.planReconcile(snapshotOf(disk, current)),
-    new Steps(Number.POSITIVE_INFINITY, null),
-  );
+  const second = planner.planReconcile(snapshotOf(disk, current));
+  execute(disk, second, new Steps(Number.POSITIVE_INFINITY, null), r);
+  return misplanned(second, disk);
 }
 
-function liveRun(run: Run, r: ReturnType<typeof random>, actions: number): void {
+function liveRun(run: Run, r: Random, actions: number, sites: readonly Site[]): void {
   for (let i = 0; i < actions; i++) {
-    const live = SITES.filter((s) => !run.excluded.has(s));
+    const live = sites.filter((s) => !run.excluded.has(s));
     const site = r.pick(live);
     const roll = r.int(100);
     if (roll < 15) run.startTee(site, 1 + r.int(50));
@@ -193,16 +213,17 @@ function liveRun(run: Run, r: ReturnType<typeof random>, actions: number): void 
     else if (roll < 65) run.plainLine(site, r.pick(["answered", "unanswered"]));
     else if (roll < 75) run.seal(site);
     else if (roll < 79) run.touchSettings();
-    else if (roll < 83 && live.length > 1) run.exclude(site);
+    else if (roll < 83 && live.length > 1) run.exclude(site, r);
     else if (roll < 90) run.exportFile();
     else run.retain(r);
   }
-  run.quit(SITES);
+  run.quit(sites);
 }
 
-/** Three runs, each ending in a crash at a random step (sometimes torn) or a clean quit, each followed by recovery. */
+/** Three runs over generated sites, each ending in a crash at a random step (sometimes torn) or a clean quit. */
 function generatedCase(planner: Planner, seed: number): string | null {
   const r = random(seed);
+  const sites = generatedSites(r, 2 + r.int(3));
   const disk = emptyDisk();
   const truth = emptyTruth();
   for (let n = 1; n <= 3; n++) {
@@ -216,7 +237,7 @@ function generatedCase(planner: Planner, seed: number): string | null {
       ),
     );
     try {
-      liveRun(run, r, 5 + r.int(40));
+      liveRun(run, r, 5 + r.int(40), sites);
     } catch (error) {
       if (!(error instanceof Crash)) throw error;
     }
@@ -230,17 +251,55 @@ function generatedCase(planner: Planner, seed: number): string | null {
     const next = `r${n + 1}` as RunId;
     const currentPart = r.chance(0.3) ? `${LAYOUT.incomingDir}/${next}.1.part` : null;
     if (currentPart !== null) disk.files.set(currentPart, "early");
-    recover(planner, disk, next, r);
-    const problem = broken(planner, disk, truth, next, currentPart);
-    if (problem !== null) return `seed ${seed}, after run ${n}: ${problem}`;
+    const problem =
+      recover(planner, disk, next, r) ?? broken(planner, disk, truth, next, currentPart);
+    if (problem !== null)
+      return `seed ${seed}, after run ${n}, sites ${sites.join(" ")}: ${problem}`;
     if (currentPart !== null) disk.files.delete(currentPart);
   }
   return null;
 }
 
-const SEEDS = Array.from({ length: 600 }, (_, i) => i + 1);
-const firstFailure = (planner: Planner): string | null => {
-  for (const seed of SEEDS) {
+/**
+ * One recorded run over generated sites, then an exclusion stopped before each of its steps in turn (settings .tmp,
+ * rename, every file of the site in a random order, the directory), each followed by recovery.
+ */
+function exclusionCases(
+  planner: Planner,
+  seed: number,
+): { readonly cases: number; readonly problem: string | null } {
+  const r = random(seed);
+  const sites = generatedSites(r, 2 + r.int(3));
+  const disk = emptyDisk();
+  const truth = emptyTruth();
+  const first = new Run("r1" as RunId, disk, truth, new Steps(Number.POSITIVE_INFINITY, null));
+  liveRun(first, r, 10 + r.int(40), sites);
+  const victim = r.pick(sites);
+  const probe = new Steps(Number.POSITIVE_INFINITY, null);
+  new Run("r2" as RunId, cloneDisk(disk), cloneTruth(truth), probe).exclude(victim, r);
+  for (let at = 0; at <= probe.taken; at++) {
+    const order = random(seed * 1_000 + at);
+    const d = cloneDisk(disk);
+    const t = cloneTruth(truth);
+    const tear = order.chance(0.5) ? order.int(1000) / 1000 : null;
+    try {
+      new Run("r2" as RunId, d, t, new Steps(at, tear)).exclude(victim, order);
+    } catch (error) {
+      if (!(error instanceof Crash)) throw error;
+    }
+    const problem =
+      recover(planner, d, "r3" as RunId, order) ?? broken(planner, d, t, "r3" as RunId, null);
+    if (problem !== null)
+      return {
+        cases: at + 1,
+        problem: `seed ${seed}, exclusion of ${victim} stopped before step ${at} of ${probe.taken}: ${problem}`,
+      };
+  }
+  return { cases: probe.taken + 1, problem: null };
+}
+
+const firstFailure = (planner: Planner, seeds: number): string | null => {
+  for (let seed = 1; seed <= seeds; seed++) {
     const problem = generatedCase(planner, seed);
     if (problem !== null) return problem;
   }
@@ -248,8 +307,18 @@ const firstFailure = (planner: Planner): string | null => {
 };
 
 describe("recovery after generated crashes", () => {
-  it("plan, apply, plan again is always empty, and no committed line or the body it names is lost", () => {
-    expect(firstFailure(reconcile)).toBeNull();
+  it(`over ${CASES} generated cases, plan, apply, plan again is always empty, and no committed line or the body it names is lost`, () => {
+    expect(firstFailure(reconcile, CASES)).toBeNull();
+  });
+
+  it(`over ${EXCLUSION_SEEDS} generated archives, an exclusion stopped before any one of its steps recovers`, () => {
+    let cases = 0;
+    for (let seed = 1; seed <= EXCLUSION_SEEDS; seed++) {
+      const result = exclusionCases(reconcile, seed);
+      expect(result.problem).toBeNull();
+      cases += result.cases;
+    }
+    console.info(`exclusion cases: ${cases} interrupt points over ${EXCLUSION_SEEDS} archives`);
   });
 
   it.each(Object.keys(reconcile.RECONCILE_STEPS))(
@@ -260,7 +329,7 @@ describe("recovery after generated crashes", () => {
         from: `steps.push({ kind: "${kind}"`,
         to: `void ({ kind: "${kind}"`,
       });
-      expect(firstFailure(planner)).not.toBeNull();
+      expect(firstFailure(planner, CASES)).not.toBeNull();
     },
   );
 });

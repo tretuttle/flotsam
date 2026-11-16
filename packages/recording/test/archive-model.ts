@@ -99,6 +99,21 @@ export const emptyTruth = (): Truth => ({
   namedBodies: new Map(),
   retained: new Set(),
 });
+export const cloneDisk = (disk: Disk): Disk => ({
+  files: new Map(disk.files),
+  siteDirs: new Set(disk.siteDirs),
+  exports: new Set(disk.exports),
+  journal: new Set(disk.journal),
+});
+export const cloneTruth = (truth: Truth): Truth => ({
+  lines: new Map([...truth.lines].map(([path, lines]) => [path, [...lines]])),
+  namedBodies: new Map(truth.namedBodies),
+  retained: new Set(truth.retained),
+});
+
+/** A directory's files, in an order the file system chooses: an exclusion may delete a log before or after its summary. */
+const filesUnder = (disk: Disk, dir: string, r: Random): readonly string[] =>
+  r.shuffle([...disk.files.keys()].filter((p) => p.startsWith(`${dir}/`)));
 
 const settingsText = (excluded: readonly Site[]) =>
   JSON.stringify({
@@ -323,11 +338,11 @@ export class Run {
   }
 
   /** Settings first, so the gate stops new captures; then the site's directory, file by file. */
-  exclude(site: Site): void {
+  exclude(site: Site, r: Random): void {
     this.writeSettings([...this.excluded, site]);
     this.excluded.add(site);
     const dir = join([LAYOUT.sitesDir, siteDirName(site)]);
-    for (const path of [...this.disk.files.keys()].filter((p) => p.startsWith(`${dir}/`)))
+    for (const path of filesUnder(this.disk, dir, r))
       this.steps.run(() => this.disk.files.delete(path));
     this.steps.run(() => this.disk.siteDirs.delete(dir));
   }
@@ -489,13 +504,12 @@ export function snapshotOf(disk: Disk, current: RunId): DirSnapshot {
 }
 
 /** The store's executor for each step, as primitive writes a crash can interrupt too. Unknown kinds do nothing. */
-export function execute(disk: Disk, plan: readonly ReconcileStep[], steps: Steps): void {
+export function execute(disk: Disk, plan: readonly ReconcileStep[], steps: Steps, r: Random): void {
   for (const step of plan) {
     switch (step.kind) {
       case "delete-excluded-site": {
         const dir = join([LAYOUT.sitesDir, siteDirName(step.site)]);
-        for (const path of [...disk.files.keys()].filter((p) => p.startsWith(`${dir}/`)))
-          steps.run(() => disk.files.delete(path));
+        for (const path of filesUnder(disk, dir, r)) steps.run(() => disk.files.delete(path));
         steps.run(() => disk.siteDirs.delete(dir));
         break;
       }
