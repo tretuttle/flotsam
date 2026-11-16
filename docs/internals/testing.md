@@ -4,7 +4,7 @@ Rules for writing tests, and for asking for them in review.
 
 ## What to test
 
-- Test behavior that can break: principal and permission boundaries, persistence and file ACL guards, size-threshold decisions, HAR serialization, race fixes, and the logic a bug fix changed. Leave out tests for what types already guarantee, trivial logic, copy text, smoke runs, and mock-call mirrors.
+- Test behavior that can break: principal and permission boundaries, persistence and file ACL guards, capture and retention decisions, HAR serialization, race fixes, and the logic a bug fix changed. Leave out tests for what types already guarantee, trivial logic, copy text, smoke runs, and mock-call mirrors.
 - Extend before you add. When an existing test or table covers the behavior, add a row or an assertion there. Write a new `it` only when no case fits.
 - Test at one layer: the lowest one that fails on `main`. Do not repeat the case in a wrapper test or at each call site.
 - In review, ask for a missing test only when it would catch a real regression. Flag a new test that breaks the rules above, and name the fix: fold it into the existing case or table, delete it, or keep one layer.

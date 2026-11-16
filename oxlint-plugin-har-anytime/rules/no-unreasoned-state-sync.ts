@@ -31,9 +31,9 @@ const MESSAGE =
   "a DOM node, listener, port, timer, storage subscription, or resource held until unmount. " +
   "Moving the same logic into a ref or store to dodge this rule is not a fix. " +
   "If the effect does that, name what it keeps in step on the line above: " +
-  "`// oxlint-disable-next-line flotsam/no-unreasoned-state-sync -- <what it syncs with and why>`.";
+  "`// oxlint-disable-next-line har-anytime/no-unreasoned-state-sync -- <what it syncs with and why>`.";
 
-// Every kept effect carries its reason in the suppression above it; flotsam/require-suppression-reason
+// Every kept effect carries its reason in the suppression above it; har-anytime/require-suppression-reason
 // rejects a suppression that does not say why.
 export default defineRule({
   meta: {

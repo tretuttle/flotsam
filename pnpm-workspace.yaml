@@ -1,6 +1,6 @@
 packages:
   - apps/*
-  - oxlint-plugin-flotsam
+  - oxlint-plugin-har-anytime
   - packages/*
   - scripts
 
