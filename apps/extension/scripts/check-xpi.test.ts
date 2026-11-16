@@ -5,49 +5,78 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { zipSync } from "fflate";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
+import { harAnytimeApi, namespace } from "../experiment/contract.ts";
+import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { bundleParent } from "./build-experiment.ts";
 import { extensionRoot } from "./manifest.ts";
+import { RULES, type Changes, type Fixtures } from "./xpi-rules.ts";
 import { renderPng } from "./write-icons.ts";
 
 const checkScript = NodePath.join(extensionRoot, "scripts", "check-xpi.ts");
 const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
 
+const REAL_PAGE = `<!DOCTYPE html><html lang="en"><head>
+    <meta charset="utf-8">
+    <title>One-Click HAR</title>
+  <link rel="stylesheet" href="/action/index.css"></head>
+  <body>
+    <div id="root"></div>
+
+  <script src="/shared/framework.js"></script><script src="/shared/commons.js"></script><script src="/action/index.js"></script>
+
+</body></html>`;
+
 let workDir = "";
-let files: Record<string, Uint8Array> = {};
-let unminifiedParent = "";
-let minifiedParent = "";
-let reactDevelopment = "";
+let fixtures: Fixtures;
+let cleanFiles: Record<string, Uint8Array> = {};
 
 beforeAll(async () => {
   workDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "check-xpi-"));
   // The real parent script, bundled by the real build with minify on and off, is the ground truth for both.
   await bundleParent(NodePath.join(workDir, "minified", "parent.js"), true);
   await bundleParent(NodePath.join(workDir, "unminified", "parent.js"), false);
-  minifiedParent = NodeFS.readFileSync(NodePath.join(workDir, "minified", "parent.js"), "utf8");
-  unminifiedParent = NodeFS.readFileSync(NodePath.join(workDir, "unminified", "parent.js"), "utf8");
-  // React's own development build of react-dom, as published.
+  const minifiedParent = NodeFS.readFileSync(
+    NodePath.join(workDir, "minified", "parent.js"),
+    "utf8",
+  );
   const reactDom = NodePath.dirname(
     NodeModule.createRequire(import.meta.url).resolve("react-dom/package.json"),
   );
-  reactDevelopment = NodeFS.readFileSync(
-    NodePath.join(reactDom, "cjs", "react-dom-client.development.js"),
-    "utf8",
-  );
-  const toolbar = NodeFS.readFileSync(
+  const toolbarSvg = NodeFS.readFileSync(
     NodePath.join(extensionRoot, "src", "icons", "toolbar-dark.svg"),
     "utf8",
   );
+  fixtures = {
+    minifiedParent,
+    unminifiedParent: NodeFS.readFileSync(
+      NodePath.join(workDir, "unminified", "parent.js"),
+      "utf8",
+    ),
+    // React's own development build of react-dom, as published.
+    reactDevelopment: NodeFS.readFileSync(
+      NodePath.join(reactDom, "cjs", "react-dom-client.development.js"),
+      "utf8",
+    ),
+    toolbarSvg,
+    framework: `/*! LICENSE: framework.js.LICENSE.txt */\n${Array.from({ length: 250 }, () => minifiedParent.trim()).join(";")}`,
+  };
   const master = NodeFS.readFileSync(
     NodePath.join(extensionRoot, "src", "icons", "icon.svg"),
     "utf8",
   );
-  files = {
-    "manifest.json": encode('{"manifest_version":3}'),
-    "action/index.html": encode('<!DOCTYPE html><html><body><div id="root"></div></body></html>'),
+  // The shape of the real XPI: pretty manifest and schema, indented page, one-line scripts and styles.
+  cleanFiles = {
+    "manifest.json": NodeFS.readFileSync(NodePath.join(extensionRoot, "src", "manifest.json")),
+    "experiment/schema.json": encode(
+      `${JSON.stringify(toGeckoSchema(namespace, harAnytimeApi), null, 2)}\n`,
+    ),
+    "action/index.html": encode(REAL_PAGE),
     "action/index.js": encode(minifiedParent),
     "action/index.css": encode("body{margin:0}h1{font-size:15px}"),
     "experiment/parent.js": encode(minifiedParent),
-    "icons/toolbar-dark.svg": encode(toolbar),
+    "shared/framework.js": encode(fixtures.framework),
+    "shared/framework.js.LICENSE.txt": NodeFS.readFileSync(NodePath.join(reactDom, "LICENSE")),
+    "icons/toolbar-dark.svg": encode(toolbarSvg),
     "icons/16.png": renderPng(master, 16),
   };
 });
@@ -61,16 +90,16 @@ interface Failure {
   readonly rule: string;
 }
 
-/** Packs `files` plus `changes` into an XPI and runs the check on it the way CI does. */
+/** Packs the clean archive plus `changes` into an XPI and runs the check on it the way CI does. */
 const check = (
   name: string,
-  changes: Record<string, string | Uint8Array>,
+  changes: Changes,
 ): { status: number | null; failures: Failure[]; stderr: string } => {
-  const entries = { ...files };
+  const entries = { ...cleanFiles };
   for (const [path, content] of Object.entries(changes)) {
     entries[path] = typeof content === "string" ? encode(content) : content;
   }
-  const xpi = NodePath.join(workDir, `${name}.xpi`);
+  const xpi = NodePath.join(workDir, `${name.replaceAll(/\W+/g, "-").slice(0, 80)}.xpi`);
   NodeFS.writeFileSync(xpi, zipSync(entries));
   const run = NodeChildProcess.spawnSync(process.execPath, [checkScript, xpi], {
     encoding: "utf8",
@@ -82,90 +111,121 @@ const check = (
   return { status: run.status, failures, stderr: run.stderr };
 };
 
+const bySortKey = (a: Failure, b: Failure): number =>
+  `${a.path}:${a.rule}`.localeCompare(`${b.path}:${b.rule}`);
+
 describe("check-xpi", () => {
-  it("passes an archive of minified production output", () => {
+  it("passes an archive shaped like the real XPI", () => {
     const result = check("clean", {});
     expect(result.failures).toEqual([]);
     expect(result.status).toBe(0);
   });
 
-  const prettyCss = "body {\n  margin: 0;\n}\n\nh1 {\n  font-size: 15px;\n}\n";
-  const prettySvg = NodeFS.readFileSync(
-    NodePath.join(extensionRoot, "src", "icons", "toolbar-dark.svg"),
-    "utf8",
-  ).replace(/></g, ">\n  <");
-
-  // One planted violation each. A plant that does not name its file and rule fails the test.
-  const plants: ReadonlyArray<{
-    readonly plant: string;
-    readonly changes: () => Record<string, string | Uint8Array>;
-    readonly expected: readonly Failure[];
-  }> = [
+  // Production output that looks like what a rule hunts for. Each must pass, or a build would fail on valid output.
+  const legitimate: ReadonlyArray<{ readonly name: string; readonly changes: () => Changes }> = [
     {
-      plant: "an unminified script",
-      changes: () => ({ "experiment/parent.js": unminifiedParent }),
-      expected: [{ path: "experiment/parent.js", rule: "not-minified" }],
-    },
-    {
-      plant: "a stray source map",
-      changes: () => ({ "experiment/parent.js.map": '{"version":3,"sources":[]}' }),
-      expected: [{ path: "experiment/parent.js.map", rule: "source-map-file" }],
-    },
-    {
-      plant: "a TypeScript file",
-      changes: () => ({ "experiment/parent.ts": "export const namespace = 1;\n" }),
-      expected: [{ path: "experiment/parent.ts", rule: "source-file" }],
-    },
-    {
-      plant: "a sourceMappingURL reference in a minified script",
+      name: "F02 one minified line of data over 100 KB",
       changes: () => ({
-        "action/index.js": `${minifiedParent}\n//# sourceMappingURL=index.js.map\n`,
+        "shared/payload.js": `var d=[${Array.from({ length: 30_000 }, (_, i) => i * 7).join(",")}];`,
       }),
-      expected: [{ path: "action/index.js", rule: "source-map-reference" }],
     },
     {
-      plant: "a development build of React",
-      changes: () => ({ "shared/framework.js": reactDevelopment }),
-      expected: [
-        { path: "shared/framework.js", rule: "development-build" },
-        { path: "shared/framework.js", rule: "not-minified" },
-      ],
-    },
-    {
-      plant: "a minified script with an unfolded development branch",
+      name: "two minified data lines of 100 KB each",
       changes: () => ({
-        "action/index.js": `${minifiedParent};"production"!==process.env.NODE_ENV&&console.log(1);`,
+        "shared/payload.js": `${"a".repeat(100_000)}\n${"b".repeat(100_000)}`,
       }),
-      expected: [{ path: "action/index.js", rule: "development-build" }],
     },
     {
-      plant: "an unminified stylesheet",
-      changes: () => ({ "action/index.css": prettyCss }),
-      expected: [{ path: "action/index.css", rule: "not-minified" }],
+      name: "F03 a string that contains /* and */",
+      changes: () => ({ "shared/payload.js": 'var s="/* not a comment */",t=1;console.log(s,t);' }),
     },
     {
-      plant: "an unminified SVG",
-      changes: () => ({ "icons/toolbar-dark.svg": prettySvg }),
-      expected: [{ path: "icons/toolbar-dark.svg", rule: "not-minified" }],
+      name: "a string that holds a line comment and a sourceMappingURL",
+      changes: () => ({
+        "shared/payload.js": `var u="http://example.test/a",m="//# sourceMappingURL=x.map";console.log(u,m);`,
+      }),
     },
     {
-      plant: "a file type an XPI does not ship",
-      changes: () => ({ "NOTES.md": "# notes\n" }),
-      expected: [{ path: "NOTES.md", rule: "unknown-file-type" }],
+      name: "a regular expression with quotes and /* in a class, then a division",
+      changes: () => ({
+        "shared/payload.js": `var r=/["'/*]+/g,q=a/2/3;var s="/* x */";console.log(r,q,s);`,
+      }),
     },
     {
-      plant: "a test fixture",
-      changes: () => ({ "fixtures/capture.json": "{}" }),
-      expected: [{ path: "fixtures/capture.json", rule: "dev-only-file" }],
+      name: "a template literal with //, /* and a nested template",
+      changes: () => ({
+        "shared/payload.js": "var t=`a // b ${`/* ${1} */`} c /* d`;console.log(t);",
+      }),
+    },
+    {
+      name: "a quote after a division that follows a closing paren",
+      changes: () => ({
+        "shared/payload.js": `var a=(b+c)/2,s="/* kept */";console.log(a,s);`,
+      }),
+    },
+    {
+      name: "a legal pointer line above one long line",
+      changes: () => ({
+        "shared/payload.js": `/*! LICENSE: payload.js.LICENSE.txt */\n${"var x=1;".repeat(500)}`,
+      }),
+    },
+    {
+      name: "a React style multi-line @license comment above one long line",
+      changes: () => ({
+        "shared/payload.js": `/**\n * @license React v19.3.1\n * react.production.js\n *\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n *\n * This source code is licensed under the MIT license found in the\n * LICENSE file in the root directory of this source tree.\n */\n${"var x=1;".repeat(500)}`,
+      }),
+    },
+    {
+      name: "three line breaks in a script",
+      changes: () => ({ "shared/payload.js": "var a=1;\nvar b=2;\nvar c=3;\nvar d=4;" }),
+    },
+    {
+      name: "a stylesheet with a url that holds //",
+      changes: () => ({
+        "action/index.css": "a{background:url(http://example.test/a.png)}b{content:'/* x */'}",
+      }),
+    },
+    {
+      name: "pretty JSON with a two line string",
+      changes: () => ({ "experiment/info.json": '{\n  "description": "line one\\nline two"\n}\n' }),
+    },
+    {
+      name: "a page that loads its script by src",
+      changes: () => ({
+        "options/index.html":
+          '<!DOCTYPE html><html><body><script src="/options/index.js"></script></body></html>',
+      }),
     },
   ];
 
-  it.each(plants)(
-    "fails on $plant, naming the file and the rule",
-    ({ plant, changes, expected }) => {
-      const result = check(plant.replaceAll(" ", "-"), changes());
-      expect(result.failures).toEqual(expected);
+  it.each(legitimate)("passes $name", ({ name, changes }) => {
+    const result = check(name, changes());
+    expect(result.failures).toEqual([]);
+    expect(result.status).toBe(0);
+  });
+
+  describe.each(RULES)("rule $id", (rule) => {
+    it("is proven by at least one planted archive", () => {
+      expect(rule.plants.length).toBeGreaterThan(0);
+    });
+
+    it.each(rule.plants)("fails on $name, naming the file and the rule", (plant) => {
+      const result = check(plant.name, plant.changes(fixtures));
+      const expected = [rule.id, ...(plant.alsoFails ?? [])]
+        .map((id) => ({ path: plant.path, rule: id }))
+        .toSorted(bySortKey);
+      expect(result.failures.toSorted(bySortKey)).toEqual(expected);
       expect(result.status).toBe(1);
-    },
-  );
+      expect(result.stderr.trim().split("\n")).toHaveLength(expected.length);
+      expect(result.stderr).toMatch(new RegExp(`^FAIL ${plant.path}: ${rule.id}: .+`, "m"));
+    });
+  });
+
+  it("lists each rule once, and every extra rule a plant expects is a rule", () => {
+    const ids = RULES.map((rule) => rule.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const extra of RULES.flatMap((rule) => rule.plants.flatMap((p) => p.alsoFails ?? []))) {
+      expect(ids).toContain(extra);
+    }
+  });
 });
