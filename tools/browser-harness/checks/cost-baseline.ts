@@ -16,7 +16,10 @@ const check: HarnessCheck = {
         name: "cost-baseline",
         ok: false,
         durationMs: Date.now() - started,
-        detail: "missing --extension path for cost-baseline check",
+        detail:
+          context.extensionPath === null
+            ? "missing --extension path for cost-baseline check"
+            : `extension path does not exist for cost-baseline check: ${context.extensionPath}`,
       };
     }
     const scenarios: readonly CostScenarioName[] = context.short
@@ -42,17 +45,17 @@ const check: HarnessCheck = {
           `${scenarioName}: ${String(result.errors)} failed runs (${result.failures.map((f) => f.reason).join("; ")})`,
         );
       }
-      const offCpu = result.arms.off.parentCpuMs;
-      const extCpu = result.arms.extension.parentCpuMs;
-      const panelCpu = result.arms.panel.parentCpuMs;
+      const offCpu = result.arms.off.parentMainThreadMs;
+      const extCpu = result.arms.extension.parentMainThreadMs;
+      const panelCpu = result.arms.panel.parentMainThreadMs;
       if (offCpu !== null && extCpu !== null && panelCpu !== null) {
-        // Allow 30 ms slack only on the short 2-scored-round CI profile where CPU ticks quantize in 10 ms steps.
+        // Short CI profile gets only 10 ms slack with 2 scored runs; full run uses exact budget.
         const slow = detectSlowArm({
           arm: "extension",
           observedMedianMs: extCpu.median,
           offMedianMs: offCpu.median,
           panelMedianMs: panelCpu.median,
-          slackMs: context.short ? 30 : 0,
+          slackMs: context.short ? 10 : 0,
         });
         if (!slow.ok && slow.reason !== null) problems.push(`${scenarioName}: ${slow.reason}`);
       }
@@ -80,4 +83,5 @@ const check: HarnessCheck = {
   },
 };
 
+/** @discovered-check */
 export default check;

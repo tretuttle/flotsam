@@ -4,7 +4,12 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
-import { launchBrowser, readExtensionId } from "../../../tools/browser-harness/src/browser.ts";
+import {
+  launchBrowser,
+  readExtensionId,
+  readExtensionPopupPath,
+  waitForActiveExtensionUrl,
+} from "../../../tools/browser-harness/src/browser.ts";
 import { BINARY_ENV, GECKO_BINARY_ENV } from "../../../tools/browser-harness/src/cli.ts";
 import { buildDir, readManifest, xpiPath } from "./manifest.ts";
 
@@ -35,6 +40,7 @@ const APPEARANCES = [
 
 const xpi = NodePath.resolve(options.xpi);
 const addonId = await readExtensionId(xpi);
+const popupPath = await readExtensionPopupPath(xpi);
 const outDir = NodePath.resolve(options.out);
 NodeFS.mkdirSync(outDir, { recursive: true });
 
@@ -46,6 +52,7 @@ await using session = await launchBrowser({
   allowSystemAccess: true,
   signal: new AbortController().signal,
 });
+await waitForActiveExtensionUrl(session, addonId, popupPath);
 console.log(`installed ${xpi} as ${addonId}`);
 
 const widget = (await session.evaluateChrome(

@@ -251,7 +251,7 @@ export function getExtendedStaticRoutes(): ReadonlyMap<string, StaticRoute> {
     "GET",
     ID_DOWNLOAD_PAGE_PATH,
     Buffer.from(
-      `<!doctype html><html><head><meta charset="utf-8"><title>download</title></head><body><a id="download-link" href="${ID_DOWNLOAD_PATH}">Download</a></body></html>`,
+      `<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>download</title></head><body><a id="download-link" href="${ID_DOWNLOAD_PATH}">Download</a></body></html>`,
       "utf8",
     ),
     "text/html; charset=utf-8",

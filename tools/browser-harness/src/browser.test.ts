@@ -15,11 +15,20 @@ import {
   readExtensionId,
   renderUserJs,
 } from "./browser.ts";
-import { currentPlatformName } from "./owned-process.ts";
+import { leaseDirectory } from "./orphan-lease.ts";
+import {
+  currentPlatformName,
+  killOwnedTree,
+  pidAlive,
+  readProcessIdentity,
+  spawnOwned,
+} from "./owned-process.ts";
 
 const directories: string[] = [];
+const cleanupPids: number[] = [];
 
 afterEach(async () => {
+  for (const pid of cleanupPids.splice(0)) await killOwnedTree(pid, []);
   await Promise.all(
     directories
       .splice(0)
@@ -104,6 +113,12 @@ describe("browser profile", () => {
     expect(browserIsOwned(5, 5, null)).toBe(true);
     expect(browserIsOwned(6, 5, 5)).toBe(true);
     expect(browserIsOwned(6, 5, 4)).toBe(false);
+  });
+
+  it("never passes -wait-for-browser on Linux or macOS", () => {
+    expect(BROWSER_PLATFORMS.linux.launcherArgs).toEqual([]);
+    expect(BROWSER_PLATFORMS.darwin.launcherArgs).toEqual([]);
+    expect(BROWSER_PLATFORMS.win32.launcherArgs).toEqual(["-wait-for-browser"]);
   });
 
   it.each(Object.entries(LIVE_PROFILES))(
@@ -215,6 +230,7 @@ describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
       const prefs = await NodeFSP.readFile(prefsFile, "utf8");
       expect(args[0]).toBe("-headless");
       expect(args).toContain("-no-remote");
+      expect(args).not.toContain("-wait-for-browser");
       if (protocol === "bidi") {
         expect(args).toContain("--remote-debugging-port");
         expect(args).not.toContain("-marionette");
@@ -270,10 +286,231 @@ describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
     expect(noneArgs).toContain("file:///tmp/example.html");
     expect(noneArgs).not.toContain("-marionette");
     expect(noneArgs).not.toContain("--remote-debugging-port");
+    expect(noneArgs).not.toContain("-wait-for-browser");
     expect(nonePrefs).not.toContain("devtools.debugger.remote-enabled");
     expect(nonePrefs).not.toContain("remote.active-protocols");
     expect(nonePrefs).not.toContain("marionette.port");
     await session[Symbol.asyncDispose]();
+  });
+
+  it("enables HTTP cache prefs only when cache: true is requested", async () => {
+    const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-cache-"));
+    directories.push(scratch);
+    const prefsFile = NodePath.join(scratch, "user.js");
+    const binary = NodePath.join(scratch, "browser");
+    await NodeFSP.writeFile(
+      binary,
+      `#!/bin/sh\ncp "$4/user.js" '${prefsFile}' 2>/dev/null || true\nexit 1\n`,
+      { mode: 0o755 },
+    );
+
+    await expect(
+      launchBrowser({
+        binaryPath: binary,
+        extensionPath: null,
+        display: "headless",
+        protocol: "marionette",
+        cache: true,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(/browser exited with code 1/);
+    const enabled = await NodeFSP.readFile(prefsFile, "utf8");
+    expect(enabled).toContain('user_pref("network.http.use-cache", true);');
+    expect(enabled).toContain('user_pref("browser.cache.disk.enable", true);');
+    expect(enabled).toContain('user_pref("browser.cache.memory.enable", true);');
+  });
+
+  it("fails immediately on early exit with buffered stderr even when a descendant keeps stderr open", async () => {
+    const scratch = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "one-click-har-desc-stderr-"),
+    );
+    directories.push(scratch);
+    const binary = NodePath.join(scratch, "browser");
+    await NodeFSP.writeFile(
+      binary,
+      `#!/bin/sh\nsleep 30 &\necho "boom: browser crashed at startup" >&2\nexit 3\n`,
+      { mode: 0o755 },
+    );
+    const started = Date.now();
+    await expect(
+      launchBrowser({
+        binaryPath: binary,
+        extensionPath: null,
+        display: "headless",
+        protocol: "marionette",
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(
+      /browser exited with code 3 before remote control opened[\s\S]*boom: browser crashed at startup/,
+    );
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  it("reports exit signal and stderr when a connected browser dies mid-session, kills its tree on dispose, and reaps prior orphans on launch", async () => {
+    const scratch = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "one-click-har-fake-marionette-"),
+    );
+    directories.push(scratch);
+
+    // Plant an orphan lease + live orphan process so launchBrowser proves it reaps on startup.
+    const orphanProfile = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "one-click-har-browser-orphan-"),
+    );
+    directories.push(orphanProfile);
+    const orphan = spawnOwned(process.execPath, [
+      "-e",
+      `// ${orphanProfile}\nsetInterval(() => {}, 1000);`,
+    ]);
+    cleanupPids.push(orphan.pid);
+    const orphanIdentity = readProcessIdentity(orphan.pid);
+    expect(orphanIdentity).not.toBeNull();
+    const orphanLeaseDir = leaseDirectory();
+    await NodeFSP.mkdir(orphanLeaseDir, { recursive: true, mode: 0o700 });
+    const orphanLease = NodePath.join(orphanLeaseDir, `test-orphan-${String(Date.now())}.json`);
+    await NodeFSP.writeFile(
+      orphanLease,
+      JSON.stringify({
+        version: 2,
+        harnessPid: 999_999_999,
+        harnessStartTime: "1",
+        spawnedPid: orphan.pid,
+        spawnedStartTime: orphanIdentity?.startTime,
+        profileDir: orphanProfile,
+        createdAt: new Date().toISOString(),
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const serverScript = NodePath.join(scratch, "fake-marionette.mjs");
+    await NodeFSP.writeFile(
+      serverScript,
+      `import * as NodeFS from "node:fs";
+       import * as NodeNet from "node:net";
+       import * as NodePath from "node:path";
+       const idx = process.argv.indexOf("-profile");
+       const profile = process.argv[idx + 1];
+       const userJs = NodeFS.readFileSync(NodePath.join(profile, "user.js"), "utf8");
+       const port = Number(/user_pref\\("marionette\\.port", (\\d+)\\)/.exec(userJs)[1]);
+       const server = NodeNet.createServer((socket) => {
+         const send = (obj) => {
+           const buf = Buffer.from(JSON.stringify(obj), "utf8");
+           socket.write(buf.length + ":" + buf.toString("utf8"));
+         };
+         send({ applicationType: "gecko", marionetteProtocol: 3 });
+         let buf = Buffer.alloc(0);
+         socket.on("data", (chunk) => {
+           buf = Buffer.concat([buf, chunk]);
+           while (buf.length > 0) {
+             const colon = buf.indexOf(0x3a);
+             if (colon <= 0) return;
+             const len = Number(buf.subarray(0, colon).toString("ascii"));
+             if (buf.length < colon + 1 + len) return;
+             const raw = buf.subarray(colon + 1, colon + 1 + len).toString("utf8");
+             buf = buf.subarray(colon + 1 + len);
+             const msg = JSON.parse(raw);
+             if (!Array.isArray(msg)) continue;
+             const [, id, cmd] = msg;
+             if (cmd === "WebDriver:NewSession") {
+               send([1, id, null, { sessionId: "1", capabilities: { "moz:processID": process.pid, browserName: "zen", browserVersion: "1.25t", "moz:buildID": "20261115114312", userAgent: "Fake/1.0" } }]);
+             } else if (cmd === "WebDriver:GetWindowHandle") {
+               send([1, id, null, { value: "win-1" }]);
+             } else if (cmd === "WebDriver:NewWindow") {
+               process.stderr.write("fatal mid-session stderr\\n");
+               process.kill(process.pid, "SIGKILL");
+             }
+           }
+         });
+       });
+       server.listen(port, "127.0.0.1");
+       setInterval(() => {}, 1000);`,
+      "utf8",
+    );
+    const fakeBin = NodePath.join(scratch, "browser");
+    await NodeFSP.writeFile(
+      fakeBin,
+      `#!/bin/sh\nexec '${process.execPath}' '${serverScript}' "$@"\n`,
+      { mode: 0o755 },
+    );
+
+    let spawnedPid = 0;
+    {
+      await using session = await launchBrowser({
+        binaryPath: fakeBin,
+        extensionPath: null,
+        display: "headless",
+        protocol: "marionette",
+        signal: new AbortController().signal,
+      });
+      spawnedPid = session.spawnedPid;
+      expect(pidAlive(orphan.pid)).toBe(false);
+      expect(NodeFS.existsSync(orphanLease)).toBe(false);
+      await expect(session.openTab("about:blank")).rejects.toThrow(
+        /Marionette socket closed \(browser exited with signal SIGKILL\)[\s\S]*fatal mid-session stderr/,
+      );
+    }
+
+    // Verify normal dispose kills a hung connected browser tree too.
+    const hangBin = NodePath.join(scratch, "browser-hang");
+    const hangScript = NodePath.join(scratch, "fake-marionette-hang.mjs");
+    await NodeFSP.writeFile(
+      hangScript,
+      `import * as NodeFS from "node:fs";
+       import * as NodeNet from "node:net";
+       import * as NodePath from "node:path";
+       const idx = process.argv.indexOf("-profile");
+       const profile = process.argv[idx + 1];
+       const userJs = NodeFS.readFileSync(NodePath.join(profile, "user.js"), "utf8");
+       const port = Number(/user_pref\\("marionette\\.port", (\\d+)\\)/.exec(userJs)[1]);
+       const server = NodeNet.createServer((socket) => {
+         const send = (obj) => {
+           const buf = Buffer.from(JSON.stringify(obj), "utf8");
+           socket.write(buf.length + ":" + buf.toString("utf8"));
+         };
+         send({ applicationType: "gecko", marionetteProtocol: 3 });
+         let buf = Buffer.alloc(0);
+         socket.on("data", (chunk) => {
+           buf = Buffer.concat([buf, chunk]);
+           while (buf.length > 0) {
+             const colon = buf.indexOf(0x3a);
+             if (colon <= 0) return;
+             const len = Number(buf.subarray(0, colon).toString("ascii"));
+             if (buf.length < colon + 1 + len) return;
+             const raw = buf.subarray(colon + 1, colon + 1 + len).toString("utf8");
+             buf = buf.subarray(colon + 1 + len);
+             const msg = JSON.parse(raw);
+             if (!Array.isArray(msg)) continue;
+             const [, id, cmd] = msg;
+             if (cmd === "WebDriver:NewSession") {
+               send([1, id, null, { sessionId: "1", capabilities: { "moz:processID": process.pid, browserName: "zen", browserVersion: "1.25t", "moz:buildID": "20261115114312", userAgent: "Fake/1.0" } }]);
+             } else if (cmd === "WebDriver:GetWindowHandle") {
+               send([1, id, null, { value: "win-1" }]);
+             }
+           }
+         });
+       });
+       server.listen(port, "127.0.0.1");
+       setInterval(() => {}, 1000);`,
+      "utf8",
+    );
+    await NodeFSP.writeFile(
+      hangBin,
+      `#!/bin/sh\nexec '${process.execPath}' '${hangScript}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    let hungPid = 0;
+    {
+      await using session = await launchBrowser({
+        binaryPath: hangBin,
+        extensionPath: null,
+        display: "headless",
+        protocol: "marionette",
+        signal: new AbortController().signal,
+      });
+      hungPid = session.spawnedPid;
+      expect(pidAlive(hungPid)).toBe(true);
+    }
+    expect(pidAlive(hungPid)).toBe(false);
+    void spawnedPid;
   });
 });
 

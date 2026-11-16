@@ -24,10 +24,19 @@ export type RemoteControl = {
   readonly dispose: () => void;
 };
 
+type ExitInfo = {
+  readonly exitStatus: () => string | null;
+  readonly waitForExit?: () => Promise<string>;
+  readonly stderr: () => string;
+};
+
+const EXIT_STATUS_WAIT_MS = 500;
+
 export async function connectRemote(options: {
   readonly protocol: RemoteProtocol;
   readonly port: number;
   readonly exitStatus: () => string | null;
+  readonly waitForExit?: () => Promise<string>;
   readonly stderr: () => string;
   readonly signal: AbortSignal;
   readonly deadlineMs?: number;
@@ -44,23 +53,29 @@ export async function connectRemote(options: {
     }
   };
   throwIfExited();
+  const exitInfo: ExitInfo = {
+    exitStatus: options.exitStatus,
+    ...(options.waitForExit === undefined ? {} : { waitForExit: options.waitForExit }),
+    stderr: options.stderr,
+  };
   const open = options.protocol === "bidi" ? openBidi : openMarionette;
   while (Date.now() < deadline) {
     throwIfExited();
     if (await tcpOpen(options.port)) {
       try {
-        return await open(options.port);
+        return await open(options.port, exitInfo);
       } catch (error) {
         detail = errorMessage(error);
       }
     }
     await delay(100);
   }
+  throwIfExited();
   throw new Error(`timed out waiting for ${options.protocol}\n${detail}\n${options.stderr()}`);
 }
 
-async function openBidi(port: number): Promise<RemoteControl> {
-  const bidi = await connectBidi(port);
+async function openBidi(port: number, exitInfo: ExitInfo): Promise<RemoteControl> {
+  const bidi = await connectBidi(port, exitInfo);
   try {
     const identity = readBidiSession(
       await bidi.call("session.new", { capabilities: { alwaysMatch: {} } }, SOCKET_MS),
@@ -105,8 +120,8 @@ async function openBidi(port: number): Promise<RemoteControl> {
   }
 }
 
-async function openMarionette(port: number): Promise<RemoteControl> {
-  const marionette = await connectMarionette(port);
+async function openMarionette(port: number, exitInfo: ExitInfo): Promise<RemoteControl> {
+  const marionette = await connectMarionette(port, exitInfo);
   try {
     const created = await marionette.call(
       "WebDriver:NewSession",
@@ -236,7 +251,7 @@ type CommandSocket = {
   close: () => void;
 };
 
-function connectBidi(port: number): Promise<CommandSocket> {
+function connectBidi(port: number, exitInfo: ExitInfo): Promise<CommandSocket> {
   const ws = new WebSocket(`ws://127.0.0.1:${String(port)}/session`);
   const pending = new Map<
     number,
@@ -244,9 +259,12 @@ function connectBidi(port: number): Promise<CommandSocket> {
   >();
   let nextId = 1;
   let failed: Error | null = null;
+  let closingPromise: Promise<Error> | null = null;
+  let closedIntentionally = false;
   const socket: CommandSocket = {
     call(method, params, timeoutMs = COMMAND_MS) {
       if (failed !== null) return Promise.reject(failed);
+      if (closingPromise !== null) return closingPromise.then((error) => Promise.reject(error));
       const id = nextId;
       nextId += 1;
       const result = new Promise<unknown>((resolve, reject) => {
@@ -269,6 +287,7 @@ function connectBidi(port: number): Promise<CommandSocket> {
       return result;
     },
     close() {
+      closedIntentionally = true;
       ws.close();
     },
   };
@@ -286,9 +305,19 @@ function connectBidi(port: number): Promise<CommandSocket> {
     waiter.resolve(message.result);
   });
   ws.addEventListener("close", () => {
-    failed = new Error("BiDi socket closed");
-    for (const waiter of pending.values()) waiter.reject(failed);
-    pending.clear();
+    if (closingPromise !== null || failed !== null) return;
+    if (closedIntentionally) {
+      failed = new Error("BiDi socket closed");
+      for (const waiter of pending.values()) waiter.reject(failed);
+      pending.clear();
+      return;
+    }
+    closingPromise = buildSocketClosedError("BiDi socket closed", exitInfo).then((error) => {
+      failed = error;
+      for (const waiter of pending.values()) waiter.reject(error);
+      pending.clear();
+      return error;
+    });
   });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -314,7 +343,7 @@ function connectBidi(port: number): Promise<CommandSocket> {
   });
 }
 
-function connectMarionette(port: number): Promise<CommandSocket> {
+function connectMarionette(port: number, exitInfo: ExitInfo): Promise<CommandSocket> {
   const socket = NodeNet.connect(port, "127.0.0.1");
   let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   const pending = new Map<
@@ -323,6 +352,8 @@ function connectMarionette(port: number): Promise<CommandSocket> {
   >();
   let nextId = 1;
   let failed: Error | null = null;
+  let closingPromise: Promise<Error> | null = null;
+  let closedIntentionally = false;
   let opened = false;
 
   function send(value: unknown): void {
@@ -333,6 +364,7 @@ function connectMarionette(port: number): Promise<CommandSocket> {
   const commands: CommandSocket = {
     call(name, params, timeoutMs = COMMAND_MS) {
       if (failed !== null) return Promise.reject(failed);
+      if (closingPromise !== null) return closingPromise.then((error) => Promise.reject(error));
       const id = nextId;
       nextId += 1;
       const result = new Promise<unknown>((resolve, reject) => {
@@ -355,6 +387,7 @@ function connectMarionette(port: number): Promise<CommandSocket> {
       return result;
     },
     close() {
+      closedIntentionally = true;
       socket.destroy();
     },
   };
@@ -365,6 +398,18 @@ function connectMarionette(port: number): Promise<CommandSocket> {
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
     socket.destroy();
+  }
+
+  function failAfterClose(label: string): void {
+    if (closingPromise !== null || failed !== null) return;
+    if (closedIntentionally) {
+      fail(new Error(label));
+      return;
+    }
+    closingPromise = buildSocketClosedError(label, exitInfo).then((error) => {
+      fail(error);
+      return error;
+    });
   }
 
   function onMessage(message: unknown, ready: (value: CommandSocket) => void): void {
@@ -413,14 +458,31 @@ function connectMarionette(port: number): Promise<CommandSocket> {
     });
     socket.on("error", () => {
       clearTimeout(timer);
+      if (opened) {
+        failAfterClose("Marionette socket failed");
+        return;
+      }
       const error = new Error("Marionette socket failed");
       fail(error);
       reject(error);
     });
     socket.on("close", () => {
-      if (opened) fail(new Error("Marionette socket closed"));
+      if (opened) failAfterClose("Marionette socket closed");
     });
   });
+}
+
+async function buildSocketClosedError(label: string, exitInfo: ExitInfo): Promise<Error> {
+  let status = exitInfo.exitStatus();
+  if (status === null && exitInfo.waitForExit !== undefined) {
+    await Promise.race([exitInfo.waitForExit(), delay(EXIT_STATUS_WAIT_MS)]);
+    status = exitInfo.exitStatus();
+  }
+  const tail = exitInfo.stderr().trim();
+  if (status === null) {
+    return new Error(tail.length > 0 ? `${label}\n${tail}` : label);
+  }
+  return new Error(`${label} (browser exited with ${status})${tail.length > 0 ? `\n${tail}` : ""}`);
 }
 
 function takeLengthMessage(

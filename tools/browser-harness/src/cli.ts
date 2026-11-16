@@ -312,7 +312,7 @@ async function main(argv: readonly string[]): Promise<void> {
       },
     });
     process.stdout.write(`${JSON.stringify(run, null, 2)}\n`);
-    if (!run.ok) process.exitCode = 1;
+    if (controller.signal.aborted || !run.ok) process.exitCode = 1;
     return;
   }
   const { file, path } = await captureBaseline({ ...command, signal: controller.signal });

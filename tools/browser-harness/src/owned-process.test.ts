@@ -11,6 +11,8 @@ import {
   PROCESS_PLATFORMS,
   removeDirectoryBounded,
   spawnOwned,
+  STDERR_DRAIN_GRACE_MS,
+  watchChildExit,
   type OwnedChild,
   type ProcessPlatformName,
 } from "./owned-process.ts";
@@ -193,6 +195,55 @@ describe("owned process trees", () => {
         await NodeFSP.chmod(parent, 0o755);
         await NodeFSP.chmod(locked, 0o755);
       }
+    },
+  );
+
+  it.runIf(currentPlatformName() !== "win32")(
+    "reports exit with buffered stderr without waiting on a descendant holding stderr open",
+    async () => {
+      const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-drain-"));
+      directories.push(scratch);
+      const child = spawnOwned(
+        "/bin/sh",
+        ["-c", "sleep 30 &\necho 'descendant pipe crash' >&2\nexit 3\n"],
+        { stdio: ["ignore", "ignore", "pipe"] },
+      );
+      owned.push(child.pid);
+      const watcher = watchChildExit(child.child);
+      const started = Date.now();
+      const result = await watcher.exited;
+      const elapsed = Date.now() - started;
+      expect(result.status).toBe("code 3");
+      expect(result.stderr).toContain("descendant pipe crash");
+      expect(elapsed).toBeGreaterThanOrEqual(STDERR_DRAIN_GRACE_MS - 20);
+      expect(elapsed).toBeLessThan(2000);
+    },
+  );
+
+  it.runIf(currentPlatformName() !== "win32")(
+    "stops processes with SIGTERM first, escalating to SIGKILL only after bounded wait",
+    async () => {
+      const scratch = await NodeFSP.mkdtemp(
+        NodePath.join(NodeOS.tmpdir(), "one-click-har-signals-"),
+      );
+      directories.push(scratch);
+      const signalLog = NodePath.join(scratch, "signals.log");
+      const stub = spawnOwned(
+        process.execPath,
+        [
+          "-e",
+          `const fs = require("node:fs");
+           process.on("SIGTERM", () => fs.appendFileSync(${JSON.stringify(signalLog)}, "SIGTERM\\n"));
+           process.stdout.write("ready\\n");
+           setInterval(() => {}, 1000);`,
+        ],
+        { stdio: ["ignore", "pipe", "ignore"] },
+      );
+      owned.push(stub.pid);
+      expect(await firstLine(stub)).toBe("ready");
+      await killOwnedTree(stub.pid, []);
+      expect(pidAlive(stub.pid)).toBe(false);
+      expect(await NodeFSP.readFile(signalLog, "utf8")).toContain("SIGTERM");
     },
   );
 });

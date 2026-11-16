@@ -1,9 +1,11 @@
 {
-  "capturedAt": "2026-11-16T12:07:30.179Z",
+  "capturedAt": "2026-11-16T14:30:22.031Z",
   "scenario": "cost-heavy",
+  "cpuMetric": "parent-main-thread",
   "arm": "off",
   "rounds": 6,
   "warmupDropped": 1,
+  "discardedRounds": [],
   "runCount": 5,
   "errors": 0,
   "failures": [],
@@ -11,79 +13,96 @@
     {
       "round": 1,
       "arm": "off",
-      "lastResourceFinishedMs": 211,
-      "parentWorkingSetBytes": 485896192,
-      "parentCpuMs": 580,
-      "wallMs": 212.69129,
+      "lastResourceFinishedMs": 139,
+      "parentWorkingSetBytes": 422486016,
+      "parentMainThreadMs": 65.6,
+      "parentProcessCpuMs": 159.7,
+      "wallMs": 139.640474,
+      "settleMs": 3311,
       "requestCount": 74
     },
     {
       "round": 2,
       "arm": "off",
-      "lastResourceFinishedMs": 194,
-      "parentWorkingSetBytes": 466911232,
-      "parentCpuMs": 420,
-      "wallMs": 195.903409,
+      "lastResourceFinishedMs": 129,
+      "parentWorkingSetBytes": 404000768,
+      "parentMainThreadMs": 57,
+      "parentProcessCpuMs": 136.4,
+      "wallMs": 130.717639,
+      "settleMs": 3579,
       "requestCount": 74
     },
     {
       "round": 3,
       "arm": "off",
-      "lastResourceFinishedMs": 217,
-      "parentWorkingSetBytes": 493981696,
-      "parentCpuMs": 500,
-      "wallMs": 220.456552,
+      "lastResourceFinishedMs": 116,
+      "parentWorkingSetBytes": 404787200,
+      "parentMainThreadMs": 52,
+      "parentProcessCpuMs": 134.9,
+      "wallMs": 116.892203,
+      "settleMs": 3307,
       "requestCount": 74
     },
     {
       "round": 4,
       "arm": "off",
-      "lastResourceFinishedMs": 236,
-      "parentWorkingSetBytes": 483127296,
-      "parentCpuMs": 660,
-      "wallMs": 238.478441,
+      "lastResourceFinishedMs": 120,
+      "parentWorkingSetBytes": 422215680,
+      "parentMainThreadMs": 55.6,
+      "parentProcessCpuMs": 130.9,
+      "wallMs": 121.178544,
+      "settleMs": 3323,
       "requestCount": 74
     },
     {
       "round": 5,
       "arm": "off",
-      "lastResourceFinishedMs": 241,
-      "parentWorkingSetBytes": 470159360,
-      "parentCpuMs": 590,
-      "wallMs": 243.987161,
+      "lastResourceFinishedMs": 129,
+      "parentWorkingSetBytes": 423280640,
+      "parentMainThreadMs": 58.4,
+      "parentProcessCpuMs": 137.2,
+      "wallMs": 130.090513,
+      "settleMs": 3308,
       "requestCount": 74
     }
   ],
   "lastResourceFinishedMs": {
-    "median": 217,
-    "spread": 47,
-    "min": 194,
-    "max": 241,
+    "median": 129,
+    "spread": 23,
+    "min": 116,
+    "max": 139,
     "runCount": 5
   },
-  "parentCpuMs": {
-    "median": 580,
-    "spread": 240,
-    "min": 420,
-    "max": 660,
+  "parentMainThreadMs": {
+    "median": 57,
+    "spread": 13.599999999999994,
+    "min": 52,
+    "max": 65.6,
+    "runCount": 5
+  },
+  "parentProcessCpuMs": {
+    "median": 136.4,
+    "spread": 28.799999999999983,
+    "min": 130.9,
+    "max": 159.7,
     "runCount": 5
   },
   "parentWorkingSetBytes": {
-    "median": 483127296,
-    "spread": 27070464,
-    "min": 466911232,
-    "max": 493981696,
+    "median": 422215680,
+    "spread": 19279872,
+    "min": 404000768,
+    "max": 423280640,
     "runCount": 5
   },
   "wallMs": {
-    "median": 220.456552,
-    "spread": 48.083751999999976,
-    "min": 195.903409,
-    "max": 243.987161,
+    "median": 130.090513,
+    "spread": 22.748271000000017,
+    "min": 116.892203,
+    "max": 139.640474,
     "runCount": 5
   },
   "browser": {
-    "binaryPath": "/tmp/och-harness-ci/twilight/zen/zen",
+    "binaryPath": "/home/trent/och-work/browsers/zen-twilight-1.25t-20261115114312/zen",
     "name": "zen",
     "version": "1.25t",
     "buildId": "20261115114312",
@@ -101,12 +120,12 @@
   },
   "load": {
     "before": {
-      "cpuBusyPercent": 1,
-      "loadAverage": [2.79, 2.2, 1.44]
+      "cpuBusyPercent": 6,
+      "loadAverage": [3.16, 4.53, 3.64]
     },
     "after": {
-      "cpuBusyPercent": 28.6,
-      "loadAverage": [8.32, 3.64, 1.97]
+      "cpuBusyPercent": 0.6,
+      "loadAverage": [3.52, 4.22, 3.62]
     }
   }
 }

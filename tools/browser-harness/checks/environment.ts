@@ -1,15 +1,14 @@
 import * as NodeFS from "node:fs";
-import * as NodeFSP from "node:fs/promises";
-import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import {
   launchBrowser,
   readExtensionId,
+  readExtensionPopupPath,
+  waitForActiveExtensionUrl,
   type BrowserIdentity,
   type BrowserSession,
 } from "../src/browser.ts";
 import type { CheckContext, CheckResult, HarnessCheck } from "../src/checks.ts";
-import { readZipEntry } from "../src/zip.ts";
 
 export type ReportedEnvironment = {
   readonly browser: {
@@ -79,69 +78,6 @@ const STEPS: ReadonlyArray<{
     text: () => "Not open on this tab",
   },
 ];
-
-export async function readExtensionPopupPath(extensionPath: string): Promise<string> {
-  const absolute = NodePath.resolve(extensionPath);
-  const stat = await NodeFSP.stat(absolute);
-  const raw = stat.isDirectory()
-    ? await NodeFSP.readFile(NodePath.join(absolute, "manifest.json"), "utf8")
-    : (await readZipEntry(absolute, "manifest.json")).toString("utf8");
-  const parsed: unknown = JSON.parse(raw);
-  if (
-    typeof parsed === "object" &&
-    parsed !== null &&
-    "action" in parsed &&
-    typeof parsed.action === "object" &&
-    parsed.action !== null &&
-    "default_popup" in parsed.action &&
-    typeof parsed.action.default_popup === "string"
-  ) {
-    return parsed.action.default_popup;
-  }
-  throw new Error(`manifest.json in ${extensionPath} has no action.default_popup`);
-}
-
-export async function waitForActiveExtensionUrl(
-  session: Pick<BrowserSession, "evaluateChrome">,
-  addonId: string,
-  popupPath: string,
-  timeoutMs = 15_000,
-): Promise<string> {
-  const result = await session.evaluateChrome(
-    `const done = arguments[arguments.length - 1];
-     const [addonId, popupPath, timeoutMs] = arguments;
-     const deadline = Date.now() + timeoutMs;
-     const poll = () => {
-       try {
-         const policy = WebExtensionPolicy.getByID(addonId);
-         if (policy && policy.active) {
-           done({ url: policy.getURL(popupPath) });
-           return;
-         }
-       } catch (error) {
-         done({ error: String(error) });
-         return;
-       }
-       if (Date.now() >= deadline) {
-         const policy = WebExtensionPolicy.getByID(addonId);
-         done({ error: policy ? "extension policy did not become active" : "extension policy missing for " + addonId });
-         return;
-       }
-       setTimeout(poll, 50);
-     };
-     poll();`,
-    [addonId, popupPath, timeoutMs],
-  );
-  if (typeof result === "object" && result !== null) {
-    if ("error" in result && typeof result.error === "string") {
-      throw new Error(result.error);
-    }
-    if ("url" in result && typeof result.url === "string" && result.url.length > 0) {
-      return result.url;
-    }
-  }
-  throw new Error(`unexpected policy result: ${JSON.stringify(result)}`);
-}
 
 export function verifyBrowserIdentity(
   actual: ReportedEnvironment["browser"],
@@ -215,6 +151,7 @@ export async function runEnvironmentVerification(
   overrides: {
     readonly oracle?: Pick<BrowserIdentity, "name" | "version" | "buildId">;
     readonly mutateEnvironment?: (env: ReportedEnvironment) => ReportedEnvironment;
+    readonly launch?: typeof launchBrowser;
   } = {},
 ): Promise<CheckResult> {
   const started = Date.now();
@@ -223,12 +160,16 @@ export async function runEnvironmentVerification(
       name: "environment",
       ok: false,
       durationMs: Date.now() - started,
-      detail: "missing --extension path for environment check",
+      detail:
+        context.extensionPath === null
+          ? "missing --extension path for environment check"
+          : `extension path does not exist for environment check: ${context.extensionPath}`,
     };
   }
   const addonId = await readExtensionId(context.extensionPath);
   const popupPath = await readExtensionPopupPath(context.extensionPath);
-  await using session = await launchBrowser({
+  const launch = overrides.launch ?? launchBrowser;
+  await using session = await launch({
     binaryPath: context.binaryPath,
     extensionPath: context.extensionPath,
     display: context.display,
@@ -322,4 +263,5 @@ const check: HarnessCheck = {
   run: (context) => runEnvironmentVerification(context),
 };
 
+/** @discovered-check */
 export default check;

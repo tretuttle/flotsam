@@ -9,13 +9,18 @@ import {
   computeBudget,
   costBaselineFileName,
   detectSlowArm,
+  highLoadReason,
+  measureCostScenario,
+  readProcInfoFromChrome,
   rotateArms,
   runCostArm,
   summarizeCostSamples,
   writeCostBaselines,
+  type CostArmSession,
   type CostBaselineFile,
   type CostSample,
   type CostScenarioResult,
+  type ProcInfoSample,
 } from "./cost.ts";
 import { getCostScenario } from "./scenarios.ts";
 
@@ -49,7 +54,7 @@ describe("three-arm cost measurement", () => {
     ];
     const offSummary = summarizeCostSamples(samples, "off");
     expect(offSummary.scoredRunCount).toBe(3);
-    expect(offSummary.parentCpuMs).toEqual({
+    expect(offSummary.parentMainThreadMs).toEqual({
       median: 45,
       spread: 10,
       min: 40,
@@ -57,7 +62,7 @@ describe("three-arm cost measurement", () => {
       runCount: 3,
     });
     const extSummary = summarizeCostSamples(samples, "extension");
-    expect(extSummary.parentCpuMs).toEqual({
+    expect(extSummary.parentMainThreadMs).toEqual({
       median: 48,
       spread: 12,
       min: 42,
@@ -87,13 +92,12 @@ describe("three-arm cost measurement", () => {
     expect(planted.reason).toMatch(/extension median 95\.0 ms exceeded budget 80\.0 ms/);
   });
 
-  it("drives the panel arm through chrome toolbox open, navigate, and close", async () => {
+  it("drives the panel arm through chrome toolbox open, netmonitor verification, and close", async () => {
     const scenario = getCostScenario("cost-images");
     const calls: string[] = [];
-    let cpu = 100;
+    let mainMs = 100;
     const result = await runCostArm({
       session: {
-        browserPid: 4242,
         openTab: async (url) => {
           calls.push(`open:${url}`);
           return "tab-1";
@@ -112,46 +116,288 @@ describe("three-arm cost measurement", () => {
           });
         },
         evaluateChrome: async (script) => {
-          calls.push(
-            script.includes("showToolboxForTab") ? "chrome:openPanel" : "chrome:closePanel",
-          );
-          return true;
+          if (script.includes("showToolboxForTab")) calls.push("chrome:openPanel");
+          else if (script.includes("closeToolboxForTab")) calls.push("chrome:closePanel");
+          else if (script.includes("getNetMonitorAPI")) calls.push("chrome:verifyPanelCount");
+          else calls.push("chrome:precondition");
+          return { ok: true, tool: "netmonitor", count: scenario.responses.length };
         },
         closeTab: async () => {
           calls.push("closeTab");
         },
       },
-      server: {
-        origin: "http://127.0.0.1:1234",
-        takeRequests: () =>
-          scenario.responses.map((r, index) => ({
-            seq: index + 1,
-            method: r.method,
-            path: r.path,
-            url: r.path,
-            status: 200,
-          })),
-      },
+      server: makeMockServer(scenario.responses),
       scenario,
       round: 1,
       arm: "panel",
-      inspect: () => {
-        cpu += 25;
-        return { parentPid: 1, workingSetBytes: 500_000_000, cpuTimeMs: cpu };
-      },
+      addonId: "ext@test",
+      popupPath: "action/index.html",
       signal: new AbortController().signal,
+      readProcInfo: async () => {
+        mainMs += 25;
+        return procInfo(mainMs);
+      },
+      settle: async () => 50,
     });
 
     expect(calls).toEqual([
+      "open:http://127.0.0.1:1234/",
+      "closeTab",
       "open:about:blank",
+      "chrome:precondition",
       "chrome:openPanel",
       "nav:http://127.0.0.1:1234/cost/images",
       "eval:window.__harnessReady",
+      "chrome:verifyPanelCount",
       "chrome:closePanel",
       "closeTab",
     ]);
-    expect(result.parentCpuMs).toBe(25);
+    expect(result.parentMainThreadMs).toBe(25);
     expect(result.lastResourceFinishedMs).toBe(55);
+  });
+
+  it("rejects failed preconditions across off, extension, and panel arms", async () => {
+    const scenario = getCostScenario("cost-images");
+
+    // Extension arm fails if policy is missing/inactive.
+    await expect(
+      runCostArm({
+        session: {
+          openTab: async () => "tab-1",
+          navigateTab: async () => undefined,
+          evaluate: async () => "{}",
+          evaluateChrome: async () => ({ error: "extension policy missing for ext@test" }),
+          closeTab: async () => undefined,
+        },
+        server: makeMockServer(scenario.responses),
+        scenario,
+        round: 1,
+        arm: "extension",
+        addonId: "ext@test",
+        popupPath: "action/index.html",
+        signal: new AbortController().signal,
+        readProcInfo: async () => procInfo(10),
+        settle: async () => 10,
+      }),
+    ).rejects.toThrow(/extension policy missing/);
+
+    // Extension arm fails if experiment API fails or returns invalid data.
+    await expect(
+      runCostArm({
+        session: {
+          openTab: async () => "tab-1",
+          navigateTab: async () => undefined,
+          evaluate: async () => JSON.stringify({ error: "API crashed" }),
+          evaluateChrome: async (script) =>
+            script.includes("WebExtensionPolicy.getByID")
+              ? { url: "moz-extension://x/action/index.html" }
+              : { ok: true },
+          closeTab: async () => undefined,
+        },
+        server: makeMockServer(scenario.responses),
+        scenario,
+        round: 1,
+        arm: "extension",
+        addonId: "ext@test",
+        popupPath: "action/index.html",
+        signal: new AbortController().signal,
+        readProcInfo: async () => procInfo(10),
+        settle: async () => 10,
+      }),
+    ).rejects.toThrow(/extension API returned invalid environment/);
+
+    // Panel arm fails if Netmonitor recorded fewer requests than the server served.
+    await expect(
+      runCostArm({
+        session: {
+          openTab: async () => "tab-1",
+          navigateTab: async () => undefined,
+          evaluate: async () =>
+            JSON.stringify({
+              lastResourceFinishedMs: 20,
+              finished: scenario.responses.map((r) => r.path),
+              failed: [],
+            }),
+          evaluateChrome: async (script) => {
+            if (script.includes("getNetMonitorAPI")) {
+              return { error: "netmonitor recorded 0 requests, expected at least 201" };
+            }
+            return { ok: true };
+          },
+          closeTab: async () => undefined,
+        },
+        server: makeMockServer(scenario.responses),
+        scenario,
+        round: 1,
+        arm: "panel",
+        addonId: "ext@test",
+        popupPath: "action/index.html",
+        signal: new AbortController().signal,
+        readProcInfo: async () => procInfo(10),
+        settle: async () => 10,
+      }),
+    ).rejects.toThrow(/netmonitor recorded 0 requests/);
+
+    // Off arm fails if unexpected extension/toolbox precondition reports error.
+    await expect(
+      runCostArm({
+        session: {
+          openTab: async () => "tab-1",
+          navigateTab: async () => undefined,
+          evaluate: async () => "{}",
+          evaluateChrome: async () => ({
+            error: "off arm requires extension absent, found ext@test",
+          }),
+          closeTab: async () => undefined,
+        },
+        server: makeMockServer(scenario.responses),
+        scenario,
+        round: 1,
+        arm: "off",
+        addonId: "ext@test",
+        popupPath: "action/index.html",
+        signal: new AbortController().signal,
+        readProcInfo: async () => procInfo(10),
+        settle: async () => 10,
+      }),
+    ).rejects.toThrow(/off precondition failed/);
+  });
+
+  it("rejects failed page resources and unexpected server requests", async () => {
+    const scenario = getCostScenario("cost-images");
+    const baseSession: CostArmSession = {
+      openTab: async () => "tab-1",
+      navigateTab: async () => undefined,
+      evaluate: async () =>
+        JSON.stringify({
+          lastResourceFinishedMs: 20,
+          finished: scenario.responses.map((r) => r.path),
+          failed: ["/cost/small/0.png"],
+        }),
+      evaluateChrome: async () => ({ ok: true }),
+      closeTab: async () => undefined,
+    };
+    await expect(
+      runCostArm({
+        session: baseSession,
+        server: makeMockServer(scenario.responses),
+        scenario,
+        round: 1,
+        arm: "off",
+        addonId: "ext@test",
+        popupPath: "action/index.html",
+        signal: new AbortController().signal,
+        readProcInfo: async () => procInfo(10),
+        settle: async () => 10,
+      }),
+    ).rejects.toThrow(/page failed \/cost\/small\/0\.png/);
+
+    await expect(
+      runCostArm({
+        session: {
+          ...baseSession,
+          evaluate: async () =>
+            JSON.stringify({
+              lastResourceFinishedMs: 20,
+              finished: scenario.responses.map((r) => r.path),
+              failed: [],
+            }),
+        },
+        server: makeMockServer([...scenario.responses, { method: "GET", path: "/unexpected.png" }]),
+        scenario,
+        round: 1,
+        arm: "off",
+        addonId: "ext@test",
+        popupPath: "action/index.html",
+        signal: new AbortController().signal,
+        readProcInfo: async () => procInfo(10),
+        settle: async () => 10,
+      }),
+    ).rejects.toThrow(/server also served 1 unexpected/);
+  });
+
+  it("reads parent main-thread CPU time by tid === pid from ChromeUtils.requestProcInfo", async () => {
+    const info = await readProcInfoFromChrome({
+      evaluateChrome: async (script) =>
+        new Promise((resolve) => {
+          const fn = new Function("ChromeUtils", "arguments", script) as (
+            cu: {
+              requestProcInfo: () => Promise<{
+                pid: number;
+                cpuTime: number;
+                memory: number;
+                threads: Array<{ tid: number; name: string; cpuTime: number }>;
+              }>;
+            },
+            args: unknown[],
+          ) => void;
+          fn(
+            {
+              requestProcInfo: async () => ({
+                pid: 42,
+                cpuTime: 120_000_000,
+                memory: 256_000_000,
+                threads: [
+                  { tid: 99, name: "MainThread", cpuTime: 90_000_000 },
+                  { tid: 42, name: "gecko", cpuTime: 45_500_000 },
+                ],
+              }),
+            },
+            [resolve],
+          );
+        }),
+    });
+    expect(info).toEqual({
+      mainThreadMs: 45.5,
+      processCpuMs: 120,
+      workingSetBytes: 256_000_000,
+      mainThreadHow: "tid",
+    });
+  });
+
+  it("discards and repeats rounds when machine load exceeds the threshold", async () => {
+    expect(highLoadReason({ cpuBusyPercent: 30, loadAverage: [1.0, 1.0, 1.0] })).toMatch(/cpu/);
+    expect(highLoadReason({ cpuBusyPercent: 5, loadAverage: [8.3, 4.0, 2.0] })).toMatch(/loadavg/);
+    expect(highLoadReason({ cpuBusyPercent: 5, loadAverage: [1.5, 1.2, 1.0] })).toBeNull();
+
+    // Simulate an overload after round 1's first attempt (8.5 > 8.0), followed by quiet retry.
+    const loads = [
+      { cpuBusyPercent: 2, loadAverage: [0.5, 0.5, 0.5] },
+      { cpuBusyPercent: 2, loadAverage: [0.5, 0.5, 0.5] },
+      { cpuBusyPercent: 3, loadAverage: [0.6, 0.5, 0.5] },
+      { cpuBusyPercent: 4, loadAverage: [0.7, 0.5, 0.5] },
+      { cpuBusyPercent: 5, loadAverage: [8.5, 2.0, 1.0] },
+      { cpuBusyPercent: 3, loadAverage: [1.1, 1.0, 1.0] },
+      { cpuBusyPercent: 3, loadAverage: [1.2, 1.0, 1.0] },
+      { cpuBusyPercent: 2, loadAverage: [1.0, 1.0, 1.0] },
+    ];
+    let loadCursor = 0;
+    let round1Attempt = 0;
+    const result = await measureCostScenario({
+      scenarioName: "cost-images",
+      rounds: 2,
+      binaryPath: "/fake",
+      extensionPath: "/fake.xpi",
+      display: "headless",
+      signal: new AbortController().signal,
+      readLoad: async () =>
+        loads[loadCursor++] ?? { cpuBusyPercent: 1, loadAverage: [0.5, 0.5, 0.5] },
+      cooldown: async () => undefined,
+      runRound: async (round) => {
+        if (round === 1) round1Attempt += 1;
+        const cpu = round === 1 && round1Attempt === 1 ? 999 : 45;
+        return {
+          samples: COST_ARMS.map((arm) => sample(round, arm, arm === "panel" ? cpu * 3 : cpu)),
+          failures: [],
+          browserIdentity: null,
+        };
+      },
+    });
+
+    expect(result.discardedRounds).toHaveLength(1);
+    expect(result.discardedRounds[0]?.round).toBe(1);
+    expect(result.scoredSamples.every((s) => s.parentMainThreadMs < 500)).toBe(true);
+    expect(result.arms.off.parentMainThreadMs?.median).toBe(45);
   });
 
   it("refuses to write cost baselines when errors > 0 and writes off and panel when errors === 0", async () => {
@@ -169,6 +415,7 @@ describe("three-arm cost measurement", () => {
     for (const filePath of written) {
       const parsed = JSON.parse(await NodeFSP.readFile(filePath, "utf8")) as CostBaselineFile;
       expect(parsed.errors).toBe(0);
+      expect(parsed.cpuMetric).toBe("parent-main-thread");
       expect(parsed.warmupDropped).toBe(1);
       expect(parsed.runCount).toBe(1);
     }
@@ -193,11 +440,12 @@ describe("committed cost baselines", () => {
         NodeFS.readFileSync(NodePath.join(directory, name), "utf8"),
       ) as CostBaselineFile;
       expect(["off", "panel"]).toContain(baseline.arm);
+      expect(baseline.cpuMetric).toBe("parent-main-thread");
       expect(baseline.errors).toBe(0);
       expect(baseline.failures).toEqual([]);
       expect(baseline.warmupDropped).toBe(1);
       expect(baseline.samples).toHaveLength(baseline.runCount);
-      expect(baseline.parentCpuMs?.runCount).toBe(baseline.runCount);
+      expect(baseline.parentMainThreadMs?.runCount).toBe(baseline.runCount);
       expect(baseline.lastResourceFinishedMs?.runCount).toBe(baseline.runCount);
       expect(baseline.load.before).toBeDefined();
       expect(baseline.load.after).toBeDefined();
@@ -205,14 +453,39 @@ describe("committed cost baselines", () => {
   });
 });
 
+function makeMockServer(responses: readonly { readonly method: string; readonly path: string }[]) {
+  return {
+    origin: "http://127.0.0.1:1234",
+    takeRequests: () =>
+      responses.map((r, index) => ({
+        seq: index + 1,
+        method: r.method,
+        path: r.path,
+        url: r.path,
+        status: 200,
+      })),
+  };
+}
+
+function procInfo(mainThreadMs: number): ProcInfoSample {
+  return {
+    mainThreadMs,
+    processCpuMs: mainThreadMs * 2,
+    workingSetBytes: 500_000_000,
+    mainThreadHow: "tid",
+  };
+}
+
 function sample(round: number, arm: CostSample["arm"], cpuMs: number): CostSample {
   return {
     round,
     arm,
     lastResourceFinishedMs: cpuMs + 5,
     parentWorkingSetBytes: 600_000_000,
-    parentCpuMs: cpuMs,
+    parentMainThreadMs: cpuMs,
+    parentProcessCpuMs: cpuMs * 2,
     wallMs: cpuMs + 20,
+    settleMs: 2500,
     requestCount: 201,
   };
 }
@@ -224,8 +497,10 @@ function costResultStub(errors: number): CostScenarioResult {
   const all = [offSample, extSample, panelSample];
   return {
     scenario: "cost-images",
+    cpuMetric: "parent-main-thread",
     rounds: 2,
     warmupDropped: 1,
+    discardedRounds: [],
     errors,
     failures: errors === 0 ? [] : [{ run: 1, reason: "planted failure" }],
     warmupSamples: [],
@@ -235,7 +510,7 @@ function costResultStub(errors: number): CostScenarioResult {
       extension: summarizeCostSamples(all, "extension"),
       panel: summarizeCostSamples(all, "panel"),
     },
-    budget: { parentCpuMs: 80, lastResourceFinishedMs: 85 },
+    budget: { parentMainThreadMs: 80, lastResourceFinishedMs: 85 },
     browser: {
       binaryPath: "/zen",
       name: "zen",

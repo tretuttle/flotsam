@@ -3,6 +3,9 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import {
   launchBrowser,
+  readExtensionId,
+  readExtensionPopupPath,
+  waitForActiveExtensionUrl,
   type BrowserDisplay,
   type BrowserIdentity,
   type BrowserSession,
@@ -15,20 +18,48 @@ import {
   type MachineLoad,
   type Summary,
 } from "./measure.ts";
-import { readProcessSnapshot, type ProcessSnapshot } from "./owned-process.ts";
 import { getCostScenario, type CostScenarioName, type MeasuredScenario } from "./scenarios.ts";
 import { startFixtureServer, type ServedRequest } from "./server.ts";
 
 export const COST_ARMS = ["off", "extension", "panel"] as const;
 export type CostArm = (typeof COST_ARMS)[number];
 
+const MIN_SETTLE_MS = 2_500;
+const MAX_SETTLE_MS = 8_000;
+const SETTLE_WINDOW_MS = 250;
+const SETTLE_QUIET_MAIN_MS = 5.0;
+
+const MAX_ROUND_CPU_BUSY_PERCENT = 25;
+function defaultMaxLoad1m(cpuCount: number = NodeOS.cpus().length): number {
+  return Math.max(4, Math.round(cpuCount * 0.25));
+}
+const MAX_LOAD_RETRIES_PER_ROUND = 5;
+const LOAD_COOLDOWN_MS = 2_000;
+const NETMONITOR_FLUSH_MS = 3_000;
+
+export type ProcInfoSample = {
+  readonly mainThreadMs: number;
+  readonly processCpuMs: number;
+  readonly workingSetBytes: number;
+  readonly mainThreadHow: "tid" | "name";
+};
+
+export type DiscardedCostRound = {
+  readonly round: number;
+  readonly attempt: number;
+  readonly reason: string;
+  readonly load: MachineLoad;
+};
+
 export type CostSample = {
   readonly round: number;
   readonly arm: CostArm;
   readonly lastResourceFinishedMs: number;
   readonly parentWorkingSetBytes: number;
-  readonly parentCpuMs: number;
+  readonly parentMainThreadMs: number;
+  readonly parentProcessCpuMs: number;
   readonly wallMs: number;
+  readonly settleMs: number;
   readonly requestCount: number;
 };
 
@@ -36,22 +67,25 @@ export type ArmSummary = {
   readonly arm: CostArm;
   readonly scoredRunCount: number;
   readonly lastResourceFinishedMs: Summary | null;
-  readonly parentCpuMs: Summary | null;
+  readonly parentMainThreadMs: Summary | null;
+  readonly parentProcessCpuMs: Summary | null;
   readonly parentWorkingSetBytes: Summary | null;
   readonly wallMs: Summary | null;
 };
 
 export type CostScenarioResult = {
   readonly scenario: CostScenarioName;
+  readonly cpuMetric: "parent-main-thread";
   readonly rounds: number;
   readonly warmupDropped: 1;
+  readonly discardedRounds: readonly DiscardedCostRound[];
   readonly errors: number;
   readonly failures: readonly FailedRun[];
   readonly warmupSamples: readonly CostSample[];
   readonly scoredSamples: readonly CostSample[];
   readonly arms: Readonly<Record<CostArm, ArmSummary>>;
   readonly budget: {
-    readonly parentCpuMs: number | null;
+    readonly parentMainThreadMs: number | null;
     readonly lastResourceFinishedMs: number | null;
   };
   readonly browser: BrowserIdentity;
@@ -62,15 +96,18 @@ export type CostScenarioResult = {
 export type CostBaselineFile = {
   readonly capturedAt: string;
   readonly scenario: CostScenarioName;
+  readonly cpuMetric: "parent-main-thread";
   readonly arm: "off" | "panel";
   readonly rounds: number;
   readonly warmupDropped: 1;
+  readonly discardedRounds: readonly DiscardedCostRound[];
   readonly runCount: number;
   readonly errors: number;
   readonly failures: readonly FailedRun[];
   readonly samples: readonly CostSample[];
   readonly lastResourceFinishedMs: Summary | null;
-  readonly parentCpuMs: Summary | null;
+  readonly parentMainThreadMs: Summary | null;
+  readonly parentProcessCpuMs: Summary | null;
   readonly parentWorkingSetBytes: Summary | null;
   readonly wallMs: Summary | null;
   readonly browser: BrowserIdentity;
@@ -111,10 +148,28 @@ export function summarizeCostSamples(samples: readonly CostSample[], arm: CostAr
     arm,
     scoredRunCount: matching.length,
     lastResourceFinishedMs: summarize(matching.map((sample) => sample.lastResourceFinishedMs)),
-    parentCpuMs: summarize(matching.map((sample) => sample.parentCpuMs)),
+    parentMainThreadMs: summarize(matching.map((sample) => sample.parentMainThreadMs)),
+    parentProcessCpuMs: summarize(matching.map((sample) => sample.parentProcessCpuMs)),
     parentWorkingSetBytes: summarize(matching.map((sample) => sample.parentWorkingSetBytes)),
     wallMs: summarize(matching.map((sample) => sample.wallMs)),
   };
+}
+
+export function highLoadReason(
+  load: MachineLoad,
+  limits: { readonly maxLoad1m: number; readonly maxCpuBusyPercent: number } = {
+    maxLoad1m: defaultMaxLoad1m(),
+    maxCpuBusyPercent: MAX_ROUND_CPU_BUSY_PERCENT,
+  },
+): string | null {
+  if (load.cpuBusyPercent > limits.maxCpuBusyPercent) {
+    return `cpu ${load.cpuBusyPercent.toFixed(1)}% exceeded ${String(limits.maxCpuBusyPercent)}%`;
+  }
+  const load1m = load.loadAverage?.[0];
+  if (load1m !== undefined && load1m > limits.maxLoad1m) {
+    return `loadavg ${load1m.toFixed(2)} exceeded ${limits.maxLoad1m.toFixed(2)}`;
+  }
+  return null;
 }
 
 export async function measureCostScenario(options: {
@@ -124,54 +179,123 @@ export async function measureCostScenario(options: {
   readonly extensionPath: string;
   readonly display: BrowserDisplay;
   readonly signal: AbortSignal;
+  readonly maxLoad1m?: number;
+  readonly maxCpuBusyPercent?: number;
+  readonly readLoad?: () => Promise<MachineLoad>;
+  readonly cooldown?: (ms: number) => Promise<void>;
+  readonly runRound?: (
+    round: number,
+    rotatedArms: readonly CostArm[],
+  ) => Promise<{
+    readonly samples: readonly CostSample[];
+    readonly failures: readonly FailedRun[];
+    readonly browserIdentity: BrowserIdentity | null;
+  }>;
 }): Promise<CostScenarioResult> {
   if (options.rounds < 2) {
     throw new Error("cost measurement requires at least 2 rounds (round 0 warmup is dropped)");
   }
+  const limits = {
+    maxLoad1m: options.maxLoad1m ?? defaultMaxLoad1m(),
+    maxCpuBusyPercent: options.maxCpuBusyPercent ?? MAX_ROUND_CPU_BUSY_PERCENT,
+  };
+  const readLoad = options.readLoad ?? readMachineLoad;
+  const cooldown = options.cooldown ?? ((ms: number) => delay(ms));
+
   const scenario = getCostScenario(options.scenarioName);
-  await using server = await startFixtureServer();
-  const loadBefore = await readMachineLoad();
+  const ownedServer = options.runRound === undefined ? await startFixtureServer() : null;
+  await using serverStack = new AsyncDisposableStack();
+  if (ownedServer !== null) serverStack.use(ownedServer);
+
+  const addonId =
+    options.runRound === undefined ? await readExtensionId(options.extensionPath) : "";
+  const popupPath =
+    options.runRound === undefined ? await readExtensionPopupPath(options.extensionPath) : "";
+
+  const loadBefore = await readLoad();
   const allSamples: CostSample[] = [];
   const failures: FailedRun[] = [];
+  const discardedRounds: DiscardedCostRound[] = [];
   let browserIdentity: BrowserIdentity | null = null;
   let runIndex = 0;
 
   for (let round = 0; round < options.rounds; round += 1) {
-    for (const arm of rotateArms(round)) {
+    const rotated = rotateArms(round);
+    let roundDone = false;
+    for (let attempt = 1; attempt <= MAX_LOAD_RETRIES_PER_ROUND + 1; attempt += 1) {
       options.signal.throwIfAborted();
-      runIndex += 1;
-      try {
-        await using session = await launchBrowser({
-          binaryPath: options.binaryPath,
-          extensionPath: arm === "extension" ? options.extensionPath : null,
-          display: options.display,
-          protocol: "marionette",
-          allowSystemAccess: arm === "panel",
-          signal: options.signal,
-        });
-        browserIdentity ??= session.identity;
-        const sample = await runCostArm({
-          session,
-          server,
-          scenario,
+      const roundLoadBefore = await readLoad();
+      const preReason = highLoadReason(roundLoadBefore, limits);
+      if (preReason !== null && attempt <= MAX_LOAD_RETRIES_PER_ROUND) {
+        discardedRounds.push({
           round,
-          arm,
-          inspect: readProcessSnapshot,
-          signal: options.signal,
+          attempt,
+          reason: `before round: ${preReason}`,
+          load: roundLoadBefore,
         });
-        allSamples.push(sample);
-      } catch (error) {
-        if (options.signal.aborted) throw error;
+        await cooldown(LOAD_COOLDOWN_MS);
+        continue;
+      }
+
+      const roundResult = options.runRound
+        ? await options.runRound(round, rotated)
+        : await executeRound({
+            round,
+            arms: rotated,
+            binaryPath: options.binaryPath,
+            extensionPath: options.extensionPath,
+            addonId,
+            popupPath,
+            display: options.display,
+            scenario,
+            server: ownedServer!,
+            signal: options.signal,
+            nextRunIndex: () => {
+              runIndex += 1;
+              return runIndex;
+            },
+          });
+
+      if (roundResult.browserIdentity !== null) {
+        browserIdentity ??= roundResult.browserIdentity;
+      }
+
+      const roundLoadAfter = await readLoad();
+      const postReason = highLoadReason(roundLoadAfter, limits);
+      if (postReason !== null) {
+        if (attempt <= MAX_LOAD_RETRIES_PER_ROUND) {
+          discardedRounds.push({
+            round,
+            attempt,
+            reason: `after round: ${postReason}`,
+            load: roundLoadAfter,
+          });
+          await cooldown(LOAD_COOLDOWN_MS);
+          continue;
+        }
         failures.push({
           run: runIndex,
-          reason: `round ${String(round)} ${arm}: ${errorMessage(error)}`,
+          reason: `round ${String(round)}: high load persisted (${postReason})`,
         });
+        roundDone = true;
+        break;
       }
+
+      allSamples.push(...roundResult.samples);
+      failures.push(...roundResult.failures);
+      roundDone = true;
+      break;
+    }
+    if (!roundDone) {
+      failures.push({
+        run: runIndex,
+        reason: `round ${String(round)}: could not run under load limit`,
+      });
     }
   }
 
-  const loadAfter = await readMachineLoad();
-  if (browserIdentity === null) {
+  const loadAfter = await readLoad();
+  if (browserIdentity === null && options.runRound === undefined) {
     throw new Error(
       `all cost runs failed for ${options.scenarioName}: ${failures.map((f) => f.reason).join("; ")}`,
     );
@@ -183,36 +307,99 @@ export async function measureCostScenario(options: {
     extension: summarizeCostSamples(allSamples, "extension"),
     panel: summarizeCostSamples(allSamples, "panel"),
   };
-  const offCpu = arms.off.parentCpuMs?.median ?? null;
-  const panelCpu = arms.panel.parentCpuMs?.median ?? null;
+  const offCpu = arms.off.parentMainThreadMs?.median ?? null;
+  const panelCpu = arms.panel.parentMainThreadMs?.median ?? null;
   const offLast = arms.off.lastResourceFinishedMs?.median ?? null;
   const panelLast = arms.panel.lastResourceFinishedMs?.median ?? null;
 
   return {
     scenario: options.scenarioName,
+    cpuMetric: "parent-main-thread",
     rounds: options.rounds,
     warmupDropped: 1,
+    discardedRounds,
     errors: failures.length,
     failures,
     warmupSamples,
     scoredSamples,
     arms,
     budget: {
-      parentCpuMs: offCpu !== null && panelCpu !== null ? computeBudget(offCpu, panelCpu) : null,
+      parentMainThreadMs:
+        offCpu !== null && panelCpu !== null ? computeBudget(offCpu, panelCpu) : null,
       lastResourceFinishedMs:
         offLast !== null && panelLast !== null ? computeBudget(offLast, panelLast) : null,
     },
-    browser: browserIdentity,
+    browser: browserIdentity ?? defaultIdentity(options.binaryPath),
     machine: readMachineInfo(),
     load: { before: loadBefore, after: loadAfter },
   };
 }
 
+async function executeRound(options: {
+  readonly round: number;
+  readonly arms: readonly CostArm[];
+  readonly binaryPath: string;
+  readonly extensionPath: string;
+  readonly addonId: string;
+  readonly popupPath: string;
+  readonly display: BrowserDisplay;
+  readonly scenario: MeasuredScenario;
+  readonly server: {
+    readonly origin: string;
+    readonly takeRequests: () => readonly ServedRequest[];
+  };
+  readonly signal: AbortSignal;
+  readonly nextRunIndex: () => number;
+}): Promise<{
+  readonly samples: readonly CostSample[];
+  readonly failures: readonly FailedRun[];
+  readonly browserIdentity: BrowserIdentity | null;
+}> {
+  const samples: CostSample[] = [];
+  const failures: FailedRun[] = [];
+  let browserIdentity: BrowserIdentity | null = null;
+  for (const arm of options.arms) {
+    options.signal.throwIfAborted();
+    const run = options.nextRunIndex();
+    try {
+      await using session = await launchBrowser({
+        binaryPath: options.binaryPath,
+        extensionPath: arm === "extension" ? options.extensionPath : null,
+        display: options.display,
+        protocol: "marionette",
+        allowSystemAccess: true,
+        signal: options.signal,
+      });
+      browserIdentity ??= session.identity;
+      const sample = await runCostArm({
+        session,
+        server: options.server,
+        scenario: options.scenario,
+        round: options.round,
+        arm,
+        addonId: options.addonId,
+        popupPath: options.popupPath,
+        signal: options.signal,
+      });
+      samples.push(sample);
+    } catch (error) {
+      if (options.signal.aborted) throw error;
+      failures.push({
+        run,
+        reason: `round ${String(options.round)} ${arm}: ${errorMessage(error)}`,
+      });
+    }
+  }
+  return { samples, failures, browserIdentity };
+}
+
+export type CostArmSession = Pick<
+  BrowserSession,
+  "openTab" | "navigateTab" | "evaluate" | "evaluateChrome" | "closeTab"
+>;
+
 export async function runCostArm(options: {
-  readonly session: Pick<
-    BrowserSession,
-    "browserPid" | "openTab" | "navigateTab" | "evaluate" | "evaluateChrome" | "closeTab"
-  >;
+  readonly session: CostArmSession;
   readonly server: {
     readonly origin: string;
     readonly takeRequests: () => readonly ServedRequest[];
@@ -220,36 +407,61 @@ export async function runCostArm(options: {
   readonly scenario: MeasuredScenario;
   readonly round: number;
   readonly arm: CostArm;
-  readonly inspect: (pid: number) => ProcessSnapshot;
+  readonly addonId: string;
+  readonly popupPath: string;
   readonly signal: AbortSignal;
+  readonly readProcInfo?: (session: CostArmSession) => Promise<ProcInfoSample>;
+  readonly settle?: (
+    session: CostArmSession,
+    readInfo: () => Promise<ProcInfoSample>,
+    signal: AbortSignal,
+  ) => Promise<number>;
 }): Promise<CostSample> {
-  const { session, server, scenario, round, arm, signal } = options;
+  const { session, server, scenario, round, arm, addonId, popupPath, signal } = options;
+  const readInfo = (): Promise<ProcInfoSample> =>
+    options.readProcInfo
+      ? options.readProcInfo(session)
+      : abortable(readProcInfoFromChrome(session), signal);
+
+  if (arm === "extension") {
+    const popupUrl = await abortable(
+      waitForActiveExtensionUrl(session, addonId, popupPath),
+      signal,
+    );
+    await verifyExtensionApiAnswers(session, popupUrl, signal);
+  }
+
+  // Warm Necko/content-process pipelines identically in every arm before opening the measured tab/panel.
+  const warmupTab = await abortable(session.openTab(`${server.origin}/`), signal);
+  await session.closeTab(warmupTab).catch(() => undefined);
+
   const context = await abortable(session.openTab("about:blank"), signal);
   let toolboxOpened = false;
   try {
+    await verifyArmChromePrecondition(session, arm, addonId, signal);
     if (arm === "panel") {
-      await abortable(
-        session.evaluateChrome(
-          `const done = arguments[arguments.length - 1];
-           const { DevToolsShim } = ChromeUtils.importESModule("chrome://devtools-startup/content/DevToolsShim.sys.mjs");
-           const tab = window.gBrowser.selectedTab;
-           DevToolsShim.showToolboxForTab(tab, { toolId: "netmonitor" })
-             .then((tb) => tb.selectTool("netmonitor").then(() => done(true)))
-             .catch((err) => done({ error: String(err) }));`,
-        ),
-        signal,
-      );
+      await openNetmonitorPanel(session, signal);
       toolboxOpened = true;
     }
+
+    const settleMs = options.settle
+      ? await options.settle(session, readInfo, signal)
+      : await settleBeforeMeasurement(session, readInfo, signal);
+
     server.takeRequests();
-    const before = options.inspect(session.browserPid);
+    const before = await readInfo();
     const started = process.hrtime.bigint();
     await abortable(session.navigateTab(context, `${server.origin}${scenario.pagePath}`), signal);
     const rawReport = await abortable(session.evaluate(context, "window.__harnessReady"), signal);
     const wallMs = Number(process.hrtime.bigint() - started) / 1e6;
-    const after = options.inspect(session.browserPid);
+    const after = await readInfo();
     const served = server.takeRequests();
     const report = parseReport(rawReport);
+
+    if (arm === "panel") {
+      await verifyPanelRecordedRequests(session, served.length, signal);
+    }
+
     const problem = verifyCostRequests(report, served, scenario);
     if (problem !== null) throw new Error(problem);
     return {
@@ -257,8 +469,10 @@ export async function runCostArm(options: {
       arm,
       lastResourceFinishedMs: report.lastResourceFinishedMs,
       parentWorkingSetBytes: after.workingSetBytes,
-      parentCpuMs: after.cpuTimeMs - before.cpuTimeMs,
+      parentMainThreadMs: Math.round((after.mainThreadMs - before.mainThreadMs) * 10) / 10,
+      parentProcessCpuMs: Math.round((after.processCpuMs - before.processCpuMs) * 10) / 10,
       wallMs,
+      settleMs,
       requestCount: served.length,
     };
   } finally {
@@ -273,6 +487,214 @@ export async function runCostArm(options: {
         .catch(() => undefined);
     }
     await session.closeTab(context).catch(() => undefined);
+  }
+}
+
+async function verifyExtensionApiAnswers(
+  session: CostArmSession,
+  popupUrl: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const popupTab = await abortable(session.openTab(popupUrl), signal);
+  try {
+    const raw = await abortable(
+      session.evaluate(
+        popupTab,
+        `(async () => {
+          const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+          const env = await browser.oneClickHar.getEnvironment(tabs[0].id);
+          return JSON.stringify(env);
+        })()`,
+      ),
+      signal,
+    );
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("browser" in parsed) ||
+      !("toolbox" in parsed)
+    ) {
+      throw new Error(`extension API returned invalid environment: ${raw}`);
+    }
+  } finally {
+    await session.closeTab(popupTab).catch(() => undefined);
+  }
+}
+
+async function verifyArmChromePrecondition(
+  session: CostArmSession,
+  arm: CostArm,
+  addonId: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const result = await abortable(
+    session.evaluateChrome(
+      `const done = arguments[arguments.length - 1];
+       const [arm, addonId] = arguments;
+       const policy = WebExtensionPolicy.getByID(addonId);
+       const hasPolicy = Boolean(policy);
+       const { DevToolsShim } = ChromeUtils.importESModule("chrome://devtools-startup/content/DevToolsShim.sys.mjs");
+       const hasToolbox = typeof DevToolsShim.isAnyToolboxPresent === "function"
+         ? DevToolsShim.isAnyToolboxPresent()
+         : Boolean(DevToolsShim.getToolboxForTab?.(window.gBrowser.selectedTab));
+       if (arm === "extension") {
+         if (!policy || !policy.active) { done({ error: "extension arm requires active policy for " + addonId }); return; }
+         if (hasToolbox) { done({ error: "extension arm requires DevTools closed" }); return; }
+         done({ ok: true });
+         return;
+       }
+       if (hasPolicy) { done({ error: arm + " arm requires extension absent, found " + addonId }); return; }
+       if (arm === "off" && hasToolbox) { done({ error: "off arm requires DevTools closed" }); return; }
+       done({ ok: true });`,
+      [arm, addonId],
+    ),
+    signal,
+  );
+  checkChromeResult(result, `${arm} precondition`);
+}
+
+async function openNetmonitorPanel(session: CostArmSession, signal: AbortSignal): Promise<void> {
+  const result = await abortable(
+    session.evaluateChrome(
+      `const done = arguments[arguments.length - 1];
+       const { DevToolsShim } = ChromeUtils.importESModule("chrome://devtools-startup/content/DevToolsShim.sys.mjs");
+       const tab = window.gBrowser.selectedTab;
+       DevToolsShim.showToolboxForTab(tab, { toolId: "netmonitor" })
+         .then(async (tb) => {
+           await tb.selectTool("netmonitor");
+           const api = await tb.getNetMonitorAPI();
+           if (tb.currentToolId !== "netmonitor" || !api) {
+             done({ error: "failed to activate netmonitor panel: " + String(tb.currentToolId) });
+             return;
+           }
+           done({ ok: true });
+         })
+         .catch((err) => done({ error: String(err) }));`,
+    ),
+    signal,
+  );
+  checkChromeResult(result, "panel precondition");
+}
+
+async function verifyPanelRecordedRequests(
+  session: CostArmSession,
+  expectedCount: number,
+  signal: AbortSignal,
+): Promise<void> {
+  const result = await abortable(
+    session.evaluateChrome(
+      `const done = arguments[arguments.length - 1];
+       const [expectedCount, timeoutMs] = arguments;
+       const { require } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs");
+       const { gDevTools } = require("resource://devtools/client/framework/devtools.js");
+       const tb = gDevTools.getToolboxForTab(window.gBrowser.selectedTab);
+       if (!tb || tb.currentToolId !== "netmonitor") {
+         done({ error: "netmonitor panel not open after navigation" });
+         return;
+       }
+       const deadline = Date.now() + timeoutMs;
+       tb.getNetMonitorAPI()
+         .then((net) => {
+           const poll = () => {
+             const reqs = net.store.getState().requests.requests;
+             const count = reqs.size ?? reqs.length ?? 0;
+             if (count >= expectedCount) {
+               done({ ok: true, count });
+               return;
+             }
+             if (Date.now() >= deadline) {
+               done({ error: "netmonitor recorded " + String(count) + " requests, expected at least " + String(expectedCount) });
+               return;
+             }
+             setTimeout(poll, 50);
+           };
+           poll();
+         })
+         .catch((err) => done({ error: String(err) }));`,
+      [expectedCount, NETMONITOR_FLUSH_MS],
+    ),
+    signal,
+  );
+  checkChromeResult(result, "panel recording verification");
+}
+
+export async function readProcInfoFromChrome(
+  session: Pick<CostArmSession, "evaluateChrome">,
+): Promise<ProcInfoSample> {
+  const result = await session.evaluateChrome(
+    `const done = arguments[arguments.length - 1];
+     ChromeUtils.requestProcInfo()
+       .then((info) => {
+         const mainName = /^(MainThread|GeckoMain|Main Thread)$/;
+         let byTid = null;
+         let byName = null;
+         for (const t of info.threads) {
+           if (t.tid === info.pid) byTid = t.cpuTime;
+           else if (byName === null && mainName.test(t.name || "")) byName = t.cpuTime;
+         }
+         if (byTid !== null) {
+           done({ ok: true, mainThreadMs: byTid / 1e6, processCpuMs: info.cpuTime / 1e6, workingSetBytes: info.memory || 0, mainThreadHow: "tid" });
+           return;
+         }
+         if (byName !== null) {
+           done({ ok: true, mainThreadMs: byName / 1e6, processCpuMs: info.cpuTime / 1e6, workingSetBytes: info.memory || 0, mainThreadHow: "name" });
+           return;
+         }
+         done({ error: "requestProcInfo returned no parent main thread for pid " + String(info.pid) });
+       })
+       .catch((err) => done({ error: String(err) }));`,
+  );
+  checkChromeResult(result, "requestProcInfo");
+  const record = result as {
+    mainThreadMs: number;
+    processCpuMs: number;
+    workingSetBytes: number;
+    mainThreadHow: "tid" | "name";
+  };
+  return {
+    mainThreadMs: record.mainThreadMs,
+    processCpuMs: record.processCpuMs,
+    workingSetBytes: record.workingSetBytes,
+    mainThreadHow: record.mainThreadHow,
+  };
+}
+
+// Force GC/CC, wait at least MIN_SETTLE_MS for first-run startup burst to clear, and require two consecutive quiet windows.
+async function settleBeforeMeasurement(
+  session: CostArmSession,
+  readInfo: () => Promise<ProcInfoSample>,
+  signal: AbortSignal,
+): Promise<number> {
+  const started = Date.now();
+  await abortable(
+    session.evaluateChrome(
+      `const done = arguments[arguments.length - 1];
+       Cu.forceGC();
+       Cu.forceCC();
+       Cu.forceGC();
+       done({ ok: true });`,
+    ),
+    signal,
+  );
+  await abortable(delay(MIN_SETTLE_MS), signal);
+  let previous = await readInfo();
+  let quietWindows = 0;
+  while (Date.now() - started < MAX_SETTLE_MS) {
+    await abortable(delay(SETTLE_WINDOW_MS), signal);
+    const current = await readInfo();
+    const delta = current.mainThreadMs - previous.mainThreadMs;
+    previous = current;
+    if (delta <= SETTLE_QUIET_MAIN_MS) quietWindows += 1;
+    else quietWindows = 0;
+    if (quietWindows >= 2) break;
+  }
+  return Date.now() - started;
+}
+
+function checkChromeResult(result: unknown, label: string): void {
+  if (typeof result === "object" && result !== null && "error" in result) {
+    throw new Error(`${label} failed: ${String(result.error)}`);
   }
 }
 
@@ -296,15 +718,18 @@ export async function writeCostBaselines(
     const file: CostBaselineFile = {
       capturedAt: new Date().toISOString(),
       scenario: result.scenario,
+      cpuMetric: result.cpuMetric,
       arm,
       rounds: result.rounds,
       warmupDropped: 1,
+      discardedRounds: result.discardedRounds,
       runCount: summary.scoredRunCount,
       errors: result.errors,
       failures: result.failures,
       samples,
       lastResourceFinishedMs: summary.lastResourceFinishedMs,
-      parentCpuMs: summary.parentCpuMs,
+      parentMainThreadMs: summary.parentMainThreadMs,
+      parentProcessCpuMs: summary.parentProcessCpuMs,
       parentWorkingSetBytes: summary.parentWorkingSetBytes,
       wallMs: summary.wallMs,
       browser: result.browser,
@@ -320,19 +745,20 @@ export async function writeCostBaselines(
 
 export function formatCostSummary(result: CostScenarioResult): string {
   const lines = [
-    `${result.scenario}: ${result.browser.name} ${result.browser.version} (${result.browser.buildId}), ${String(result.rounds)} rounds (round 0 dropped, ${String(result.rounds - 1)} scored), ${String(result.errors)} errors`,
+    `${result.scenario}: ${result.browser.name} ${result.browser.version} (${result.browser.buildId}), metric=${result.cpuMetric}, ${String(result.rounds)} rounds (round 0 dropped, ${String(result.rounds - 1)} scored, ${String(result.discardedRounds.length)} discarded for load), ${String(result.errors)} errors`,
     `load before: cpu ${result.load.before.cpuBusyPercent.toFixed(1)}%, loadavg ${formatLoadAvg(result.load.before.loadAverage)}; after: cpu ${result.load.after.cpuBusyPercent.toFixed(1)}%, loadavg ${formatLoadAvg(result.load.after.loadAverage)}`,
   ];
   for (const arm of COST_ARMS) {
     const s = result.arms[arm];
-    const cpu = s.parentCpuMs;
+    const main = s.parentMainThreadMs;
+    const proc = s.parentProcessCpuMs;
     const last = s.lastResourceFinishedMs;
     lines.push(
-      `  ${arm.padEnd(10)} n=${String(s.scoredRunCount)} cpu=${cpu ? `${cpu.median.toFixed(1)}ms (spread ${cpu.spread.toFixed(1)}ms)` : "n/a"} last=${last ? `${last.median.toFixed(1)}ms (spread ${last.spread.toFixed(1)}ms)` : "n/a"}`,
+      `  ${arm.padEnd(10)} n=${String(s.scoredRunCount)} main=${main ? `${main.median.toFixed(1)}ms (spread ${main.spread.toFixed(1)}ms)` : "n/a"} proc=${proc ? `${proc.median.toFixed(1)}ms` : "n/a"} last=${last ? `${last.median.toFixed(1)}ms` : "n/a"}`,
     );
   }
-  if (result.budget.parentCpuMs !== null) {
-    lines.push(`  budget cpu=${result.budget.parentCpuMs.toFixed(1)}ms`);
+  if (result.budget.parentMainThreadMs !== null) {
+    lines.push(`  budget main=${result.budget.parentMainThreadMs.toFixed(1)}ms`);
   }
   return lines.join("\n");
 }
@@ -409,6 +835,18 @@ function parseReport(text: string): {
   };
 }
 
+function defaultIdentity(binaryPath: string): BrowserIdentity {
+  return {
+    binaryPath,
+    name: "unknown",
+    version: "unknown",
+    buildId: "unknown",
+    userAgent: "",
+    remoteProtocol: "marionette",
+    headless: true,
+  };
+}
+
 function readMachineInfo(): MachineInfo {
   const cpus = NodeOS.cpus();
   return {
@@ -434,7 +872,7 @@ async function readMachineLoad(): Promise<MachineLoad> {
     return { busy, total };
   };
   const first = snap();
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  await delay(250);
   const second = snap();
   const total = second.total - first.total;
   return {
@@ -459,6 +897,10 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
       },
     );
   });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function errorMessage(error: unknown): string {

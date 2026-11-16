@@ -1,18 +1,21 @@
 import * as NodeFS from "node:fs";
-import { launchBrowser, prepareProfile, readExtensionId } from "../src/browser.ts";
+import {
+  launchBrowser,
+  prepareProfile,
+  readExtensionId,
+  readExtensionPopupPath,
+  waitForActiveExtensionUrl,
+} from "../src/browser.ts";
 import type { CheckContext, CheckResult, HarnessCheck } from "../src/checks.ts";
 import { removeDirectoryBounded } from "../src/owned-process.ts";
-import {
-  callGetEnvironment,
-  readExtensionPopupPath,
-  readPopupFacts,
-  verifyBrowserIdentity,
-  waitForActiveExtensionUrl,
-} from "./environment.ts";
+import { callGetEnvironment, readPopupFacts, verifyBrowserIdentity } from "./environment.ts";
 
 export async function runRestartVerification(
   context: CheckContext,
-  options: { readonly dropExtensionOnRestart?: boolean } = {},
+  options: {
+    readonly dropExtensionOnRestart?: boolean;
+    readonly launch?: typeof launchBrowser;
+  } = {},
 ): Promise<CheckResult> {
   const started = Date.now();
   if (context.extensionPath === null || !NodeFS.existsSync(context.extensionPath)) {
@@ -20,7 +23,10 @@ export async function runRestartVerification(
       name: "restart",
       ok: false,
       durationMs: Date.now() - started,
-      detail: "missing --extension path for restart check",
+      detail:
+        context.extensionPath === null
+          ? "missing --extension path for restart check"
+          : `extension path does not exist for restart check: ${context.extensionPath}`,
     };
   }
   const addonId = await readExtensionId(context.extensionPath);
@@ -29,9 +35,10 @@ export async function runRestartVerification(
   await using stack = new AsyncDisposableStack();
   const profileDir = await prepareProfile(context.extensionPath);
   stack.defer(() => removeDirectoryBounded(profileDir));
+  const launch = options.launch ?? launchBrowser;
 
   const verifyLaunch = async (phase: string): Promise<string> => {
-    await using session = await launchBrowser({
+    await using session = await launch({
       binaryPath: context.binaryPath,
       extensionPath: null,
       profileDir,
@@ -40,7 +47,14 @@ export async function runRestartVerification(
       allowSystemAccess: true,
       signal: context.signal,
     });
-    const popupUrl = await waitForActiveExtensionUrl(session, addonId, popupPath);
+    let popupUrl: string;
+    try {
+      popupUrl = await waitForActiveExtensionUrl(session, addonId, popupPath);
+    } catch (error) {
+      throw new Error(`${phase}: ${error instanceof Error ? error.message : String(error)}`, {
+        cause: error,
+      });
+    }
     const tab = await session.openTab(popupUrl);
     try {
       const env = await callGetEnvironment(session, tab, null);
@@ -85,4 +99,5 @@ const check: HarnessCheck = {
   run: (context) => runRestartVerification(context),
 };
 
+/** @discovered-check */
 export default check;

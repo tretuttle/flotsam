@@ -2,6 +2,8 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   // Exported types are part of our contracts even before they have consumers.
   "rules": { "types": "off", "nsTypes": "off" },
+  // Dynamically loaded check modules in tools/browser-harness/checks/*.ts tag their default export.
+  "tags": ["-discovered-check"],
   "workspaces": {
     "apps/extension": {
       // extension.js builds the pages src/manifest.json names, and scripts/build-experiment.ts bundles the parent script.
@@ -42,6 +44,7 @@
     },
     "tools/browser-harness": {
       "entry": ["src/cli.ts", "checks/*.ts"],
+      "includeEntryExports": true,
       // Knip does not resolve these platform process tools.
       "ignoreBinaries": ["taskkill.exe", "powershell.exe", "getconf"],
     },

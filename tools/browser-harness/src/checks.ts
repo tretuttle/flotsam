@@ -38,8 +38,9 @@ function defaultChecksDir(): string {
 
 export async function discoverChecks(
   checksDir: string = defaultChecksDir(),
+  readdir: (dir: string) => Promise<readonly string[]> = (dir) => NodeFSP.readdir(dir),
 ): Promise<readonly HarnessCheck[]> {
-  const entries = (await NodeFSP.readdir(checksDir))
+  const entries = (await readdir(checksDir))
     .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts") && !name.endsWith(".d.ts"))
     .sort((left, right) => left.localeCompare(right));
   const checks: HarnessCheck[] = [];
@@ -49,6 +50,9 @@ export async function discoverChecks(
     const loaded: unknown = await import(NodeURL.pathToFileURL(filePath).href);
     const check = extractCheck(loaded, filePath, expectedName);
     checks.push(check);
+  }
+  if (checks.length === 0) {
+    throw new Error(`no check files discovered in ${checksDir}`);
   }
   return checks;
 }

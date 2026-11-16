@@ -5,11 +5,13 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { createLaunchLease, reapOrphanedLaunches } from "./orphan-lease.ts";
 import {
-  killOwnedTree,
   currentPlatformName,
+  killOwnedTree,
+  readProcessIdentity,
   readProcessSnapshot,
   removeDirectoryBounded,
   spawnOwned,
+  watchChildExit,
   type ProcessPlatformName,
 } from "./owned-process.ts";
 import { connectRemote, type RemoteProtocol } from "./remote.ts";
@@ -260,9 +262,16 @@ type CommonLaunchRequest = {
   readonly extensionPath: string | null;
   readonly display: BrowserDisplay;
   readonly profileDir?: string;
+  readonly cache?: boolean;
   readonly extraPrefs?: readonly Pref[];
   readonly signal: AbortSignal;
 };
+
+const CACHE_ENABLED_PREFS: readonly Pref[] = [
+  { name: "browser.cache.disk.enable", value: true },
+  { name: "browser.cache.memory.enable", value: true },
+  { name: "network.http.use-cache", value: true },
+];
 
 export type RemoteLaunchRequest = CommonLaunchRequest & {
   readonly launchMode?: "recommended" | "real-defaults";
@@ -283,10 +292,11 @@ export async function launchBrowser(
   const launchMode: BrowserLaunchMode = request.launchMode ?? "recommended";
   await reapOrphanedLaunches(assertSafeProfileDirectory);
   await using stack = new AsyncDisposableStack();
+  const cachePrefs = request.cache === true ? CACHE_ENABLED_PREFS : [];
 
   if (launchMode === "none") {
     const untouchedRequest = request as UntouchedLaunchRequest;
-    const prefs = untouchedRequest.extraPrefs ?? [];
+    const prefs = [...cachePrefs, ...(untouchedRequest.extraPrefs ?? [])];
     const directory = await resolveProfileDir(
       stack,
       untouchedRequest.profileDir,
@@ -304,19 +314,21 @@ export async function launchBrowser(
       ...BROWSER_PLATFORMS[currentPlatformName()].launcherArgs,
       ...(untouchedRequest.urls ?? []),
     ];
+    // Never open a pipe when output is not consumed; avoids filling the pipe buffer under MOZ_LOG.
     const spawned = spawnOwned(untouchedRequest.binaryPath, args, {
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: "ignore",
       env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1", MOZ_DISABLE_AUTO_UPDATE: "1" },
     });
-    const closed = watchChildClose(spawned.child);
-    await lease.setSpawnedPid(spawned.pid);
+    const identity = readProcessIdentity(spawned.pid);
+    if (identity !== null) lease.setSpawnedProcess(spawned.pid, identity.startTime);
+    const watcher = watchChildExit(spawned.child);
     stack.defer(() => killOwnedTree(spawned.pid, []));
     const owned = stack.move();
     return {
       spawnedPid: spawned.pid,
       profileDir: directory,
       launchMode: "none",
-      exited: closed,
+      exited: watcher.exited.then((result) => result.status),
       [Symbol.asyncDispose]: () => owned.disposeAsync(),
     };
   }
@@ -327,7 +339,12 @@ export async function launchBrowser(
   const remoteLaunch = REMOTE_LAUNCH[protocol](port);
   const modePrefs: readonly Pref[] =
     launchMode === "real-defaults" ? [{ name: "remote.prefs.recommended", value: false }] : [];
-  const prefs = [...remoteLaunch.prefs, ...modePrefs, ...(remoteRequest.extraPrefs ?? [])];
+  const prefs = [
+    ...remoteLaunch.prefs,
+    ...modePrefs,
+    ...cachePrefs,
+    ...(remoteRequest.extraPrefs ?? []),
+  ];
   const directory = await resolveProfileDir(
     stack,
     remoteRequest.profileDir,
@@ -355,22 +372,18 @@ export async function launchBrowser(
     stdio: ["ignore", "ignore", "pipe"],
     env,
   });
-  let closedStatus: string | null = null;
-  const closed = watchChildClose(spawned.child, (status) => {
-    closedStatus = status;
-  });
-  let stderrTail = "";
-  spawned.child.stderr?.on("data", (chunk: Buffer) => {
-    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
-  });
-  await lease.setSpawnedPid(spawned.pid);
+  const identity = readProcessIdentity(spawned.pid);
+  if (identity !== null) lease.setSpawnedProcess(spawned.pid, identity.startTime);
+  const watcher = watchChildExit(spawned.child);
+  const exitedStatus = watcher.exited.then((result) => result.status);
   let browserPid: number | null = null;
   stack.defer(() => killOwnedTree(spawned.pid, browserPid === null ? [] : [browserPid]));
   const remote = await connectRemote({
     protocol,
     port,
-    exitStatus: () => closedStatus,
-    stderr: () => stderrTail,
+    exitStatus: watcher.status,
+    waitForExit: () => exitedStatus,
+    stderr: watcher.stderr,
     signal: remoteRequest.signal,
   });
   stack.defer(() => remote.dispose());
@@ -400,7 +413,7 @@ export async function launchBrowser(
     closeTab: (context) => remote.closeTab(context),
     quit: async () => {
       await remote.quit();
-      await raceTimeout(closed, 10_000);
+      await raceTimeout(exitedStatus, 10_000);
     },
     [Symbol.asyncDispose]: () => owned.disposeAsync(),
   };
@@ -422,30 +435,6 @@ async function resolveProfileDir(
   await writeProfilePrefs(profileDir, prefs, basePrefs);
   if (extensionPath !== null) await installExtension(profileDir, extensionPath);
   return profileDir;
-}
-
-function watchChildClose(
-  child: {
-    once: (
-      event: "close",
-      cb: (code: number | null, signal: NodeJS.Signals | null) => void,
-    ) => void;
-  },
-  onClose?: (status: string) => void,
-): Promise<string> {
-  return new Promise((resolve) => {
-    child.once("close", (code, signal) => {
-      const status = formatExitStatus(code, signal);
-      onClose?.(status);
-      resolve(status);
-    });
-  });
-}
-
-function formatExitStatus(code: number | null, signal: NodeJS.Signals | string | null): string {
-  if (code !== null) return `code ${String(code)}`;
-  if (signal !== null) return `signal ${signal}`;
-  return "code 0";
 }
 
 function raceTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
@@ -482,13 +471,62 @@ function assertOwnedBrowser(browserPid: number, spawnedPid: number): void {
   }
 }
 
-export async function readExtensionId(extensionPath: string): Promise<string> {
+async function readExtensionManifest(extensionPath: string): Promise<unknown> {
   const absolute = NodePath.resolve(extensionPath);
   const stat = await NodeFSP.stat(absolute);
-  const manifest: unknown = stat.isDirectory()
+  return stat.isDirectory()
     ? JSON.parse(await NodeFSP.readFile(NodePath.join(absolute, "manifest.json"), "utf8"))
     : JSON.parse((await readZipEntry(absolute, "manifest.json")).toString("utf8"));
-  return readGeckoId(manifest);
+}
+
+export async function readExtensionId(extensionPath: string): Promise<string> {
+  return readGeckoId(await readExtensionManifest(extensionPath));
+}
+
+export async function readExtensionPopupPath(extensionPath: string): Promise<string> {
+  const parsed = await readExtensionManifest(extensionPath);
+  const action = recordField(parsed, "action");
+  const popup = recordField(action, "default_popup");
+  if (typeof popup === "string" && popup.length > 0) return popup;
+  throw new Error(`manifest.json in ${extensionPath} has no action.default_popup`);
+}
+
+export async function waitForActiveExtensionUrl(
+  session: Pick<BrowserSession, "evaluateChrome">,
+  addonId: string,
+  popupPath: string,
+  timeoutMs = 15_000,
+): Promise<string> {
+  const result = await session.evaluateChrome(
+    `const done = arguments[arguments.length - 1];
+     const [addonId, popupPath, timeoutMs] = arguments;
+     const deadline = Date.now() + timeoutMs;
+     const poll = () => {
+       try {
+         const policy = WebExtensionPolicy.getByID(addonId);
+         if (policy && policy.active) {
+           done({ url: policy.getURL(popupPath) });
+           return;
+         }
+       } catch (error) {
+         done({ error: String(error) });
+         return;
+       }
+       if (Date.now() >= deadline) {
+         const policy = WebExtensionPolicy.getByID(addonId);
+         done({ error: policy ? "extension policy did not become active" : "extension policy missing for " + addonId });
+         return;
+       }
+       setTimeout(poll, 50);
+     };
+     poll();`,
+    [addonId, popupPath, timeoutMs],
+  );
+  if (isRecord(result)) {
+    if (typeof result.error === "string") throw new Error(result.error);
+    if (typeof result.url === "string" && result.url.length > 0) return result.url;
+  }
+  throw new Error(`unexpected policy result: ${JSON.stringify(result)}`);
 }
 
 async function installExtension(profileDir: string, extensionPath: string): Promise<void> {

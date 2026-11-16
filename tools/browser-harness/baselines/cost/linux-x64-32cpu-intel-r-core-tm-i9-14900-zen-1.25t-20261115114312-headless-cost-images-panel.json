@@ -1,9 +1,11 @@
 {
-  "capturedAt": "2026-11-16T12:06:44.353Z",
+  "capturedAt": "2026-11-16T14:28:39.519Z",
   "scenario": "cost-images",
+  "cpuMetric": "parent-main-thread",
   "arm": "panel",
   "rounds": 6,
   "warmupDropped": 1,
+  "discardedRounds": [],
   "runCount": 5,
   "errors": 0,
   "failures": [],
@@ -11,79 +13,96 @@
     {
       "round": 1,
       "arm": "panel",
-      "lastResourceFinishedMs": 161,
-      "parentWorkingSetBytes": 566697984,
-      "parentCpuMs": 270,
-      "wallMs": 175.442694,
+      "lastResourceFinishedMs": 145,
+      "parentWorkingSetBytes": 512438272,
+      "parentMainThreadMs": 149.5,
+      "parentProcessCpuMs": 230.1,
+      "wallMs": 164.694031,
+      "settleMs": 3324,
       "requestCount": 201
     },
     {
       "round": 2,
       "arm": "panel",
-      "lastResourceFinishedMs": 140,
-      "parentWorkingSetBytes": 558948352,
-      "parentCpuMs": 270,
-      "wallMs": 164.738694,
+      "lastResourceFinishedMs": 143,
+      "parentWorkingSetBytes": 437133312,
+      "parentMainThreadMs": 157.4,
+      "parentProcessCpuMs": 245.1,
+      "wallMs": 168.676754,
+      "settleMs": 3070,
       "requestCount": 201
     },
     {
       "round": 3,
       "arm": "panel",
-      "lastResourceFinishedMs": 155,
-      "parentWorkingSetBytes": 559251456,
-      "parentCpuMs": 270,
-      "wallMs": 171.300264,
+      "lastResourceFinishedMs": 156,
+      "parentWorkingSetBytes": 459661312,
+      "parentMainThreadMs": 158.8,
+      "parentProcessCpuMs": 245.1,
+      "wallMs": 174.392703,
+      "settleMs": 3085,
       "requestCount": 201
     },
     {
       "round": 4,
       "arm": "panel",
-      "lastResourceFinishedMs": 167,
-      "parentWorkingSetBytes": 567095296,
-      "parentCpuMs": 300,
-      "wallMs": 187.630637,
+      "lastResourceFinishedMs": 176,
+      "parentWorkingSetBytes": 458637312,
+      "parentMainThreadMs": 177.9,
+      "parentProcessCpuMs": 283.7,
+      "wallMs": 196.391078,
+      "settleMs": 3071,
       "requestCount": 201
     },
     {
       "round": 5,
       "arm": "panel",
-      "lastResourceFinishedMs": 158,
-      "parentWorkingSetBytes": 564629504,
-      "parentCpuMs": 280,
-      "wallMs": 178.804225,
+      "lastResourceFinishedMs": 156,
+      "parentWorkingSetBytes": 448589824,
+      "parentMainThreadMs": 158.5,
+      "parentProcessCpuMs": 250.9,
+      "wallMs": 174.639314,
+      "settleMs": 3068,
       "requestCount": 201
     }
   ],
   "lastResourceFinishedMs": {
-    "median": 158,
-    "spread": 27,
-    "min": 140,
-    "max": 167,
+    "median": 156,
+    "spread": 33,
+    "min": 143,
+    "max": 176,
     "runCount": 5
   },
-  "parentCpuMs": {
-    "median": 270,
-    "spread": 30,
-    "min": 270,
-    "max": 300,
+  "parentMainThreadMs": {
+    "median": 158.5,
+    "spread": 28.400000000000006,
+    "min": 149.5,
+    "max": 177.9,
+    "runCount": 5
+  },
+  "parentProcessCpuMs": {
+    "median": 245.1,
+    "spread": 53.599999999999994,
+    "min": 230.1,
+    "max": 283.7,
     "runCount": 5
   },
   "parentWorkingSetBytes": {
-    "median": 564629504,
-    "spread": 8146944,
-    "min": 558948352,
-    "max": 567095296,
+    "median": 458637312,
+    "spread": 75304960,
+    "min": 437133312,
+    "max": 512438272,
     "runCount": 5
   },
   "wallMs": {
-    "median": 175.442694,
-    "spread": 22.891942999999998,
-    "min": 164.738694,
-    "max": 187.630637,
+    "median": 174.392703,
+    "spread": 31.697046999999998,
+    "min": 164.694031,
+    "max": 196.391078,
     "runCount": 5
   },
   "browser": {
-    "binaryPath": "/tmp/och-harness-ci/twilight/zen/zen",
+    "binaryPath": "/home/trent/och-work/browsers/zen-twilight-1.25t-20261115114312/zen",
     "name": "zen",
     "version": "1.25t",
     "buildId": "20261115114312",
@@ -101,12 +120,12 @@
   },
   "load": {
     "before": {
-      "cpuBusyPercent": 0.5,
-      "loadAverage": [2.13, 2.01, 1.36]
+      "cpuBusyPercent": 5.9,
+      "loadAverage": [6.48, 5.38, 3.78]
     },
     "after": {
-      "cpuBusyPercent": 0.5,
-      "loadAverage": [2.79, 2.2, 1.44]
+      "cpuBusyPercent": 8.3,
+      "loadAverage": [3.16, 4.53, 3.64]
     }
   }
 }
