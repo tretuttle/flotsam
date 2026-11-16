@@ -313,6 +313,7 @@ interface GeckoModules {
 declare const ChromeUtils: {
   importESModule<Url extends keyof GeckoModules>(url: Url): GeckoModules[Url];
   getXPCOMErrorName(status: number): string;
+  now(): number;
 };
 
 interface IOUtilsStat {

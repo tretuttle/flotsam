@@ -111,6 +111,8 @@ export interface Recorder {
     readonly live: number;
     readonly overflow: number;
     readonly observerErrors: readonly string[];
+    /** Main-thread milliseconds spent in each topic's observer, for the harness's cost breakdown. */
+    readonly observerMs: Readonly<Record<string, number>>;
   };
 }
 
@@ -242,6 +244,7 @@ export function startRecorder(options: {
   let overflow = 0;
   let admitted = 0;
   const observerErrors: string[] = [];
+  const observerMs: Record<string, number> = {};
   const live = new Map<number, LiveEntry>();
   const watched = new Set<Sink>();
   let watchdog: { cancel(): void } | null = null;
@@ -541,6 +544,7 @@ export function startRecorder(options: {
 
   const observer: Observer = {
     observe: (subject, topic) => {
+      const startedAt = ChromeUtils.now();
       const channel = optional(() => (subject as HttpChannel).QueryInterface(Ci.nsIHttpChannel));
       if (channel === null) return;
       try {
@@ -550,6 +554,8 @@ export function startRecorder(options: {
       } catch (error) {
         if (observerErrors.length < MAX_ERRORS_KEPT)
           observerErrors.push(`${topic}: ${String(error)}`);
+      } finally {
+        observerMs[topic] = (observerMs[topic] ?? 0) + ChromeUtils.now() - startedAt;
       }
     },
   };
@@ -578,6 +584,6 @@ export function startRecorder(options: {
       live.clear();
       store.commitAbandoned(abandoned);
     },
-    counts: () => ({ live: live.size, overflow, observerErrors }),
+    counts: () => ({ live: live.size, overflow, observerErrors, observerMs }),
   };
 }

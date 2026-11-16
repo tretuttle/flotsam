@@ -109,14 +109,29 @@ export const errorName = (status: number): string => {
   }
 };
 
-/** Registrable domain through Services.eTLD; IP hosts and single-label hosts are their own site. */
-export const siteOfHost = (host: string): Site | null => {
-  if (host === "") return null;
+const SITE_CACHE_MAX = 4_096;
+const siteCache = new Map<string, Site | null>();
+
+const lookupSite = (host: string): Site | null => {
   try {
     return parseSite(Services.eTLD.getBaseDomainFromHost(host));
   } catch {
     return parseSite(host);
   }
+};
+
+/**
+ * Registrable domain through Services.eTLD; IP hosts and single-label hosts are their own site. Each request asks for
+ * up to three hosts that repeat, and the lookup was the largest part of examine on 2000 requests, so answers are kept.
+ */
+export const siteOfHost = (host: string): Site | null => {
+  if (host === "") return null;
+  const known = siteCache.get(host);
+  if (known !== undefined) return known;
+  if (siteCache.size >= SITE_CACHE_MAX) siteCache.clear();
+  const site = lookupSite(host);
+  siteCache.set(host, site);
+  return site;
 };
 
 export const siteOfUri = (uri: Uri | null | undefined): Site | null =>
