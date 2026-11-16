@@ -3,14 +3,9 @@ import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import {
-  authorizeLeaseTarget,
-  commandLineHasPath,
-  currentPlatformName,
-  killOwnedTree,
-  readProcessIdentity,
-  removeDirectoryBounded,
-} from "./owned-process.ts";
+import { removeDirectoryBounded, stopOwnedTree, type ProcessIo } from "./owned-process.ts";
+import { readProcessIdentity } from "./process-table.ts";
+import { decideLease } from "./signal-policy.ts";
 
 const PROFILE_PREFIX = "one-click-har-browser-";
 
@@ -22,6 +17,9 @@ export type LaunchLease = {
   readonly spawnedStartTime: string | null;
   readonly profileDir: string;
   readonly createdAt: string;
+  // A failed reap keeps the lease so the next launch retries it.
+  readonly reapFailures?: number;
+  readonly lastReapFailure?: string;
 };
 
 export type ActiveLease = {
@@ -61,7 +59,7 @@ export async function createLaunchLease(
   const dir = leaseDirectory(tmpdir);
   await ensureSecureLeaseDir(dir);
   const harnessIdentity = readProcessIdentity(process.pid);
-  if (harnessIdentity === null) {
+  if (harnessIdentity === undefined) {
     throw new Error(`could not read start time for harness pid ${String(process.pid)}`);
   }
   const filePath = NodePath.join(dir, `${String(process.pid)}-${NodeCrypto.randomUUID()}.json`);
@@ -100,11 +98,19 @@ export async function createLaunchLease(
 }
 
 export async function reapOrphanedLaunches(
+  io: ProcessIo,
   assertSafeProfile: (directory: string) => void,
-  tmpdir: string = NodeOS.tmpdir(),
-  onWarning: (message: string) => void = (message) => process.stderr.write(`${message}\n`),
+  options: {
+    readonly tmpdir?: string;
+    readonly onWarning?: (message: string) => void;
+    readonly removeProfile?: (directory: string) => Promise<void>;
+  } = {},
 ): Promise<number> {
-  const dir = leaseDirectory(tmpdir);
+  const dir = leaseDirectory(options.tmpdir);
+  const onWarning =
+    options.onWarning ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const removeProfile =
+    options.removeProfile ?? ((directory: string) => removeDirectoryBounded(io, directory));
   let entries: string[];
   try {
     await ensureExistingSecureLeaseDir(dir);
@@ -124,27 +130,36 @@ export async function reapOrphanedLaunches(
 
     const lease = await readLease(filePath);
     if (lease === null) continue;
-
-    const liveHarness = readProcessIdentity(lease.harnessPid);
-    if (liveHarness !== null && liveHarness.startTime === lease.harnessStartTime) {
-      continue;
-    }
+    const verdict = decideLease(lease, io.table());
+    if (verdict.action === "leave") continue;
 
     assertSafeProfile(lease.profileDir);
     try {
-      await killVerifiedOrphan(lease);
-      if (NodeFS.existsSync(lease.profileDir)) {
-        await removeDirectoryBounded(lease.profileDir);
-      }
+      if (verdict.action === "stop-and-clean") await stopOwnedTree(io, verdict.root);
+      if (NodeFS.existsSync(lease.profileDir)) await removeProfile(lease.profileDir);
     } catch (error) {
+      const failure = error instanceof Error ? error.message : String(error);
+      const attempts = (lease.reapFailures ?? 0) + 1;
+      await writeLeaseFile(filePath, {
+        ...lease,
+        reapFailures: attempts,
+        lastReapFailure: failure,
+      });
       onWarning(
-        `warning: failed to reap orphaned browser for ${lease.profileDir}: ${error instanceof Error ? error.message : String(error)}`,
+        `warning: failed to reap orphaned browser for ${lease.profileDir} (attempt ${String(attempts)}); kept its lease to retry on the next launch: ${failure}`,
       );
+      continue;
     }
     await NodeFSP.rm(filePath, { force: true }).catch(() => undefined);
     reaped += 1;
   }
   return reaped;
+}
+
+async function writeLeaseFile(filePath: string, lease: LaunchLease): Promise<void> {
+  const staging = `${filePath}.${NodeCrypto.randomUUID()}.tmp`;
+  await NodeFSP.writeFile(staging, `${JSON.stringify(lease)}\n`, { encoding: "utf8", mode: 0o600 });
+  await NodeFSP.rename(staging, filePath);
 }
 
 async function ensureExistingSecureLeaseDir(dir: string): Promise<void> {
@@ -158,53 +173,6 @@ async function ensureExistingSecureLeaseDir(dir: string): Promise<void> {
   if (process.platform !== "win32" && (stat.mode & 0o777) !== 0o700) {
     await NodeFSP.chmod(dir, 0o700);
   }
-}
-
-async function killVerifiedOrphan(lease: LaunchLease): Promise<void> {
-  if (lease.spawnedPid === null || lease.spawnedStartTime === null) return;
-  const live = readProcessIdentity(lease.spawnedPid);
-  if (
-    live === null ||
-    live.startTime !== lease.spawnedStartTime ||
-    !commandLineHasPath(live, lease.profileDir)
-  ) {
-    return;
-  }
-  authorizeLeaseTarget(lease.spawnedPid, {
-    startTime: lease.spawnedStartTime,
-    profileDir: lease.profileDir,
-  });
-  const members =
-    currentPlatformName() === "linux"
-      ? linuxVerifiedDescendants(lease.spawnedPid, lease.profileDir)
-      : [];
-  await killOwnedTree(lease.spawnedPid, members, {
-    lease: { profileDir: lease.profileDir, spawnedStartTime: lease.spawnedStartTime },
-  });
-}
-
-function linuxVerifiedDescendants(spawnedPid: number, profileDir: string): number[] {
-  const matched: number[] = [];
-  let entries: string[];
-  try {
-    entries = NodeFS.readdirSync("/proc");
-  } catch {
-    return [spawnedPid];
-  }
-  for (const entry of entries) {
-    if (!/^\d+$/u.test(entry)) continue;
-    const pid = Number(entry);
-    if (pid <= 1) continue;
-    if (pid === spawnedPid) {
-      matched.push(pid);
-      continue;
-    }
-    const id = readProcessIdentity(pid);
-    if (id !== null && commandLineHasPath(id, profileDir)) {
-      matched.push(pid);
-    }
-  }
-  return matched;
 }
 
 async function readLease(filePath: string): Promise<LaunchLease | null> {
@@ -246,6 +214,14 @@ async function readLease(filePath: string): Promise<LaunchLease | null> {
       spawnedStartTime.length > 0;
     if (!bothNull && !bothValid) return null;
     const createdAt = "createdAt" in raw && typeof raw.createdAt === "string" ? raw.createdAt : "";
+    const reapFailures =
+      "reapFailures" in raw && typeof raw.reapFailures === "number" && raw.reapFailures > 0
+        ? raw.reapFailures
+        : undefined;
+    const lastReapFailure =
+      "lastReapFailure" in raw && typeof raw.lastReapFailure === "string"
+        ? raw.lastReapFailure
+        : undefined;
     return {
       version: 2,
       harnessPid: raw.harnessPid,
@@ -254,6 +230,8 @@ async function readLease(filePath: string): Promise<LaunchLease | null> {
       spawnedStartTime: bothValid ? (spawnedStartTime as string) : null,
       profileDir: raw.profileDir,
       createdAt,
+      ...(reapFailures === undefined ? {} : { reapFailures }),
+      ...(lastReapFailure === undefined ? {} : { lastReapFailure }),
     };
   } catch {
     return null;

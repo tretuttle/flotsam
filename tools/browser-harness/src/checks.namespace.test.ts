@@ -4,10 +4,13 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { launchBrowser, waitForActiveExtensionUrl } from "./browser.ts";
+import { waitForActiveExtensionUrl, type launchBrowser } from "./browser.ts";
 import { runEnvironmentVerification, verifyBrowserIdentity } from "../checks/environment.ts";
 import { runRestartVerification } from "../checks/restart.ts";
 import { discoverChecks, runDiscoveredChecks } from "./checks.ts";
+import { requireIsolatedPidNamespace } from "./namespace-isolation.ts";
+
+requireIsolatedPidNamespace();
 
 const cleanupDirs: string[] = [];
 

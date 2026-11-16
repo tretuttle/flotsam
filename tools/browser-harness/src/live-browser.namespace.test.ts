@@ -3,6 +3,9 @@ import { describe, expect, it } from "vite-plus/test";
 import { launchBrowser, type BrowserSession } from "./browser.ts";
 import { ID_CACHED_PATH, ID_INDEX_PATH, ID_REVAL_PATH } from "./extended-fixtures.ts";
 import { startFixtureServer } from "./server.ts";
+import { requireIsolatedPidNamespace } from "./namespace-isolation.ts";
+
+requireIsolatedPidNamespace();
 
 const binary = process.env.BROWSER_HARNESS_BINARY;
 

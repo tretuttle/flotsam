@@ -12,7 +12,7 @@ import {
 } from "./cost.ts";
 import { checkHarFile, formatHarCheck } from "./har.ts";
 import { captureBaseline, measurePage, type MeasureResult } from "./measure.ts";
-import { currentPlatformName } from "./owned-process.ts";
+import { currentPlatformName } from "./process-table.ts";
 import type { RemoteProtocol } from "./remote.ts";
 import {
   COST_SCENARIO_NAMES,

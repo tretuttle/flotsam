@@ -7,7 +7,7 @@ import {
   waitForActiveExtensionUrl,
 } from "../src/browser.ts";
 import type { CheckContext, CheckResult, HarnessCheck } from "../src/checks.ts";
-import { removeDirectoryBounded } from "../src/owned-process.ts";
+import { hostProcessIo, removeDirectoryBounded } from "../src/owned-process.ts";
 import { callGetEnvironment, readPopupFacts, verifyBrowserIdentity } from "./environment.ts";
 
 export async function runRestartVerification(
@@ -34,7 +34,7 @@ export async function runRestartVerification(
 
   await using stack = new AsyncDisposableStack();
   const profileDir = await prepareProfile(context.extensionPath);
-  stack.defer(() => removeDirectoryBounded(profileDir));
+  stack.defer(() => removeDirectoryBounded(hostProcessIo(), profileDir));
   const launch = options.launch ?? launchBrowser;
 
   const verifyLaunch = async (phase: string): Promise<string> => {

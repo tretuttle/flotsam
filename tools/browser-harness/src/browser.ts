@@ -5,14 +5,18 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { createLaunchLease, reapOrphanedLaunches, type ActiveLease } from "./orphan-lease.ts";
 import {
-  currentPlatformName,
-  killOwnedTree,
-  readProcessSnapshot,
+  hostProcessIo,
   removeDirectoryBounded,
   spawnOwned,
+  stopOwnedTree,
   watchChildExit,
-  type ProcessPlatformName,
+  type ProcessIo,
 } from "./owned-process.ts";
+import {
+  currentPlatformName,
+  readProcessSnapshot,
+  type ProcessPlatformName,
+} from "./process-table.ts";
 import { connectRemote, type RemoteProtocol } from "./remote.ts";
 import { readZipEntry } from "./zip.ts";
 
@@ -340,7 +344,9 @@ function spawnLeasedBrowser(
     env: options.env,
     profileDir: options.profileDir,
   });
-  if (spawned.startTime !== null) lease.setSpawnedProcess(spawned.pid, spawned.startTime);
+  if (spawned.ownership !== null) {
+    lease.setSpawnedProcess(spawned.pid, spawned.ownership.startTime);
+  }
   return { spawned, watcher: watchChildExit(spawned.child) };
 }
 
@@ -367,7 +373,8 @@ export async function launchBrowser(
   request: RemoteLaunchRequest | UntouchedLaunchRequest,
 ): Promise<BrowserSession | UntouchedBrowserSession> {
   const launchMode: BrowserLaunchMode = request.launchMode ?? "recommended";
-  await reapOrphanedLaunches(assertSafeProfileDirectory);
+  const io = hostProcessIo();
+  await reapOrphanedLaunches(io, assertSafeProfileDirectory);
   await using stack = new AsyncDisposableStack();
   const cachePrefs = request.cache === true ? CACHE_ENABLED_PREFS : [];
 
@@ -375,6 +382,7 @@ export async function launchBrowser(
     const untouchedRequest = request as UntouchedLaunchRequest;
     const prefs = [...cachePrefs, ...(untouchedRequest.extraPrefs ?? [])];
     const directory = await resolveProfileDir(
+      io,
       stack,
       untouchedRequest.profileDir,
       untouchedRequest.extensionPath,
@@ -398,7 +406,7 @@ export async function launchBrowser(
       profileDir: directory,
       suppressCoreDumps: untouchedRequest.suppressCoreDumps,
     });
-    stack.defer(() => killOwnedTree(spawned.pid, []));
+    stack.defer(() => stopOwnedTree(io, spawned.ownership));
     const owned = stack.move();
     return {
       spawnedPid: spawned.pid,
@@ -422,6 +430,7 @@ export async function launchBrowser(
     ...(remoteRequest.extraPrefs ?? []),
   ];
   const directory = await resolveProfileDir(
+    io,
     stack,
     remoteRequest.profileDir,
     remoteRequest.extensionPath,
@@ -451,8 +460,7 @@ export async function launchBrowser(
     suppressCoreDumps: remoteRequest.suppressCoreDumps,
   });
   const exitedStatus = watcher.exited.then((result) => result.status);
-  let browserPid: number | null = null;
-  stack.defer(() => killOwnedTree(spawned.pid, browserPid === null ? [] : [browserPid]));
+  stack.defer(() => stopOwnedTree(io, spawned.ownership));
   const remote = await connectRemote({
     protocol,
     port,
@@ -462,7 +470,6 @@ export async function launchBrowser(
     signal: remoteRequest.signal,
   });
   stack.defer(() => remote.dispose());
-  browserPid = remote.browserPid;
   assertOwnedBrowser(remote.browserPid, spawned.pid);
   const owned = stack.move();
   return {
@@ -495,6 +502,7 @@ export async function launchBrowser(
 }
 
 async function resolveProfileDir(
+  io: ProcessIo,
   stack: AsyncDisposableStack,
   profileDir: string | undefined,
   extensionPath: string | null,
@@ -503,7 +511,7 @@ async function resolveProfileDir(
 ): Promise<string> {
   if (profileDir === undefined) {
     const directory = await prepareProfile(extensionPath, prefs, basePrefs);
-    stack.defer(() => removeDirectoryBounded(directory));
+    stack.defer(() => removeDirectoryBounded(io, directory));
     return directory;
   }
   assertSafeProfileDirectory(profileDir);

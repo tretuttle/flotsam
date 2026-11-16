@@ -9,7 +9,7 @@ import {
 } from "./browser.ts";
 import type { RemoteProtocol } from "./remote.ts";
 import { FIXTURE_SEED, SMALL_KINDS, SMALL_PER_KIND } from "./fixtures.ts";
-import { readProcessSnapshot, type ProcessSnapshot } from "./owned-process.ts";
+import { readProcessSnapshot, type ProcessSnapshot } from "./process-table.ts";
 import { SCENARIOS, type MeasuredScenario } from "./scenarios.ts";
 import { startFixtureServer } from "./server.ts";
 
