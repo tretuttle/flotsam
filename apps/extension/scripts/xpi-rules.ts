@@ -518,9 +518,9 @@ export const RULES: readonly Rule[] = [
       {
         name: "a comment in a vector image",
         changes: (fixtures) => ({
-          "icons/toolbar-dark.svg": fixtures.toolbarSvg.replace("<rect", "<!-- bars --><rect"),
+          "icons/toolbar.svg": fixtures.toolbarSvg.replace("<rect", "<!-- bars --><rect"),
         }),
-        path: "icons/toolbar-dark.svg",
+        path: "icons/toolbar.svg",
       },
     ],
   },
@@ -589,8 +589,8 @@ export const RULES: readonly Rule[] = [
       },
       {
         name: "V10 a pretty vector image",
-        changes: (fixtures) => ({ "icons/toolbar-dark.svg": prettySvg(fixtures) }),
-        path: "icons/toolbar-dark.svg",
+        changes: (fixtures) => ({ "icons/toolbar.svg": prettySvg(fixtures) }),
+        path: "icons/toolbar.svg",
       },
       {
         name: "N09 a pretty function repeated 8 times after the large bundle",

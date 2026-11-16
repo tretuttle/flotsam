@@ -43,7 +43,7 @@ beforeAll(async () => {
     NodeModule.createRequire(import.meta.url).resolve("react-dom/package.json"),
   );
   const toolbarSvg = NodeFS.readFileSync(
-    NodePath.join(extensionRoot, "src", "icons", "toolbar-dark.svg"),
+    NodePath.join(extensionRoot, "src", "icons", "toolbar.svg"),
     "utf8",
   );
   fixtures = {
@@ -76,7 +76,7 @@ beforeAll(async () => {
     "experiment/parent.js": encode(minifiedParent),
     "shared/framework.js": encode(fixtures.framework),
     "shared/framework.js.LICENSE.txt": NodeFS.readFileSync(NodePath.join(reactDom, "LICENSE")),
-    "icons/toolbar-dark.svg": encode(toolbarSvg),
+    "icons/toolbar.svg": encode(toolbarSvg),
     "icons/16.png": renderPng(master, 16),
   };
 });
