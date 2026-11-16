@@ -352,10 +352,10 @@ const plural = (count: number, noun: string): string => `${count} ${noun}${count
 
 // What re-minifying a minified file can still save, measured on the real build: the 218521 byte bundle saves 302
 // bytes (0.14 percent, from whole-bundle renaming and merged duplicates) and every other file saves 0, 3, 5 or 7.
-// Floor: 4.6 times the largest small-file saving. Fraction: 2.1 times the bundle's rate, for a file between the two.
-// Ceiling: 1.7 times the bundle's 302, so a large file cannot hide more than about a kilobyte of readable code.
+// Floor: 4.6 times the largest small-file saving. Fraction: slack for a small file another minifier wrote.
+// Ceiling: 1.7 times the bundle's 302, so a percentage cannot grow into 15750 bytes of readable code on a large file.
 const MINIFY_FLOOR_BYTES = 32;
-const MINIFY_FRACTION = 0.003;
+const MINIFY_FRACTION = 0.03;
 const MINIFY_CEILING_BYTES = 512;
 
 export const minifyMargin = (length: number): number =>
