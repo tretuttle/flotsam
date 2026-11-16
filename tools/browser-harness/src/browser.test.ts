@@ -1,3 +1,4 @@
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -13,7 +14,9 @@ import {
   readExtensionId,
   renderUserJs,
   resolveBrowserSpawnCommand,
+  spawnLeasedBrowser,
 } from "./browser.ts";
+import { createLaunchLease } from "./orphan-lease.ts";
 
 const directories: string[] = [];
 
@@ -225,6 +228,57 @@ describe("browser profile", () => {
     expect(
       resolveBrowserSpawnCommand("C:\\zen\\zen.exe", ["-headless"], { platform: "win32" }),
     ).toEqual({ command: "C:\\zen\\zen.exe", args: ["-headless"] });
+  });
+
+  // A stand-in prlimit on the launch's own PATH records that it wrapped the command, then runs it.
+  async function launchStandIn(suppressCoreDumps: boolean | undefined) {
+    const tmpdir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-spawn-"));
+    directories.push(tmpdir);
+    const profileDir = await NodeFSP.mkdtemp(NodePath.join(tmpdir, "one-click-har-browser-"));
+    const bin = NodePath.join(tmpdir, "bin");
+    const marker = NodePath.join(tmpdir, "wrapped");
+    await NodeFSP.mkdir(bin);
+    await NodeFSP.writeFile(
+      NodePath.join(bin, "prlimit"),
+      `#!/bin/sh\necho wrapped > '${marker}'\nshift 2\nexec "$@"\n`,
+      { mode: 0o755 },
+    );
+    const lease = await createLaunchLease(profileDir, tmpdir);
+    // Exits by itself, so nothing here has to stop it.
+    const { spawned, watcher } = spawnLeasedBrowser(
+      process.execPath,
+      ["-e", "process.stderr.write(String(process.env.OCH_MARK))", profileDir],
+      lease,
+      {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, PATH: bin, OCH_MARK: "set" },
+        profileDir,
+        suppressCoreDumps,
+      },
+    );
+    const exit = await watcher.exited;
+    const recorded: unknown = JSON.parse(NodeFS.readFileSync(lease.filePath, "utf8"));
+    await lease.remove();
+    return { spawned, exit, recorded, profileDir, wrapped: NodeFS.existsSync(marker) };
+  }
+
+  it("owns the launched browser with its profile directory, records it in the lease, and runs it with the launch's environment", async () => {
+    const launch = await launchStandIn(false);
+    expect(launch.spawned.ownership).toMatchObject({
+      pid: launch.spawned.pid,
+      profileDir: launch.profileDir,
+    });
+    expect(launch.recorded).toMatchObject({
+      spawnedPid: launch.spawned.pid,
+      spawnedStartTime: launch.spawned.ownership?.startTime,
+    });
+    expect(launch.exit.status).toBe("code 0");
+    expect(launch.exit.stderr).toBe("set");
+    expect(launch.wrapped).toBe(false);
+  });
+
+  it("wraps the launch with the prlimit found on the launch's own PATH unless core dumps are allowed", async () => {
+    expect((await launchStandIn(undefined)).wrapped).toBe(true);
   });
 });
 

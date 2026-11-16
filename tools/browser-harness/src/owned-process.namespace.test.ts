@@ -19,7 +19,7 @@ import {
   readHostProcessTable,
   readProcessIdentity,
 } from "./process-table.ts";
-import { adoptSpawnedChild } from "./signal-policy.ts";
+import { adoptSpawnedChild, decideSignal, type SignalOrder } from "./signal-policy.ts";
 
 requireIsolatedPidNamespace();
 
@@ -36,6 +36,7 @@ afterEach(async () => {
 });
 
 const running = (pid: number): boolean => readHostProcessTable().has(pid);
+const READY_AND_WAIT = 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);';
 const IGNORES_SIGTERM = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);';
 
 const ALLOCATED_BYTES = 200 * 1024 * 1024;
@@ -144,6 +145,44 @@ describe("owned process trees (real signals)", () => {
     await stopOwnedTree(hostProcessIo(), stub.ownership);
     expect(running(stub.pid)).toBe(false);
     expect(await NodeFSP.readFile(log, "utf8")).toBe("SIGTERM\n");
+  });
+
+  it("runs under a 1-byte core limit with a private TMPDIR", () => {
+    expect(NodeFS.readFileSync("/proc/self/limits", "utf8")).toMatch(
+      /^Max core file size\s+1\s+1\s+bytes\s*$/mu,
+    );
+    expect(NodePath.basename(NodeOS.tmpdir())).toMatch(/^och-ns-tmp-\w{6}$/u);
+  });
+
+  it("signals process groups on Linux", () => {
+    expect(hostProcessIo().groupSignals).toBe(true);
+  });
+
+  it("the host performer refuses a forged order, sends an issued one once, and refuses it again", async () => {
+    const target = spawn(process.execPath, ["-e", READY_AND_WAIT], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    expect(await firstLine(target)).toBe("ready");
+    const io = hostProcessIo();
+    const forged = { rawTarget: target.pid, signal: "SIGTERM" } as unknown as SignalOrder;
+    expect(() => io.perform(forged)).toThrow(/did not issue or that was already used/);
+    expect(running(target.pid)).toBe(true);
+    const decision =
+      target.ownership === null
+        ? null
+        : decideSignal({
+            target: { id: target.pid, kind: "process" },
+            signal: "SIGTERM",
+            owner: target.ownership,
+            self: io.self(),
+            table: io.table(),
+            groupSignals: io.groupSignals,
+          });
+    if (decision?.verdict !== "send") throw new Error("expected an order for the spawned child");
+    const exited = new Promise((resolve) => target.child.once("exit", resolve));
+    expect(io.perform(decision.order)).toBe(true);
+    await exited;
+    expect(() => io.perform(decision.order)).toThrow(/already used/);
   });
 
   it("the host performer refuses this namespace's PID 1 and the harness itself, and both keep running", async () => {

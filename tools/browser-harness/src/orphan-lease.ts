@@ -176,66 +176,52 @@ async function ensureExistingSecureLeaseDir(dir: string): Promise<void> {
 }
 
 async function readLease(filePath: string): Promise<LaunchLease | null> {
+  const text = await NodeFSP.readFile(filePath, "utf8").catch(() => null);
+  return text === null ? null : parseLease(text);
+}
+
+const isPositiveInteger = (value: unknown): value is number =>
+  Number.isInteger(value) && (value as number) > 0;
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0;
+
+// A lease this does not fully understand is ignored: never acted on, never deleted.
+export function parseLease(text: string): LaunchLease | null {
+  let parsed: unknown;
   try {
-    const raw: unknown = JSON.parse(await NodeFSP.readFile(filePath, "utf8"));
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
-    if (!("version" in raw) || raw.version !== 2) return null;
-    if (
-      !("harnessPid" in raw) ||
-      typeof raw.harnessPid !== "number" ||
-      !Number.isInteger(raw.harnessPid) ||
-      raw.harnessPid <= 0
-    ) {
-      return null;
-    }
-    if (
-      !("harnessStartTime" in raw) ||
-      typeof raw.harnessStartTime !== "string" ||
-      raw.harnessStartTime.length === 0
-    ) {
-      return null;
-    }
-    if (
-      !("profileDir" in raw) ||
-      typeof raw.profileDir !== "string" ||
-      !NodePath.isAbsolute(raw.profileDir) ||
-      !NodePath.basename(raw.profileDir).startsWith(PROFILE_PREFIX)
-    ) {
-      return null;
-    }
-    const spawnedPid = "spawnedPid" in raw ? raw.spawnedPid : undefined;
-    const spawnedStartTime = "spawnedStartTime" in raw ? raw.spawnedStartTime : undefined;
-    const bothNull = spawnedPid === null && spawnedStartTime === null;
-    const bothValid =
-      typeof spawnedPid === "number" &&
-      Number.isInteger(spawnedPid) &&
-      spawnedPid > 1 &&
-      typeof spawnedStartTime === "string" &&
-      spawnedStartTime.length > 0;
-    if (!bothNull && !bothValid) return null;
-    const createdAt = "createdAt" in raw && typeof raw.createdAt === "string" ? raw.createdAt : "";
-    const reapFailures =
-      "reapFailures" in raw && typeof raw.reapFailures === "number" && raw.reapFailures > 0
-        ? raw.reapFailures
-        : undefined;
-    const lastReapFailure =
-      "lastReapFailure" in raw && typeof raw.lastReapFailure === "string"
-        ? raw.lastReapFailure
-        : undefined;
-    return {
-      version: 2,
-      harnessPid: raw.harnessPid,
-      harnessStartTime: raw.harnessStartTime,
-      spawnedPid: bothValid ? (spawnedPid as number) : null,
-      spawnedStartTime: bothValid ? (spawnedStartTime as string) : null,
-      profileDir: raw.profileDir,
-      createdAt,
-      ...(reapFailures === undefined ? {} : { reapFailures }),
-      ...(lastReapFailure === undefined ? {} : { lastReapFailure }),
-    };
+    parsed = JSON.parse(text);
   } catch {
     return null;
   }
+  const raw = Object(parsed) as Record<string, unknown>;
+  const { harnessPid, harnessStartTime, profileDir, spawnedPid, spawnedStartTime } = raw;
+  if (raw.version !== 2 || !isPositiveInteger(harnessPid) || !isNonEmptyString(harnessStartTime)) {
+    return null;
+  }
+  if (
+    typeof profileDir !== "string" ||
+    !NodePath.isAbsolute(profileDir) ||
+    !NodePath.basename(profileDir).startsWith(PROFILE_PREFIX)
+  ) {
+    return null;
+  }
+  const spawned =
+    spawnedPid === null && spawnedStartTime === null
+      ? { spawnedPid: null, spawnedStartTime: null }
+      : isPositiveInteger(spawnedPid) && spawnedPid > 1 && isNonEmptyString(spawnedStartTime)
+        ? { spawnedPid, spawnedStartTime }
+        : null;
+  if (spawned === null) return null;
+  return {
+    version: 2,
+    harnessPid,
+    harnessStartTime,
+    ...spawned,
+    profileDir,
+    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : "",
+    ...(isPositiveInteger(raw.reapFailures) ? { reapFailures: raw.reapFailures } : {}),
+    ...(typeof raw.lastReapFailure === "string" ? { lastReapFailure: raw.lastReapFailure } : {}),
+  };
 }
 
 function errorCode(error: unknown): string | null {

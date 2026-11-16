@@ -324,7 +324,7 @@ export function resolveBrowserSpawnCommand(
   return BROWSER_PLATFORMS[platform].wrapCoreLimit(binaryPath, args, options.env ?? process.env);
 }
 
-function spawnLeasedBrowser(
+export function spawnLeasedBrowser(
   binaryPath: string,
   args: readonly string[],
   lease: ActiveLease,

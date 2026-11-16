@@ -47,8 +47,9 @@ export type SignalDecision =
 const MINTED_OWNERSHIP = new WeakSet<Ownership>();
 const UNSPENT_ORDERS = new WeakSet<SignalOrder>();
 
+// Minted values are frozen, so a record checked once cannot be pointed at another process later.
 function mintOwnership(pid: number, startTime: string, profileDir: string | null): Ownership {
-  const ownership = { pid, startTime, profileDir } as Ownership;
+  const ownership = Object.freeze({ pid, startTime, profileDir }) as Ownership;
   MINTED_OWNERSHIP.add(ownership);
   return ownership;
 }
@@ -61,12 +62,12 @@ export function adoptSpawnedChild(spawned: {
   return mintOwnership(spawned.pid, spawned.startTime, spawned.profileDir);
 }
 
+// The path must stand as a whole argument: bounded by the line's ends, whitespace, NUL, `=` before
+// it (`--profile=<path>`), or a quote, since Windows quotes a path that holds spaces.
 function commandLineHasPath(identity: ProcessIdentity, targetPath: string): boolean {
-  if (identity.args.includes(targetPath)) return true;
   const escaped = targetPath.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  // Windows quotes a path that holds spaces, so a quote also bounds it.
   const boundary = new RegExp(`(?:^|[\\s\\0="])${escaped}(?:$|[\\s\\0"])`, "u");
-  return identity.args.some((arg) => boundary.test(arg)) || boundary.test(identity.commandLine);
+  return boundary.test(identity.commandLine);
 }
 
 function isRunning(owner: Ownership, table: ProcessTable): boolean {
@@ -78,18 +79,23 @@ type SignalCase = {
   readonly kind: TargetKind;
   readonly owner: Ownership;
   readonly self: HarnessSelf;
-  readonly live: ProcessIdentity | undefined;
   readonly groupSignals: boolean;
 };
 
-// Checked in order; the first rule that returns a reason refuses the signal.
+type LiveCase = SignalCase & { readonly live: ProcessIdentity };
+
+// PID 0 and 1, -1 and non-integers are never a target, as a process or as a group's leader.
+function isSignalableId(id: number): boolean {
+  return Number.isInteger(id) && id > 1;
+}
+
+// Checked in order; the first rule that returns a reason refuses the signal. These need no
+// process table; the live rules below run only once the target is known to be running.
 const SIGNAL_RULES: readonly ((c: SignalCase) => string | null)[] = [
-  (c) =>
-    Number.isInteger(c.id) && c.id > 1 ? null : "target ID must be an integer greater than 1",
+  (c) => (isSignalableId(c.id) ? null : "target ID must be an integer greater than 1"),
   (c) => (c.id === c.self.pid ? "target matches harness pid" : null),
   (c) => (c.id === c.self.parentPid ? "target matches harness parent pid" : null),
-  (c) =>
-    c.self.pgrp !== null && c.id === c.self.pgrp ? "target matches harness process group" : null,
+  (c) => (c.id === c.self.pgrp ? "target matches harness process group" : null),
   (c) => (c.kind === "group" && !c.groupSignals ? "this platform has no process groups" : null),
   (c) =>
     c.kind === "group" && c.self.pgrp === null ? "could not determine harness process group" : null,
@@ -98,22 +104,30 @@ const SIGNAL_RULES: readonly ((c: SignalCase) => string | null)[] = [
       ? null
       : "target was not spawned in this run or recorded in a valid lease",
   (c) => (c.owner.pid === c.id ? null : `ownership record is for ${String(c.owner.pid)}`),
-  (c) => (c.live === undefined ? "target is not running" : null),
+];
+
+const LIVE_RULES: readonly ((c: LiveCase) => string | null)[] = [
   (c) =>
-    c.live !== undefined && c.live.startTime !== c.owner.startTime
-      ? `start time ${c.live.startTime} does not match expected ${c.owner.startTime}`
-      : null,
+    c.live.startTime === c.owner.startTime
+      ? null
+      : `start time ${c.live.startTime} does not match expected ${c.owner.startTime}`,
   (c) =>
-    c.live !== undefined &&
-    c.owner.profileDir !== null &&
-    !commandLineHasPath(c.live, c.owner.profileDir)
+    c.owner.profileDir !== null && !commandLineHasPath(c.live, c.owner.profileDir)
       ? `profile path ${c.owner.profileDir} missing from command line`
       : null,
   (c) =>
-    c.kind === "group" && c.live !== undefined && c.live.pgrp !== c.id
-      ? `process group ${String(c.live?.pgrp)} is not led by ${String(c.id)}`
+    c.kind === "group" && c.live.pgrp !== c.id
+      ? `process group ${String(c.live.pgrp)} is not led by ${String(c.id)}`
       : null,
 ];
+
+function firstReason<C>(rules: readonly ((c: C) => string | null)[], c: C): string | null {
+  for (const rule of rules) {
+    const reason = rule(c);
+    if (reason !== null) return reason;
+  }
+  return null;
+}
 
 export function decideSignal(input: {
   readonly target: { readonly id: number; readonly kind: TargetKind };
@@ -129,19 +143,24 @@ export function decideSignal(input: {
     kind,
     owner: input.owner,
     self: input.self,
-    live: input.table.get(id),
     groupSignals: input.groupSignals,
   };
-  for (const rule of SIGNAL_RULES) {
-    const reason = rule(signalCase);
-    if (reason !== null) {
-      return {
-        verdict: "refuse",
-        reason: `refusing ${input.signal} to ${kind} ${String(id)}: ${reason}`,
-      };
-    }
+  const live = input.table.get(id);
+  const reason =
+    firstReason(SIGNAL_RULES, signalCase) ??
+    (live === undefined
+      ? "target is not running"
+      : firstReason(LIVE_RULES, { ...signalCase, live }));
+  if (reason !== null) {
+    return {
+      verdict: "refuse",
+      reason: `refusing ${input.signal} to ${kind} ${String(id)}: ${reason}`,
+    };
   }
-  const order = { rawTarget: kind === "group" ? -id : id, signal: input.signal } as SignalOrder;
+  const order = Object.freeze({
+    rawTarget: kind === "group" ? -id : id,
+    signal: input.signal,
+  }) as SignalOrder;
   UNSPENT_ORDERS.add(order);
   return { verdict: "send", order };
 }
@@ -156,26 +175,23 @@ export function redeemOrder(order: SignalOrder): {
       "refusing a signal order that decideSignal did not issue or that was already used",
     );
   }
-  if (!Number.isInteger(order.rawTarget) || Math.abs(order.rawTarget) <= 1) {
+  // Repeats decideSignal's first rule at the last step before the system call.
+  if (!isSignalableId(Math.abs(order.rawTarget))) {
     throw new Error(`refusing signal target ${String(order.rawTarget)}`);
   }
   return { rawTarget: order.rawTarget, signal: order.signal };
 }
 
 // Members are the root's process group (only while the root itself still runs, so a reused PID
-// cannot lend its group) and any process naming the root's profile directory.
-function selectTreeMembers(input: {
-  readonly root: Ownership;
-  readonly table: ProcessTable;
-  readonly self: HarnessSelf;
-  readonly groupSignals: boolean;
-}): Ownership[] {
-  const { root, table, self } = input;
-  const groupTrusted = input.groupSignals && isRunning(root, table);
+// cannot lend its group) and any other process naming the root's profile directory. PID 1 and the
+// harness, its parent and its group leader are never members, whatever their command lines say.
+function selectTreeMembers(root: Ownership, table: ProcessTable, self: HarnessSelf): Ownership[] {
+  const groupTrusted = isRunning(root, table);
+  const excluded = new Set<number | null>([1, self.pid, self.parentPid, self.pgrp]);
   const members: Ownership[] = [];
   for (const identity of table.values()) {
-    if (identity.pid === root.pid || identity.pid <= 1) continue;
-    if (identity.pid === self.pid || identity.pid === self.parentPid) continue;
+    const isRoot = identity.pid === root.pid && identity.startTime === root.startTime;
+    if (isRoot || excluded.has(identity.pid)) continue;
     const sameGroup = groupTrusted && identity.pgrp === root.pid;
     const sameProfile = root.profileDir !== null && commandLineHasPath(identity, root.profileDir);
     if (!sameGroup && !sameProfile) continue;
@@ -189,24 +205,32 @@ function selectTreeMembers(input: {
 const SIGTERM_GRACE_MS = 1_500;
 const STOP_DEADLINE_MS = 5_000;
 
-export type StopState = {
-  readonly step: "start" | "terminating" | "killing";
-  readonly since: number;
-  readonly members: readonly Ownership[];
-};
+export type StopState =
+  | { readonly step: "start"; readonly members: readonly Ownership[] }
+  | {
+      readonly step: "terminating" | "killing";
+      readonly since: number;
+      readonly members: readonly Ownership[];
+    };
+
+export const START_STOP: StopState = { step: "start", members: [] };
 
 export type StopStep =
   | { readonly kind: "done" }
   | { readonly kind: "wait"; readonly next: StopState }
-  | {
-      readonly kind: "signal";
-      readonly decisions: readonly SignalDecision[];
-      readonly next: StopState;
-    }
+  | { readonly kind: "signal"; readonly orders: readonly SignalOrder[]; readonly next: StopState }
+  | { readonly kind: "refuse"; readonly reasons: readonly string[] }
   | { readonly kind: "fail"; readonly running: readonly number[] };
 
-export function startStop(now: number): StopState {
-  return { step: "start", since: now, members: [] };
+// Sends only when every decision in the step is a send; one refusal stops the whole stop.
+function signalStep(decisions: readonly SignalDecision[], next: StopState): StopStep {
+  const orders: SignalOrder[] = [];
+  const reasons: string[] = [];
+  for (const decision of decisions) {
+    if (decision.verdict === "send") orders.push(decision.order);
+    else reasons.push(decision.reason);
+  }
+  return reasons.length === 0 ? { kind: "signal", orders, next } : { kind: "refuse", reasons };
 }
 
 // SIGTERM to the tree, SIGKILL after the grace period, give up at the deadline. Never any other signal.
@@ -219,10 +243,7 @@ export function nextStopStep(input: {
   readonly groupSignals: boolean;
 }): StopStep {
   const { root, state, table, now, self, groupSignals } = input;
-  const members = mergeMembers(
-    state.members,
-    selectTreeMembers({ root, table, self, groupSignals }),
-  );
+  const members = mergeMembers(state.members, selectTreeMembers(root, table, self));
   const rootRunning = isRunning(root, table);
   const runningMembers = members.filter((member) => isRunning(member, table));
   const running = [...(rootRunning ? [root.pid] : []), ...runningMembers.map((m) => m.pid)];
@@ -230,6 +251,7 @@ export function nextStopStep(input: {
 
   const decide = (owner: Ownership, kind: TargetKind, signal: StopSignal): SignalDecision =>
     decideSignal({ target: { id: owner.pid, kind }, signal, owner, self, table, groupSignals });
+  // Only a group signal to a running root covers its group's members; otherwise each is signalled.
   const groupCovers = (member: Ownership): boolean =>
     groupSignals && rootRunning && table.get(member.pid)?.pgrp === root.pid;
   const treeSignal = (signal: StopSignal): SignalDecision[] => [
@@ -241,24 +263,16 @@ export function nextStopStep(input: {
 
   switch (state.step) {
     case "start":
-      return {
-        kind: "signal",
-        decisions: treeSignal("SIGTERM"),
-        next: { step: "terminating", since: now, members },
-      };
+      return signalStep(treeSignal("SIGTERM"), { step: "terminating", since: now, members });
     case "terminating":
       if (now - state.since < SIGTERM_GRACE_MS) {
         return { kind: "wait", next: { ...state, members } };
       }
-      return {
-        kind: "signal",
-        decisions: treeSignal("SIGKILL"),
-        next: { step: "killing", since: now, members },
-      };
+      return signalStep(treeSignal("SIGKILL"), { step: "killing", since: now, members });
     case "killing":
-      if (now - state.since < STOP_DEADLINE_MS - SIGTERM_GRACE_MS) {
-        return { kind: "wait", next: { ...state, members } };
-      }
+      // Nothing is signalled after SIGKILL, so there is no member left to remember.
+      if (now - state.since < STOP_DEADLINE_MS - SIGTERM_GRACE_MS)
+        return { kind: "wait", next: state };
       return { kind: "fail", running };
   }
 }
@@ -290,8 +304,7 @@ export type LeaseVerdict =
 // Only then may its browser be stopped, and only if that browser is still the same process.
 export function decideLease(lease: LeaseRecord, table: ProcessTable): LeaseVerdict {
   if (table.get(lease.harnessPid)?.startTime === lease.harnessStartTime) return { action: "leave" };
-  if (lease.spawnedPid === null || lease.spawnedStartTime === null) return { action: "clean" };
-  const live = table.get(lease.spawnedPid);
+  const live = lease.spawnedPid === null ? undefined : table.get(lease.spawnedPid);
   if (
     live === undefined ||
     live.startTime !== lease.spawnedStartTime ||
@@ -301,6 +314,6 @@ export function decideLease(lease: LeaseRecord, table: ProcessTable): LeaseVerdi
   }
   return {
     action: "stop-and-clean",
-    root: mintOwnership(lease.spawnedPid, lease.spawnedStartTime, lease.profileDir),
+    root: mintOwnership(live.pid, live.startTime, lease.profileDir),
   };
 }

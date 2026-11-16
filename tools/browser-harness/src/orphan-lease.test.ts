@@ -3,7 +3,12 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { createLaunchLease, leaseDirectory, reapOrphanedLaunches } from "./orphan-lease.ts";
+import {
+  createLaunchLease,
+  leaseDirectory,
+  parseLease,
+  reapOrphanedLaunches,
+} from "./orphan-lease.ts";
 import type { ProcessIdentity } from "./signal-policy.ts";
 import { HARNESS, processIdentity, simulateProcesses } from "./simulated-process-io.ts";
 
@@ -98,22 +103,26 @@ describe("orphan launch leases", () => {
       spawnedStartTime: "50000",
       args: ["/usr/bin/editor"],
     },
-  ])("never signals $name, and clears the stale lease and profile", async (row) => {
-    const { tmpdir, profileDir, leaseDir } = await leaseFixture();
-    const leaseFile = await writeLease(leaseDir, "stale", {
-      spawnedPid: 5000,
-      spawnedStartTime: row.spawnedStartTime,
-      profileDir,
-    });
-    const world = simulateProcesses([
-      processIdentity(5000, { args: row.args ?? ["/opt/zen/zen", "-profile", profileDir] }),
-    ]);
-    expect(await reapOrphanedLaunches(world.io, () => undefined, { tmpdir })).toBe(1);
-    expect(world.sent).toEqual([]);
-    expect(world.running(5000)).toBe(true);
-    expect(NodeFS.existsSync(leaseFile)).toBe(false);
-    expect(NodeFS.existsSync(profileDir)).toBe(false);
-  });
+  ])(
+    "never signals $name or a helper naming its profile, and clears the stale lease and profile",
+    async (row) => {
+      const { tmpdir, profileDir, leaseDir } = await leaseFixture();
+      const leaseFile = await writeLease(leaseDir, "stale", {
+        spawnedPid: 5000,
+        spawnedStartTime: row.spawnedStartTime,
+        profileDir,
+      });
+      const world = simulateProcesses([
+        processIdentity(5000, { args: row.args ?? ["/opt/zen/zen", "-profile", profileDir] }),
+        processIdentity(5100, { args: ["/opt/zen/zen", "-profile", profileDir, "-helper"] }),
+      ]);
+      expect(await reapOrphanedLaunches(world.io, () => undefined, { tmpdir })).toBe(1);
+      expect(world.sent).toEqual([]);
+      expect([5000, 5100].map(world.running)).toEqual([true, true]);
+      expect(NodeFS.existsSync(leaseFile)).toBe(false);
+      expect(NodeFS.existsSync(profileDir)).toBe(false);
+    },
+  );
 
   it.each([
     { name: "a quoted profile path with a space", quoted: true, suffix: "", stopped: true },
@@ -147,12 +156,17 @@ describe("orphan launch leases", () => {
     const corrupt = NodePath.join(leaseDir, "corrupt.json");
     await NodeFSP.writeFile(corrupt, "{not valid json", "utf8");
     const old = await writeLease(leaseDir, "v1", { version: 1, spawnedPid: 5000, profileDir });
+    const forgedText = await NodeFSP.readFile(forged, "utf8");
     const world = simulateProcesses([
       processIdentity(1, { parentPid: 0, args: ["/sbin/init", "-profile", profileDir] }),
       orphanBrowser(profileDir),
     ]);
-    expect(await reapOrphanedLaunches(world.io, () => undefined, { tmpdir })).toBe(0);
+    const warnings: string[] = [];
+    const options = { tmpdir, onWarning: (message: string) => warnings.push(message) };
+    expect(await reapOrphanedLaunches(world.io, () => undefined, options)).toBe(0);
     expect(world.sent).toEqual([]);
+    expect(warnings).toEqual([]);
+    expect(await NodeFSP.readFile(forged, "utf8")).toBe(forgedText);
     expect([forged, corrupt, old, profileDir].map((path) => NodeFS.existsSync(path))).toEqual([
       true,
       true,
@@ -214,11 +228,14 @@ describe("orphan launch leases", () => {
     const removeProfile = (directory: string) =>
       NodeFSP.rm(directory, { recursive: true, force: true });
     const options = { tmpdir, onWarning: (m: string) => warnings.push(m), removeProfile };
-    expect(await reapOrphanedLaunches(world.io, () => undefined, options)).toBe(0);
-    expect(warnings).toHaveLength(1);
-    expect(NodeFS.existsSync(leaseFile)).toBe(true);
+    try {
+      expect(await reapOrphanedLaunches(world.io, () => undefined, options)).toBe(0);
+      expect(warnings).toHaveLength(1);
+      expect(NodeFS.existsSync(leaseFile)).toBe(true);
+    } finally {
+      await NodeFSP.chmod(parent, 0o755);
+    }
 
-    await NodeFSP.chmod(parent, 0o755);
     expect(await reapOrphanedLaunches(world.io, () => undefined, options)).toBe(1);
     expect(NodeFS.existsSync(leaseFile)).toBe(false);
     expect(NodeFS.existsSync(profileDir)).toBe(false);
@@ -240,5 +257,95 @@ describe("orphan launch leases", () => {
         { tmpdir },
       ),
     ).rejects.toThrow("refusing live profile root");
+  });
+});
+
+const VALID_LEASE = {
+  version: 2,
+  harnessPid: 4242,
+  harnessStartTime: "9",
+  spawnedPid: 5000,
+  spawnedStartTime: "50000",
+  profileDir: "/tmp/one-click-har-browser-abc",
+  createdAt: "2026-11-16T00:00:00.000Z",
+};
+const leaseText = (fields: Record<string, unknown>, without: readonly string[] = []) =>
+  JSON.stringify(
+    Object.fromEntries(
+      Object.entries({ ...VALID_LEASE, ...fields }).filter(([key]) => !without.includes(key)),
+    ),
+  );
+
+describe("parsing a lease", () => {
+  it.each([
+    ["text that is not JSON", "{not valid json"],
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a number", "5"],
+    ["version 1", leaseText({ version: 1 })],
+    ["version 3", leaseText({ version: 3 })],
+    ["no version", leaseText({}, ["version"])],
+    ["no harness PID", leaseText({}, ["harnessPid"])],
+    ["a harness PID written as text", leaseText({ harnessPid: "4242" })],
+    ["a fractional harness PID", leaseText({ harnessPid: 1.5 })],
+    ["harness PID 0", leaseText({ harnessPid: 0 })],
+    ["a negative harness PID", leaseText({ harnessPid: -1 })],
+    ["no harness start time", leaseText({}, ["harnessStartTime"])],
+    ["an empty harness start time", leaseText({ harnessStartTime: "" })],
+    ["a harness start time written as a number", leaseText({ harnessStartTime: 9 })],
+    ["a harness start time inside an array", leaseText({ harnessStartTime: ["9"] })],
+    ["no profile directory", leaseText({}, ["profileDir"])],
+    ["a profile directory that is not text", leaseText({ profileDir: 5 })],
+    ["a relative profile directory", leaseText({ profileDir: "tmp/one-click-har-browser-abc" })],
+    ["a profile directory without the prefix", leaseText({ profileDir: "/tmp/other-abc" })],
+    [
+      "the prefix only on a parent directory",
+      leaseText({ profileDir: "/tmp/one-click-har-browser-abc/inner" }),
+    ],
+    ["browser PID 1", leaseText({ spawnedPid: 1 })],
+    ["browser PID 0", leaseText({ spawnedPid: 0 })],
+    ["a browser PID written as text", leaseText({ spawnedPid: "5000" })],
+    ["a fractional browser PID", leaseText({ spawnedPid: 1.5 })],
+    ["an empty browser start time", leaseText({ spawnedStartTime: "" })],
+    ["a browser start time written as a number", leaseText({ spawnedStartTime: 50000 })],
+    ["a browser start time without a PID", leaseText({ spawnedPid: null })],
+    ["a browser PID without a start time", leaseText({ spawnedStartTime: null })],
+    ["no browser fields at all", leaseText({}, ["spawnedPid", "spawnedStartTime"])],
+  ])("ignores %s", (_name, text) => {
+    expect(parseLease(text)).toBeNull();
+  });
+
+  it.each([
+    ["a complete lease", {}, {}],
+    ["harness PID 1", { harnessPid: 1 }, { harnessPid: 1 }],
+    [
+      "browser PID 2 with a one-digit start time",
+      { spawnedPid: 2, spawnedStartTime: "1" },
+      { spawnedPid: 2, spawnedStartTime: "1" },
+    ],
+    [
+      "a launch that never recorded its browser",
+      { spawnedPid: null, spawnedStartTime: null },
+      { spawnedPid: null, spawnedStartTime: null },
+    ],
+    ["a creation time that is not text", { createdAt: 5 }, { createdAt: "" }],
+    [
+      "a failed reap's count and message",
+      { reapFailures: 2, lastReapFailure: "boom" },
+      { reapFailures: 2, lastReapFailure: "boom" },
+    ],
+    ["a zero failure count", { reapFailures: 0 }, {}],
+    ["a failure count written as text", { reapFailures: "2" }, {}],
+    ["a fractional failure count", { reapFailures: 1.5 }, {}],
+    ["a failure message that is not text", { lastReapFailure: 5 }, {}],
+  ])("reads %s", (_name, fields, expected) => {
+    expect(parseLease(leaseText(fields))).toStrictEqual({ ...VALID_LEASE, ...expected });
+  });
+
+  it("drops a missing creation time to empty text", () => {
+    expect(parseLease(leaseText({}, ["createdAt"]))).toStrictEqual({
+      ...VALID_LEASE,
+      createdAt: "",
+    });
   });
 });

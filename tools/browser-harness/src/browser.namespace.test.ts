@@ -9,14 +9,17 @@ import { requireIsolatedPidNamespace } from "./namespace-isolation.ts";
 import { leaseDirectory } from "./orphan-lease.ts";
 import { hostProcessIo, spawnOwned, stopOwnedTree, type OwnedChild } from "./owned-process.ts";
 import { readHostProcessTable, readProcessIdentity } from "./process-table.ts";
+import { adoptSpawnedChild, type Ownership } from "./signal-policy.ts";
 
 requireIsolatedPidNamespace();
 
 const directories: string[] = [];
 const cleanup: OwnedChild[] = [];
+const adopted: Ownership[] = [];
 
 afterEach(async () => {
   for (const child of cleanup.splice(0)) await stopOwnedTree(hostProcessIo(), child.ownership);
+  for (const owner of adopted.splice(0)) await stopOwnedTree(hostProcessIo(), owner);
   await Promise.all(
     directories
       .splice(0)
@@ -69,6 +72,46 @@ describe("browser launch (real signals)", () => {
       expect(NodeFS.existsSync(profile)).toBe(false);
     },
   );
+
+  it("on dispose stops a process outside the browser's group that still names its profile", async () => {
+    const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-holder-"));
+    directories.push(scratch);
+    const pidFile = NodePath.join(scratch, "holder.pid");
+    const binary = NodePath.join(scratch, "browser");
+    // The holder leaves the browser's process group with setsid, so only its profile path ties it to the launch.
+    await NodeFSP.writeFile(
+      binary,
+      `#!/bin/sh
+while [ $# -gt 0 ] && [ "$1" != "-profile" ]; do shift; done
+setsid '${process.execPath}' -e 'require("node:fs").writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);' '${pidFile}' "$2" &
+exec '${process.execPath}' -e 'setInterval(() => {}, 1000)' -profile "$2"
+`,
+      { mode: 0o755 },
+    );
+    const session = await launchBrowser({
+      binaryPath: binary,
+      extensionPath: null,
+      display: "headless",
+      launchMode: "none",
+      signal: new AbortController().signal,
+    });
+    const holderPid = await readPidFile(pidFile);
+    const holder = readProcessIdentity(holderPid);
+    if (holder !== undefined) {
+      adopted.push(
+        adoptSpawnedChild({
+          pid: holderPid,
+          startTime: holder.startTime,
+          profileDir: session.profileDir,
+        }),
+      );
+    }
+    expect(holder?.pgrp).not.toBe(session.spawnedPid);
+    await session[Symbol.asyncDispose]();
+    expect(running(session.spawnedPid)).toBe(false);
+    expect(running(holderPid)).toBe(false);
+    expect(NodeFS.existsSync(session.profileDir)).toBe(false);
+  });
 
   it("writes remote.prefs.recommended=false in real-defaults mode and omits remote flags/prefs in none mode", async () => {
     const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-mode-"));
@@ -181,11 +224,14 @@ describe("browser launch (real signals)", () => {
       NodePath.join(NodeOS.tmpdir(), "one-click-har-browser-orphan-"),
     );
     directories.push(orphanProfile);
-    const orphan = spawnOwned(process.execPath, [
-      "-e",
-      `// ${orphanProfile}\nsetInterval(() => {}, 1000);`,
-    ]);
+    const orphan = spawnOwned(
+      process.execPath,
+      ["-e", `// ${orphanProfile}\nprocess.stdout.write("ready\\n"); setInterval(() => {}, 1000);`],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
     cleanup.push(orphan);
+    // Until the child has exec'd, /proc/<pid>/cmdline can be empty and the process unreadable.
+    await new Promise((resolve) => orphan.child.stdout?.once("data", resolve));
     const orphanIdentity = readProcessIdentity(orphan.pid);
     expect(orphanIdentity).toBeDefined();
     const orphanLeaseDir = leaseDirectory();
@@ -468,4 +514,13 @@ function restoreEnv(previous: Record<string, string | undefined>): void {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+}
+
+async function readPidFile(file: string): Promise<number> {
+  for (let attempt = 0; attempt < 250; attempt += 1) {
+    const text = await NodeFSP.readFile(file, "utf8").catch(() => "");
+    if (/^\d+$/u.test(text)) return Number(text);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`no PID written to ${file}`);
 }

@@ -11,7 +11,7 @@ import {
   adoptSpawnedChild,
   nextStopStep,
   redeemOrder,
-  startStop,
+  START_STOP,
   type HarnessSelf,
   type Ownership,
   type ProcessTable,
@@ -33,20 +33,30 @@ const HOST_PERFORMERS: Readonly<
   Record<"posix" | "win32", (rawTarget: number, signal: StopSignal) => void>
 > = {
   posix: (rawTarget, signal) => process.kill(rawTarget, signal),
-  // Graceful close attempt first (/T without /F); not observed on Linux.
-  win32: (rawTarget, signal) =>
-    runTaskkill(["/PID", String(rawTarget), "/T", ...(signal === "SIGKILL" ? ["/F"] : [])]),
+  // Running taskkill is not observed on Linux; its arguments are tested.
+  win32: (rawTarget, signal) => runTaskkill(taskkillArgs(rawTarget, signal)),
 };
 
-function performHostSignal(order: SignalOrder): boolean {
-  const { rawTarget, signal } = redeemOrder(order);
-  try {
-    HOST_PERFORMERS[currentPlatformName() === "win32" ? "win32" : "posix"](rawTarget, signal);
-    return true;
-  } catch (error) {
-    if (errorCode(error) === "ESRCH") return false;
-    throw error;
-  }
+// The whole tree (/T), closed gracefully for SIGTERM and forced (/F) only for SIGKILL.
+export function taskkillArgs(rawTarget: number, signal: StopSignal): string[] {
+  return ["/PID", String(rawTarget), "/T", ...(signal === "SIGKILL" ? ["/F"] : [])];
+}
+
+// Every performer, the host's and the simulated one, redeems the order before sending anything.
+// False means the target was already gone; any other failure is thrown.
+export function signalPerformer(
+  send: (rawTarget: number, signal: StopSignal) => void,
+): (order: SignalOrder) => boolean {
+  return (order) => {
+    const { rawTarget, signal } = redeemOrder(order);
+    try {
+      send(rawTarget, signal);
+      return true;
+    } catch (error) {
+      if (errorCode(error) === "ESRCH") return false;
+      throw error;
+    }
+  };
 }
 
 export function hostProcessIo(): ProcessIo {
@@ -56,7 +66,9 @@ export function hostProcessIo(): ProcessIo {
     table: readHostProcessTable,
     now: Date.now,
     sleep: delay,
-    perform: performHostSignal,
+    perform: signalPerformer(
+      HOST_PERFORMERS[currentPlatformName() === "win32" ? "win32" : "posix"],
+    ),
   };
 }
 
@@ -105,7 +117,7 @@ export function spawnOwned(
 export async function stopOwnedTree(io: ProcessIo, root: Ownership | null): Promise<void> {
   if (root === null) return;
   const self = io.self();
-  let state = startStop(io.now());
+  let state = START_STOP;
   for (;;) {
     const step = nextStopStep({
       root,
@@ -115,20 +127,22 @@ export async function stopOwnedTree(io: ProcessIo, root: Ownership | null): Prom
       self,
       groupSignals: io.groupSignals,
     });
-    if (step.kind === "done") return;
-    if (step.kind === "fail") {
-      throw new Error(`owned process still running: ${step.running.join(", ")}`);
+    switch (step.kind) {
+      case "done":
+        return;
+      case "fail":
+        throw new Error(`owned process still running: ${step.running.join(", ")}`);
+      case "refuse":
+        throw new Error(step.reasons.join("; "));
+      case "signal":
+        for (const order of step.orders) io.perform(order);
+        state = step.next;
+        break;
+      case "wait":
+        await io.sleep(STOP_POLL_MS);
+        state = step.next;
+        break;
     }
-    if (step.kind === "signal") {
-      const refusals = step.decisions.flatMap((d) => (d.verdict === "refuse" ? [d.reason] : []));
-      if (refusals.length > 0) throw new Error(refusals.join("; "));
-      for (const decision of step.decisions) {
-        if (decision.verdict === "send") io.perform(decision.order);
-      }
-    } else {
-      await io.sleep(STOP_POLL_MS);
-    }
-    state = step.next;
   }
 }
 

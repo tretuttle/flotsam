@@ -2,15 +2,28 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { removeDirectoryBounded, stopOwnedTree } from "./owned-process.ts";
+import {
+  removeDirectoryBounded,
+  signalPerformer,
+  spawnOwned,
+  stopOwnedTree,
+  taskkillArgs,
+} from "./owned-process.ts";
 import {
   currentPlatformName,
   parseDarwinProcessTable,
   parseLinuxProcess,
   parseWin32ProcessTable,
   PROCESS_PLATFORMS,
+  readProcessIdentity,
 } from "./process-table.ts";
-import { adoptSpawnedChild, decideSignal, redeemOrder, type Ownership } from "./signal-policy.ts";
+import {
+  adoptSpawnedChild,
+  decideSignal,
+  type Ownership,
+  type SignalOrder,
+  type StopSignal,
+} from "./signal-policy.ts";
 import { HARNESS, processIdentity, simulateProcesses } from "./simulated-process-io.ts";
 
 const directories: string[] = [];
@@ -147,6 +160,7 @@ describe("stopping an owned tree", () => {
       "5100 SIGTERM @0",
       "-5000 SIGKILL @1500",
     ]);
+    expect(world.io.now()).toBe(5000);
   });
 
   it("after the root exited, stops only processes naming its profile, never members of a group a reused PID could lead", async () => {
@@ -162,6 +176,124 @@ describe("stopping an owned tree", () => {
     await stopOwnedTree(world.io, browserRoot("49999"));
     expect(world.sent).toEqual([]);
     expect(world.running(5000)).toBe(true);
+  });
+
+  it("starts the grace period and the deadline from the clock's reading, not from zero", async () => {
+    const world = simulateProcesses(browserTree(), {
+      startAt: 10_000,
+      survives: { 5000: "everything" },
+    });
+    await expect(stopOwnedTree(world.io, browserRoot())).rejects.toThrow(/still running: 5000$/);
+    expect(world.sent.map((s) => `${String(s.rawTarget)} ${s.signal} @${String(s.at)}`)).toEqual([
+      "-5000 SIGTERM @10000",
+      "5100 SIGTERM @10000",
+      "-5000 SIGKILL @11500",
+    ]);
+    expect(world.io.now()).toBe(15_000);
+  });
+
+  it("never takes PID 1, the harness, its parent or its group leader as members, even when they name the profile", async () => {
+    const naming = (pid: number, parentPid: number, pgrp: number) =>
+      processIdentity(pid, { parentPid, pgrp, args: ["/bin/sh", "-c", `rm -rf ${PROFILE}`] });
+    const world = simulateProcesses([
+      ...browserTree(),
+      naming(1, 0, 1),
+      naming(1800, 1, 1800),
+      naming(1900, 1800, 1900),
+      naming(2000, 1800, 1900),
+      naming(2, 1, 2),
+    ]);
+    await stopOwnedTree(world.io, browserRoot());
+    expect(world.sent.map((s) => s.rawTarget).sort((a, b) => a - b)).toEqual([-5000, 2, 5100]);
+    expect([1, 1800, 1900, 2000].map(world.running)).toEqual([true, true, true, true]);
+  });
+
+  it("keeps stopping members of the root's group after the root exits", async () => {
+    const world = simulateProcesses(browserTree(), { survives: { 5001: "SIGTERM" } });
+    await stopOwnedTree(world.io, browserRoot());
+    expect(world.sent).toEqual([
+      { rawTarget: -5000, signal: "SIGTERM", at: 0 },
+      { rawTarget: 5100, signal: "SIGTERM", at: 0 },
+      { rawTarget: 5001, signal: "SIGKILL", at: 1500 },
+    ]);
+    expect(world.running(5001)).toBe(false);
+  });
+
+  it("remembers a group member that started during the grace period, after the root exits", async () => {
+    const world = simulateProcesses(browserTree(), {
+      survives: { 5000: "SIGTERM", 5002: "SIGTERM" },
+      onSleep: (now, live) => {
+        if (now === 500) live.set(5002, processIdentity(5002, { parentPid: 5000, pgrp: 5000 }));
+        if (now === 1000) live.delete(5000);
+      },
+    });
+    await stopOwnedTree(world.io, browserRoot());
+    expect(world.sent.filter((s) => s.at === 1500)).toEqual([
+      { rawTarget: 5002, signal: "SIGKILL", at: 1500 },
+    ]);
+    expect(world.running(5002)).toBe(false);
+  });
+
+  it("refuses to escalate against a member that exec'd into a process no longer naming the profile", async () => {
+    const world = simulateProcesses(browserTree(), {
+      survives: { 5100: "SIGTERM" },
+      onSignal: (rawTarget, signal, live) => {
+        if (rawTarget === 5100 && signal === "SIGTERM") {
+          live.set(5100, processIdentity(5100, { parentPid: 5000, args: ["/usr/bin/other"] }));
+        }
+      },
+    });
+    await expect(stopOwnedTree(world.io, browserRoot())).rejects.toThrow(
+      /refusing SIGKILL to process 5100: profile path .* missing from command line/,
+    );
+    expect(world.sent.filter((s) => s.signal === "SIGKILL")).toEqual([]);
+  });
+
+  it("stops each profile holder even when two share the root's start time", async () => {
+    const holder = (pid: number) =>
+      processIdentity(pid, { startTime: "50000", args: ["/opt/zen/zen", "-profile", PROFILE] });
+    const world = simulateProcesses([
+      ...browserTree().filter((p) => p.pid !== 5100),
+      holder(5100),
+      holder(5101),
+    ]);
+    await stopOwnedTree(world.io, browserRoot());
+    expect(world.sent.map((s) => s.rawTarget)).toEqual([-5000, 5100, 5101]);
+  });
+
+  it("stops a profile holder that took a stopped member's PID during the grace period", async () => {
+    const world = simulateProcesses(browserTree(), {
+      survives: { 5000: "SIGTERM", 5100: "SIGTERM" },
+      onSleep: (now, live) => {
+        if (now !== 500) return;
+        live.set(
+          5100,
+          processIdentity(5100, {
+            startTime: "99999",
+            args: ["/opt/zen/zen", "-profile", PROFILE],
+          }),
+        );
+      },
+    });
+    await stopOwnedTree(world.io, browserRoot());
+    expect(world.sent.filter((s) => s.signal === "SIGKILL").map((s) => s.rawTarget)).toEqual([
+      -5000, 5100,
+    ]);
+    expect(world.running(5100)).toBe(false);
+  });
+
+  it("stops a process that reuses the root's PID when it names the profile", async () => {
+    const world = simulateProcesses([
+      processIdentity(5000, { args: ["/opt/zen/zen", "-profile", PROFILE] }),
+    ]);
+    await stopOwnedTree(world.io, browserRoot("49999"));
+    expect(world.sent).toEqual([{ rawTarget: 5000, signal: "SIGTERM", at: 0 }]);
+  });
+
+  it("signals each member itself on a platform that cannot signal a group", async () => {
+    const world = simulateProcesses(browserTree(), { groupSignals: false });
+    await stopOwnedTree(world.io, browserRoot());
+    expect(world.sent.map((s) => s.rawTarget)).toEqual([5000, 5001, 5100]);
   });
 
   it("on Windows signals the root process itself, since there are no process groups", async () => {
@@ -217,23 +349,103 @@ describe("stopping an owned tree", () => {
   });
 });
 
-describe("signal orders", () => {
-  it("are performed once, and only when decideSignal issued them", () => {
-    const world = simulateProcesses(browserTree());
+describe("the performer", () => {
+  const issue = (): SignalOrder => {
     const decision = decideSignal({
       target: { id: 5000, kind: "group" },
       signal: "SIGTERM",
       owner: browserRoot(),
       self: HARNESS,
-      table: world.io.table(),
+      table: simulateProcesses(browserTree()).io.table(),
       groupSignals: true,
     });
     if (decision.verdict !== "send") throw new Error(decision.reason);
-    expect(redeemOrder(decision.order)).toEqual({ rawTarget: -5000, signal: "SIGTERM" });
-    expect(() => redeemOrder(decision.order)).toThrow(/already used/);
-    const forgedOrder = { rawTarget: -1, signal: "SIGKILL" } as unknown as typeof decision.order;
-    expect(() => world.io.perform(forgedOrder)).toThrow(/did not issue/);
+    return decision.order;
+  };
+  const recording = (fail?: string) => {
+    const sent: string[] = [];
+    const perform = signalPerformer((rawTarget: number, signal: StopSignal) => {
+      sent.push(`${String(rawTarget)} ${signal}`);
+      if (fail !== undefined) throw Object.assign(new Error(fail), { code: fail });
+    });
+    return { sent, perform };
+  };
+
+  it("sends an issued order once, and never a forged or spent one", () => {
+    const { sent, perform } = recording();
+    const order = issue();
+    expect(perform(order)).toBe(true);
+    const refusal = /did not issue or that was already used/;
+    expect(() => perform(order)).toThrow(refusal);
+    const forged = { rawTarget: -5000, signal: "SIGTERM" } as unknown as SignalOrder;
+    expect(() => perform(forged)).toThrow(refusal);
+    expect(sent).toEqual(["-5000 SIGTERM"]);
+  });
+
+  it("on Windows closes the whole tree, forcing it only for SIGKILL", () => {
+    expect(taskkillArgs(5000, "SIGTERM")).toEqual(["/PID", "5000", "/T"]);
+    expect(taskkillArgs(5000, "SIGKILL")).toEqual(["/PID", "5000", "/T", "/F"]);
+  });
+
+  it("does nothing for a child whose start time could not be read", async () => {
+    const world = simulateProcesses(browserTree());
+    await stopOwnedTree(world.io, null);
     expect(world.sent).toEqual([]);
+  });
+
+  it("reports a target that is already gone, and throws every other failure", () => {
+    expect(recording("ESRCH").perform(issue())).toBe(false);
+    expect(() => recording("EPERM").perform(issue())).toThrow("EPERM");
+  });
+});
+
+describe("spawning an owned child", () => {
+  it("opens no pipes unless asked", async () => {
+    const owned = spawnOwned(process.execPath, ["-e", ""]);
+    const exited = new Promise((resolve) => owned.child.once("exit", resolve));
+    expect([owned.child.stdin, owned.child.stdout, owned.child.stderr]).toEqual([null, null, null]);
+    await exited;
+  });
+
+  it("throws, without an unhandled error event, when the command cannot start", async () => {
+    expect(() => spawnOwned("/nonexistent/one-click-har-binary", [])).toThrow(
+      "could not start /nonexistent/one-click-har-binary",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
+  it("records the child's PID, start time and profile directory in a record the guard accepts", async () => {
+    const owned = spawnOwned(
+      process.execPath,
+      ["-e", 'process.stdout.write("ready\\n"); process.stdin.resume();', PROFILE],
+      { stdio: ["pipe", "pipe", "ignore"], profileDir: PROFILE },
+    );
+    const exited = new Promise((resolve) => owned.child.once("exit", resolve));
+    try {
+      await new Promise((resolve) => owned.child.stdout?.once("data", resolve));
+      const identity = readProcessIdentity(owned.pid);
+      expect(owned.ownership).toEqual({
+        pid: owned.pid,
+        startTime: identity?.startTime,
+        profileDir: PROFILE,
+      });
+      const live = identity === undefined ? [] : [identity];
+      const decision =
+        owned.ownership === null
+          ? null
+          : decideSignal({
+              target: { id: owned.pid, kind: "process" },
+              signal: "SIGTERM",
+              owner: owned.ownership,
+              self: HARNESS,
+              table: new Map(live.map((row) => [row.pid, row])),
+              groupSignals: true,
+            });
+      expect(decision?.verdict).toBe("send");
+    } finally {
+      owned.child.stdin?.end();
+      await exited;
+    }
   });
 });
 

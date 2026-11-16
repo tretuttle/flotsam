@@ -13,7 +13,7 @@ Rules for writing tests, and for asking for them in review.
 
 ## Tests that can send a signal
 
-A test that can reach a real signal lives in a `*.namespace.test.ts` file and runs only inside a fresh PID namespace; a refusal is tested on the pure decision with fixed data instead. [Browser harness](browser-harness.md#tests-that-can-send-a-signal) explains the check that enforces this.
+A test that can reach a real signal lives in a `*.namespace.test.ts` file and runs only inside a fresh PID namespace; a refusal is tested on the pure decision with fixed data instead. [Browser harness](browser-harness.md#tests-that-can-send-a-signal) explains the check that enforces this, and [mutation testing of the guard](browser-harness.md#mutation-testing-of-the-guard) the run that fails when a guard rule has no test.
 
 ## Real-browser checks
 
