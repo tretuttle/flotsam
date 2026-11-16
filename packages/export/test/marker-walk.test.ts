@@ -91,7 +91,10 @@ function placeOf(
   report: HarLogRedactionExtension,
 ): HarRedactionPlace | null {
   const plantedPlace = planted.find((p) => p.marker === occurrence.marker)!.place;
-  const places = TABLE[occurrence.field]?.places ?? [];
+  // Every marker is a string in a string field, so the field's wrong-type place never applies to it.
+  const places: readonly HarRedactionPlace[] = (TABLE[occurrence.field]?.places ?? []).filter(
+    (p) => p !== "wrong-type",
+  );
   if (places.includes(plantedPlace)) return plantedPlace;
   const derived = DERIVED_PLACE[plantedPlace];
   if (derived !== undefined && places.includes(derived)) return derived;

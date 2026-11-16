@@ -75,7 +75,7 @@ function sideEntry(): SideEntry {
         lastAccess: "2026-11-16T00:00:00.000Z",
         eTag: mark("cache"),
         hitCount: 1,
-        comment: mark("comment"),
+        comment: mark("cache"),
       },
     },
     timings: { send: 1, wait: 2, receive: 3, comment: mark("comment") },

@@ -113,6 +113,20 @@ const MIXED: readonly FakeRow[] = [
     tab: 2,
     devtools: { body: { none: "devtools-discarded" } },
   },
+  {
+    id: 31,
+    url: "https://m.example/cached.css",
+    tab: 1,
+    devtools: {
+      entry: {
+        _fromCache: "disk",
+        cache: {
+          beforeRequest: { lastAccess: "2026-11-16T00:00:00.000Z", eTag: 'W/"1"', hitCount: 2 },
+        },
+      },
+      body: { kind: "text", slices: ["body{}"] },
+    },
+  },
   { id: 29, url: "https://:99999/", recording: {} },
   { id: 30, url: "http://", devtools: {} },
 ];
