@@ -1,6 +1,6 @@
-// Installs the packed XPI into a fresh profile of a Gecko browser, opens the popup page in a tab, and reads
-// getEnvironment() three times: before DevTools starts, with a toolbox open on that tab, and after it closes.
-// Each reading is checked against the browser's application.ini and the toolbox state this script set.
+// Installs the packed XPI into a fresh profile of a Gecko browser, opens its popup page in a tab, and reads
+// getEnvironment() before DevTools starts, with a toolbox open on that tab, and after it closes, checking each
+// against application.ini and the toolbox state this script set. It also sends the arguments the schema must refuse.
 // Usage: pnpm run verify:zen [--binary <path to zen.exe or firefox.exe>] [--xpi <path>]
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -66,16 +66,45 @@ const STEPS: ReadonlyArray<{
   },
 ];
 
-/** Calls the API from the popup page in the current tab, for the active tab or for the given tab ID. */
-const getEnvironment = (marionette: Marionette, tabId: number | null = null) =>
+/**
+ * Calls the API from the popup page in the current tab with the given source text as the argument list, or for the
+ * active tab when there is none. A synchronous throw from the call is reported like a rejection.
+ */
+const callWith = (marionette: Marionette, argumentList: string | null) =>
   marionette.script<Environment | { error: string }>(
     "content",
-    `const [tabId, done] = arguments;
-     const tab = tabId === null ? browser.tabs.query({ active: true, currentWindow: true }).then(([active]) => active.id) : Promise.resolve(tabId);
-     tab.then((id) => browser.harAnytime.getEnvironment(id))
+    `const done = arguments[arguments.length - 1];
+     const arguments_ = ${argumentList === null ? "browser.tabs.query({ active: true, currentWindow: true }).then(([active]) => [active.id])" : `Promise.resolve([${argumentList}])`};
+     arguments_.then((list) => browser.harAnytime.getEnvironment(...list))
        .then((environment) => done(JSON.parse(JSON.stringify(environment))), (error) => done({ error: String(error) }));`,
-    [tabId],
   );
+
+/** Calls the API from the popup page for the active tab, or for the given tab ID. */
+const getEnvironment = (marionette: Marionette, tabId: number | null = null) =>
+  callWith(marionette, tabId === null ? null : String(tabId));
+
+const SCHEMA_REFUSAL = "Incorrect argument types for harAnytime.getEnvironment.";
+
+// Gecko validates arguments against schema.json and refuses these before the parent script runs, so none of them
+// can reach a tab lookup. Each entry is the source text of the argument list.
+const REFUSED_CALLS: ReadonlyArray<{ call: string; argumentList: string; message: string }> = [
+  { call: "no argument", argumentList: "", message: SCHEMA_REFUSAL },
+  {
+    call: "a negative integer",
+    argumentList: "-1",
+    message: "Integer -1 is too small (must be at least 0)",
+  },
+  { call: "a float", argumentList: "1.5", message: SCHEMA_REFUSAL },
+  { call: "a numeric string", argumentList: '"1"', message: SCHEMA_REFUSAL },
+  { call: "a path string", argumentList: '"/etc/passwd"', message: SCHEMA_REFUSAL },
+  { call: "null", argumentList: "null", message: SCHEMA_REFUSAL },
+  {
+    call: "an object whose toString returns 1",
+    argumentList: '{ toString() { return "1" } }',
+    message: SCHEMA_REFUSAL,
+  },
+  { call: "an extra argument", argumentList: "0, 'extra'", message: SCHEMA_REFUSAL },
+];
 
 const readPopup = async (marionette: Marionette) => {
   await marionette.command("Marionette:SetContext", { value: "content" });
@@ -144,6 +173,28 @@ getEnvironment(2147483647) -> ${JSON.stringify(unknownTab)}`);
     open: false,
     reason: "no-such-tab",
   });
+
+  const smallestTab = await getEnvironment(marionette, 0);
+  check(
+    "tab ID 0, the smallest the schema accepts, reaches the parent: toolbox",
+    "toolbox" in smallestTab ? smallestTab.toolbox : smallestTab,
+    {
+      open: false,
+      reason: "no-such-tab",
+    },
+  );
+  for (const { call, argumentList, message } of REFUSED_CALLS) {
+    const result = await callWith(marionette, argumentList);
+    check(
+      `${call} is refused by the schema`,
+      "error" in result
+        ? result.error.includes(message)
+          ? `refused: ${message}`
+          : result.error
+        : result,
+      `refused: ${message}`,
+    );
+  }
 
   let host = "";
   for (const { step, act, toolbox, text } of STEPS) {
