@@ -6,7 +6,7 @@ Trent (`tretuttle`) maintains it. Follow T3 Code (`pingdotgg/t3code`) and `parkp
 
 ## Security boundaries
 
-Use these words exactly. The [Glossary](docs/internals/glossary.md) defines each one.
+Use these words exactly. The [Glossary](docs/internals/glossary/README.md) defines each one.
 
 - **Parent process and content processes.** Gecko runs browser chrome and privileged code in the parent process and web pages in content processes. Recording and storage happen in the parent process.
 - **System principal.** The experiment API parent script runs with the system principal in the parent process. Only the extension that declares the experiment API can call it. It is the only code that reads or writes stored captures.
@@ -36,11 +36,11 @@ Decided, and changed only by the maintainer:
 
 ## Where things are written down
 
-Do not rely on tool memory. Put durable state in one of these:
+Never rely on tool memory; put durable state in:
 
 - What is being built next: GitHub issues. The pull request that lands the work closes its issue.
 - A decision and its reason: `docs/internals/`, in the pull request that acts on it.
-- A term or product noun: `docs/internals/glossary.md`.
+- A term or product noun: `docs/internals/glossary/README.md`.
 - A lesson about working here: a check first (a lint rule, a test, a CI step), and a line in this file only when no check can hold it.
 
 `notes.md` at the repository root is gitignored scratch on one machine. Move anything durable out of it before calling work done.
