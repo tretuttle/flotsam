@@ -173,20 +173,23 @@ describe("counts against a brute-force count over the same lines", () => {
     }
   });
 
-  it("the current run's keys per tab are the channels of this run's settled lines", () => {
+  it("the current run's keys for a tab, or for every tab, are the channels of this run's settled lines", () => {
     const { index, made, viaLines } = build(9);
-    for (const t of [tab(RUN, 1), tab(RUN, 2), tab(OLD, 1), null]) {
-      const want = made
-        .filter(
-          (x) =>
-            viaLines.has(x.segment) &&
-            x.exchange.request.id.startsWith(`${RUN}.`) &&
-            JSON.stringify(x.exchange.request.tab) === JSON.stringify(t),
-        )
-        .map((x) => x.exchange.request.id.slice(RUN.length + 1));
-      expect(want.length > 0 || t?.run === OLD).toBe(true);
-      expect(currentRunKeys(index, t)).toEqual(new Set(want));
+    const thisRun = made.filter(
+      (x) => viaLines.has(x.segment) && x.exchange.request.id.startsWith(`${RUN}.`),
+    );
+    const channels = (xs: typeof made) =>
+      new Set(xs.map((x) => x.exchange.request.id.slice(RUN.length + 1)));
+    for (const t of [tab(RUN, 1), tab(RUN, 2), tab(OLD, 1)]) {
+      const want = thisRun.filter(
+        (x) => JSON.stringify(x.exchange.request.tab) === JSON.stringify(t),
+      );
+      expect(want.length > 0 || t.run === OLD).toBe(true);
+      expect(currentRunKeys(index, t)).toEqual(channels(want));
     }
+    const tabless = thisRun.filter((x) => x.exchange.request.tab === null);
+    expect(tabless.length > 0 && tabless.length < thisRun.length).toBe(true);
+    expect(currentRunKeys(index, null)).toEqual(channels(thisRun));
   });
 });
 

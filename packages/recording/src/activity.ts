@@ -162,14 +162,15 @@ const allBuckets = function* (index: ActivityIndex): Generator<ActivityBucket> {
 };
 
 /**
- * The channel keys this run recorded, per tab. DevTools items are always of the current run, so this set is all a
- * preview needs to count both, recording-only and DevTools-only exactly, without reading disk (row C8).
+ * The channel keys this run recorded for one tab, or for every tab (and no tab) when `tab` is null. DevTools items are
+ * always of the current run, so this set is all a preview needs to count both, recording-only and DevTools-only
+ * exactly, without reading disk (row C8).
  */
 export function currentRunKeys(index: ActivityIndex, tab: TabKey | null): ReadonlySet<ChannelKey> {
-  const wanted = tabName(tab);
+  const wanted = tab === null ? null : tabName(tab);
   const keys = new Set<ChannelKey>();
   for (const r of state(index).segments.values())
-    for (const [key, k] of r.keys) if (k.tab === wanted) keys.add(key);
+    for (const [key, k] of r.keys) if (wanted === null || k.tab === wanted) keys.add(key);
   return keys;
 }
 
