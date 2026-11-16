@@ -3,7 +3,8 @@ import { describe, expect, it } from "vite-plus/test";
 import { buildHar } from "../src/build.ts";
 import { toHarUrl, toIsoDateTime, toMimeType } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
-import { DEFAULT_REDACTION_RULES, redactHar, redactHarEntry, redactUrl } from "../src/redact.ts";
+import { redactHar, redactHarEntry, redactUrl } from "../src/redact.ts";
+import { DEFAULT_REDACTION_RULES } from "../src/rules.ts";
 
 describe("redactHar", () => {
   it("removes structurally defined credential carriers under standard and leaves bodies byte-identical", () => {

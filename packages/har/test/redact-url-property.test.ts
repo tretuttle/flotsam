@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { isHarUrl, type HarDocument } from "../src/model.ts";
-import { redactHar, redactUrl, type HarRedactionRule } from "../src/redact.ts";
+import { redactHar, redactUrl } from "../src/redact.ts";
+import type { HarRedactionRule } from "../src/rules.ts";
 
 // The oracle is the platform's own URL Standard parser, used here only: the package has no
 // browser or Node globals.
