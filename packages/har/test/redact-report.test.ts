@@ -13,6 +13,7 @@ import {
 import { parseHar } from "../src/parse.ts";
 import {
   HAR_MODEL_FIELD_TABLE,
+  HAR_PLACE_TABLE,
   PLACE_SEPARATOR,
   redactHar,
   redactHarEntry,
@@ -517,6 +518,138 @@ describe("values of the wrong type", () => {
         ruleId: `${level}:wrong-type`,
         count: 2,
       });
+    }
+  });
+});
+
+describe("values inside whole-object places, declared custom fields and nulls", () => {
+  it("records every field it removes inside initiators, WebSocket messages, cookies and declared custom fields", () => {
+    const { document } = buildMarkerDocument();
+    const fields = new Set<string>(
+      redactHar(document, { level: "shareable" }).report.records.map((record) => record.field),
+    );
+    for (const field of [
+      "entry._initiator.<custom>",
+      "entry._initiator.stack.callFrames[].url",
+      "entry._webSocketMessages[].<custom>",
+      "entry._webSocketMessages[].data",
+      "response._transferSize",
+      "timings._workerStart",
+      "request.cookies[].httpOnly",
+      "request.cookies[].secure",
+    ]) {
+      expect(fields.has(field), field).toBe(true);
+    }
+  });
+
+  it("counts the call frames of a parent stack in the initiator place", () => {
+    const frame = (url: string) => ({
+      functionName: "f",
+      scriptId: "1",
+      url,
+      lineNumber: 1,
+      columnNumber: 1,
+    });
+    const initiator = {
+      type: "script",
+      stack: {
+        callFrames: [frame("https://a.example/one.js")],
+        parent: { callFrames: [frame("https://a.example/two.js")] },
+      },
+    };
+    const { report } = redactHar(documentOf([entry({ _initiator: initiator })]), {
+      level: "shareable",
+    });
+    const urls = report.records.find(
+      (record) => record.field === "entry._initiator.stack.callFrames[].url",
+    );
+    expect(urls?.count).toBe(2);
+  });
+
+  it("treats null as a value of the wrong type in a field that cannot be null", () => {
+    for (const level of REDACTION_LEVELS) {
+      const { document, report } = redactHar(
+        documentOf([entry({ time: null, _initiator: null })]),
+        { level },
+      );
+      expect(document.log.entries[0]!.time).toBe(0);
+      expect("_initiator" in document.log.entries[0]!).toBe(false);
+      const wrong = report.records
+        .filter((record) => record.place === "wrong-type")
+        .map((record) => record.field)
+        .sort();
+      expect(wrong, level).toEqual(["entry._initiator", "entry.time"]);
+    }
+  });
+
+  it("gives a removed required number the row's removal value", () => {
+    const placeTable = {
+      ...HAR_PLACE_TABLE,
+      measurement: { ...HAR_PLACE_TABLE.measurement, standard: "removed" as const },
+    };
+    const { document } = redactHar(documentOf([entry({ time: 12 })]), { placeTable });
+    const redacted = document.log.entries[0]!;
+    expect([redacted.time, redacted.timings.send, redacted.request.headersSize]).toEqual([
+      0, 0, -1,
+    ]);
+  });
+
+  it("counts null and empty values as present and records their removal", () => {
+    const input = documentOf([
+      {
+        ...entry(
+          {},
+          {
+            cookies: [{ name: "sid", value: "v", expires: null }],
+            postData: { mimeType: "text/plain", params: [], text: null },
+          },
+        ),
+      },
+    ]);
+    const standard = redactHar(input, { level: "standard" });
+    expect(standard.document.log.entries[0]!.request.cookies[0]!.expires).toBeNull();
+    expect(standard.report.places.find((place) => place.place === "cookie-metadata")?.count).toBe(
+      2,
+    );
+    const shareable = redactHar(input, { level: "shareable" });
+    const fields = shareable.report.records.map((record) => record.field);
+    for (const field of [
+      "request.cookies[].expires",
+      "request.postData.text",
+      "response.redirectURL",
+    ]) {
+      expect(fields, field).toContain(field);
+    }
+    expect(shareable.document.log.entries[0]!._harExport?.redactedFields).toContain(
+      "request.cookies[].expires",
+    );
+  });
+});
+
+describe("URL authorities", () => {
+  it("reads the host of every scheme with an authority, so a table that removes hosts removes it", () => {
+    const placeTable = {
+      ...HAR_PLACE_TABLE,
+      "request-url-host": { ...HAR_PLACE_TABLE["request-url-host"], shareable: "removed" as const },
+    };
+    const urls = ["https://a.example/p", "wss://b.example:8443/socket", "ftp://c.example/f"];
+    const { document } = redactHar(documentOf(urls.map((url) => entry({}, { url }))), {
+      level: "shareable",
+      placeTable,
+    });
+    expect(document.log.entries.map((item) => item.request.url)).toEqual([
+      "https://redacted.invalid/p",
+      "wss://redacted.invalid/socket",
+      "ftp://redacted.invalid/f",
+    ]);
+  });
+
+  it("counts each kept userinfo once, at the start of a URL or inside a wrapper", () => {
+    for (const url of ["https://u:p@a.example/", "blob:https://u:p@a.example/x"]) {
+      const { report } = redactHar(documentOf([entry({}, { url })]), { rules: [] });
+      const place = report.places.find((item) => item.place === "request-url-userinfo");
+      expect(place?.status, url).toBe("kept-not-examined");
+      expect(place?.count, url).toBe(1);
     }
   });
 });

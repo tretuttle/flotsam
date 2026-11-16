@@ -71,10 +71,6 @@ export const OWNED_FIELDS = {
     "redactedFields",
   ]),
   logExport: new Set(["redaction"]),
-  initiator: new Set(["type", "url", "lineNumber", "columnNumber", "requestId", "stack"]),
-  initiatorStack: new Set(["callFrames", "parent"]),
-  initiatorFrame: new Set(["functionName", "scriptId", "url", "lineNumber", "columnNumber"]),
-  webSocketMessage: new Set(["type", "time", "opcode", "data"]),
 } as const;
 
 export function pickCustomFields(record: object, owned: ReadonlySet<string>): CustomHarFields {

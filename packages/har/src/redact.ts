@@ -15,6 +15,7 @@ import {
   type HarLogRedactionExtension,
   type HarModelField,
   type HarModelFieldIsOptional,
+  type HarModelFieldValues,
   type HarModelItemKind,
   type HarModelKind,
   type HarValueKind,
@@ -30,6 +31,7 @@ import {
   type HarTimings,
   type HarUrl,
   type IsoDateTime,
+  type MimeType,
   type PageId,
   type PlaceExamStatus,
   type PlaceReportDetail,
@@ -174,7 +176,8 @@ export const HAR_PLACE_TABLE: {
     place: "request-url-userinfo",
     standard: "removed",
     shareable: "removed",
-    label: "the userinfo part of request URLs and URL page titles",
+    label:
+      "the userinfo of every URL authority in request URLs and page titles, at any nesting depth, inside any wrapper scheme and in any percent-encoding",
     selectedBy: { target: "url-userinfo", byName: false },
   },
   "request-url-host": {
@@ -747,11 +750,23 @@ type ItemsDisagree = {
     ? never
     : F;
 }[HarModelField];
+// A removal value is plain JSON, so a branded string in the model type is checked as a string.
+type Unbranded<V> = V extends IsoDateTime | HarUrl | PageId | MimeType
+  ? string
+  : V extends readonly (infer Item)[]
+    ? readonly Unbranded<Item>[]
+    : V extends object
+      ? { readonly [K in keyof V]: Unbranded<V[K]> }
+      : V;
 type RemovalDisagrees = {
   [F in HarModelField]: HarModelFieldIsOptional<F> extends (
     "whenRemoved" extends keyof Rows[F] ? false : true
   )
-    ? never
+    ? Rows[F] extends { readonly whenRemoved: infer Removed }
+      ? [Removed] extends [Unbranded<HarModelFieldValues[F]>]
+        ? never
+        : F
+      : never
     : F;
 }[HarModelField];
 type RowsDisagree = KindsDisagree | ItemsDisagree | RemovalDisagrees;
@@ -1352,6 +1367,57 @@ function redactDeclaredCustomField(
   return value;
 }
 
+// Separators of an authority, raw or percent-encoded to any depth (`%3A`, `%253A`, ...).
+const COLON = "(?::|%(?:25)*3[Aa])";
+const SLASH = "(?:[/\\\\]|%(?:25)*(?:2[Ff]|5[Cc]))";
+const AT_SIGN = /@|%(?:25)*40/gu;
+const AUTHORITY_END = /[/\\?#\s"'<>]|%(?:25)*(?:2[Ff]|5[Cc]|3[Ff]|23)/u;
+const AUTHORITY_START = new RegExp(`[A-Za-z][A-Za-z0-9+.-]*${COLON}${SLASH}${SLASH}`, "gu");
+
+// Removes the userinfo of every authority in `text`, whatever the scheme, the wrapper around it
+// (`blob:`, `view-source:`, `jar:`, or one nobody has named yet), the nesting depth, or the
+// encoding. It does not parse the outer URL, so a scheme it has never seen cannot hide one.
+function redactEveryUserinfo(
+  text: string,
+  ctx: RedactContext,
+  field: "request.url" | "log.pages[].title",
+  outerCounted: boolean,
+): string {
+  const replacement = encodeURIComponent(ctx.replacement);
+  const removed = ctx.isRemoved("request-url-userinfo");
+  const ruleId =
+    findMatchingRule(ctx.rules, "url-userinfo", "userinfo")?.id ??
+    ctx.levelRule("request-url-userinfo");
+  let out = "";
+  let cursor = 0;
+  for (const start of text.matchAll(AUTHORITY_START)) {
+    const authorityStart = start.index + start[0].length;
+    if (authorityStart < cursor || (outerCounted && start.index === 0)) {
+      continue;
+    }
+    const rest = text.slice(authorityStart);
+    const end = rest.search(AUTHORITY_END);
+    const authority = end === -1 ? rest : rest.slice(0, end);
+    const lastAt = [...authority.matchAll(AT_SIGN)].at(-1);
+    if (lastAt === undefined) {
+      continue;
+    }
+    const userinfo = authority.slice(0, lastAt.index);
+    if (userinfo === replacement || (userinfo.length === 0 && ctx.level === "shareable")) {
+      continue;
+    }
+    if (!removed) {
+      ctx.tracker.kept(field, "request-url-userinfo");
+      continue;
+    }
+    ctx.tracker.removed(field, "request-url-userinfo", ruleId);
+    out += text.slice(cursor, authorityStart);
+    out += ctx.level === "shareable" ? "" : `${replacement}${lastAt[0]}`;
+    cursor = authorityStart + lastAt.index + lastAt[0].length;
+  }
+  return out + text.slice(cursor);
+}
+
 function redactStructuredUrl(
   raw: string,
   ctx: RedactContext,
@@ -1398,7 +1464,7 @@ function redactStructuredUrl(
       if (ctx.isRemoved("request-url-host")) {
         ctx.tracker.removed("request.url", "request-url-host", ctx.levelRule("request-url-host"));
         hostPort = "redacted.invalid";
-      } else if (hostPort.length > 0) {
+      } else {
         ctx.tracker.kept("request.url", "request-url-host");
       }
     }
@@ -1414,6 +1480,26 @@ function redactStructuredUrl(
     }
 
     head = `${schemePrefix}${nextUserinfoPrefix}${hostPort}${nextPath}`;
+  } else if (!isPage) {
+    // A URL with no `scheme://` at its start: the scheme is its host place, the rest its path.
+    const schemeEnd = /^[a-zA-Z][a-zA-Z0-9+.-]*:/u.exec(beforeQuery)?.[0].length ?? 0;
+    const parts = [
+      ["request-url-host", beforeQuery.slice(0, schemeEnd)],
+      ["request-url-path", beforeQuery.slice(schemeEnd)],
+    ] as const;
+    head = parts
+      .map(([place, part]) => {
+        if (part.length === 0) {
+          return part;
+        }
+        if (ctx.isRemoved(place)) {
+          ctx.tracker.removed("request.url", place, ctx.levelRule(place));
+          return "";
+        }
+        ctx.tracker.kept("request.url", place);
+        return part;
+      })
+      .join("");
   }
 
   let nextQuery: string | null = null;
@@ -1473,20 +1559,21 @@ function redactStructuredUrl(
 
   const queryPart = nextQuery !== null ? `?${nextQuery}` : "";
   const fragmentPart = nextFragment !== null ? `#${nextFragment}` : "";
-  return `${head}${queryPart}${fragmentPart}`;
+  return redactEveryUserinfo(
+    `${head}${queryPart}${fragmentPart}`,
+    ctx,
+    field,
+    authorityMatch !== null,
+  );
 }
 
 function redactPageTitle(title: string, ctx: RedactContext): string {
   const afterUrl = redactStructuredUrl(title, ctx, "log.pages[].title");
   if (ctx.isRemoved("page-title")) {
-    if (title.length > 0) {
-      ctx.tracker.removed("log.pages[].title", "page-title", ctx.levelRule("page-title"));
-    }
+    ctx.tracker.removed("log.pages[].title", "page-title", ctx.levelRule("page-title"));
     return "";
   }
-  if (afterUrl.length > 0) {
-    ctx.tracker.kept("log.pages[].title", "page-title");
-  }
+  ctx.tracker.kept("log.pages[].title", "page-title");
   return afterUrl;
 }
 
@@ -1565,7 +1652,7 @@ function redactCookies(
     };
 
     for (const key of COOKIE_METADATA_KEYS) {
-      if (typeof cookie[key] !== "string") {
+      if (cookie[key] === undefined) {
         continue;
       }
       if (metaRemoved) {
@@ -1716,7 +1803,7 @@ function redactParams(
     };
 
     for (const key of PARAM_METADATA_KEYS) {
-      if (typeof param[key] !== "string") {
+      if (param[key] === undefined) {
         continue;
       }
       if (metaRemoved) {
@@ -1772,8 +1859,11 @@ function redactPostData(
   };
 
   const text = postData.text;
-  if (typeof text === "string" && text.length > 0) {
-    const bodyPlace = classifyRequestBodyPlace(postData.mimeType, text);
+  if (text !== undefined) {
+    const bodyPlace =
+      typeof text === "string" && text.length > 0
+        ? classifyRequestBodyPlace(postData.mimeType, text)
+        : "request-body-other";
     if (ctx.isRemoved(bodyPlace)) {
       ctx.tracker.removed("request.postData.text", bodyPlace, ctx.levelRule(bodyPlace));
       changes.text = "";
@@ -1796,8 +1886,11 @@ function redactContent(content: HarContent, ctx: RedactContext): HarContent {
   }
 
   const text = content.text;
-  if (typeof text === "string" && text.length > 0) {
-    const bodyPlace = classifyResponseBodyPlace(content.mimeType, content.encoding, text);
+  if (text !== undefined) {
+    const bodyPlace =
+      text.length > 0
+        ? classifyResponseBodyPlace(content.mimeType, content.encoding, text)
+        : "response-body-other";
     if (ctx.isRemoved(bodyPlace)) {
       ctx.tracker.removed("response.content.text", bodyPlace, ctx.levelRule(bodyPlace));
       changes.text = undefined;
@@ -1996,7 +2089,7 @@ function redactResponse(entry: HarEntry, ctx: RedactContext): HarEntry["response
     content: redactContent(response.content, ctx),
     comment: redactComment(response.comment, "response.comment", ctx),
   };
-  if (response.redirectURL.length > 0) {
+  if (response.redirectURL !== undefined) {
     if (ctx.isRemoved("redirect-url")) {
       ctx.tracker.removed("response.redirectURL", "redirect-url", ctx.levelRule("redirect-url"));
       changes.redirectURL = "";

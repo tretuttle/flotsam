@@ -84,7 +84,8 @@ export function isHarUrl(value: string): value is HarUrl {
     const host = hostPort.includes(":") ? hostPort.slice(0, hostPort.indexOf(":")) : hostPort;
     return host.length > 0;
   }
-  return rest.length > 0;
+  // A wrapper such as `blob:`, `view-source:` or `jar:` carries another URL, which must be valid too.
+  return URL_SCHEME_PATTERN.test(rest) && !rest.startsWith("//") ? isHarUrl(rest) : rest.length > 0;
 }
 
 export function toHarUrl(value: string): HarUrl | null {

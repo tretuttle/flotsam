@@ -37,6 +37,14 @@ describe("HAR branded primitives", () => {
     expect(isoDateTimeFromEpochMs(0)).toBe("1970-01-01T00:00:00.000Z");
   });
 
+  it("validates the URL a wrapper scheme carries", () => {
+    expect(isHarUrl("blob:https://app.example/0d1f")).toBe(true);
+    expect(isHarUrl("view-source:blob:https://app.example/")).toBe(true);
+    expect(isHarUrl("blob:file:///tmp/a")).toBe(true);
+    expect(isHarUrl("blob:https://user:secret@/no-host")).toBe(false);
+    expect(isHarUrl("view-source:https://")).toBe(false);
+  });
+
   it("validates absolute URLs across web and browser schemes", () => {
     expect(isHarUrl("https://example.com/path?a=1")).toBe(true);
     expect(isHarUrl("http://[::1]:8080/health")).toBe(true);
