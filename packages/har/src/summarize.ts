@@ -1,7 +1,6 @@
 import { extractUrlHost, utf8ByteLength } from "./internal.ts";
 import {
   isoDateTimeFromEpochMs,
-  type HarBodyState,
   type HarDocument,
   type HarEntry,
   type HarLogRedactionExtension,
@@ -24,7 +23,15 @@ export interface HarBodySummary {
   readonly empty: number;
   readonly missing: number;
   readonly missingByReason: Record<HarMissingBodyReason, number>;
+  readonly incomplete: number;
+  readonly incompleteByReason: Record<HarMissingBodyReason, number>;
 }
+
+export type HarBodyClass =
+  | { readonly state: "present" }
+  | { readonly state: "empty" }
+  | { readonly state: "incomplete"; readonly reason: HarMissingBodyReason }
+  | { readonly state: "missing"; readonly reason: HarMissingBodyReason };
 
 export interface HarStatusBuckets {
   readonly failed: number;
@@ -59,9 +66,14 @@ export interface HarSummary {
   readonly redaction: HarRedactionSummary;
 }
 
-export interface SummarizeEntriesOptions {
-  readonly pageCount?: number | undefined;
+export interface SummarizeOptions {
+  // The report `redactHar` returned for this export. A report read from the document itself is not
+  // trusted, because any file can carry one.
   readonly redaction?: HarLogRedactionExtension | undefined;
+}
+
+export interface SummarizeEntriesOptions extends SummarizeOptions {
+  readonly pageCount?: number | undefined;
 }
 
 const MISSING_REASONS: readonly HarMissingBodyReason[] = [
@@ -136,85 +148,65 @@ function resolveBodyMissingReason(raw: string): HarMissingBodyReason {
   return BODY_MISSING_TO_REASON[raw] ?? "unavailable";
 }
 
-export function classifyEntryBodyState(entry: HarEntry): HarBodyState {
+// `bodyIncomplete` and `bodyMissing` are read before `content.text`: a body cut short keeps its first
+// bytes in `text`, and must still count as incomplete, never as present.
+export function classifyEntryBodyState(entry: HarEntry): HarBodyClass {
   const { content, status, bodySize } = entry.response;
   const exportMeta = entry._harExport;
   const annotated = exportMeta?.bodyState;
   const bodyMissing = exportMeta?.bodyMissing;
-  if (
-    exportMeta?.bodyIncomplete === true ||
-    (typeof bodyMissing === "string" && bodyMissing.length > 0)
-  ) {
-    if (isMissingReason(annotated)) {
-      return annotated;
-    }
-    if (typeof bodyMissing === "string" && bodyMissing.length > 0) {
-      return resolveBodyMissingReason(bodyMissing);
-    }
-    return status === 0 ? "aborted" : "unavailable";
+  const annotatedReason = isMissingReason(annotated)
+    ? annotated
+    : typeof bodyMissing === "string" && bodyMissing.length > 0
+      ? resolveBodyMissingReason(bodyMissing)
+      : undefined;
+
+  if (exportMeta?.bodyIncomplete === true) {
+    return {
+      state: "incomplete",
+      reason: annotatedReason ?? (status === 0 ? "aborted" : "unavailable"),
+    };
+  }
+  if (typeof bodyMissing === "string" && bodyMissing.length > 0 && annotatedReason) {
+    return { state: "missing", reason: annotatedReason };
   }
 
   if (status === 204 || status === 304) {
     if (content.text === undefined || content.text.length === 0) {
-      return "empty";
+      return { state: "empty" };
     }
   }
   if (content.text !== undefined) {
-    return "present";
+    return { state: "present" };
   }
 
-  if (annotated !== undefined && annotated !== "present") {
-    if (annotated === "empty" || isMissingReason(annotated)) {
-      return annotated;
-    }
+  if (annotated === "empty") {
+    return { state: "empty" };
+  }
+  if (isMissingReason(annotated)) {
+    return { state: "missing", reason: annotated };
   }
   if (status === 0) {
-    return "aborted";
+    return { state: "missing", reason: "aborted" };
   }
-
   if (content.size === 0 || (content.size === -1 && bodySize === 0)) {
-    return "empty";
+    return { state: "empty" };
   }
-
-  return "unknown";
+  return { state: "missing", reason: "unknown" };
 }
 
 function addNonNegative(current: number, value: number): number {
   return value >= 0 ? current + value : current;
 }
 
-function summarizeRedactionMetadata(
-  redaction: HarLogRedactionExtension | undefined,
-  entryCount: number,
-): HarRedactionSummary {
-  if (!redaction || redaction.applied !== true || !Array.isArray(redaction.records)) {
-    return { applied: false, totalRemoved: 0, entriesAffected: 0 };
-  }
-  const hasPlaces = Array.isArray(redaction.places) && redaction.places.length > 0;
-  let totalRemoved = 0;
-  const affectedIndices = new Set<number>();
-  for (const record of redaction.records) {
-    if (
-      typeof record?.count === "number" &&
-      record.count > 0 &&
-      typeof record.entryIndex === "number" &&
-      record.entryIndex >= -1 &&
-      record.entryIndex < entryCount
-    ) {
-      totalRemoved += record.count;
-      if (record.entryIndex >= 0) {
-        affectedIndices.add(record.entryIndex);
+function summarizeRedaction(redaction: HarLogRedactionExtension | undefined): HarRedactionSummary {
+  return redaction
+    ? {
+        applied: true,
+        totalRemoved: redaction.totalRemoved,
+        entriesAffected: redaction.entriesAffected,
       }
-    }
-  }
-  if (!hasPlaces && totalRemoved === 0) {
-    return { applied: false, totalRemoved: 0, entriesAffected: 0 };
-  }
-  return {
-    applied: true,
-    totalRemoved,
-    entriesAffected: affectedIndices.size,
-  };
+    : { applied: false, totalRemoved: 0, entriesAffected: 0 };
 }
 
 export function summarizeEntries(
@@ -223,6 +215,7 @@ export function summarizeEntries(
 ): HarSummary {
   const hosts = new Set<string>();
   const missingByReason = createEmptyMissingByReason();
+  const incompleteByReason = createEmptyMissingByReason();
 
   let requestHeaders = 0;
   let requestBody = 0;
@@ -235,6 +228,7 @@ export function summarizeEntries(
   let withoutBody = 0;
   let empty = 0;
   let missing = 0;
+  let incomplete = 0;
 
   let sumEntryTimeMs = 0;
   let minStartMs = Number.POSITIVE_INFINITY;
@@ -271,21 +265,26 @@ export function summarizeEntries(
     responseBodyWire = addNonNegative(responseBodyWire, entry.response.bodySize);
     responseBodyDecoded = addNonNegative(responseBodyDecoded, entry.response.content.size);
 
-    const state = classifyEntryBodyState(entry);
-    if (state === "present") {
-      withBody += 1;
+    const body = classifyEntryBodyState(entry);
+    if (body.state === "present" || body.state === "incomplete") {
       const text = entry.response.content.text ?? "";
       includedResponseTextBytes +=
         entry.response.content.encoding === "base64"
           ? base64DecodedLength(text)
           : utf8ByteLength(text);
+    }
+    if (body.state === "present") {
+      withBody += 1;
+    } else if (body.state === "incomplete") {
+      incomplete += 1;
+      incompleteByReason[body.reason] += 1;
     } else {
       withoutBody += 1;
-      if (state === "empty") {
+      if (body.state === "empty") {
         empty += 1;
-      } else if (isMissingReason(state)) {
+      } else {
         missing += 1;
-        missingByReason[state] += 1;
+        missingByReason[body.reason] += 1;
       }
     }
 
@@ -339,6 +338,8 @@ export function summarizeEntries(
       empty,
       missing,
       missingByReason,
+      incomplete,
+      incompleteByReason,
     },
     statusBuckets: {
       failed,
@@ -348,13 +349,13 @@ export function summarizeEntries(
       clientError,
       serverError,
     },
-    redaction: summarizeRedactionMetadata(options?.redaction, entries.length),
+    redaction: summarizeRedaction(options?.redaction),
   };
 }
 
-export function summarizeHar(document: HarDocument): HarSummary {
+export function summarizeHar(document: HarDocument, options?: SummarizeOptions): HarSummary {
   return summarizeEntries(document.log.entries, {
     pageCount: document.log.pages?.length ?? 0,
-    redaction: document.log._harExport?.redaction,
+    redaction: options?.redaction,
   });
 }

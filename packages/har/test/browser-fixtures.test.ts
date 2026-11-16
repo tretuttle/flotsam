@@ -21,9 +21,9 @@ describe("browser and spec HAR fixtures", () => {
     expect(result.problems.some((problem) => problem.rule === "redirect-url")).toBe(true);
     expect(entries[3]!.timings).toMatchObject({ send: 0, wait: 0, receive: 0 });
     expect(result.problems.some((problem) => problem.rule === "browser-timings")).toBe(true);
-    expect(classifyEntryBodyState(entries[1]!)).toBe("empty");
-    expect(classifyEntryBodyState(entries[3]!)).toBe("aborted");
-    expect(classifyEntryBodyState(entries[4]!)).toBe("unknown");
+    expect(classifyEntryBodyState(entries[1]!)).toEqual({ state: "empty" });
+    expect(classifyEntryBodyState(entries[3]!)).toEqual({ state: "missing", reason: "aborted" });
+    expect(classifyEntryBodyState(entries[4]!)).toEqual({ state: "missing", reason: "unknown" });
     expect(summarizeHar(result.document).bodies.missingByReason.unknown).toBe(1);
   });
 

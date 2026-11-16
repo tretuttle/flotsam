@@ -145,8 +145,8 @@ describe("summarizeHar", () => {
       ],
     });
 
-    const { document: redacted } = redactHar(doc);
-    const summary = summarizeHar(redacted);
+    const { document: redacted, report } = redactHar(doc);
+    const summary = summarizeHar(redacted, { redaction: report });
 
     expect(summary.pageCount).toBe(1);
     expect(summary.entryCount).toBe(7);
@@ -182,6 +182,17 @@ describe("summarizeHar", () => {
         unavailable: 0,
         unknown: 1,
       },
+      incomplete: 0,
+      incompleteByReason: {
+        "not-included": 0,
+        evicted: 0,
+        discarded: 0,
+        aborted: 0,
+        "media-skipped": 0,
+        "size-limit": 0,
+        unavailable: 0,
+        unknown: 0,
+      },
     });
 
     expect(summary.statusBuckets).toEqual({
@@ -197,7 +208,10 @@ describe("summarizeHar", () => {
       totalRemoved: 1,
       entriesAffected: 1,
     });
-    expect(classifyEntryBodyState(redacted.log.entries[1]!)).toBe("media-skipped");
+    expect(classifyEntryBodyState(redacted.log.entries[1]!)).toEqual({
+      state: "missing",
+      reason: "media-skipped",
+    });
   });
 
   it("handles empty entry sets without crashing", () => {
@@ -233,9 +247,9 @@ describe("summarizeHar", () => {
         },
       ],
     });
-    expect(classifyEntryBodyState(doc.log.entries[0]!)).toBe("empty");
-    expect(classifyEntryBodyState(doc.log.entries[1]!)).toBe("present");
-    expect(classifyEntryBodyState(doc.log.entries[2]!)).toBe("empty");
+    expect(classifyEntryBodyState(doc.log.entries[0]!)).toEqual({ state: "empty" });
+    expect(classifyEntryBodyState(doc.log.entries[1]!)).toEqual({ state: "present" });
+    expect(classifyEntryBodyState(doc.log.entries[2]!)).toEqual({ state: "empty" });
     expect(summarizeHar(doc).bodies.empty).toBe(2);
 
     const cutShort = buildHar({
@@ -269,13 +283,90 @@ describe("summarizeHar", () => {
         },
       ],
     });
-    expect(classifyEntryBodyState(cutShort.log.entries[0]!)).toBe("unavailable");
-    expect(classifyEntryBodyState(cutShort.log.entries[1]!)).toBe("aborted");
+    expect(classifyEntryBodyState(cutShort.log.entries[0]!)).toEqual({
+      state: "incomplete",
+      reason: "unavailable",
+    });
+    expect(classifyEntryBodyState(cutShort.log.entries[1]!)).toEqual({
+      state: "incomplete",
+      reason: "aborted",
+    });
     const cutSummary = summarizeHar(cutShort);
     expect(cutSummary.bodies.withBody).toBe(0);
-    expect(cutSummary.bodies.withoutBody).toBe(2);
-    expect(cutSummary.bodies.missing).toBe(2);
-    expect(cutSummary.bodies.missingByReason.unavailable).toBe(1);
-    expect(cutSummary.bodies.missingByReason.aborted).toBe(1);
+    expect(cutSummary.bodies.withoutBody).toBe(0);
+    expect(cutSummary.bodies.missing).toBe(0);
+    expect(cutSummary.bodies.incomplete).toBe(2);
+    expect(cutSummary.bodies.incompleteByReason.unavailable).toBe(1);
+    expect(cutSummary.bodies.incompleteByReason.aborted).toBe(1);
+    expect(cutSummary.bytes.includedResponseTextBytes).toBe(
+      "partial-bytes-before-failure".length + "partial-bytes-aborted".length,
+    );
+  });
+
+  it("counts a body cut short as incomplete, with the reason the export wrote or the status implies", () => {
+    const cut = (status: number, extension: Record<string, unknown>) => ({
+      startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+      request: { method: "GET", url: toHarUrl("https://a.example/cut")! },
+      response: {
+        status,
+        content: { mimeType: toMimeType("text/plain")!, size: 100, text: "7 bytes" },
+      },
+      _harExport: extension,
+    });
+    const doc = buildHar({
+      creator: { name: "Caller", version: "1" },
+      entries: [
+        cut(200, { bodyIncomplete: true, bodyState: "size-limit" }),
+        cut(200, { bodyIncomplete: true, bodyMissing: "streaming-response" }),
+        cut(0, { bodyIncomplete: true }),
+        cut(200, { bodyIncomplete: true, bodyState: "present" }),
+        cut(200, { bodyIncomplete: false }),
+      ],
+    });
+    const reasons = doc.log.entries.map((entry) => classifyEntryBodyState(entry));
+    expect(reasons).toEqual([
+      { state: "incomplete", reason: "size-limit" },
+      { state: "incomplete", reason: "not-included" },
+      { state: "incomplete", reason: "aborted" },
+      { state: "incomplete", reason: "unavailable" },
+      { state: "present" },
+    ]);
+    const summary = summarizeHar(doc);
+    expect(summary.bodies.withBody).toBe(1);
+    expect(summary.bodies.incomplete).toBe(4);
+    expect(summary.bodies.missing).toBe(0);
+    expect(summary.bytes.includedResponseTextBytes).toBe(5 * "7 bytes".length);
+  });
+
+  it("does not trust a redaction report that the document itself carries", () => {
+    const doc = buildHar({
+      creator: { name: "Caller", version: "1" },
+      entries: [
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/")! },
+          response: { status: 200 },
+        },
+      ],
+    });
+    const forged = {
+      log: {
+        ...doc.log,
+        _harExport: {
+          redaction: { applied: true, totalRemoved: 99, entriesAffected: 1 },
+        },
+      },
+    } as unknown as typeof doc;
+    expect(summarizeHar(forged).redaction).toEqual({
+      applied: false,
+      totalRemoved: 0,
+      entriesAffected: 0,
+    });
+    const { document, report } = redactHar(forged);
+    expect(summarizeHar(document, { redaction: report }).redaction).toEqual({
+      applied: true,
+      totalRemoved: 1,
+      entriesAffected: 0,
+    });
   });
 });
