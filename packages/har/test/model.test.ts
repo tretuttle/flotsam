@@ -37,25 +37,31 @@ describe("HAR branded primitives", () => {
     expect(isoDateTimeFromEpochMs(0)).toBe("1970-01-01T00:00:00.000Z");
   });
 
-  it("validates the URL a wrapper scheme carries", () => {
-    expect(isHarUrl("blob:https://app.example/0d1f")).toBe(true);
-    expect(isHarUrl("view-source:blob:https://app.example/")).toBe(true);
-    expect(isHarUrl("blob:file:///tmp/a")).toBe(true);
-    expect(isHarUrl("blob:https://user:secret@/no-host")).toBe(false);
-    expect(isHarUrl("view-source:https://")).toBe(false);
-  });
-
-  it("validates absolute URLs across web and browser schemes", () => {
-    expect(isHarUrl("https://example.com/path?a=1")).toBe(true);
-    expect(isHarUrl("http://[::1]:8080/health")).toBe(true);
-    expect(isHarUrl("wss://socket.example.com/feed")).toBe(true);
-    expect(isHarUrl("data:text/plain;base64,SGVsbG8=")).toBe(true);
-    expect(isHarUrl("moz-extension://uuid-123/sidebar.html")).toBe(true);
-
-    expect(isHarUrl("")).toBe(false);
-    expect(isHarUrl("/relative/path")).toBe(false);
-    expect(isHarUrl("https://")).toBe(false);
-    expect(isHarUrl("https://example.com/with space")).toBe(false);
+  it("takes a string as a URL exactly when the URL Standard parses it as an absolute URL", () => {
+    const cases: ReadonlyArray<readonly [string, boolean]> = [
+      ["https://example.com/path?a=1", true],
+      ["http://[::1]:8080/health", true],
+      ["wss://socket.example.com/feed", true],
+      ["data:text/plain;base64,SGVsbG8=", true],
+      ["moz-extension://uuid-123/sidebar.html", true],
+      ["blob:https://user:secret@/no-host", true],
+      ["https://example.com/with space", true],
+      ["https:example.com", true],
+      ["  https://example.com/  ", true],
+      ["about:", true],
+      ["file:///tmp/a", true],
+      ["", false],
+      ["/relative/path", false],
+      ["https://", false],
+      ["https://user:SECRET%40example.com/path", false],
+      ["https://[fe80::1%25eth0]/", false],
+      ["https://256.1.1.1/", false],
+      ["foo://u@/x", false],
+      ["file://user@host/x", false],
+    ];
+    for (const [value, valid] of cases) {
+      expect(isHarUrl(value), value).toBe(valid);
+    }
     expect(toHarUrl("https://example.com")).toBe("https://example.com");
     expect(toHarUrl("/relative")).toBeNull();
   });

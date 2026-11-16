@@ -429,13 +429,25 @@ describe("number and boolean fields", () => {
       for (const field of NUMBER_FIELDS) {
         expect(output, `${level}: ${field}`).not.toContain(text(field));
       }
+      // A whole place that held a wrong value goes whole, and that removal is recorded too.
+      const wholePlaces = [
+        "cache.afterRequest",
+        "cache.beforeRequest",
+        "entry._initiator",
+        "entry._webSocketMessages",
+      ];
       const wrongType = report.records.filter((record) => record.place === "wrong-type");
       expect(wrongType.map((record) => record.field).sort(), level).toEqual(
-        [...NUMBER_FIELDS].sort(),
+        [...NUMBER_FIELDS, ...wholePlaces].sort(),
       );
       expect(report.places.find((place) => place.place === "wrong-type")?.count).toBe(
-        NUMBER_FIELDS.length,
+        NUMBER_FIELDS.length + wholePlaces.length,
       );
+      for (const field of wholePlaces) {
+        expect(JSON.stringify(document.log.entries[0]), field).not.toContain(
+          `"${field.split(".").at(-1)!}"`,
+        );
+      }
       const timings = document.log.entries[0]!.timings;
       expect([timings.send, timings.wait, timings.receive, timings.ssl]).toEqual([
         0,
@@ -651,6 +663,85 @@ describe("URL authorities", () => {
       expect(place?.status, url).toBe("kept-not-examined");
       expect(place?.count, url).toBe(1);
     }
+  });
+});
+
+describe("empty values and URLs with no host", () => {
+  it("counts and records an empty title, empty param fields, and null or empty bodies in their own places", () => {
+    const input = documentOf(
+      [
+        entry(
+          {
+            response: {
+              status: 200,
+              statusText: "OK",
+              httpVersion: "HTTP/1.1",
+              cookies: [],
+              headers: [],
+              content: { size: 0, mimeType: "application/json", text: "" },
+              redirectURL: "",
+              headersSize: -1,
+              bodySize: -1,
+            },
+          },
+          {
+            postData: {
+              mimeType: "application/json",
+              params: [{ name: "p", value: "v", fileName: "", contentType: "" }],
+              text: null,
+            },
+          },
+        ),
+      ],
+      {
+        pages: [
+          { id: "p", title: "", startedDateTime: "2026-11-16T09:00:00.000Z", pageTimings: {} },
+        ],
+      },
+    );
+    const count = (report: HarLogRedactionExtension, place: string) =>
+      report.places.find((item) => item.place === place)?.count;
+    const standard = redactHar(input, { level: "standard" }).report;
+    expect(count(standard, "page-title")).toBe(1);
+    expect(count(standard, "body-param")).toBe(4);
+    expect(count(standard, "request-body-other")).toBe(1);
+    expect(count(standard, "body-json")).toBe(0);
+    expect(count(standard, "response-body-other")).toBe(1);
+    expect(count(standard, "response-body-json")).toBe(0);
+    const recorded = redactHar(input, { level: "shareable" }).report.records.map(
+      (record) => `${record.place} ${record.field}`,
+    );
+    for (const expected of [
+      "page-title log.pages[].title",
+      "body-param request.postData.params[].fileName",
+      "body-param request.postData.params[].contentType",
+      "request-body-other request.postData.text",
+      "response-body-other response.content.text",
+    ]) {
+      expect(recorded, expected).toContain(expected);
+    }
+  });
+
+  it("counts the scheme as the host place and the rest as path or opaque content", () => {
+    const counts = (url: string) => {
+      const { report } = redactHar(documentOf([entry({}, { url })]), { level: "standard" });
+      return ["request-url-host", "request-url-path", "request-url-opaque"].map(
+        (place) => report.places.find((item) => item.place === place)?.count,
+      );
+    };
+    expect(counts("file:///var/log/app.log")).toEqual([1, 1, 0]);
+    expect(counts("data:text/plain,hello")).toEqual([1, 0, 1]);
+    expect(counts("about:blank")).toEqual([1, 0, 1]);
+    expect(counts("https://a.example")).toEqual([1, 0, 0]);
+  });
+
+  it("reduces a URL with no host to its scheme and a placeholder under shareable", () => {
+    const { document, report } = redactHar(
+      documentOf([entry({}, { url: "mailto:someone@mail.example?subject=hi" })]),
+      { level: "shareable" },
+    );
+    expect(document.log.entries[0]!.request.url).toBe("mailto:redacted");
+    expect(report.records.map((record) => record.place)).toContain("request-url-opaque");
   });
 });
 

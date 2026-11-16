@@ -378,22 +378,22 @@ export function buildMarkerDocument(): {
   const beforeLastFetched = nextMarker("cache.beforeRequest.lastFetched", "cache");
   const beforeETag = nextMarker("cache.beforeRequest.eTag", "cache");
   const beforeFetchCount = nextMarker("cache.beforeRequest.fetchCount", "cache");
-  const beforeComment = nextMarker("cache.beforeRequest.comment", "comment");
+  const beforeComment = nextMarker("cache.beforeRequest.comment", "cache");
   const beforeDataSize = nextMarker("cache.beforeRequest._dataSize", "cache");
   const beforeLastModified = nextMarker("cache.beforeRequest._lastModified", "cache");
   const beforeDevice = nextMarker("cache.beforeRequest._device", "cache");
-  const beforeCustom = nextMarker("cache.beforeRequest.<custom>", "other-custom-field");
+  const beforeCustom = nextMarker("cache.beforeRequest.<custom>", "cache");
 
   const afterExpires = nextMarker("cache.afterRequest.expires", "cache");
   const afterLastAccess = nextMarker("cache.afterRequest.lastAccess", "cache");
   const afterLastFetched = nextMarker("cache.afterRequest.lastFetched", "cache");
   const afterETag = nextMarker("cache.afterRequest.eTag", "cache");
   const afterFetchCount = nextMarker("cache.afterRequest.fetchCount", "cache");
-  const afterComment = nextMarker("cache.afterRequest.comment", "comment");
+  const afterComment = nextMarker("cache.afterRequest.comment", "cache");
   const afterDataSize = nextMarker("cache.afterRequest._dataSize", "cache");
   const afterLastModified = nextMarker("cache.afterRequest._lastModified", "cache");
   const afterDevice = nextMarker("cache.afterRequest._device", "cache");
-  const afterCustom = nextMarker("cache.afterRequest.<custom>", "other-custom-field");
+  const afterCustom = nextMarker("cache.afterRequest.<custom>", "cache");
 
   const timingsComment = nextMarker("timings.comment", "comment");
   const timingsCustom = nextMarker("timings.<custom>", "other-custom-field");
@@ -638,7 +638,10 @@ export function buildMarkerDocument(): {
     text: `<p>${contentTextOther}</p>`,
   };
 
-  const otherBodyEntry = baseEntry(3);
+  const otherBodyEntry = baseEntry(
+    3,
+    `data:text/plain,${nextMarker("request.url", "request-url-opaque")}`,
+  );
   (otherBodyEntry.request as Record<string, unknown>).method = "POST";
   (otherBodyEntry.request as Record<string, unknown>).postData = {
     mimeType: "text/plain",

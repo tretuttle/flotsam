@@ -1,3 +1,5 @@
+import { parseUrl } from "./url-standard.ts";
+
 declare const IsoDateTimeBrand: unique symbol;
 declare const HarUrlBrand: unique symbol;
 declare const PageIdBrand: unique symbol;
@@ -15,9 +17,6 @@ export type CustomHarFields = {
 const ISO_DATE_TIME_PATTERN =
   /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d{1,9}))?(Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)$/u;
 
-const URL_SCHEME_PATTERN = /^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/u;
-const AUTHORITY_SCHEMES = new Set(["http", "https", "ws", "wss", "ftp"]);
-const CONTROL_OR_SPACE_PATTERN = /[\u0000-\u0020\u007f]/u;
 const MIME_TYPE_PATTERN =
   /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\/[!#$%&'*+\-.^_`|~0-9A-Za-z]+(?:\s*;.*)?$/u;
 
@@ -57,35 +56,9 @@ export function isoDateTimeFromEpochMs(epochMs: number): IsoDateTime {
   return iso;
 }
 
+// A URL is what the WHATWG URL Standard parses as an absolute URL.
 export function isHarUrl(value: string): value is HarUrl {
-  if (value.length === 0 || CONTROL_OR_SPACE_PATTERN.test(value)) {
-    return false;
-  }
-  const match = URL_SCHEME_PATTERN.exec(value);
-  if (!match) {
-    return false;
-  }
-  const scheme = match[1]?.toLowerCase() ?? "";
-  const rest = match[2] ?? "";
-  if (AUTHORITY_SCHEMES.has(scheme)) {
-    if (!rest.startsWith("//")) {
-      return false;
-    }
-    const afterSlashes = rest.slice(2);
-    const authorityEnd = afterSlashes.search(/[/?#]/u);
-    const authority = authorityEnd === -1 ? afterSlashes : afterSlashes.slice(0, authorityEnd);
-    const hostPort = authority.includes("@")
-      ? authority.slice(authority.lastIndexOf("@") + 1)
-      : authority;
-    if (hostPort.startsWith("[")) {
-      const closeBracket = hostPort.indexOf("]");
-      return closeBracket > 1;
-    }
-    const host = hostPort.includes(":") ? hostPort.slice(0, hostPort.indexOf(":")) : hostPort;
-    return host.length > 0;
-  }
-  // A wrapper such as `blob:`, `view-source:` or `jar:` carries another URL, which must be valid too.
-  return URL_SCHEME_PATTERN.test(rest) && !rest.startsWith("//") ? isHarUrl(rest) : rest.length > 0;
+  return parseUrl(value) !== null;
 }
 
 export function toHarUrl(value: string): HarUrl | null {
@@ -140,6 +113,7 @@ export const HAR_REDACTION_PLACES = [
   "request-url-query-secret",
   "request-url-query",
   "request-url-fragment",
+  "request-url-opaque",
   "header-name",
   "header-value-secret",
   "header-value-allowlisted",

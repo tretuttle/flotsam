@@ -86,7 +86,7 @@ describe("redactHar", () => {
 
     const first = redacted.log.entries[0]!;
     expect(first.request.url).toBe(
-      "https://%5BREDACTED%5D@api.example/oauth/token?access_token=%5BREDACTED%5D&page=2",
+      "https://api.example/oauth/token?access_token=%5BREDACTED%5D&page=2",
     );
     expect(first.request.queryString).toEqual([
       { name: "access_token", value: "[REDACTED]" },
@@ -245,9 +245,7 @@ describe("redactHar", () => {
 
     const singleStandard = redactHarEntry(built.log.entries[0]!, DEFAULT_REDACTION_RULES, 0);
     expect(singleStandard.touched).toBe(true);
-    expect(singleStandard.url).toBe(
-      "https://%5BREDACTED%5D@api.example/items?token=%5BREDACTED%5D&page=1",
-    );
+    expect(singleStandard.url).toBe("https://api.example/items?token=%5BREDACTED%5D&page=1");
     expect(singleStandard.covered).toEqual([
       "request-url-userinfo",
       "request-url-query-secret",
@@ -275,9 +273,7 @@ describe("redactHar", () => {
 
     const titleStandard = redactUrl("https://user:pw@app.example/callback?code=oauth123&state=ok");
     expect(titleStandard.touched).toBe(true);
-    expect(titleStandard.url).toBe(
-      "https://%5BREDACTED%5D@app.example/callback?code=%5BREDACTED%5D&state=ok",
-    );
+    expect(titleStandard.url).toBe("https://app.example/callback?code=%5BREDACTED%5D&state=ok");
 
     const titleShareable = redactUrl(
       "https://user:pw@app.example/callback?code=oauth123&state=ok#frag",

@@ -1,11 +1,11 @@
 import { OWNED_FIELDS, safeDecodeQueryComponent } from "./internal.ts";
+import { parseUrl, type UrlParts, type UrlSpan } from "./url-standard.ts";
 import {
   HAR_REDACTION_PLACES,
-  toHarUrl,
+  isHarUrl,
   toIsoDateTime,
   toPageId,
   type HarCache,
-  type HarCacheEntry,
   type HarContent,
   type HarCookie,
   type HarCreator,
@@ -67,6 +67,9 @@ export interface HarModelFieldSpec {
   readonly items?: HarValueKind | undefined;
   // Where the fields of this object, or of its array items, are listed when not under its own path.
   readonly children?: string | undefined;
+  // The object is one place, kept or removed whole, so its removal never leaves an object missing
+  // members HAR 1.2 requires.
+  readonly wholePlace?: true | undefined;
 }
 
 export type HarModelFieldRow<F extends HarModelField = HarModelField> = HarModelFieldSpec & {
@@ -177,7 +180,7 @@ export const HAR_PLACE_TABLE: {
     standard: "removed",
     shareable: "removed",
     label:
-      "the userinfo of every URL authority in request URLs and page titles, at any nesting depth, inside any wrapper scheme and in any percent-encoding",
+      "the username and password of request URLs, and of page titles that are a URL, as the URL Standard parses them, including the URL inside up to 3 blob:, view-source:, jar: or filesystem: wrappers",
     selectedBy: { target: "url-userinfo", byName: false },
   },
   "request-url-host": {
@@ -204,6 +207,13 @@ export const HAR_PLACE_TABLE: {
     standard: "kept-not-examined",
     shareable: "removed",
     label: "query parameter names and every other query value in request URLs",
+  },
+  "request-url-opaque": {
+    place: "request-url-opaque",
+    standard: "kept-not-examined",
+    shareable: "removed",
+    label:
+      "the content after the scheme of request URLs that have no host, such as data:, mailto:, about: and javascript: URLs, which becomes redacted when removed",
   },
   "request-url-fragment": {
     place: "request-url-fragment",
@@ -335,7 +345,8 @@ export const HAR_PLACE_TABLE: {
     place: "page-title",
     standard: "kept-not-examined",
     shareable: "removed",
-    label: "page titles",
+    label:
+      "page titles, which are text and not examined unless the whole title is a URL with no space or control character",
   },
   initiator: {
     place: "initiator",
@@ -353,7 +364,7 @@ export const HAR_PLACE_TABLE: {
     place: "cache",
     standard: "kept-not-examined",
     shareable: "removed",
-    label: "cache entry fields",
+    label: "cache entries in cache.beforeRequest and cache.afterRequest, kept or removed whole",
   },
   comment: {
     place: "comment",
@@ -397,7 +408,7 @@ export const HAR_PLACE_TABLE: {
     standard: "removed",
     shareable: "removed",
     label:
-      "values whose JSON type is not the one the HAR model gives their field, and request URLs that are not valid URLs once redacted",
+      "values whose JSON type is not the one the HAR model gives their field, and request URLs that are not URLs by the URL Standard, wrap more than 3 URLs, or are not URLs once redacted",
   },
 };
 
@@ -506,11 +517,16 @@ const HAR_MODEL_ROWS = {
   "entry.comment": { kinds: ["string"], places: ["comment"] },
   "entry._securityState": { kinds: ["string"], places: ["other-custom-field"] },
   "entry._priority": { kinds: ["string"], places: ["other-custom-field"] },
-  "entry._initiator": { kinds: ["object"], places: ["initiator"] },
+  "entry._initiator": { kinds: ["object"], places: ["initiator"], wholePlace: true },
   "entry._resourceType": { kinds: ["string"], places: ["other-custom-field"] },
   "entry._fromCache": { kinds: ["string"], places: ["other-custom-field"] },
   "entry._connectionId": { kinds: ["string"], places: ["other-custom-field"] },
-  "entry._webSocketMessages": { kinds: ["array"], places: ["websocket"], items: "object" },
+  "entry._webSocketMessages": {
+    kinds: ["array"],
+    places: ["websocket"],
+    items: "object",
+    wholePlace: true,
+  },
   "entry._harExport": { kinds: ["object"], places: [] },
   "entry.<custom>": { kinds: ["unknown"], places: ["other-custom-field"] },
   "entry._initiator.type": { kinds: ["string"], places: ["initiator"], whenRemoved: "" },
@@ -590,6 +606,7 @@ const HAR_MODEL_ROWS = {
       "request-url-query-secret",
       "request-url-query",
       "request-url-fragment",
+      "request-url-opaque",
     ],
     whenRemoved: "https://redacted.invalid/",
   },
@@ -693,8 +710,8 @@ const HAR_MODEL_ROWS = {
   "response.content.encoding": { kinds: ["string"], places: ["protocol-metadata"] },
   "response.content.comment": { kinds: ["string"], places: ["comment"] },
   "response.content.<custom>": { kinds: ["unknown"], places: ["other-custom-field"] },
-  "cache.beforeRequest": { kinds: ["object", "null"], places: [] },
-  "cache.afterRequest": { kinds: ["object", "null"], places: [] },
+  "cache.beforeRequest": { kinds: ["object", "null"], places: ["cache"], wholePlace: true },
+  "cache.afterRequest": { kinds: ["object", "null"], places: ["cache"], wholePlace: true },
   "cache.comment": { kinds: ["string"], places: ["comment"] },
   "cache.<custom>": { kinds: ["unknown"], places: ["other-custom-field"] },
   "cache.beforeRequest.expires": { kinds: ["string"], places: ["cache"] },
@@ -703,22 +720,22 @@ const HAR_MODEL_ROWS = {
   "cache.beforeRequest.eTag": { kinds: ["string"], places: ["cache"] },
   "cache.beforeRequest.hitCount": { kinds: ["number"], places: ["cache"] },
   "cache.beforeRequest.fetchCount": { kinds: ["string", "number"], places: ["cache"] },
-  "cache.beforeRequest.comment": { kinds: ["string"], places: ["comment"] },
+  "cache.beforeRequest.comment": { kinds: ["string"], places: ["cache"] },
   "cache.beforeRequest._dataSize": { kinds: ["string"], places: ["cache"] },
   "cache.beforeRequest._lastModified": { kinds: ["string"], places: ["cache"] },
   "cache.beforeRequest._device": { kinds: ["string"], places: ["cache"] },
-  "cache.beforeRequest.<custom>": { kinds: ["unknown"], places: ["other-custom-field"] },
+  "cache.beforeRequest.<custom>": { kinds: ["unknown"], places: ["cache"] },
   "cache.afterRequest.expires": { kinds: ["string"], places: ["cache"] },
   "cache.afterRequest.lastAccess": { kinds: ["string"], places: ["cache"] },
   "cache.afterRequest.lastFetched": { kinds: ["string"], places: ["cache"] },
   "cache.afterRequest.eTag": { kinds: ["string"], places: ["cache"] },
   "cache.afterRequest.hitCount": { kinds: ["number"], places: ["cache"] },
   "cache.afterRequest.fetchCount": { kinds: ["string", "number"], places: ["cache"] },
-  "cache.afterRequest.comment": { kinds: ["string"], places: ["comment"] },
+  "cache.afterRequest.comment": { kinds: ["string"], places: ["cache"] },
   "cache.afterRequest._dataSize": { kinds: ["string"], places: ["cache"] },
   "cache.afterRequest._lastModified": { kinds: ["string"], places: ["cache"] },
   "cache.afterRequest._device": { kinds: ["string"], places: ["cache"] },
-  "cache.afterRequest.<custom>": { kinds: ["unknown"], places: ["other-custom-field"] },
+  "cache.afterRequest.<custom>": { kinds: ["unknown"], places: ["cache"] },
   "timings.blocked": { kinds: ["number"], places: ["measurement"] },
   "timings.dns": { kinds: ["number"], places: ["measurement"] },
   "timings.connect": { kinds: ["number"], places: ["measurement"] },
@@ -1172,7 +1189,12 @@ function enforceKinds<T extends object>(
       : typeof value === "object" && value !== null && !shallow.has(key)
         ? enforceObject(value, row.children ?? field, ctx)
         : value;
-    if (next !== value) {
+    if (next !== value && row.wholePlace === true) {
+      // A whole place that held a value of the wrong type goes whole, so no object is left
+      // missing a member HAR 1.2 requires.
+      changes[key] = row.whenRemoved;
+      ctx.tracker.removedField(field, "wrong-type", ctx.levelRule("wrong-type"));
+    } else if (next !== value) {
       changes[key] = next;
     }
   }
@@ -1367,208 +1389,185 @@ function redactDeclaredCustomField(
   return value;
 }
 
-// Separators of an authority, raw or percent-encoded to any depth (`%3A`, `%253A`, ...).
-const COLON = "(?::|%(?:25)*3[Aa])";
-const SLASH = "(?:[/\\\\]|%(?:25)*(?:2[Ff]|5[Cc]))";
-const AT_SIGN = /@|%(?:25)*40/gu;
-const AUTHORITY_END = /[/\\?#\s"'<>]|%(?:25)*(?:2[Ff]|5[Cc]|3[Ff]|23)/u;
-const AUTHORITY_START = new RegExp(`[A-Za-z][A-Za-z0-9+.-]*${COLON}${SLASH}${SLASH}`, "gu");
+// A URL is what the WHATWG URL Standard parses as one; `parseUrl` applies its rules. These schemes
+// carry another URL after their colon, which is redacted the same way, up to MAX_WRAPPER_DEPTH deep.
+const URL_WRAPPERS: ReadonlySet<string> = new Set(["blob", "view-source", "jar", "filesystem"]);
+// What the removed content of a URL with no host becomes, so the URL keeps a non-empty path, which
+// the HAR 1.2 schema's `uri` format requires.
+const OPAQUE_PLACEHOLDER = "redacted";
+const MAX_WRAPPER_DEPTH = 3;
 
-// Removes the userinfo of every authority in `text`, whatever the scheme, the wrapper around it
-// (`blob:`, `view-source:`, `jar:`, or one nobody has named yet), the nesting depth, or the
-// encoding. It does not parse the outer URL, so a scheme it has never seen cannot hide one.
-function redactEveryUserinfo(
-  text: string,
-  ctx: RedactContext,
-  field: "request.url" | "log.pages[].title",
-  outerCounted: boolean,
-): string {
-  const replacement = encodeURIComponent(ctx.replacement);
-  const removed = ctx.isRemoved("request-url-userinfo");
-  const ruleId =
-    findMatchingRule(ctx.rules, "url-userinfo", "userinfo")?.id ??
-    ctx.levelRule("request-url-userinfo");
-  let out = "";
-  let cursor = 0;
-  for (const start of text.matchAll(AUTHORITY_START)) {
-    const authorityStart = start.index + start[0].length;
-    if (authorityStart < cursor || (outerCounted && start.index === 0)) {
-      continue;
-    }
-    const rest = text.slice(authorityStart);
-    const end = rest.search(AUTHORITY_END);
-    const authority = end === -1 ? rest : rest.slice(0, end);
-    const lastAt = [...authority.matchAll(AT_SIGN)].at(-1);
-    if (lastAt === undefined) {
-      continue;
-    }
-    const userinfo = authority.slice(0, lastAt.index);
-    if (userinfo === replacement || (userinfo.length === 0 && ctx.level === "shareable")) {
-      continue;
-    }
-    if (!removed) {
-      ctx.tracker.kept(field, "request-url-userinfo");
-      continue;
-    }
-    ctx.tracker.removed(field, "request-url-userinfo", ruleId);
-    out += text.slice(cursor, authorityStart);
-    out += ctx.level === "shareable" ? "" : `${replacement}${lastAt[0]}`;
-    cursor = authorityStart + lastAt.index + lastAt[0].length;
-  }
-  return out + text.slice(cursor);
+interface Cut {
+  readonly start: number;
+  readonly end: number;
+  readonly text: string;
 }
 
-function redactStructuredUrl(
-  raw: string,
+// The parts of the URL itself, or of the URL a wrapper carries, with indices into `value`.
+function innermostUrl(value: string): { readonly parts: UrlParts; readonly offset: number } | null {
+  let parts = parseUrl(value);
+  let offset = 0;
+  for (
+    let depth = 0;
+    parts !== null && parts.opaquePath && URL_WRAPPERS.has(parts.scheme);
+    depth += 1
+  ) {
+    if (depth === MAX_WRAPPER_DEPTH) {
+      return null;
+    }
+    const inner = parseUrl(value.slice(offset + parts.afterScheme));
+    if (inner === null) {
+      break;
+    }
+    offset += parts.afterScheme;
+    parts = inner;
+  }
+  return parts === null ? null : { parts, offset };
+}
+
+// Redacts a value that is a URL, cutting each removed part out of the original string so every
+// other byte stays as it was. Returns null when the value is not a URL by the URL Standard, or
+// wraps more than MAX_WRAPPER_DEPTH URLs.
+function redactUrlValue(
+  value: string,
   ctx: RedactContext,
   field: "request.url" | "log.pages[].title",
-): string {
+): string | null {
+  const found = innermostUrl(value);
+  if (found === null) {
+    return null;
+  }
+  const { parts, offset } = found;
   const isPage = field === "log.pages[].title";
-  const encodedReplacement = encodeURIComponent(ctx.replacement);
+  const cuts: Cut[] = [];
+  const span = (part: UrlSpan) => ({ start: offset + part.start, end: offset + part.end });
 
-  const hashIndex = raw.indexOf("#");
-  const beforeHash = hashIndex === -1 ? raw : raw.slice(0, hashIndex);
-  const fragment = hashIndex === -1 ? null : raw.slice(hashIndex + 1);
-
-  const queryIndex = beforeHash.indexOf("?");
-  const beforeQuery = queryIndex === -1 ? beforeHash : beforeHash.slice(0, queryIndex);
-  const query = queryIndex === -1 ? null : beforeHash.slice(queryIndex + 1);
-
-  let head = beforeQuery;
-  const authorityMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/?#]*)(.*)$/u.exec(beforeQuery);
-  if (authorityMatch) {
-    const schemePrefix = authorityMatch[1] ?? "";
-    const authority = authorityMatch[2] ?? "";
-    const pathPart = authorityMatch[3] ?? "";
-    const atIndex = authority.lastIndexOf("@");
-    const userinfo = atIndex === -1 ? null : authority.slice(0, atIndex);
-    let hostPort = atIndex === -1 ? authority : authority.slice(atIndex + 1);
-
-    let nextUserinfoPrefix = "";
-    if (userinfo !== null) {
-      if (ctx.isRemoved("request-url-userinfo")) {
-        const rule = findMatchingRule(ctx.rules, "url-userinfo", "userinfo");
-        ctx.tracker.removed(
-          field,
-          "request-url-userinfo",
-          rule?.id ?? ctx.levelRule("request-url-userinfo"),
-        );
-        nextUserinfoPrefix = ctx.level === "shareable" ? "" : `${encodedReplacement}@`;
-      } else {
-        ctx.tracker.kept(field, "request-url-userinfo");
-        nextUserinfoPrefix = `${userinfo}@`;
-      }
+  if (parts.credentials !== null) {
+    if (ctx.isRemoved("request-url-userinfo")) {
+      const rule = findMatchingRule(ctx.rules, "url-userinfo", "userinfo");
+      ctx.tracker.removed(
+        field,
+        "request-url-userinfo",
+        rule?.id ?? ctx.levelRule("request-url-userinfo"),
+      );
+      cuts.push({ ...span(parts.credentials), text: "" });
+    } else {
+      ctx.tracker.kept(field, "request-url-userinfo");
     }
-
-    if (!isPage) {
-      if (ctx.isRemoved("request-url-host")) {
-        ctx.tracker.removed("request.url", "request-url-host", ctx.levelRule("request-url-host"));
-        hostPort = "redacted.invalid";
-      } else {
-        ctx.tracker.kept("request.url", "request-url-host");
-      }
-    }
-
-    let nextPath = pathPart;
-    if (!isPage && pathPart.length > 0) {
-      if (ctx.isRemoved("request-url-path")) {
-        ctx.tracker.removed("request.url", "request-url-path", ctx.levelRule("request-url-path"));
-        nextPath = "/";
-      } else {
-        ctx.tracker.kept("request.url", "request-url-path");
-      }
-    }
-
-    head = `${schemePrefix}${nextUserinfoPrefix}${hostPort}${nextPath}`;
-  } else if (!isPage) {
-    // A URL with no `scheme://` at its start: the scheme is its host place, the rest its path.
-    const schemeEnd = /^[a-zA-Z][a-zA-Z0-9+.-]*:/u.exec(beforeQuery)?.[0].length ?? 0;
-    const parts = [
-      ["request-url-host", beforeQuery.slice(0, schemeEnd)],
-      ["request-url-path", beforeQuery.slice(schemeEnd)],
-    ] as const;
-    head = parts
-      .map(([place, part]) => {
-        if (part.length === 0) {
-          return part;
-        }
-        if (ctx.isRemoved(place)) {
-          ctx.tracker.removed("request.url", place, ctx.levelRule(place));
-          return "";
-        }
-        ctx.tracker.kept("request.url", place);
-        return part;
-      })
-      .join("");
   }
 
-  let nextQuery: string | null = null;
-  if (query !== null) {
-    const otherQueryRemoved = !isPage && ctx.isRemoved("request-url-query");
-    const keptSegments: string[] = [];
-    for (const segment of query.split("&")) {
-      const eqIndex = segment.indexOf("=");
-      const rawName = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
-      const secretRule =
-        segment.length > 0
-          ? findMatchingRule(ctx.rules, "query", safeDecodeQueryComponent(rawName))
-          : undefined;
-      if (secretRule) {
-        if (ctx.isRemoved("request-url-query-secret")) {
-          ctx.tracker.removed(field, "request-url-query-secret", secretRule.id);
-          if (!otherQueryRemoved) {
-            keptSegments.push(`${rawName}=${encodedReplacement}`);
-          }
-        } else {
-          ctx.tracker.kept(field, "request-url-query-secret");
-          keptSegments.push(segment);
-        }
-      } else if (otherQueryRemoved) {
-        if (segment.length > 0) {
-          ctx.tracker.removed(
-            "request.url",
-            "request-url-query",
-            ctx.levelRule("request-url-query"),
-          );
-        }
-      } else {
-        if (!isPage && segment.length > 0) {
-          ctx.tracker.kept("request.url", "request-url-query");
-        }
-        keptSegments.push(segment);
+  if (!isPage) {
+    if (ctx.isRemoved("request-url-host")) {
+      ctx.tracker.removed("request.url", "request-url-host", ctx.levelRule("request-url-host"));
+      if (parts.host !== null) {
+        cuts.push({ ...span(parts.host), text: "redacted.invalid" });
       }
+    } else {
+      ctx.tracker.kept("request.url", "request-url-host");
     }
-    nextQuery = otherQueryRemoved && keptSegments.length === 0 ? null : keptSegments.join("&");
+    const pathPlace = parts.opaquePath ? "request-url-opaque" : "request-url-path";
+    if (parts.path.end > parts.path.start) {
+      if (ctx.isRemoved(pathPlace)) {
+        ctx.tracker.removed("request.url", pathPlace, ctx.levelRule(pathPlace));
+        cuts.push({ ...span(parts.path), text: parts.opaquePath ? OPAQUE_PLACEHOLDER : "/" });
+      } else {
+        ctx.tracker.kept("request.url", pathPlace);
+      }
+    } else if (parts.opaquePath && ctx.isRemoved(pathPlace)) {
+      cuts.push({ ...span(parts.path), text: OPAQUE_PLACEHOLDER });
+    }
   }
 
-  let nextFragment: string | null = fragment;
-  if (fragment !== null && !isPage) {
+  if (parts.query !== null) {
+    const query = span(parts.query);
+    const text = value.slice(query.start + 1, query.end);
+    const next = redactQuery(text, ctx, field);
+    if (next === null) {
+      cuts.push({ ...query, text: "" });
+    } else if (next !== text) {
+      cuts.push({ ...query, text: `?${next}` });
+    }
+  }
+
+  if (parts.fragment !== null && !isPage) {
     if (ctx.isRemoved("request-url-fragment")) {
-      if (fragment.length > 0) {
-        ctx.tracker.removed(
-          "request.url",
-          "request-url-fragment",
-          ctx.levelRule("request-url-fragment"),
-        );
-      }
-      nextFragment = null;
-    } else if (fragment.length > 0) {
+      ctx.tracker.removed(
+        "request.url",
+        "request-url-fragment",
+        ctx.levelRule("request-url-fragment"),
+      );
+      cuts.push({ ...span(parts.fragment), text: "" });
+    } else {
       ctx.tracker.kept("request.url", "request-url-fragment");
     }
   }
 
-  const queryPart = nextQuery !== null ? `?${nextQuery}` : "";
-  const fragmentPart = nextFragment !== null ? `#${nextFragment}` : "";
-  return redactEveryUserinfo(
-    `${head}${queryPart}${fragmentPart}`,
-    ctx,
-    field,
-    authorityMatch !== null,
-  );
+  let out = "";
+  let cursor = 0;
+  for (const cut of cuts.sort((a, b) => a.start - b.start)) {
+    out += value.slice(cursor, cut.start) + cut.text;
+    cursor = cut.end;
+  }
+  return out + value.slice(cursor);
+}
+
+// Redacts the text after a query's `?`. Returns null when the whole query, `?` included, goes.
+function redactQuery(
+  query: string,
+  ctx: RedactContext,
+  field: "request.url" | "log.pages[].title",
+): string | null {
+  const isPage = field === "log.pages[].title";
+  const encodedReplacement = encodeURIComponent(ctx.replacement);
+  const otherQueryRemoved = !isPage && ctx.isRemoved("request-url-query");
+  const keptSegments: string[] = [];
+  for (const segment of query.split("&")) {
+    const eqIndex = segment.indexOf("=");
+    const rawName = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
+    const secretRule =
+      segment.length > 0
+        ? findMatchingRule(ctx.rules, "query", safeDecodeQueryComponent(rawName))
+        : undefined;
+    if (secretRule) {
+      if (ctx.isRemoved("request-url-query-secret")) {
+        ctx.tracker.removed(field, "request-url-query-secret", secretRule.id);
+        if (!otherQueryRemoved) {
+          keptSegments.push(`${rawName}=${encodedReplacement}`);
+        }
+      } else {
+        ctx.tracker.kept(field, "request-url-query-secret");
+        keptSegments.push(segment);
+      }
+    } else if (otherQueryRemoved) {
+      if (segment.length > 0) {
+        ctx.tracker.removed("request.url", "request-url-query", ctx.levelRule("request-url-query"));
+      }
+    } else {
+      if (!isPage && segment.length > 0) {
+        ctx.tracker.kept("request.url", "request-url-query");
+      }
+      keptSegments.push(segment);
+    }
+  }
+  return otherQueryRemoved ? null : keptSegments.join("&");
+}
+
+// A page title is examined as a URL only when the whole title is one, with no space or control
+// character anywhere. Any other title is text, which is not examined.
+function isUrlTitle(title: string): boolean {
+  for (let index = 0; index < title.length; index += 1) {
+    const code = title.charCodeAt(index);
+    if (code <= 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  return parseUrl(title) !== null;
 }
 
 function redactPageTitle(title: string, ctx: RedactContext): string {
-  const afterUrl = redactStructuredUrl(title, ctx, "log.pages[].title");
+  const afterUrl = isUrlTitle(title)
+    ? (redactUrlValue(title, ctx, "log.pages[].title") ?? title)
+    : title;
   if (ctx.isRemoved("page-title")) {
     ctx.tracker.removed("log.pages[].title", "page-title", ctx.levelRule("page-title"));
     return "";
@@ -1901,45 +1900,12 @@ function redactContent(content: HarContent, ctx: RedactContext): HarContent {
   return rebuild(content, changes);
 }
 
-const CACHE_ENTRY_KEYS = [
-  "expires",
-  "lastAccess",
-  "lastFetched",
-  "eTag",
-  "hitCount",
-  "fetchCount",
-  "_dataSize",
-  "_lastModified",
-  "_device",
-] as const;
-
-const CACHE_ENTRY_ALL_OWNED = new Set<string>([...OWNED_FIELDS.cacheEntry, ...CACHE_ENTRY_KEYS]);
-
-function redactCacheEntry(
-  entry: HarCacheEntry | null | undefined,
-  slot: "beforeRequest" | "afterRequest",
-  ctx: RedactContext,
-): HarCacheEntry | null | undefined {
-  if (entry === undefined || entry === null) {
-    return entry;
-  }
-  return rebuild(entry, {
-    ...redactSingleFields(
-      entry,
-      CACHE_ENTRY_KEYS.map((key) => `cache.${slot}.${key}` as const),
-      ctx,
-    ),
-    ...redactCustomFields(entry, CACHE_ENTRY_ALL_OWNED, `cache.${slot}.<custom>`, ctx),
-    comment: redactComment(entry.comment, `cache.${slot}.comment`, ctx),
-  });
-}
-
 function redactCache(cache: HarCache, ctx: RedactContext): HarCache {
   return rebuild(cache, {
     ...redactCustomFields(cache, OWNED_FIELDS.cache, "cache.<custom>", ctx),
     comment: redactComment(cache.comment, "cache.comment", ctx),
-    beforeRequest: redactCacheEntry(cache.beforeRequest, "beforeRequest", ctx),
-    afterRequest: redactCacheEntry(cache.afterRequest, "afterRequest", ctx),
+    beforeRequest: redactWholePlace(cache.beforeRequest, "cache.beforeRequest", ctx),
+    afterRequest: redactWholePlace(cache.afterRequest, "cache.afterRequest", ctx),
   });
 }
 
@@ -1961,13 +1927,17 @@ function redactTimings(timings: HarTimings, ctx: RedactContext): HarTimings {
   });
 }
 
-// The initiator and the WebSocket messages are each one place, removed or kept whole.
+type WholePlaceField = {
+  [F in HarModelField]: Rows[F] extends { readonly wholePlace: true } ? F : never;
+}[HarModelField];
+
+// A whole place (initiator, WebSocket messages, a cache entry) is kept or removed as one object.
 function redactWholePlace<T>(
   value: T | undefined,
-  field: "entry._initiator" | "entry._webSocketMessages",
-  place: "initiator" | "websocket",
+  field: WholePlaceField,
   ctx: RedactContext,
 ): T | undefined {
+  const place = HAR_MODEL_ROWS[field].places[0];
   const counts = new Map<HarModelField, number>();
   countValues(value, field, counts);
   const removed = ctx.isRemoved(place);
@@ -2041,10 +2011,10 @@ const ENTRY_CUSTOM_STRING_FIELDS = [
 
 const RESPONSE_DECLARED_CUSTOM = new Set<string>(["_error"]);
 
-// A URL that is no longer a valid HAR URL once its parts are removed is replaced, never put back.
+// A request URL that is not a URL, or is no longer one once redacted, is replaced, never put back.
 function redactRequestUrl(url: string, ctx: RedactContext): HarUrl {
-  const redacted = toHarUrl(redactStructuredUrl(url, ctx, "request.url"));
-  if (redacted !== null) {
+  const redacted = redactUrlValue(url, ctx, "request.url");
+  if (redacted !== null && isHarUrl(redacted)) {
     return redacted;
   }
   ctx.tracker.removed("request.url", "wrong-type", ctx.levelRule("wrong-type"));
@@ -2122,13 +2092,8 @@ function redactEntryWithContext(
     cache: redactCache(entry.cache, ctx),
     timings: redactTimings(entry.timings, ctx),
     comment: redactComment(entry.comment, "entry.comment", ctx),
-    _initiator: redactWholePlace(entry._initiator, "entry._initiator", "initiator", ctx),
-    _webSocketMessages: redactWholePlace(
-      entry._webSocketMessages,
-      "entry._webSocketMessages",
-      "websocket",
-      ctx,
-    ),
+    _initiator: redactWholePlace(entry._initiator, "entry._initiator", ctx),
+    _webSocketMessages: redactWholePlace(entry._webSocketMessages, "entry._webSocketMessages", ctx),
   };
   for (const [key, field] of ENTRY_CUSTOM_STRING_FIELDS) {
     if (entry[key] !== undefined) {
@@ -2215,7 +2180,7 @@ export function redactUrl(
 ): RedactUrlResult {
   const { level, rules, replacement, table } = normalizeOptions(optionsOrRules);
   const ctx = createContext(-1, level, rules, replacement, table);
-  const next = redactStructuredUrl(url, ctx, "request.url");
+  const next = redactRequestUrl(url, ctx);
   const records = ctx.tracker.records();
   return { url: next, touched: records.length > 0 || next !== url, records };
 }
