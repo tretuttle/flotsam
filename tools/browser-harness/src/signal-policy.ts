@@ -64,7 +64,8 @@ export function adoptSpawnedChild(spawned: {
 function commandLineHasPath(identity: ProcessIdentity, targetPath: string): boolean {
   if (identity.args.includes(targetPath)) return true;
   const escaped = targetPath.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  const boundary = new RegExp(`(?:^|[\\s\\0=])${escaped}(?:$|[\\s\\0])`, "u");
+  // Windows quotes a path that holds spaces, so a quote also bounds it.
+  const boundary = new RegExp(`(?:^|[\\s\\0="])${escaped}(?:$|[\\s\\0"])`, "u");
   return identity.args.some((arg) => boundary.test(arg)) || boundary.test(identity.commandLine);
 }
 

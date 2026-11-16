@@ -115,6 +115,28 @@ describe("orphan launch leases", () => {
     expect(NodeFS.existsSync(profileDir)).toBe(false);
   });
 
+  it.each([
+    { name: "a quoted profile path with a space", quoted: true, suffix: "", stopped: true },
+    {
+      name: "a path that only starts with the profile path",
+      quoted: false,
+      suffix: "-longer",
+      stopped: false,
+    },
+  ])("matches the profile path as a whole argument: $name", async (row) => {
+    const { tmpdir, leaseDir } = await leaseFixture();
+    const profileDir = NodePath.join(tmpdir, "Jane Doe", "one-click-har-browser-q");
+    await NodeFSP.mkdir(profileDir, { recursive: true });
+    await writeLease(leaseDir, "path", { spawnedPid: 5000, spawnedStartTime: "50000", profileDir });
+    const shown = row.quoted ? `"${profileDir}"` : `${profileDir}${row.suffix}`;
+    const commandLine = `zen.exe -profile ${shown}`;
+    const world = simulateProcesses([
+      { ...processIdentity(5000), args: commandLine.split(/\s+/u), commandLine },
+    ]);
+    await reapOrphanedLaunches(world.io, () => undefined, { tmpdir });
+    expect(world.sent).toEqual(row.stopped ? [{ rawTarget: -5000, signal: "SIGTERM", at: 0 }] : []);
+  });
+
   it("ignores leases naming PID 1, unparseable leases and old versions without touching them", async () => {
     const { tmpdir, profileDir, leaseDir } = await leaseFixture();
     const forged = await writeLease(leaseDir, "pid-1", {

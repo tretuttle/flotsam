@@ -67,6 +67,11 @@ jobs:
           grep -qx "Version=${ZEN_VERSION}" "${{ runner.temp }}/zen-browser/zen/application.ini"
           grep -qx "BuildID=${ZEN_BUILD_ID}" "${{ runner.temp }}/zen-browser/zen/application.ini"
 
+      # The *.namespace.test.ts suites need an unprivileged PID and user namespace and fail under CI
+      # without one. This runner's AppArmor default refuses it (write failed /proc/self/uid_map).
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Pack extension
         run: vp run @one-click-har/extension#pack
 
@@ -76,6 +81,12 @@ jobs:
         run: |
           XPI=$(echo apps/extension/dist/one-click-har-*.xpi)
           node tools/browser-harness/src/cli.ts check --binary "$GECKO_BINARY" --extension "$XPI" --short --out-dir browser-results
+
+      - name: Run real-signal suites against the pinned browser
+        working-directory: tools/browser-harness
+        env:
+          BROWSER_HARNESS_BINARY: ${{ runner.temp }}/zen-browser/zen/zen
+        run: vp test run --config ../../vite.config.ts --dir . src/namespace-isolation.test.ts
 
       - name: Upload browser check results
         if: always()

@@ -11,6 +11,10 @@ Rules for writing tests, and for asking for them in review.
 - Behavior changes in `packages/*` ship with focused tests for that behavior.
 - Proof for a bug fix depends on the bug. Logic, data, and state bugs get a failing test first, then the fix. Purely visual bugs get before/after captures as their proof and no test.
 
+## Tests that can send a signal
+
+A test that can reach a real signal lives in a `*.namespace.test.ts` file and runs only inside a fresh PID namespace; a refusal is tested on the pure decision with fixed data instead. [Browser harness](browser-harness.md#tests-that-can-send-a-signal) explains the check that enforces this.
+
 ## Real-browser checks
 
 - Real-browser checks live under `tools/browser-harness/checks/*.ts` and are found by file discovery. A new check is one file exporting a `HarnessCheck` whose `name` matches its filename, with no shared registry edit.
