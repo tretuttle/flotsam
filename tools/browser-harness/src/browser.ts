@@ -3,7 +3,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { createLaunchLease, reapOrphanedLaunches } from "./orphan-lease.ts";
+import { createLaunchLease, reapOrphanedLaunches, type ActiveLease } from "./orphan-lease.ts";
 import {
   currentPlatformName,
   killOwnedTree,
@@ -85,11 +85,22 @@ export type UntouchedBrowserSession = AsyncDisposable & {
 
 type LiveRootBase = "HOME" | "APPDATA" | "LOCALAPPDATA" | "XDG_CONFIG_HOME" | "XDG_CACHE_HOME";
 
+type BrowserCommand = {
+  readonly command: string;
+  readonly args: readonly string[];
+};
+
 type BrowserPlatform = {
   readonly path: NodePath.PlatformPath;
   readonly launcherArgs: readonly string[];
   // Where Zen and the Firefox family keep real profiles. A launch never touches these.
   readonly liveProfileRoots: readonly (readonly [LiveRootBase, ...string[]])[];
+  // Prevent abnormal exits from reaching the host crash handler when a platform supports it.
+  readonly wrapCoreLimit: (
+    binaryPath: string,
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+  ) => BrowserCommand;
 };
 
 const FIREFOX_FAMILY_FLATPAKS = [
@@ -99,6 +110,22 @@ const FIREFOX_FAMILY_FLATPAKS = [
   "one.ablaze.floorp",
   "net.waterfox.waterfox",
 ] as const;
+
+function findExecutable(name: string, pathEnv: string | undefined): string | null {
+  if (!pathEnv) return null;
+  for (const dir of pathEnv.split(NodePath.posix.delimiter)) {
+    if (!dir) continue;
+    const candidate = NodePath.posix.join(dir, name);
+    try {
+      if (!NodeFS.statSync(candidate).isFile()) continue;
+      NodeFS.accessSync(candidate, NodeFS.constants.X_OK);
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 
 export const BROWSER_PLATFORMS: Readonly<Record<ProcessPlatformName, BrowserPlatform>> = {
   win32: {
@@ -111,6 +138,8 @@ export const BROWSER_PLATFORMS: Readonly<Record<ProcessPlatformName, BrowserPlat
       [base, "Floorp"],
       [base, "Waterfox"],
     ]),
+    // Windows WER does not use POSIX RLIMIT_CORE; unobserved on Linux.
+    wrapCoreLimit: (command, args) => ({ command, args }),
   },
   linux: {
     path: NodePath.posix,
@@ -134,6 +163,12 @@ export const BROWSER_PLATFORMS: Readonly<Record<ProcessPlatformName, BrowserPlat
       ["HOME", "snap", "firefox"],
       ...FIREFOX_FAMILY_FLATPAKS.map((id) => ["HOME", ".var", "app", id] as const),
     ],
+    // `ulimit -c 0` still triggers systemd-coredump here; `1` byte skips the core pipe handler.
+    wrapCoreLimit: (binaryPath, args, env) => {
+      const prlimit = findExecutable("prlimit", env.PATH);
+      if (prlimit === null) return { command: binaryPath, args };
+      return { command: prlimit, args: ["--core=1:1", "--", binaryPath, ...args] };
+    },
   },
   darwin: {
     path: NodePath.posix,
@@ -143,6 +178,8 @@ export const BROWSER_PLATFORMS: Readonly<Record<ProcessPlatformName, BrowserPlat
         (name) => ["HOME", "Library", folder, name] as const,
       ),
     ),
+    // macOS has no prlimit and ReportCrash uses Mach exceptions; unobserved on Linux.
+    wrapCoreLimit: (command, args) => ({ command, args }),
   },
 };
 
@@ -263,9 +300,49 @@ type CommonLaunchRequest = {
   readonly display: BrowserDisplay;
   readonly profileDir?: string;
   readonly cache?: boolean;
+  readonly suppressCoreDumps?: boolean;
   readonly extraPrefs?: readonly Pref[];
   readonly signal: AbortSignal;
 };
+
+export function resolveBrowserSpawnCommand(
+  binaryPath: string,
+  args: readonly string[],
+  options: {
+    readonly platform?: ProcessPlatformName | undefined;
+    readonly suppressCoreDumps?: boolean | undefined;
+    readonly env?: NodeJS.ProcessEnv | undefined;
+  } = {},
+): BrowserCommand {
+  if (options.suppressCoreDumps === false) {
+    return { command: binaryPath, args };
+  }
+  const platform = options.platform ?? currentPlatformName();
+  return BROWSER_PLATFORMS[platform].wrapCoreLimit(binaryPath, args, options.env ?? process.env);
+}
+
+function spawnLeasedBrowser(
+  binaryPath: string,
+  args: readonly string[],
+  lease: ActiveLease,
+  options: {
+    readonly stdio: "ignore" | ["ignore", "ignore", "pipe"];
+    readonly env: NodeJS.ProcessEnv;
+    readonly suppressCoreDumps: boolean | undefined;
+  },
+) {
+  const launch = resolveBrowserSpawnCommand(binaryPath, args, {
+    suppressCoreDumps: options.suppressCoreDumps,
+    env: options.env,
+  });
+  const spawned = spawnOwned(launch.command, launch.args, {
+    stdio: options.stdio,
+    env: options.env,
+  });
+  const identity = readProcessIdentity(spawned.pid);
+  if (identity !== null) lease.setSpawnedProcess(spawned.pid, identity.startTime);
+  return { spawned, watcher: watchChildExit(spawned.child) };
+}
 
 const CACHE_ENABLED_PREFS: readonly Pref[] = [
   { name: "browser.cache.disk.enable", value: true },
@@ -315,13 +392,11 @@ export async function launchBrowser(
       ...(untouchedRequest.urls ?? []),
     ];
     // Never open a pipe when output is not consumed; avoids filling the pipe buffer under MOZ_LOG.
-    const spawned = spawnOwned(untouchedRequest.binaryPath, args, {
+    const { spawned, watcher } = spawnLeasedBrowser(untouchedRequest.binaryPath, args, lease, {
       stdio: "ignore",
       env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1", MOZ_DISABLE_AUTO_UPDATE: "1" },
+      suppressCoreDumps: untouchedRequest.suppressCoreDumps,
     });
-    const identity = readProcessIdentity(spawned.pid);
-    if (identity !== null) lease.setSpawnedProcess(spawned.pid, identity.startTime);
-    const watcher = watchChildExit(spawned.child);
     stack.defer(() => killOwnedTree(spawned.pid, []));
     const owned = stack.move();
     return {
@@ -368,13 +443,11 @@ export async function launchBrowser(
     MOZ_DISABLE_AUTO_UPDATE: "1",
     ...(remoteRequest.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
   };
-  const spawned = spawnOwned(remoteRequest.binaryPath, args, {
+  const { spawned, watcher } = spawnLeasedBrowser(remoteRequest.binaryPath, args, lease, {
     stdio: ["ignore", "ignore", "pipe"],
     env,
+    suppressCoreDumps: remoteRequest.suppressCoreDumps,
   });
-  const identity = readProcessIdentity(spawned.pid);
-  if (identity !== null) lease.setSpawnedProcess(spawned.pid, identity.startTime);
-  const watcher = watchChildExit(spawned.child);
   const exitedStatus = watcher.exited.then((result) => result.status);
   let browserPid: number | null = null;
   stack.defer(() => killOwnedTree(spawned.pid, browserPid === null ? [] : [browserPid]));

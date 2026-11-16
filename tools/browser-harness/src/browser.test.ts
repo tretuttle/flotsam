@@ -1,3 +1,4 @@
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
@@ -14,6 +15,7 @@ import {
   prepareProfile,
   readExtensionId,
   renderUserJs,
+  resolveBrowserSpawnCommand,
 } from "./browser.ts";
 import { leaseDirectory } from "./orphan-lease.ts";
 import {
@@ -511,6 +513,131 @@ describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
     }
     expect(pidAlive(hungPid)).toBe(false);
     void spawnedPid;
+  });
+
+  it("wraps Linux launches with prlimit --core=1:1 -- by default, suppresses coredumpctl on abort, and honors suppressCoreDumps: false", async () => {
+    const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-core-"));
+    directories.push(scratch);
+    const fakeBinDir = NodePath.join(scratch, "bin");
+    const fakePrlimit = NodePath.join(fakeBinDir, "prlimit");
+    const prlimitCallsFile = NodePath.join(scratch, "prlimit-calls");
+    await NodeFSP.mkdir(fakeBinDir, { recursive: true });
+    await NodeFSP.writeFile(
+      fakePrlimit,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${prlimitCallsFile}'\nif [ "$1" = "--core=1:1" ] && [ "$2" = "--" ]; then shift 2; fi\nexec "$@"\n`,
+      { mode: 0o755 },
+    );
+
+    expect(
+      resolveBrowserSpawnCommand("/opt/zen/zen", ["-headless"], {
+        platform: "linux",
+        env: { PATH: fakeBinDir },
+      }),
+    ).toEqual({
+      command: fakePrlimit,
+      args: ["--core=1:1", "--", "/opt/zen/zen", "-headless"],
+    });
+    expect(
+      resolveBrowserSpawnCommand("/opt/zen/zen", ["-headless"], {
+        platform: "linux",
+        suppressCoreDumps: false,
+        env: { PATH: fakeBinDir },
+      }),
+    ).toEqual({
+      command: "/opt/zen/zen",
+      args: ["-headless"],
+    });
+    expect(
+      resolveBrowserSpawnCommand("/opt/zen/zen", ["-headless"], {
+        platform: "linux",
+        env: { PATH: scratch },
+      }),
+    ).toEqual({
+      command: "/opt/zen/zen",
+      args: ["-headless"],
+    });
+    expect(
+      resolveBrowserSpawnCommand("/opt/zen/zen", ["-headless"], { platform: "darwin" }),
+    ).toEqual({ command: "/opt/zen/zen", args: ["-headless"] });
+    expect(
+      resolveBrowserSpawnCommand("C:\\zen\\zen.exe", ["-headless"], { platform: "win32" }),
+    ).toEqual({ command: "C:\\zen\\zen.exe", args: ["-headless"] });
+
+    if (currentPlatformName() === "linux") {
+      const pidFile = NodePath.join(scratch, "abort-pid");
+      const abortBin = NodePath.join(scratch, "abort-browser");
+      const abortScript = NodePath.join(scratch, "abort-browser.mjs");
+      await NodeFSP.writeFile(
+        abortScript,
+        `import * as fs from "node:fs";
+const limit = fs.readFileSync("/proc/self/limits", "utf8").split("\\n").find((l) => /core file/i.test(l)) ?? "";
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+console.error("LIMIT:" + limit);
+process.abort();
+`,
+        "utf8",
+      );
+      await NodeFSP.writeFile(
+        abortBin,
+        `#!/bin/sh\nexec '${process.execPath}' '${abortScript}' "$@"\n`,
+        { mode: 0o755 },
+      );
+      const beforeEpochSec = Math.floor(Date.now() / 1000) - 1;
+      await expect(
+        launchBrowser({
+          binaryPath: abortBin,
+          extensionPath: null,
+          display: "headless",
+          protocol: "marionette",
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow(/SIGABRT[\s\S]*LIMIT:Max core file size\s+1\s+1\s+bytes/);
+      const abortedPid = Number(await NodeFSP.readFile(pidFile, "utf8"));
+      expect(Number.isInteger(abortedPid) && abortedPid > 0).toBe(true);
+
+      const coredumpCheck = NodeChildProcess.spawnSync(
+        "coredumpctl",
+        ["list", "--since", `@${String(beforeEpochSec)}`, "--json=short", "--no-pager"],
+        { encoding: "utf8" },
+      );
+      if (coredumpCheck.error === undefined && coredumpCheck.status === 0) {
+        const entries = JSON.parse(coredumpCheck.stdout) as readonly { readonly pid?: number }[];
+        expect(entries.some((entry) => entry.pid === abortedPid)).toBe(false);
+      }
+    }
+
+    const probeBin = NodePath.join(scratch, "probe-browser");
+    await NodeFSP.writeFile(probeBin, "#!/bin/sh\nexit 3\n", { mode: 0o755 });
+    const previousEnv = { PATH: process.env.PATH };
+    process.env.PATH = `${fakeBinDir}:${previousEnv.PATH ?? ""}`;
+    try {
+      await expect(
+        launchBrowser({
+          binaryPath: probeBin,
+          extensionPath: null,
+          display: "headless",
+          protocol: "marionette",
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow(/code 3/);
+      await expect(
+        launchBrowser({
+          binaryPath: probeBin,
+          extensionPath: null,
+          display: "headless",
+          protocol: "marionette",
+          suppressCoreDumps: false,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow(/code 3/);
+    } finally {
+      restoreEnv(previousEnv);
+    }
+    const calls = (await NodeFSP.readFile(prlimitCallsFile, "utf8")).trim().split("\n");
+    if (currentPlatformName() === "linux") {
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toContain(`--core=1:1 -- ${probeBin}`);
+    }
   });
 });
 
