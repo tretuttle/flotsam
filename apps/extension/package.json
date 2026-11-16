@@ -7,6 +7,7 @@
     "build": "node scripts/write-icons.ts && extension build --browser firefox --no-addon-lint --no-telemetry && node scripts/build-experiment.ts dist/firefox",
     "check:xpi": "node scripts/check-xpi.ts",
     "pack": "vp run build && node scripts/pack.ts && node scripts/check-xpi.ts",
+    "screenshot:toolbar": "node scripts/screenshot-toolbar.ts",
     "test": "vp test run --config ../../vite.config.ts --dir .",
     "typecheck": "effect-tsgo tsrs --noEmit && effect-tsgo tsrs --noEmit -p experiment",
     "verify:zen": "node scripts/verify-zen.ts"
