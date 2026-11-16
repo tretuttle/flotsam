@@ -1,0 +1,76 @@
+name: Browser
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ZEN_VERSION: "1.25t"
+  ZEN_BUILD_ID: "20261115114312"
+  ZEN_TAG: "twilight-1"
+  ZEN_SHA256: "5316e7d6edab0391c80ee90f673f20f4e3ee3418cd4228ce375cbcebd9a6620a"
+
+jobs:
+  browser:
+    name: Browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version: "26"
+          cache: true
+          run-install: true
+
+      - name: Cache Zen Twilight
+        id: cache-zen
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/zen-twilight
+          key: zen-twilight-linux-x64-${{ env.ZEN_VERSION }}-${{ env.ZEN_BUILD_ID }}-${{ env.ZEN_SHA256 }}
+
+      - name: Download and verify Zen Twilight
+        if: steps.cache-zen.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "${{ runner.temp }}/zen-twilight"
+          curl -fsSL -o "${{ runner.temp }}/zen.tar.xz" "https://github.com/zen-browser/desktop/releases/download/${ZEN_TAG}/zen.linux-x86_64.tar.xz"
+          echo "${ZEN_SHA256}  ${{ runner.temp }}/zen.tar.xz" | sha256sum -c -
+          tar -xf "${{ runner.temp }}/zen.tar.xz" -C "${{ runner.temp }}/zen-twilight"
+          rm -f "${{ runner.temp }}/zen.tar.xz"
+
+      - name: Verify cached Zen Twilight
+        run: |
+          grep -q "^Version=${ZEN_VERSION}$" "${{ runner.temp }}/zen-twilight/zen/application.ini"
+          grep -q "^BuildID=${ZEN_BUILD_ID}$" "${{ runner.temp }}/zen-twilight/zen/application.ini"
+
+      - name: Pack extension
+        run: vp run @one-click-har/extension#pack
+
+      - name: Run discovered browser checks
+        env:
+          GECKO_BINARY: ${{ runner.temp }}/zen-twilight/zen/zen
+        run: |
+          XPI=$(echo apps/extension/dist/one-click-har-*.xpi)
+          node tools/browser-harness/src/cli.ts check --binary "$GECKO_BINARY" --extension "$XPI" --short --out-dir browser-results
+
+      - name: Upload browser check results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-check-results
+          path: browser-results/
+          if-no-files-found: warn
