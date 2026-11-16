@@ -2,16 +2,24 @@
 
 The rule: everything in the packed XPI is production build output. No source, no source maps, no development builds, nothing unminified. `pack` and CI run `apps/extension/scripts/check-xpi.ts` on the archive, and it fails naming the file and the rule.
 
-The check answers one question: is every shipped file what the build's own minifier writes, with no source file or source map beside it? Its oracle is the minifier itself. It runs the shared minifier again on every script and stylesheet, including those a page carries inline, and fails a file that comes back smaller by more than a measured margin. Everything else it does finds source maps and source files by their structure, or fails closed on what it cannot read.
+The check answers one question: is every shipped file what the build step that wrote it writes, with no source file or source map beside it? Its oracle is that step. It runs the step again on every script and stylesheet, including those a page or vector carries inline, and fails a file that comes back smaller by more than a measured margin. Everything else it does finds source maps and source files by their structure, or fails closed on what it cannot read.
 
-## One minifier per kind of file, shared by the build and the check
+## One table of build steps, shared by the build and the check
 
-`scripts/minify.ts` owns the minifiers and their options. `extension.config.js` installs them in the rspack page build, `build-experiment.ts` runs the same SWC function on the parent script after rolldown bundles it, and the check runs them again. `PRODUCERS` in `xpi-rules.ts` maps each kind of shipped file to the build step that writes it and the minifier it must survive.
+`MINIFIED` in `scripts/minify.ts` maps each kind of minified file to the step that writes it and that step's options, comment handling included. `extension.config.js` and `build-experiment.ts` build with its entries, and the check runs the same entry again on each packed file:
 
-A file is minified when that minifier, run again, saves at most a small absolute margin. The margins are measured, not chosen:
+- **Page scripts**, every `.js` but the parent: rspack's `SwcJsMinimizerRspackPlugin`. It moves legal comments, by rspack's own condition, into `<chunk>.LICENSE.txt`, leaves a `/*! LICENSE: <chunk>.LICENSE.txt */` pointer, and drops every other comment.
+- **The parent script**, where the manifest's `experiment_apis` names it: `build-experiment.ts` runs SWC with the same options after rolldown bundles it, and drops every comment, legal ones too.
+- **Stylesheets**: lightningcss, run until a pass changes nothing. `toolbar-icon.ts` writes the toolbar icon's `<style>` with this step too.
 
-- **Scripts, 16 bytes.** SWC with `compress.passes: 0` runs until a pass changes nothing. A second run then saves 0 bytes on every packed script and 1 on `shared/framework.js`. On the 24 libraries `minify.test.ts` builds through both script build paths, the most it saves is vue's: 7 bytes through the page build and 8 through the parent build. With rspack's default of 2 passes it left 509 bytes on zod and 468 on vue, which is why both build paths now use `passes: 0`. The parent script moved from the Oxc minifier to SWC for the same reason: re-minifying one minifier's output with another fails honest code.
-- **Stylesheets, 0 bytes.** lightningcss reaches a fixed point in one run: 0 bytes on both packed sheets and on real 13 KB and 90 KB sheets. The style minimizer passes no browser targets, because every browser this ships to is a current Gecko.
+The build writes no inline script or style attribute, so the check judges one like the parent script or a stylesheet.
+
+The comment option has to be the writing step's own. Re-minifying every script with legal comments kept passed a page script that kept a 1,142 byte legal comment holding a readable function, because a second run saves 0. Dropping every comment failed the page build's own 36 byte pointer. Re-running each file's own step does neither: a kept legal comment saves its length, less the pointer the page step writes in its place.
+
+A file is minified when its step, run again, saves at most a small absolute margin. The margins are measured, not chosen:
+
+- **Scripts, 16 bytes.** SWC with `compress.passes: 0` runs until a pass changes nothing. A second run then saves 0 bytes on every packed script and 1 on `shared/framework.js`. On the 25 libraries `minify.test.ts` builds through both script build paths, the most it saves is vue's: 6 bytes through the page build and 8 through the parent build. With rspack's default of 2 passes it left 509 bytes on zod and 468 on vue, which is why both build paths now use `passes: 0`.
+- **Stylesheets, 0 bytes.** One lightningcss run is not always a fixed point. Of the 58 sheets those libraries ship, a second run changes 4 of Bootstrap 5.3.8's and shortens `bootstrap.css` by 1 byte, so one run would fail that honest sheet by 1 byte. Every sheet settles by the second run, so the step runs until a pass changes nothing, and a second run of its output saves 0. A sheet that still changes after 8 runs fails the build, and `cannot-judge` in the check. The step passes no browser targets, because every browser this ships to is a current Gecko.
 
 A margin is the most readable code that can hide in a file. With 16 bytes, no readable function or arrow function fits on any packed script, two spaced statements (52 bytes) do, and nothing fits on a stylesheet. A version bump that moves a residual past its margin fails `minify.test.ts` first: re-measure and change the margin with the numbers.
 
@@ -31,9 +39,11 @@ The crash path stays as the backstop for what the limit does not cover. `xpi-jud
 
 ## What the check does not judge
 
-**String contents and the comments the minifier keeps.** The minifier treats a string as data and writes its contents back unchanged. So "did the build minify this?" has no answer for a string, and minifying cannot make it smaller, which is the performance reason for the rule. Four rounds of rules that guessed which strings hold source each failed a published library: ejs, handlebars and djv ship their own runtime source as strings to compile at run time. The same holds for comments the minifier keeps. The page build's `SwcJsMinimizerRspackPlugin` with `extractComments: true` (`pageMinimizers` in `minify.ts`) moves legal comments into `<chunk>.LICENSE.txt` and leaves a `/*! LICENSE: ... */` pointer. The parent's `minifyScript` drops every comment. The check's `reminifyScript` keeps legal comments (`format.comments: "some"`), so a kept legal comment saves nothing, and a `.LICENSE.txt` is not read for code. Any other comment in a script is something the minifier removes, so it counts toward the margin like whitespace.
+**String contents and the text of a license notice.** The minifier treats a string as data and writes its contents back unchanged. So "did the build minify this?" has no answer for a string, and minifying cannot make it smaller, which is the performance reason for the rule. Four rounds of rules that guessed which strings hold source each failed a published library: ejs, handlebars and djv ship their own runtime source as strings to compile at run time. A `.LICENSE.txt` is the comments the page step moved out of a chunk; the browser does not run it, and it is searched only for a source map.
 
-So readable source inside a string, a legal comment or a license notice passes. No build mistake writes it there: a skipped minify leaves whitespace, names and ordinary comments in the code, and those fail. Putting it there is concealment, not a build mistake. The same holds for a source map split across two files, base64-encoded in a string, or inside a CSS string.
+So readable source inside a string or a license notice passes. No build mistake writes it there: a skipped minify leaves whitespace, names and comments in the code, and those fail. Putting it there is concealment, not a build mistake. The same holds for a source map split across two files, base64-encoded in a string, or inside a CSS string.
+
+**A kept comment no longer than the margin.** The check compares lengths. A comment of up to 16 bytes passes on any script, and a page chunk without a pointer may keep a legal comment up to the length of the pointer it would have had, plus 16 bytes: 54 bytes for `vendor.js`, whose pointer line is 38.
 
 A stylesheet whose rules are joined by U+2028, with nothing else to remove, passes, correctly. CSS reads U+2028 as part of a name, so lightningcss writes those bytes back unchanged, and that is what the build writes for any source holding the character. A sheet that skipped the minifier keeps spaces, line breaks or comments, which fail, and layout written with U+2028 does not parse.
 
