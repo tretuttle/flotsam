@@ -1,8 +1,8 @@
-# HAR Anytime
+# One-Click HAR
 
-HAR Anytime is a Zen and Firefox extension that always exports a HAR. It exports from two sources: DevTools' own capture when a toolbox is open, and an always-on, low-cost background recording when DevTools was not open. It runs on Gecko browsers that do not force add-on signing: Zen, Firefox Nightly, Firefox Developer Edition, and unbranded builds. Stored data is readable only by the user's own Windows account and by system-principal code.
+One-Click HAR is a Zen and Firefox extension that saves a complete HAR of any tab in one click. No DevTools needed, and it includes what already happened. An export must always succeed. DevTools capture and an always-on background recording make one export. It runs on Gecko browsers that do not force add-on signing: Zen, Firefox Nightly, Firefox Developer Edition, and unbranded builds. Stored data is readable only by the user's own Windows account and by system-principal code. Code identifiers use `har-anytime` until a rename sweep.
 
-Trent (`tretuttle`) maintains it and decides stack questions. The repository setup follows T3 Code (`pingdotgg/t3code`) and `parkpal-monorepo`; copy their patterns when structure is unclear.
+Trent (`tretuttle`) maintains it. Follow T3 Code (`pingdotgg/t3code`) and `parkpal-monorepo` when structure is unclear.
 
 ## Security boundaries
 
@@ -11,7 +11,7 @@ Use these words exactly. The [Glossary](docs/internals/glossary.md) defines each
 - **Parent process and content processes.** Gecko runs browser chrome and privileged code in the parent process and web pages in content processes. Recording and storage happen in the parent process.
 - **System principal.** The experiment API parent script runs with the system principal in the parent process. Only the extension that declares the experiment API can call it. It is the only code that reads or writes stored captures.
 - **`moz-extension` principal.** Extension pages and the background script run with the `moz-extension` principal. They reach stored data only through the experiment API.
-- **Content principal.** Web pages run with a content principal in a content process. Nothing HAR Anytime stores or exposes is reachable from a content principal.
+- **Content principal.** Web pages run with a content principal in a content process. Nothing One-Click HAR stores or exposes is reachable from a content principal.
 
 A change that moves data or code across one of these boundaries says so in its pull request.
 
@@ -59,7 +59,7 @@ Do not rely on tool memory. Put durable state in one of these:
 
 ## Documentation
 
-Most code changes do not need a documentation change. Agents can read the code.
+Most code changes do not need a documentation change.
 
 - `docs/internals/` is for architectural decisions and their reasons, constraints that span components, and traps that are hard to discover from the source. Before adding a paragraph, ask what a maintainer would get wrong without it.
 - Do not document every feature, enumerate fields or methods, narrate control flow, or append PR summaries.

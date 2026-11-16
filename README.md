@@ -1,6 +1,6 @@
-# HAR Anytime
+# One-Click HAR
 
-A Zen and Firefox extension that always exports your HAR. It works when DevTools' own export fails or comes out empty, and when DevTools was never open.
+A Zen and Firefox extension that saves a complete HAR of any tab in one click. No DevTools needed, and it includes what already happened.
 
 ## Status
 

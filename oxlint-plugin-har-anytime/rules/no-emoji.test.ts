@@ -13,7 +13,7 @@ describe("har-anytime/no-emoji", () => {
 
   rule.valid(
     "allows copyright, registered, and trademark symbols",
-    `const legal = "© 2026 HAR Anytime ${EM_DASH} ® and ™ are typography, not emoji";`,
+    `const legal = "© 2026 One-Click HAR ${EM_DASH} ® and ™ are typography, not emoji";`,
   );
 
   rule.valid("allows non-emoji arrow U+2192", 'const arrow = "Click Export → then Save";');

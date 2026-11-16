@@ -18,7 +18,7 @@ describe("har-anytime/no-low-value-comments", () => {
   rule.valid(
     "allows license headers over four lines",
     `/*
- * Copyright (c) 2026 HAR Anytime
+ * Copyright (c) 2026 One-Click HAR
  * Line 2
  * Line 3
  * Line 4
