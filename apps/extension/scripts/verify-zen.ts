@@ -75,7 +75,7 @@ const callWith = (marionette: Marionette, argumentList: string | null) =>
     "content",
     `const done = arguments[arguments.length - 1];
      const arguments_ = ${argumentList === null ? "browser.tabs.query({ active: true, currentWindow: true }).then(([active]) => [active.id])" : `Promise.resolve([${argumentList}])`};
-     arguments_.then((list) => browser.harAnytime.getEnvironment(...list))
+     arguments_.then((list) => browser.oneClickHar.getEnvironment(...list))
        .then((environment) => done(JSON.parse(JSON.stringify(environment))), (error) => done({ error: String(error) }));`,
   );
 
@@ -83,7 +83,7 @@ const callWith = (marionette: Marionette, argumentList: string | null) =>
 const getEnvironment = (marionette: Marionette, tabId: number | null = null) =>
   callWith(marionette, tabId === null ? null : String(tabId));
 
-const SCHEMA_REFUSAL = "Incorrect argument types for harAnytime.getEnvironment.";
+const SCHEMA_REFUSAL = "Incorrect argument types for oneClickHar.getEnvironment.";
 
 // Gecko validates arguments against schema.json and refuses these before the parent script runs, so none of them
 // can reach a tab lookup. Each entry is the source text of the argument list.

@@ -1,6 +1,6 @@
 # One-Click HAR
 
-One-Click HAR is a Zen and Firefox extension that saves a complete HAR of any tab in one click. No DevTools needed, and it includes what already happened. An export must always succeed. DevTools capture and an always-on background recording make one export. It runs on Gecko browsers that do not force add-on signing: Zen, Firefox Nightly, Firefox Developer Edition, and unbranded builds. Stored data is readable only by the user's own Windows account and by system-principal code. Code identifiers use `har-anytime` until a rename sweep.
+One-Click HAR is a Zen and Firefox extension that saves a complete HAR of any tab in one click. No DevTools needed, and it includes what already happened. An export must always succeed. DevTools capture and an always-on background recording make one export. It runs on Gecko browsers that do not force add-on signing: Zen, Firefox Nightly, Firefox Developer Edition, and unbranded builds. Stored data is readable only by the user's own Windows account and by system-principal code.
 
 Trent (`tretuttle`) maintains it. Follow T3 Code (`pingdotgg/t3code`) and `parkpal-monorepo` when structure is unclear.
 
@@ -22,7 +22,7 @@ Decided, and changed only by the maintainer:
 - One pnpm monorepo. Node and pnpm are pinned in `package.json` (`engines`, `packageManager`) and `mise.toml`.
 - `apps/extension` is the browser extension, built with extension.js. It declares the experiment API and ships its parent script.
 - `packages/*` holds pure domain logic shared by the extension and the experiment API parent script, such as capture policy and HAR serialization. No browser globals and no barrel files; export subpaths.
-- `oxlint-plugin-har-anytime` holds the custom lint rules and their tests. `scripts` holds repository checks.
+- `oxlint-plugin-one-click-har` holds the custom lint rules and their tests. `scripts` holds repository checks.
 
 ## Repository rules
 
@@ -30,7 +30,7 @@ Decided, and changed only by the maintainer:
 - Work on a branch or worktree off `main`. Open no drafts and leave nothing unpushed.
 - Do not commit plans, research notes, scratch files, or captured browser data.
 - `.audit/` holds decision trails. Add rows; do not rewrite or delete existing ones.
-- No emoji or em dashes in product copy. `har-anytime/no-emoji` and `har-anytime/no-em-dash-copy` enforce it in app and package source.
+- No emoji or em dashes in product copy. `one-click-har/no-emoji` and `one-click-har/no-em-dash-copy` enforce it in app and package source.
 - Every tool runs through a package script or `pnpm exec`. Do not assume a global `vp`.
 - Never change global configuration (mise, npm, git) or switch package managers to get past an error. Language runtimes stay in `mise.toml`.
 
@@ -52,10 +52,10 @@ Never rely on tool memory; put durable state in:
 - One piece at a time: `pnpm run lint`, `pnpm run typecheck`, `pnpm run knip:check`, or `pnpm exec vp test run <files>`.
 - `typecheck` runs `effect-tsgo tsrs --noEmit` per package, the native TypeScript 7 checker. There is no `typescript` package to run.
 - Test rules are in [Testing](docs/internals/testing.md).
-- Lint suppressions and `@ts-expect-error` need a reason: end the directive with `-- reason` or put a comment on the line above. `har-anytime/require-suppression-reason` enforces it, and unused suppressions are errors.
-- `har-anytime/no-low-value-comments` caps a comment at four lines and rejects ones that restate the code.
-- `har-anytime/no-unreasoned-state-sync` reports every React effect; one that stays states its reason with `// oxlint-disable-next-line har-anytime/no-unreasoned-state-sync -- <why>`.
-- `har-anytime/namespace-node-imports` requires `import * as NodeFS from "node:fs"` style imports for Node built-ins.
+- Lint suppressions and `@ts-expect-error` need a reason: end the directive with `-- reason` or put a comment on the line above. `one-click-har/require-suppression-reason` enforces it, and unused suppressions are errors.
+- `one-click-har/no-low-value-comments` caps a comment at four lines and rejects ones that restate the code.
+- `one-click-har/no-unreasoned-state-sync` reports every React effect; one that stays states its reason with `// oxlint-disable-next-line one-click-har/no-unreasoned-state-sync -- <why>`.
+- `one-click-har/namespace-node-imports` requires `import * as NodeFS from "node:fs"` style imports for Node built-ins.
 
 ## Documentation
 

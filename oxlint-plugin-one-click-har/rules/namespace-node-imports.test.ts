@@ -2,9 +2,9 @@ import { assert, describe } from "@effect/vitest";
 
 import { createOxlintRuleHarness } from "../test/utils.ts";
 
-const rule = createOxlintRuleHarness("har-anytime/namespace-node-imports");
+const rule = createOxlintRuleHarness("one-click-har/namespace-node-imports");
 
-describe("har-anytime/namespace-node-imports", () => {
+describe("one-click-har/namespace-node-imports", () => {
   rule.valid(
     "allows canonical Node namespaces",
     `

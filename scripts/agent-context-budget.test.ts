@@ -65,7 +65,7 @@ function createCleanEnv(
 
 function createFixtureRepo(options: { withOriginMain?: boolean } = {}): FixtureRepo {
   const root = NodeFS.realpathSync(
-    NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "har-anytime-budget-test-")),
+    NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-budget-test-")),
   );
   tempRoots.push(root);
 

@@ -11,7 +11,7 @@ type Reading =
   | { readonly kind: "failed"; readonly message: string };
 
 const readEnvironment = async (): Promise<Reading> => {
-  const api = browser.harAnytime;
+  const api = browser.oneClickHar;
   if (api === undefined) return { kind: "api-missing" };
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });

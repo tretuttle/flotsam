@@ -1,7 +1,7 @@
 import { asyncFunction, integer, returns, type ApiFunctions } from "./gecko-schema.ts";
 
-/** The experiment namespace: `browser.harAnytime` in extension pages, `experiment_apis.harAnytime` in the manifest. */
-export const namespace = "harAnytime";
+/** The experiment namespace: `browser.oneClickHar` in extension pages, `experiment_apis.oneClickHar` in the manifest. */
+export const namespace = "oneClickHar";
 
 export type ToolboxState =
   | { readonly open: true; readonly host: string }
@@ -19,8 +19,8 @@ export interface Environment {
   readonly toolbox: ToolboxState;
 }
 
-export const harAnytimeApi = {
+export const oneClickHarApi = {
   getEnvironment: asyncFunction([integer("tabId", { minimum: 0 })], returns<Environment>()),
 };
 
-export type HarAnytimeApi = ApiFunctions<typeof harAnytimeApi>;
+export type OneClickHarApi = ApiFunctions<typeof oneClickHarApi>;

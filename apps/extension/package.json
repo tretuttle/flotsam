@@ -1,5 +1,5 @@
 {
-  "name": "@har-anytime/extension",
+  "name": "@one-click-har/extension",
   "private": true,
   "type": "module",
   "scripts": {

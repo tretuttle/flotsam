@@ -2,9 +2,9 @@ import { assert, describe } from "@effect/vitest";
 
 import { createOxlintRuleHarness } from "../test/utils.ts";
 
-const rule = createOxlintRuleHarness("har-anytime/no-low-value-comments");
+const rule = createOxlintRuleHarness("one-click-har/no-low-value-comments");
 
-describe("har-anytime/no-low-value-comments", () => {
+describe("one-click-har/no-low-value-comments", () => {
   rule.valid(
     "allows concise why-comments and external issue references",
     `

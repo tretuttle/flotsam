@@ -1,14 +1,14 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { describe, expect, expectTypeOf, it } from "vite-plus/test";
-import { harAnytimeApi, namespace, type Environment, type HarAnytimeApi } from "./contract.ts";
+import { oneClickHarApi, namespace, type Environment, type OneClickHarApi } from "./contract.ts";
 import { toGeckoSchema } from "./gecko-schema.ts";
 
-describe("harAnytime contract", () => {
+describe("oneClickHar contract", () => {
   it("generates the schema.json Gecko loads: async functions, validated parameters, no return schema", () => {
-    expect(toGeckoSchema(namespace, harAnytimeApi)).toEqual([
+    expect(toGeckoSchema(namespace, oneClickHarApi)).toEqual([
       {
-        namespace: "harAnytime",
+        namespace: "oneClickHar",
         functions: [
           {
             name: "getEnvironment",
@@ -22,8 +22,8 @@ describe("harAnytime contract", () => {
   });
 
   it("types exactly the functions in the table, for callers and for the parent script", () => {
-    expectTypeOf<keyof HarAnytimeApi>().toEqualTypeOf<"getEnvironment">();
-    expectTypeOf<HarAnytimeApi["getEnvironment"]>().toEqualTypeOf<
+    expectTypeOf<keyof OneClickHarApi>().toEqualTypeOf<"getEnvironment">();
+    expectTypeOf<OneClickHarApi["getEnvironment"]>().toEqualTypeOf<
       (tabId: number) => Promise<Environment>
     >();
   });

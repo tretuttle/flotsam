@@ -5,7 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { zipSync } from "fflate";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
-import { harAnytimeApi, namespace } from "../experiment/contract.ts";
+import { oneClickHarApi, namespace } from "../experiment/contract.ts";
 import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { bundleParent } from "./build-experiment.ts";
 import { extensionRoot } from "./manifest.ts";
@@ -68,7 +68,7 @@ beforeAll(async () => {
   cleanFiles = {
     "manifest.json": NodeFS.readFileSync(NodePath.join(extensionRoot, "src", "manifest.json")),
     "experiment/schema.json": encode(
-      `${JSON.stringify(toGeckoSchema(namespace, harAnytimeApi), null, 2)}\n`,
+      `${JSON.stringify(toGeckoSchema(namespace, oneClickHarApi), null, 2)}\n`,
     ),
     "action/index.html": encode(REAL_PAGE),
     "action/index.js": encode(minifiedParent),

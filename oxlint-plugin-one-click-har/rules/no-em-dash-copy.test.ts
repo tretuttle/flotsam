@@ -2,11 +2,11 @@ import { describe } from "@effect/vitest";
 
 import { createOxlintRuleHarness } from "../test/utils.ts";
 
-const rule = createOxlintRuleHarness("har-anytime/no-em-dash-copy", {
+const rule = createOxlintRuleHarness("one-click-har/no-em-dash-copy", {
   filename: "apps/extension/src/components/Example.tsx",
 });
 
-describe("har-anytime/no-em-dash-copy", () => {
+describe("one-click-har/no-em-dash-copy", () => {
   rule.valid(
     "allows em dashes in comments and regex literals",
     `

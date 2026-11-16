@@ -1,4 +1,4 @@
-import { namespace, type Environment, type HarAnytimeApi, type ToolboxState } from "./contract.ts";
+import { namespace, type Environment, type OneClickHarApi, type ToolboxState } from "./contract.ts";
 
 const nativeTab = (context: ExtensionContext, tabId: number): NativeTab | undefined => {
   try {
@@ -26,7 +26,7 @@ const toolboxState = (context: ExtensionContext, tabId: number): ToolboxState =>
     : { open: true, host: toolbox.hostType };
 };
 
-class HarAnytimeParent extends ExtensionAPI {
+class OneClickHarParent extends ExtensionAPI {
   override getAPI(context: ExtensionContext) {
     // TypeScript skips the excess property check on a returned object unless the return type is written out.
     const api = {
@@ -38,10 +38,10 @@ class HarAnytimeParent extends ExtensionAPI {
         },
         toolbox: toolboxState(context, tabId),
       }),
-    } satisfies HarAnytimeApi;
+    } satisfies OneClickHarApi;
     return { [namespace]: api };
   }
 }
 
 // ExtensionCommon.sys.mjs reads the API class from this script's global under the namespace name.
-Object.assign(globalThis, { [namespace]: HarAnytimeParent });
+Object.assign(globalThis, { [namespace]: OneClickHarParent });

@@ -1,5 +1,5 @@
 {
-  "name": "@har-anytime/oxlint-plugin-har-anytime",
+  "name": "@one-click-har/oxlint-plugin-one-click-har",
   "private": true,
   "type": "module",
   "scripts": {

@@ -145,7 +145,7 @@ export const startZen = async (
   binary: string,
   { headless }: { headless: boolean },
 ): Promise<ZenSession> => {
-  const profile = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "har-anytime-verify-"));
+  const profile = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-verify-"));
   const port = await freePort();
   NodeFS.writeFileSync(
     NodePath.join(profile, "user.js"),
