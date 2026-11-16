@@ -1,0 +1,9 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ESNext"],
+    "types": []
+  },
+  "include": ["parent.ts", "gecko.d.ts", "contract.ts", "gecko-schema.ts"]
+}
