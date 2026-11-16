@@ -6,6 +6,7 @@ import type { BrowserDisplay } from "./browser.ts";
 import { checkHarFile, formatHarCheck } from "./har.ts";
 import { captureBaseline, measurePage, type MeasureResult } from "./measure.ts";
 import { currentPlatformName } from "./owned-process.ts";
+import type { RemoteProtocol } from "./remote.ts";
 import { parseScenarioName, SCENARIO_NAMES, SCENARIOS } from "./scenarios.ts";
 import { startFixtureServer } from "./server.ts";
 
@@ -14,8 +15,8 @@ export const BINARY_ENV = "BROWSER_HARNESS_BINARY";
 const USAGE = [
   "usage:",
   "  browser-harness serve",
-  `  browser-harness measure --binary <path> [--runs <n>] [--extension <path>] [--show-window]`,
-  `  browser-harness baseline --binary <path> [--runs <n>] [--out-dir <dir>] [--show-window]`,
+  `  browser-harness measure --binary <path> [--runs <n>] [--extension <path>] [--protocol bidi|marionette] [--show-window]`,
+  `  browser-harness baseline --binary <path> [--runs <n>] [--out-dir <dir>] [--protocol bidi|marionette] [--show-window]`,
   `  browser-harness har-check --scenario <${SCENARIO_NAMES.join("|")}> <file.har>`,
   `The binary may come from ${BINARY_ENV} instead of --binary. Browsers run headless unless --show-window is passed.`,
 ].join("\n");
@@ -30,6 +31,7 @@ type Command =
       readonly runs: number;
       readonly binaryPath: string;
       readonly display: BrowserDisplay;
+      readonly protocol: RemoteProtocol;
       readonly extensionPath: string | null;
     }
   | {
@@ -37,6 +39,7 @@ type Command =
       readonly runs: number;
       readonly binaryPath: string;
       readonly display: BrowserDisplay;
+      readonly protocol: RemoteProtocol;
       readonly outDir: string;
     };
 
@@ -65,10 +68,11 @@ export function parseCommand(argv: readonly string[], env: NodeJS.ProcessEnv): C
     return { kind: "har-check", scenario: values.scenario, file: rest[0] ?? "" };
   }
   if (command === "measure" || command === "baseline") {
-    const common = ["binary", "runs", "show-window"];
+    const common = ["binary", "runs", "show-window", "protocol"];
     const runs = parseRuns(values.runs ?? "10");
     const binaryPath = requireBinary(values.binary ?? env[BINARY_ENV]);
     const display: BrowserDisplay = values["show-window"] === true ? "window" : "headless";
+    const protocol = parseProtocol(values.protocol);
     if (command === "measure") {
       allowed([...common, "extension"], 0);
       return {
@@ -76,12 +80,13 @@ export function parseCommand(argv: readonly string[], env: NodeJS.ProcessEnv): C
         runs,
         binaryPath,
         display,
+        protocol,
         extensionPath: values.extension ?? null,
       };
     }
     allowed([...common, "out-dir"], 0);
     const outDir = values["out-dir"] ?? NodePath.join(packageRoot(), "baselines");
-    return { kind: "baseline", runs, binaryPath, display, outDir };
+    return { kind: "baseline", runs, binaryPath, display, protocol, outDir };
   }
   usage(command === undefined ? "missing command" : `unknown command ${command}`);
 }
@@ -98,6 +103,7 @@ function parse(args: readonly string[]) {
       "out-dir": { type: "string" },
       scenario: { type: "string" },
       "show-window": { type: "boolean" },
+      protocol: { type: "string" },
     },
   });
 }
@@ -114,6 +120,12 @@ function requireBinary(value: string | undefined): string {
   }
   if (!NodeFS.statSync(path).isFile()) usage(`browser binary is not a file: ${path}`);
   return path;
+}
+
+function parseProtocol(value: string | undefined): RemoteProtocol {
+  if (value === undefined) return "bidi";
+  if (value === "bidi" || value === "marionette") return value;
+  usage("--protocol expects bidi or marionette");
 }
 
 function parseRuns(value: string): number {
@@ -165,7 +177,7 @@ async function main(argv: readonly string[]): Promise<void> {
   process.stderr.write(`wrote ${path}\n`);
 }
 
-function report(result: Omit<MeasureResult, "extensionPath">): void {
+export function report(result: Omit<MeasureResult, "extensionPath">): void {
   const { lastResourceFinishedMs: time, parentWorkingSetBytes: memory } = result;
   process.stderr.write(
     `${result.browser.name} ${result.browser.version} (${result.browser.buildId}), ${result.browser.headless ? "headless" : "window"}, ${String(result.runCount)} runs, ${String(result.errors)} failed\n`,

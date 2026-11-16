@@ -7,6 +7,7 @@ import {
   type BrowserIdentity,
   type BrowserSession,
 } from "./browser.ts";
+import type { RemoteProtocol } from "./remote.ts";
 import { FIXTURE_SEED, SMALL_KINDS, SMALL_PER_KIND } from "./fixtures.ts";
 import { readProcessSnapshot, type ProcessSnapshot } from "./owned-process.ts";
 import { SCENARIOS, type Scenario } from "./scenarios.ts";
@@ -198,6 +199,7 @@ export async function measurePage(options: {
   readonly binaryPath: string;
   readonly extensionPath: string | null;
   readonly display: BrowserDisplay;
+  readonly protocol?: RemoteProtocol;
   readonly signal: AbortSignal;
 }): Promise<MeasureResult> {
   await using server = await startFixtureServer();
@@ -205,6 +207,7 @@ export async function measurePage(options: {
     binaryPath: options.binaryPath,
     extensionPath: options.extensionPath,
     display: options.display,
+    ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
     signal: options.signal,
   });
   const loadBefore = await machineLoad();
@@ -232,6 +235,7 @@ export async function captureBaseline(options: {
   readonly runs: number;
   readonly binaryPath: string;
   readonly display: BrowserDisplay;
+  readonly protocol?: RemoteProtocol;
   readonly outDir: string;
   readonly signal: AbortSignal;
 }): Promise<{ readonly file: BaselineFile; readonly path: string }> {
@@ -240,6 +244,7 @@ export async function captureBaseline(options: {
     binaryPath: options.binaryPath,
     extensionPath: null,
     display: options.display,
+    ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
     signal: options.signal,
   });
   const file: BaselineFile = {
@@ -254,10 +259,23 @@ export async function captureBaseline(options: {
     },
     ...measured,
   };
-  const path = NodePath.join(options.outDir, baselineFileName(file));
-  await NodeFSP.mkdir(options.outDir, { recursive: true });
-  await NodeFSP.writeFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  const path = await writeBaseline(file, options.outDir);
   return { file, path };
+}
+
+export async function writeBaseline(file: BaselineFile, outDir: string): Promise<string> {
+  if (file.errors > 0) {
+    const reasons = file.failures
+      .map((failure) => `run ${String(failure.run)}: ${failure.reason}`)
+      .join("; ");
+    throw new Error(
+      `refusing to write a baseline with ${String(file.errors)} failed runs${reasons.length > 0 ? `: ${reasons}` : ""}`,
+    );
+  }
+  const path = NodePath.join(outDir, baselineFileName(file));
+  await NodeFSP.mkdir(outDir, { recursive: true });
+  await NodeFSP.writeFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  return path;
 }
 
 // Two baselines compare only when every part of this name matches.

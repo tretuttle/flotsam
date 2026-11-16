@@ -13,12 +13,12 @@ afterEach(async () => {
 });
 
 describe("remote control", () => {
-  it("uses BiDi when that socket accepts a session and evaluates after navigation finished", async () => {
+  it("uses BiDi when that protocol is requested, even if Marionette is already open", async () => {
     const bidi = await startBidi();
-    const marionette = await startMarionette();
+    await startMarionette();
     const remote = await connectRemote({
-      bidiPort: bidi.port,
-      marionettePort: marionette.port,
+      protocol: "bidi",
+      port: bidi.port,
       exitStatus: () => null,
       stderr: () => "",
       signal: new AbortController().signal,
@@ -33,12 +33,12 @@ describe("remote control", () => {
     remote.dispose();
   });
 
-  it("uses Marionette when BiDi does not answer and evaluates after navigation finished", async () => {
-    const bidi = await startClosedPort();
+  it("uses Marionette when that protocol is requested and can open a second tab", async () => {
+    await startBidi();
     const marionette = await startMarionette();
     const remote = await connectRemote({
-      bidiPort: bidi,
-      marionettePort: marionette.port,
+      protocol: "marionette",
+      port: marionette.port,
       exitStatus: () => null,
       stderr: () => "",
       signal: new AbortController().signal,
@@ -47,17 +47,20 @@ describe("remote control", () => {
     expect(remote.browserPid).toBe(88);
     expect(remote.browserName).toBe("zen");
     expect(remote.userAgent).toBe("ZenMarionette");
-    const context = await remote.openTab("http://127.0.0.1/");
-    expect(await remote.evaluate(context, "window.__harnessReady")).toBe(READY);
-    await remote.closeTab(context);
+    const first = await remote.openTab("http://127.0.0.1/");
+    expect(await remote.evaluate(first, "window.__harnessReady")).toBe(READY);
+    await remote.closeTab(first);
+    const second = await remote.openTab("http://127.0.0.1/again");
+    expect(await remote.evaluate(second, "window.__harnessReady")).toBe(READY);
+    await remote.closeTab(second);
     remote.dispose();
   });
 
   it("reports the browser exit instead of waiting for a port", async () => {
     await expect(
       connectRemote({
-        bidiPort: 1,
-        marionettePort: 1,
+        protocol: "bidi",
+        port: 1,
         exitStatus: () => "code 9",
         stderr: () => "startup failed",
         signal: new AbortController().signal,
@@ -66,16 +69,6 @@ describe("remote control", () => {
     ).rejects.toThrow(/exited with code 9[\s\S]*startup failed/);
   });
 });
-
-async function startClosedPort(): Promise<number> {
-  const server = NodeNet.createServer();
-  await listenNet(server);
-  const port = portOf(server);
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  });
-  return port;
-}
 
 async function startBidi(): Promise<{ port: number }> {
   const server = NodeHttp.createServer();
@@ -180,7 +173,13 @@ async function startMarionette(): Promise<{ port: number }> {
     socket.on("error", () => undefined);
     writeLength(socket, { applicationType: "gecko", marionetteProtocol: 3 });
     let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-    const page = { loaded: false, waitsForLoad: false };
+    const session = {
+      loaded: false,
+      waitsForLoad: false,
+      handles: ["initial"],
+      current: "initial" as string | null,
+      nextWindow: 1,
+    };
     socket.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
       while (buffer.length > 0) {
@@ -193,14 +192,14 @@ async function startMarionette(): Promise<{ port: number }> {
         const params: unknown = next.message[3];
         if (typeof id !== "number" || typeof name !== "string") continue;
         if (name === "WebDriver:NewSession") {
-          page.waitsForLoad = JSON.stringify(params).includes('"pageLoadStrategy":"normal"');
+          session.waitsForLoad = JSON.stringify(params).includes('"pageLoadStrategy":"normal"');
         }
         if (name === "WebDriver:Navigate") {
-          page.loaded = false;
+          session.loaded = false;
           const finish = (): void => {
-            page.loaded = true;
+            session.loaded = true;
           };
-          if (page.waitsForLoad) {
+          if (session.waitsForLoad) {
             setImmediate(() => {
               finish();
               writeLength(socket, [1, id, null, {}]);
@@ -210,7 +209,20 @@ async function startMarionette(): Promise<{ port: number }> {
           }
           continue;
         }
-        if (name === "WebDriver:ExecuteAsyncScript" && !page.loaded) {
+        const discarded = session.current === null || !session.handles.includes(session.current);
+        if (
+          (name === "WebDriver:NewWindow" || name === "WebDriver:ExecuteAsyncScript") &&
+          discarded
+        ) {
+          writeLength(socket, [
+            1,
+            id,
+            { error: "unknown error", message: "Browsing context has been discarded" },
+            null,
+          ]);
+          continue;
+        }
+        if (name === "WebDriver:ExecuteAsyncScript" && !session.loaded) {
           writeLength(socket, [
             1,
             id,
@@ -219,7 +231,7 @@ async function startMarionette(): Promise<{ port: number }> {
           ]);
           continue;
         }
-        writeLength(socket, [1, id, null, marionetteResult(name)]);
+        writeLength(socket, [1, id, null, marionetteResult(name, params, session)]);
       }
     });
   });
@@ -234,7 +246,15 @@ async function startMarionette(): Promise<{ port: number }> {
   return { port: portOf(server) };
 }
 
-function marionetteResult(name: string): unknown {
+type MarionetteSession = {
+  loaded: boolean;
+  waitsForLoad: boolean;
+  handles: string[];
+  current: string | null;
+  nextWindow: number;
+};
+
+function marionetteResult(name: string, params: unknown, session: MarionetteSession): unknown {
   if (name === "WebDriver:NewSession") {
     return {
       capabilities: {
@@ -245,13 +265,34 @@ function marionetteResult(name: string): unknown {
       },
     };
   }
-  if (name === "WebDriver:ExecuteScript") return "ZenMarionette";
-  if (name === "WebDriver:NewWindow") return { handle: "win-1", type: "tab" };
-  if (name === "WebDriver:ExecuteAsyncScript") return READY;
-  if (name === "WebDriver:SwitchToWindow" || name === "WebDriver:CloseWindow") {
+  if (name === "WebDriver:GetWindowHandle") return { value: session.current };
+  if (name === "WebDriver:ExecuteScript") return { value: "ZenMarionette" };
+  if (name === "WebDriver:NewWindow") {
+    const handle = `win-${String(session.nextWindow)}`;
+    session.nextWindow += 1;
+    session.handles.push(handle);
+    session.current = handle;
+    return { value: { handle, type: "tab" } };
+  }
+  if (name === "WebDriver:ExecuteAsyncScript") return { value: READY };
+  if (name === "WebDriver:SwitchToWindow") {
+    const handle = isRecord(params) && typeof params.handle === "string" ? params.handle : "";
+    if (!session.handles.includes(handle)) {
+      throw new Error(`mock switch to missing window ${handle}`);
+    }
+    session.current = handle;
+    return {};
+  }
+  if (name === "WebDriver:CloseWindow") {
+    session.handles = session.handles.filter((handle) => handle !== session.current);
+    session.current = null;
     return {};
   }
   throw new Error(`unexpected Marionette command ${name}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function writeLength(socket: NodeNet.Socket, value: unknown): void {

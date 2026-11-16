@@ -24,7 +24,7 @@ export const LAUNCH_PREFS: readonly Pref[] = [
   { name: "xpinstall.signatures.required", value: false },
   { name: "extensions.autoDisableScopes", value: 0 },
   { name: "devtools.debugger.remote-enabled", value: true },
-  { name: "remote.active-protocols", value: 2 },
+  { name: "remote.active-protocols", value: 1 },
   { name: "browser.shell.checkDefaultBrowser", value: false },
   { name: "datareporting.policy.dataSubmissionEnabled", value: false },
   { name: "toolkit.telemetry.enabled", value: false },
@@ -105,6 +105,9 @@ export const BROWSER_PLATFORMS: Readonly<Record<ProcessPlatformName, BrowserPlat
       ["HOME", ".waterfox"],
       ["XDG_CONFIG_HOME", "zen"],
       ["XDG_CONFIG_HOME", "mozilla"],
+      ["XDG_CONFIG_HOME", "librewolf"],
+      ["XDG_CONFIG_HOME", "floorp"],
+      ["XDG_CONFIG_HOME", "waterfox"],
       ["XDG_CACHE_HOME", "zen"],
       ["XDG_CACHE_HOME", "mozilla"],
       ["XDG_CACHE_HOME", "librewolf"],
@@ -160,59 +163,81 @@ export function assertOutsideLiveProfiles(
   directory: string,
   roots: readonly string[],
   path: NodePath.PlatformPath = NodePath,
+  caseFold = false,
 ): void {
+  const fold = (value: string): string => (caseFold ? value.toLowerCase() : value);
   for (const root of roots) {
-    const relative = path.relative(path.resolve(root), path.resolve(directory));
+    const relative = path.relative(path.resolve(fold(root)), path.resolve(fold(directory)));
     if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
       throw new Error(`refusing to use ${directory}: it is inside the live profile root ${root}`);
     }
   }
 }
 
+function foldsCase(platform: ProcessPlatformName): boolean {
+  return platform === "darwin" || platform === "win32";
+}
+
 export async function prepareProfile(
   extensionPath: string | null,
   extraPrefs: readonly Pref[] = [],
 ): Promise<string> {
-  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-browser-"));
+  const platform = currentPlatformName();
+  const row = BROWSER_PLATFORMS[platform];
+  const roots = liveProfileRoots(platform, process.env, NodeOS.homedir());
+  const directory = NodeOS.tmpdir();
+  assertOutsideLiveProfiles(directory, roots, row.path, foldsCase(platform));
+  assertOutsideLiveProfiles(
+    NodeFS.realpathSync(directory),
+    roots.map(realpathIfPresent),
+    row.path,
+    foldsCase(platform),
+  );
+  const profile = await NodeFSP.mkdtemp(NodePath.join(directory, "har-anytime-browser-"));
   try {
-    const platform = currentPlatformName();
-    const roots = liveProfileRoots(platform, process.env, NodeOS.homedir());
-    assertOutsideLiveProfiles(directory, roots);
-    assertOutsideLiveProfiles(NodeFS.realpathSync(directory), roots.map(realpathIfPresent));
     await NodeFSP.writeFile(
-      NodePath.join(directory, "user.js"),
+      NodePath.join(profile, "user.js"),
       renderUserJs([...LAUNCH_PREFS, ...extraPrefs]),
       "utf8",
     );
-    if (extensionPath !== null) await installExtension(directory, extensionPath);
-    return directory;
+    if (extensionPath !== null) await installExtension(profile, extensionPath);
+    return profile;
   } catch (error) {
-    await NodeFSP.rm(directory, { recursive: true, force: true });
+    await NodeFSP.rm(profile, { recursive: true, force: true });
     throw error;
   }
 }
+
+const REMOTE_LAUNCH: Record<
+  RemoteProtocol,
+  (port: number) => { readonly args: readonly string[]; readonly prefs: readonly Pref[] }
+> = {
+  bidi: (port) => ({ args: ["--remote-debugging-port", String(port)], prefs: [] }),
+  marionette: (port) => ({
+    args: ["-marionette"],
+    prefs: [{ name: "marionette.port", value: port }],
+  }),
+};
 
 export async function launchBrowser(request: {
   readonly binaryPath: string;
   readonly extensionPath: string | null;
   readonly display: BrowserDisplay;
+  readonly protocol?: RemoteProtocol;
   readonly signal: AbortSignal;
 }): Promise<BrowserSession> {
+  const protocol = request.protocol ?? "bidi";
   await using stack = new AsyncDisposableStack();
-  const bidiPort = await freePort();
-  const marionettePort = await freePort();
-  const directory = await prepareProfile(request.extensionPath, [
-    { name: "marionette.port", value: marionettePort },
-  ]);
+  const port = await freePort();
+  const remoteLaunch = REMOTE_LAUNCH[protocol](port);
+  const directory = await prepareProfile(request.extensionPath, remoteLaunch.prefs);
   stack.defer(() => removeDirectoryBounded(directory));
   const args = [
     ...(request.display === "headless" ? ["-headless"] : []),
     "-no-remote",
     "-profile",
     directory,
-    "--remote-debugging-port",
-    String(bidiPort),
-    "-marionette",
+    ...remoteLaunch.args,
     ...BROWSER_PLATFORMS[currentPlatformName()].launcherArgs,
   ];
   const spawned = spawnOwned(request.binaryPath, args, {
@@ -226,8 +251,8 @@ export async function launchBrowser(request: {
     stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
   });
   const remote = await connectRemote({
-    bidiPort,
-    marionettePort,
+    protocol,
+    port,
     exitStatus: () => exitStatus(spawned.child),
     stderr: () => stderrTail,
     signal: request.signal,

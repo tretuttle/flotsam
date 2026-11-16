@@ -102,6 +102,33 @@ describe("process inspection table", () => {
   });
 });
 
+describe.runIf(currentPlatformName() !== "win32")("windows process trees", () => {
+  it("asks taskkill to end the tree", async () => {
+    const bin = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-taskkill-"));
+    directories.push(bin);
+    const argsFile = NodePath.join(bin, "args");
+    await NodeFSP.writeFile(
+      NodePath.join(bin, "taskkill.exe"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" > '${argsFile}'\nexit 0\n`,
+      { mode: 0o755 },
+    );
+    const previous = process.env.PATH;
+    process.env.PATH = `${bin}${NodePath.delimiter}${previous ?? ""}`;
+    try {
+      PROCESS_PLATFORMS.win32.killTree(4242);
+      expect((await NodeFSP.readFile(argsFile, "utf8")).trim().split("\n")).toEqual([
+        "/PID",
+        "4242",
+        "/T",
+        "/F",
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+    }
+  });
+});
+
 describe("owned process trees", () => {
   it("kills the spawned tree and leaves an unrelated process running", async () => {
     const tree = await spawnTree();

@@ -1,4 +1,6 @@
 import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { describe, expect, it } from "vite-plus/test";
@@ -7,6 +9,8 @@ import {
   measureRuns,
   summarize,
   tallyRuns,
+  writeBaseline,
+  type BaselineFile,
   type MeasureTarget,
   type RequestLog,
 } from "./measure.ts";
@@ -106,6 +110,31 @@ describe("measure runs", () => {
       reason: /server never served GET \/r\/css\/0/,
     },
     {
+      label: "a request the scenario did not ask for",
+      run: {
+        served: [
+          ...scenario.responses.map((response) => ({
+            method: response.method,
+            path: response.path,
+          })),
+          { method: "GET", path: "/unexpected" },
+        ],
+      },
+      reason: /server also served GET \/unexpected/,
+    },
+    {
+      label: "a resource that never finished when the page reports no failure",
+      run: {
+        evaluate: async () =>
+          JSON.stringify({
+            lastResourceFinishedMs: 50,
+            finished: resourcePaths.slice(1),
+            failed: [],
+          }),
+      },
+      reason: /page did not finish \/r\/css\/0/,
+    },
+    {
       label: "a sample of zero milliseconds",
       run: {
         evaluate: async () =>
@@ -176,12 +205,84 @@ describe("baselines", () => {
     ).toBe("linux-x64-32cpu-intel-r-core-tm-i9-14900-zen-1.25t-20261115114312-headless.json");
   });
 
-  it.each(files)("%s records the identity its file name claims", (name) => {
+  it.each(files)("%s records a complete successful sample", (name) => {
     const baseline = JSON.parse(
       NodeFS.readFileSync(NodePath.join(directory, name), "utf8"),
-    ) as Parameters<typeof baselineFileName>[0] & { load: unknown; sampleDefinition: unknown };
+    ) as BaselineFile;
     expect(baselineFileName(baseline)).toBe(name);
-    expect(typeof baseline.sampleDefinition).toBe("string");
-    expect(baseline.load).toBeDefined();
+    expect(baseline.errors).toBe(0);
+    expect(baseline.failures).toEqual([]);
+    expect(baseline.samples).toHaveLength(baseline.runCount);
+    expect(baseline.lastResourceFinishedMs).not.toBeNull();
+    expect(baseline.parentWorkingSetBytes).not.toBeNull();
+    expect(baseline.lastResourceFinishedMs?.runCount).toBe(baseline.runCount);
+    expect(baseline.parentWorkingSetBytes?.runCount).toBe(baseline.runCount);
+  });
+
+  it("does not write a baseline file when any run failed", async () => {
+    const outDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-baseline-"));
+    const failed = { ...baselineStub(), errors: 2, failures: [{ run: 1, reason: "page failed" }] };
+    await expect(writeBaseline(failed, outDir)).rejects.toThrow(
+      "refusing to write a baseline with 2 failed runs",
+    );
+    expect(NodeFS.readdirSync(outDir)).toEqual([]);
+    const written = await writeBaseline(baselineStub(), outDir);
+    expect(NodeFS.existsSync(written)).toBe(true);
+    await NodeFSP.rm(outDir, { recursive: true, force: true });
   });
 });
+
+function baselineStub(): BaselineFile {
+  return {
+    capturedAt: "2026-11-16T00:00:00.000Z",
+    extension: null,
+    scenario: "page",
+    sampleDefinition: "last-resource-finished",
+    runCount: 1,
+    errors: 0,
+    failures: [],
+    samples: [
+      {
+        run: 1,
+        lastResourceFinishedMs: 10,
+        parentWorkingSetBytes: 1,
+        parentCpuMs: 1,
+        wallMs: 1,
+        requestCount: 1,
+      },
+    ],
+    lastResourceFinishedMs: { median: 10, spread: 0, min: 10, max: 10, runCount: 1 },
+    parentWorkingSetBytes: { median: 1, spread: 0, min: 1, max: 1, runCount: 1 },
+    wallTimeMs: 1,
+    browserCpuMs: 1,
+    limiter: "parent CPU does not fill the timed region",
+    browser: {
+      binaryPath: "/zen",
+      name: "zen",
+      version: "1",
+      buildId: "1",
+      userAgent: "Mozilla",
+      remoteProtocol: "bidi",
+      headless: true,
+    },
+    machine: {
+      platform: "linux",
+      release: "1",
+      arch: "x64",
+      cpuModel: "test",
+      cpuCount: 1,
+      totalMemoryBytes: 1,
+    },
+    load: {
+      before: { cpuBusyPercent: 0, loadAverage: [0, 0, 0] },
+      after: { cpuBusyPercent: 0, loadAverage: [0, 0, 0] },
+    },
+    page: {
+      resourceCount: 200,
+      cache: "no-store",
+      seed: "s",
+      smallPerKind: 50,
+      kinds: ["css", "js", "image", "json"],
+    },
+  };
+}

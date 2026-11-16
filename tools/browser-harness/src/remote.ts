@@ -20,16 +20,15 @@ export type RemoteControl = {
 };
 
 export async function connectRemote(options: {
-  readonly bidiPort: number;
-  readonly marionettePort: number;
+  readonly protocol: RemoteProtocol;
+  readonly port: number;
   readonly exitStatus: () => string | null;
   readonly stderr: () => string;
   readonly signal: AbortSignal;
   readonly deadlineMs?: number;
 }): Promise<RemoteControl> {
   const deadline = Date.now() + (options.deadlineMs ?? CONNECT_MS);
-  let bidiError = "BiDi port did not open";
-  let marionetteError = "Marionette port did not open";
+  let detail = `${options.protocol} port did not open`;
   const throwIfExited = (): void => {
     options.signal.throwIfAborted();
     const status = options.exitStatus();
@@ -40,27 +39,19 @@ export async function connectRemote(options: {
     }
   };
   throwIfExited();
+  const open = options.protocol === "bidi" ? openBidi : openMarionette;
   while (Date.now() < deadline) {
     throwIfExited();
-    if (await tcpOpen(options.bidiPort)) {
+    if (await tcpOpen(options.port)) {
       try {
-        return await openBidi(options.bidiPort);
+        return await open(options.port);
       } catch (error) {
-        bidiError = errorMessage(error);
-      }
-    }
-    if (await tcpOpen(options.marionettePort)) {
-      try {
-        return await openMarionette(options.marionettePort);
-      } catch (error) {
-        marionetteError = errorMessage(error);
+        detail = errorMessage(error);
       }
     }
     await delay(100);
   }
-  throw new Error(
-    `timed out waiting for browser remote control\nBiDi: ${bidiError}\nMarionette: ${marionetteError}\n${options.stderr()}`,
-  );
+  throw new Error(`timed out waiting for ${options.protocol}\n${detail}\n${options.stderr()}`);
 }
 
 async function openBidi(port: number): Promise<RemoteControl> {
@@ -114,6 +105,9 @@ async function openMarionette(port: number): Promise<RemoteControl> {
     );
     const identity = readMarionetteSession(created);
     const userAgent = await readMarionetteUserAgent(marionette, identity.userAgent);
+    const initialWindow = readMarionetteHandle(
+      await marionette.call("WebDriver:GetWindowHandle", {}),
+    );
     return {
       protocol: "marionette",
       browserPid: identity.browserPid,
@@ -126,7 +120,11 @@ async function openMarionette(port: number): Promise<RemoteControl> {
           type: "tab",
           focus: true,
         });
-        const handle = readStringField(createdWindow, "handle", "WebDriver:NewWindow");
+        const handle = readStringField(
+          unwrapMarionette(createdWindow),
+          "handle",
+          "WebDriver:NewWindow",
+        );
         await marionette.call("WebDriver:SwitchToWindow", { handle, focus: true });
         await marionette.call("WebDriver:Navigate", { url });
         return handle;
@@ -142,6 +140,7 @@ async function openMarionette(port: number): Promise<RemoteControl> {
       closeTab: async (context) => {
         await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
         await marionette.call("WebDriver:CloseWindow", {});
+        await marionette.call("WebDriver:SwitchToWindow", { handle: initialWindow, focus: true });
       },
       dispose: () => marionette.close(),
     };
@@ -407,7 +406,20 @@ async function readMarionetteUserAgent(
     script: "return navigator.userAgent",
     args: [],
   });
-  return readText(value, "user agent");
+  return readText(unwrapMarionette(value), "user agent");
+}
+
+function readMarionetteHandle(value: unknown): string {
+  const handle = unwrapMarionette(value);
+  if (typeof handle !== "string" || handle.length === 0) {
+    throw new Error(`WebDriver:GetWindowHandle returned ${JSON.stringify(value)}`);
+  }
+  return handle;
+}
+
+function unwrapMarionette(value: unknown): unknown {
+  if (isRecord(value) && "value" in value) return value.value;
+  return value;
 }
 
 function readBidiString(result: unknown): string {
@@ -425,12 +437,14 @@ function readBidiString(result: unknown): string {
 }
 
 function readMarionetteString(value: unknown): string {
-  if (isRecord(value) && typeof value.__harnessError === "string") {
-    throw new Error(value.__harnessError);
+  const unwrapped = unwrapMarionette(value);
+  if (isRecord(unwrapped) && typeof unwrapped.__harnessError === "string") {
+    throw new Error(unwrapped.__harnessError);
   }
-  if (typeof value !== "string")
+  if (typeof unwrapped !== "string") {
     throw new Error(`Marionette evaluate returned ${JSON.stringify(value)}`);
-  return value;
+  }
+  return unwrapped;
 }
 
 function readPid(value: unknown, source: string): number {
