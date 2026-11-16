@@ -4,6 +4,28 @@ import * as NodeNet from "node:net";
 import * as NodeZlib from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import {
+  COST_HEAVY_PATH,
+  COST_IMAGES_COUNT,
+  COST_IMAGES_PATH,
+  COST_MIXED_COUNT,
+  COST_MIXED_PATH,
+  getCostScenarios,
+  ID_BIG_BYTE_LENGTH,
+  ID_BIG_PATH,
+  ID_CACHED_PATH,
+  ID_DOWNLOAD_PAGE_PATH,
+  ID_DOWNLOAD_PATH,
+  ID_ENDLESS_PATH,
+  ID_REDIRECT_1_PATH,
+  ID_REDIRECT_2_PATH,
+  ID_REDIRECT_FINAL_PATH,
+  ID_REVAL_PATH,
+  POLL_PATH,
+  SW_INDEX_PATH,
+  SW_JS_PATH,
+  SW_PASS_PATH,
+} from "./extended-fixtures.ts";
+import {
   BINARY_BYTE_LENGTH,
   buildBody,
   expectedResourceCount,
@@ -12,7 +34,12 @@ import {
   WEBSOCKET_PATH,
 } from "./fixtures.ts";
 import { PINNED_RESPONSES } from "./pinned-responses.ts";
-import { SCENARIOS } from "./scenarios.ts";
+import {
+  COST_SCENARIO_NAMES,
+  getCostScenario,
+  parseCostScenarioName,
+  SCENARIOS,
+} from "./scenarios.ts";
 import { startFixtureServer, type FixtureServer } from "./server.ts";
 
 let server: FixtureServer;
@@ -155,6 +182,187 @@ describe("fixture server", () => {
     }
   });
 });
+
+describe("extended cost and identity fixtures", () => {
+  it("tags every response with X-Seq, logs requests, and matches per-sequence SHA-256 (catching a flipped byte)", async () => {
+    const beforeCount = server.getRequestLog().length;
+    const first = await readHttp(server.port, POLL_PATH);
+    const second = await readHttp(server.port, POLL_PATH);
+    const seq1 = Number(first.headers["x-seq"]);
+    const seq2 = Number(second.headers["x-seq"]);
+    expect(seq2).toBeGreaterThan(seq1);
+    expect(first.body.toString("utf8")).not.toBe(second.body.toString("utf8"));
+
+    const truth1 = server.getSequenceTruth(seq1);
+    const truth2 = server.getSequenceTruth(seq2);
+    expect(truth1?.wireSha256).toBe(hashBuffer(first.body));
+    expect(truth2?.wireSha256).toBe(hashBuffer(second.body));
+
+    // Planted flipped byte must not match server ground truth.
+    const flipped = Buffer.from(first.body);
+    flipped[0] = (flipped[0] ?? 0) ^ 0xff;
+    expect(hashBuffer(flipped)).not.toBe(truth1?.wireSha256);
+
+    // Control endpoints do not pollute the request log.
+    const truthHttp = await readHttp(server.port, `/__harness/truth?seq=${String(seq1)}`);
+    expect(truthHttp.status).toBe(200);
+    expect(JSON.parse(truthHttp.body.toString("utf8"))).toMatchObject({ seq: seq1 });
+
+    const logged = server.getRequestLog().slice(beforeCount);
+    expect(logged).toEqual([
+      { seq: seq1, method: "GET", path: POLL_PATH, url: POLL_PATH, status: 200 },
+      { seq: seq2, method: "GET", path: POLL_PATH, url: POLL_PATH, status: 200 },
+    ]);
+  });
+
+  it("serves all three cost pages with exact counts and per-sequence SHA-256", async () => {
+    const scenarios = getCostScenarios();
+    expect(scenarios.map((s) => s.name)).toEqual([...COST_SCENARIO_NAMES]);
+    expect(getCostScenario(parseCostScenarioName("cost-images")).pagePath).toBe(COST_IMAGES_PATH);
+    expect(() => parseCostScenarioName("no-such")).toThrow(/unknown cost scenario/);
+
+    const imagesPage = await readHttp(server.port, COST_IMAGES_PATH);
+    expect(imagesPage.status).toBe(200);
+    expect(imagesPage.body.toString("utf8").match(/\/cost\/small\/\d+\.png/gu)?.length).toBe(
+      COST_IMAGES_COUNT * 3,
+    );
+    const small0 = await readHttp(server.port, "/cost/small/0.png");
+    expect(small0.headers["cache-control"]).toBe("no-store");
+    expect(server.getSequenceTruth(Number(small0.headers["x-seq"]))?.wireSha256).toBe(
+      hashBuffer(small0.body),
+    );
+
+    const heavyPage = await readHttp(server.port, COST_HEAVY_PATH);
+    expect(heavyPage.status).toBe(200);
+    const blob = await readHttp(server.port, "/cost/h/blob.bin");
+    expect(blob.body.length).toBe(50_000_000);
+    expect(server.getSequenceTruth(Number(blob.headers["x-seq"]))?.wireSha256).toBe(
+      hashBuffer(blob.body),
+    );
+
+    const mixedPage = await readHttp(server.port, COST_MIXED_PATH);
+    expect(mixedPage.status).toBe(200);
+    expect(scenarios.find((s) => s.name === "cost-mixed")?.requests.length).toBe(
+      COST_MIXED_COUNT + 1,
+    );
+    const mixed0 = await readHttp(server.port, "/cost/m/0");
+    expect(mixed0.headers["cache-control"]).toBe("no-store");
+    const mixed1 = await readHttp(server.port, "/cost/m/1");
+    expect(mixed1.headers["cache-control"]).toBe("max-age=3600");
+  });
+
+  it("serves all identity fixtures with X-Seq ground truth", async () => {
+    // 4 MiB download (full fetch with tiny delay, and aborted midway)
+    const bigFull = await readHttp(server.port, `${ID_BIG_PATH}?delayMs=1`);
+    expect(bigFull.body.length).toBe(ID_BIG_BYTE_LENGTH);
+    expect(server.getSequenceTruth(Number(bigFull.headers["x-seq"]))?.wireSha256).toBe(
+      hashBuffer(bigFull.body),
+    );
+
+    const abortedBig = await readAborted(server.port, ID_BIG_PATH, 1_048_576);
+    expect(abortedBig.bytes.length).toBeGreaterThanOrEqual(1_048_576);
+    expect(abortedBig.bytes.length).toBeLessThan(ID_BIG_BYTE_LENGTH);
+    await waitForCondition(() => server.getSequenceTruth(abortedBig.seq)?.aborted === true);
+    expect(server.getSequenceTruth(abortedBig.seq)?.expectedLength).toBe(ID_BIG_BYTE_LENGTH);
+
+    // 304 revalidation
+    const reval200 = await readHttp(server.port, ID_REVAL_PATH);
+    expect(reval200.status).toBe(200);
+    expect(reval200.body.length).toBe(20_000);
+    const reval304 = await readHttp(server.port, ID_REVAL_PATH, {
+      headers: { "If-None-Match": String(reval200.headers.etag) },
+    });
+    expect(reval304.status).toBe(304);
+    expect(reval304.body.length).toBe(0);
+    expect(server.getSequenceTruth(Number(reval304.headers["x-seq"]))?.status).toBe(304);
+
+    // Cache hit fixture
+    const cached = await readHttp(server.port, ID_CACHED_PATH);
+    expect(cached.headers["cache-control"]).toBe("max-age=3600");
+    expect(cached.body.length).toBe(30_000);
+
+    // 302 -> 307 -> 200 redirect chain
+    const r1 = await readHttp(server.port, ID_REDIRECT_1_PATH);
+    expect(r1.status).toBe(302);
+    expect(r1.headers.location).toBe(ID_REDIRECT_2_PATH);
+    const r2 = await readHttp(server.port, ID_REDIRECT_2_PATH);
+    expect(r2.status).toBe(307);
+    expect(r2.headers.location).toBe(ID_REDIRECT_FINAL_PATH);
+    const rFinal = await readHttp(server.port, ID_REDIRECT_FINAL_PATH);
+    expect(rFinal.status).toBe(200);
+    expect(rFinal.body.toString("utf8")).toBe("final target");
+
+    // Service worker fixtures
+    const swHtml = await readHttp(server.port, SW_INDEX_PATH);
+    expect(swHtml.status).toBe(200);
+    const swJs = await readHttp(server.port, SW_JS_PATH);
+    expect(swJs.body.toString("utf8")).toContain("/sw/synth");
+    const swPass = await readHttp(server.port, SW_PASS_PATH);
+    expect(swPass.body.toString("utf8")).toBe("passed-through-network");
+
+    // Endless stream
+    const endless = await readAborted(server.port, ID_ENDLESS_PATH, 4096);
+    expect(endless.bytes.toString("utf8")).toContain('{"n":1}\n');
+    await waitForCondition(() => server.getSequenceTruth(endless.seq)?.aborted === true);
+
+    // Refused port
+    await expect(connectPort(server.refusedOrigin)).rejects.toThrow(/ECONNREFUSED/);
+
+    // Download link
+    const dlPage = await readHttp(server.port, ID_DOWNLOAD_PAGE_PATH);
+    expect(dlPage.body.toString("utf8")).toContain(`href="${ID_DOWNLOAD_PATH}"`);
+    const dl = await readHttp(server.port, ID_DOWNLOAD_PATH);
+    expect(dl.headers["content-disposition"]).toContain("attachment");
+    expect(server.getSequenceTruth(Number(dl.headers["x-seq"]))?.wireSha256).toBe(
+      hashBuffer(dl.body),
+    );
+  });
+});
+
+function readAborted(
+  port: number,
+  path: string,
+  minBytes: number,
+): Promise<{ seq: number; bytes: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const request = NodeHttp.request({ host: "127.0.0.1", port, path }, (response) => {
+      const seq = Number(response.headers["x-seq"]);
+      const chunks: Buffer[] = [];
+      let total = 0;
+      response.on("data", (chunk: Buffer) => {
+        chunks.push(chunk);
+        total += chunk.length;
+        if (total >= minBytes) {
+          request.destroy();
+          resolve({ seq, bytes: Buffer.concat(chunks) });
+        }
+      });
+    });
+    request.on("error", (error) => {
+      if ((error as NodeJS.ErrnoException).code !== "ECONNRESET") reject(error);
+    });
+    request.end();
+  });
+}
+
+function connectPort(origin: string): Promise<void> {
+  const parsed = new URL(origin);
+  return new Promise((resolve, reject) => {
+    const socket = NodeNet.connect(Number(parsed.port), parsed.hostname, () => {
+      socket.destroy();
+      resolve();
+    });
+    socket.on("error", reject);
+  });
+}
+
+async function waitForCondition(check: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (check()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error("condition did not become true");
+}
 
 function pin(id: string): { sha256: string; byteLength: number } {
   const pinned = PINNED_RESPONSES[id];

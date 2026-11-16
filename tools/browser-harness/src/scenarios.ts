@@ -1,3 +1,4 @@
+import { getCostScenarios } from "./extended-fixtures.ts";
 import {
   FIXTURES_PAGE_PATH,
   FIXTURES_PAGE_REQUESTS,
@@ -23,8 +24,38 @@ export type Scenario = {
   readonly responses: readonly ExpectedResponse[];
 };
 
+export type MeasuredScenario = {
+  readonly name: string;
+  readonly pagePath: string;
+  readonly description: string;
+  readonly responses: readonly { readonly method: FixtureMethod; readonly path: string }[];
+};
+
 export const SCENARIO_NAMES = ["page", "fixtures"] as const;
 export type ScenarioName = (typeof SCENARIO_NAMES)[number];
+export const COST_SCENARIO_NAMES = ["cost-images", "cost-heavy", "cost-mixed"] as const;
+export type CostScenarioName = (typeof COST_SCENARIO_NAMES)[number];
+
+export function getCostScenario(name: CostScenarioName): MeasuredScenario {
+  const spec = getCostScenarios().find((item) => item.name === name);
+  if (spec === undefined) throw new Error(`unknown cost scenario ${name}`);
+  return {
+    name: spec.name,
+    pagePath: spec.pagePath,
+    description: spec.description,
+    responses: spec.requests,
+  };
+}
+
+export function parseCostScenarioName(value: string): CostScenarioName {
+  const name = COST_SCENARIO_NAMES.find((candidate) => candidate === value);
+  if (name === undefined) {
+    throw new Error(
+      `unknown cost scenario ${value}; expected one of ${COST_SCENARIO_NAMES.join(", ")}`,
+    );
+  }
+  return name;
+}
 
 export const SCENARIOS: Readonly<Record<ScenarioName, Scenario>> = {
   page: {

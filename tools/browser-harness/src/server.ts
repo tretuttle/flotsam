@@ -1,21 +1,59 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeHttp from "node:http";
+import * as NodeNet from "node:net";
 import * as NodeStream from "node:stream";
 import * as NodeZlib from "node:zlib";
+import {
+  getBigBody,
+  getExtendedStaticRoutes,
+  getRevalBody,
+  ID_BIG_FIRST_CHUNK_BYTES,
+  ID_BIG_PATH,
+  ID_ENDLESS_PATH,
+  ID_INDEX_PATH,
+  ID_REVAL_PATH,
+  identityIndexHtml,
+  POLL_PATH,
+  type StaticRoute,
+} from "./extended-fixtures.ts";
 import { buildBody, listFixtures, WEBSOCKET_PATH, type Fixture } from "./fixtures.ts";
 
 const CHUNK_BYTES = 64 * 1024;
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const HARNESS_PREFIX = "/__harness/";
+const BIG_DELAY_MS = 1500;
+const ENDLESS_CHUNK = Buffer.from('{"n":1}\n'.repeat(512), "utf8");
 
 export type ServedRequest = {
+  readonly seq: number;
   readonly method: string;
   readonly path: string;
+  readonly url: string;
+  readonly status: number;
+};
+
+export type SequenceTruth = {
+  readonly seq: number;
+  readonly method: string;
+  readonly path: string;
+  readonly url: string;
+  readonly status: number;
+  readonly expectedLength: number | null;
+  readonly wireBytesSent: number;
+  readonly wireSha256: string;
+  readonly decodedLength: number | null;
+  readonly decodedSha256: string | null;
+  readonly aborted: boolean;
 };
 
 export type FixtureServer = AsyncDisposable & {
   readonly origin: string;
   readonly port: number;
+  readonly refusedOrigin: string;
   readonly takeRequests: () => readonly ServedRequest[];
+  readonly getRequestLog: () => readonly ServedRequest[];
+  readonly getSequenceTruth: (seq: number) => SequenceTruth | undefined;
+  readonly getAllSequenceTruth: () => ReadonlyMap<number, SequenceTruth>;
 };
 
 export async function startFixtureServer(): Promise<FixtureServer> {
@@ -23,10 +61,41 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   for (const fixture of listFixtures()) {
     routes.set(routeKey(fixture.method, fixture.path), fixture);
   }
+  const extendedRoutes = getExtendedStaticRoutes();
+  const refusedPort = await allocateClosedPort();
+  const refusedOrigin = `http://127.0.0.1:${String(refusedPort)}`;
   let served: ServedRequest[] = [];
+  const requestLog: ServedRequest[] = [];
+  const seqTruth = new Map<number, SequenceTruth>();
+  let nextSeq = 0;
+  let pollCount = 0;
+
+  const state: ServerState = {
+    routes,
+    extendedRoutes,
+    refusedOrigin,
+    nextSequence: () => {
+      nextSeq += 1;
+      return nextSeq;
+    },
+    nextPollCount: () => {
+      pollCount += 1;
+      return pollCount;
+    },
+    recordRequest: (entry) => {
+      served.push(entry);
+      requestLog.push(entry);
+    },
+    setTruth: (truth) => {
+      seqTruth.set(truth.seq, truth);
+    },
+    getTruth: (seq) => seqTruth.get(seq),
+    allTruth: () => seqTruth,
+    allRequests: () => requestLog,
+  };
+
   const server = NodeHttp.createServer((request, response) => {
-    served.push({ method: request.method ?? "GET", path: request.url?.split("?")[0] ?? "/" });
-    void handle(routes, request, response).catch(() => {
+    void handle(state, request, response).catch(() => {
       if (!response.headersSent) response.writeHead(500);
       response.end();
     });
@@ -42,14 +111,19 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   if (address === null || typeof address === "string") {
     throw new Error("fixture server did not bind a TCP port");
   }
+  const origin = `http://127.0.0.1:${String(address.port)}`;
   return {
-    origin: `http://127.0.0.1:${String(address.port)}`,
+    origin,
     port: address.port,
+    refusedOrigin,
     takeRequests: () => {
       const taken = served;
       served = [];
       return taken;
     },
+    getRequestLog: () => [...requestLog],
+    getSequenceTruth: (seq) => seqTruth.get(seq),
+    getAllSequenceTruth: () => new Map(seqTruth),
     [Symbol.asyncDispose]: () =>
       new Promise((resolve, reject) => {
         server.closeAllConnections();
@@ -58,58 +132,391 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   };
 }
 
+type ServerState = {
+  readonly routes: ReadonlyMap<string, Fixture>;
+  readonly extendedRoutes: ReadonlyMap<string, StaticRoute>;
+  readonly refusedOrigin: string;
+  readonly nextSequence: () => number;
+  readonly nextPollCount: () => number;
+  readonly recordRequest: (entry: ServedRequest) => void;
+  readonly setTruth: (truth: SequenceTruth) => void;
+  readonly getTruth: (seq: number) => SequenceTruth | undefined;
+  readonly allTruth: () => ReadonlyMap<number, SequenceTruth>;
+  readonly allRequests: () => readonly ServedRequest[];
+};
+
 async function handle(
-  routes: ReadonlyMap<string, Fixture>,
+  state: ServerState,
   request: NodeHttp.IncomingMessage,
   response: NodeHttp.ServerResponse,
 ): Promise<void> {
   const method = request.method ?? "GET";
-  const path = request.url?.split("?")[0] ?? "/";
-  await drainRequest(request);
-  const fixture = routes.get(routeKey(method, path));
-  if (fixture === undefined) {
-    const otherMethod = method === "GET" ? "POST" : "GET";
-    const status = routes.has(routeKey(otherMethod, path)) ? 405 : 404;
-    response.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
-    response.end(status === 405 ? "method not allowed\n" : "not found\n");
+  const rawUrl = request.url ?? "/";
+  const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
+  const path = parsedUrl.pathname;
+
+  if (path.startsWith(HARNESS_PREFIX)) {
+    await drainRequest(request);
+    handleHarnessControl(state, parsedUrl, response);
     return;
   }
+
+  await drainRequest(request);
+  const seq = state.nextSequence();
+  const meta: RequestMeta = { seq, method, path, url: rawUrl };
+
+  if (method === "GET" && path === POLL_PATH) {
+    const count = 1000 + state.nextPollCount();
+    const body = Buffer.from(`${JSON.stringify({ count })}\n`, "utf8");
+    sendBuffered(
+      state,
+      response,
+      meta,
+      200,
+      { "content-type": "application/json", "cache-control": "no-store" },
+      body,
+      body,
+    );
+    return;
+  }
+
+  if (method === "GET" && path === ID_REVAL_PATH) {
+    const etag = '"r1"';
+    if (request.headers["if-none-match"] === etag) {
+      sendBuffered(
+        state,
+        response,
+        meta,
+        304,
+        { etag, "cache-control": "no-cache" },
+        Buffer.alloc(0),
+        Buffer.alloc(0),
+      );
+      return;
+    }
+    const body = getRevalBody();
+    sendBuffered(
+      state,
+      response,
+      meta,
+      200,
+      { "content-type": "text/plain; charset=utf-8", etag, "cache-control": "no-cache" },
+      body,
+      body,
+    );
+    return;
+  }
+
+  if (method === "GET" && path === ID_BIG_PATH) {
+    const delayParam = parsedUrl.searchParams.get("delayMs");
+    const delayMs =
+      delayParam !== null && /^\d+$/u.test(delayParam) ? Number(delayParam) : BIG_DELAY_MS;
+    await writeBigDownload(state, request, response, meta, delayMs);
+    return;
+  }
+
+  if (method === "GET" && path === ID_ENDLESS_PATH) {
+    writeEndlessStream(state, request, response, meta);
+    return;
+  }
+
+  if (method === "GET" && path === ID_INDEX_PATH) {
+    const body = Buffer.from(identityIndexHtml(state.refusedOrigin), "utf8");
+    sendBuffered(
+      state,
+      response,
+      meta,
+      200,
+      { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      body,
+      body,
+    );
+    return;
+  }
+
+  const extended = state.extendedRoutes.get(routeKey(method, path));
+  if (extended !== undefined) {
+    const headers: Record<string, string> = {
+      "content-type": extended.contentType,
+      ...(extended.cacheControl === null ? {} : { "cache-control": extended.cacheControl }),
+      ...extended.extraHeaders,
+      ...(extended.gzip === true ? { "content-encoding": "gzip" } : {}),
+    };
+    sendBuffered(state, response, meta, extended.status, headers, extended.wire, extended.decoded);
+    return;
+  }
+
+  const fixture = state.routes.get(routeKey(method, path));
+  if (fixture === undefined) {
+    const otherMethod = method === "GET" ? "POST" : "GET";
+    const hasOther =
+      state.routes.has(routeKey(otherMethod, path)) ||
+      state.extendedRoutes.has(routeKey(otherMethod, path));
+    const status = hasOther ? 405 : 404;
+    const body = Buffer.from(status === 405 ? "method not allowed\n" : "not found\n", "utf8");
+    sendBuffered(
+      state,
+      response,
+      meta,
+      status,
+      { "content-type": "text/plain; charset=utf-8" },
+      body,
+      body,
+    );
+    return;
+  }
+
   const bytes = buildBody(fixture);
   const headers: Record<string, string> = { "content-type": fixture.contentType };
   if (fixture.cacheControl !== null) headers["cache-control"] = fixture.cacheControl;
   if (fixture.transfer === "chunked") {
-    await writeChunked(response, headers, bytes);
+    await writeChunked(state, response, meta, headers, bytes);
     return;
   }
   if (fixture.transfer === "gzip") {
     const compressed = NodeZlib.gzipSync(bytes);
-    response.writeHead(200, {
-      ...headers,
-      "content-encoding": "gzip",
-      "content-length": String(compressed.length),
-    });
-    response.end(compressed);
+    sendBuffered(
+      state,
+      response,
+      meta,
+      200,
+      { ...headers, "content-encoding": "gzip" },
+      compressed,
+      bytes,
+    );
     return;
   }
   if (fixture.transfer === "range") {
-    writeRange(response, headers, bytes, request.headers.range);
+    writeRange(state, response, meta, headers, bytes, request.headers.range);
     return;
   }
-  response.writeHead(200, { ...headers, "content-length": String(bytes.length) });
-  response.end(bytes);
+  sendBuffered(state, response, meta, 200, headers, bytes, bytes);
+}
+
+function handleHarnessControl(
+  state: ServerState,
+  parsedUrl: URL,
+  response: NodeHttp.ServerResponse,
+): void {
+  if (parsedUrl.pathname === "/__harness/info") {
+    sendJsonControl(response, 200, { refusedOrigin: state.refusedOrigin });
+    return;
+  }
+  if (parsedUrl.pathname === "/__harness/truth") {
+    const seqParam = parsedUrl.searchParams.get("seq");
+    if (seqParam !== null) {
+      const seq = Number(seqParam);
+      const truth = Number.isInteger(seq) ? state.getTruth(seq) : undefined;
+      if (truth === undefined) {
+        sendJsonControl(response, 404, { error: "unknown seq" });
+        return;
+      }
+      sendJsonControl(response, 200, truth);
+      return;
+    }
+    sendJsonControl(response, 200, {
+      seqTruth: Object.fromEntries(state.allTruth()),
+      requests: state.allRequests(),
+    });
+    return;
+  }
+  sendJsonControl(response, 404, { error: "unknown control path" });
+}
+
+function sendJsonControl(response: NodeHttp.ServerResponse, status: number, value: unknown): void {
+  const body = Buffer.from(JSON.stringify(value), "utf8");
+  response.writeHead(status, {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+    "content-length": String(body.length),
+  });
+  response.end(body);
+}
+
+type RequestMeta = {
+  readonly seq: number;
+  readonly method: string;
+  readonly path: string;
+  readonly url: string;
+};
+
+function sendBuffered(
+  state: ServerState,
+  response: NodeHttp.ServerResponse,
+  meta: RequestMeta,
+  status: number,
+  headers: Record<string, string>,
+  wire: Buffer,
+  decoded: Buffer,
+): void {
+  const finalHeaders: Record<string, string> = {
+    ...headers,
+    "x-seq": String(meta.seq),
+  };
+  if (status !== 304) finalHeaders["content-length"] = String(wire.length);
+  const truth: SequenceTruth = {
+    seq: meta.seq,
+    method: meta.method,
+    path: meta.path,
+    url: meta.url,
+    status,
+    expectedLength: wire.length,
+    wireBytesSent: wire.length,
+    wireSha256: sha256(wire),
+    decodedLength: decoded.length,
+    decodedSha256: sha256(decoded),
+    aborted: false,
+  };
+  state.setTruth(truth);
+  state.recordRequest({ ...meta, status });
+  response.writeHead(status, finalHeaders);
+  response.end(status === 304 ? undefined : wire);
 }
 
 async function writeChunked(
+  state: ServerState,
   response: NodeHttp.ServerResponse,
+  meta: RequestMeta,
   headers: Record<string, string>,
   bytes: Buffer,
 ): Promise<void> {
-  response.writeHead(200, headers);
+  const hash = sha256(bytes);
+  state.setTruth({
+    seq: meta.seq,
+    method: meta.method,
+    path: meta.path,
+    url: meta.url,
+    status: 200,
+    expectedLength: bytes.length,
+    wireBytesSent: bytes.length,
+    wireSha256: hash,
+    decodedLength: bytes.length,
+    decodedSha256: hash,
+    aborted: false,
+  });
+  state.recordRequest({ ...meta, status: 200 });
+  response.writeHead(200, { ...headers, "x-seq": String(meta.seq) });
   for (let offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
     const chunk = bytes.subarray(offset, Math.min(offset + CHUNK_BYTES, bytes.length));
     if (!response.write(chunk)) await waitForDrain(response);
   }
   response.end();
+}
+
+function writeBigDownload(
+  state: ServerState,
+  request: NodeHttp.IncomingMessage,
+  response: NodeHttp.ServerResponse,
+  meta: RequestMeta,
+  delayMs: number,
+): Promise<void> {
+  const full = getBigBody();
+  const fullHash = sha256(full);
+  const streamHash = NodeCrypto.createHash("sha256");
+  const first = full.subarray(0, ID_BIG_FIRST_CHUNK_BYTES);
+  const rest = full.subarray(ID_BIG_FIRST_CHUNK_BYTES);
+  let sent = 0;
+
+  const updateTruth = (aborted: boolean, wireSha: string): void => {
+    state.setTruth({
+      seq: meta.seq,
+      method: meta.method,
+      path: meta.path,
+      url: meta.url,
+      status: 200,
+      expectedLength: full.length,
+      wireBytesSent: sent,
+      wireSha256: wireSha,
+      decodedLength: aborted ? null : full.length,
+      decodedSha256: aborted ? null : fullHash,
+      aborted,
+    });
+  };
+
+  state.recordRequest({ ...meta, status: 200 });
+  updateTruth(false, fullHash);
+  response.writeHead(200, {
+    "content-type": "application/octet-stream",
+    "content-length": String(full.length),
+    etag: '"big1"',
+    "accept-ranges": "bytes",
+    "cache-control": "max-age=3600",
+    "x-seq": String(meta.seq),
+  });
+  streamHash.update(first);
+  sent += first.length;
+  response.write(first);
+
+  return new Promise((resolve) => {
+    let finished = false;
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      streamHash.update(rest);
+      sent += rest.length;
+      updateTruth(false, fullHash);
+      response.end(rest, () => resolve());
+    }, delayMs);
+
+    const onClose = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      updateTruth(true, streamHash.digest("hex"));
+      resolve();
+    };
+    request.once("close", onClose);
+    response.once("close", onClose);
+  });
+}
+
+function writeEndlessStream(
+  state: ServerState,
+  request: NodeHttp.IncomingMessage,
+  response: NodeHttp.ServerResponse,
+  meta: RequestMeta,
+): void {
+  const hash = NodeCrypto.createHash("sha256");
+  let sent = 0;
+  let closed = false;
+  const update = (aborted: boolean, digest: string): void => {
+    state.setTruth({
+      seq: meta.seq,
+      method: meta.method,
+      path: meta.path,
+      url: meta.url,
+      status: 200,
+      expectedLength: null,
+      wireBytesSent: sent,
+      wireSha256: digest,
+      decodedLength: null,
+      decodedSha256: null,
+      aborted,
+    });
+  };
+  state.recordRequest({ ...meta, status: 200 });
+  update(false, sha256(Buffer.alloc(0)));
+  response.writeHead(200, {
+    "content-type": "application/x-ndjson",
+    "cache-control": "no-store",
+    "x-seq": String(meta.seq),
+  });
+  const pushChunk = (): void => {
+    if (closed) return;
+    hash.update(ENDLESS_CHUNK);
+    sent += ENDLESS_CHUNK.length;
+    response.write(ENDLESS_CHUNK);
+  };
+  pushChunk();
+  const interval = setInterval(pushChunk, 5);
+  const stop = (): void => {
+    if (closed) return;
+    closed = true;
+    clearInterval(interval);
+    update(true, hash.digest("hex"));
+  };
+  request.once("close", stop);
+  response.once("close", stop);
 }
 
 function waitForDrain(response: NodeHttp.ServerResponse): Promise<void> {
@@ -119,32 +526,43 @@ function waitForDrain(response: NodeHttp.ServerResponse): Promise<void> {
 }
 
 function writeRange(
+  state: ServerState,
   response: NodeHttp.ServerResponse,
+  meta: RequestMeta,
   headers: Record<string, string>,
   bytes: Buffer,
   header: string | undefined,
 ): void {
   const range = header === undefined ? null : parseByteRange(header, bytes.length);
   if (header !== undefined && range === null) {
-    response.writeHead(416, {
-      ...headers,
-      "content-range": `bytes */${String(bytes.length)}`,
-    });
-    response.end();
+    sendBuffered(
+      state,
+      response,
+      meta,
+      416,
+      { ...headers, "content-range": `bytes */${String(bytes.length)}` },
+      Buffer.alloc(0),
+      Buffer.alloc(0),
+    );
     return;
   }
   if (range === null) {
-    response.writeHead(200, { ...headers, "content-length": String(bytes.length) });
-    response.end(bytes);
+    sendBuffered(state, response, meta, 200, headers, bytes, bytes);
     return;
   }
   const slice = bytes.subarray(range.start, range.end + 1);
-  response.writeHead(206, {
-    ...headers,
-    "content-length": String(slice.length),
-    "content-range": `bytes ${String(range.start)}-${String(range.end)}/${String(bytes.length)}`,
-  });
-  response.end(slice);
+  sendBuffered(
+    state,
+    response,
+    meta,
+    206,
+    {
+      ...headers,
+      "content-range": `bytes ${String(range.start)}-${String(range.end)}/${String(bytes.length)}`,
+    },
+    slice,
+    slice,
+  );
 }
 
 function parseByteRange(header: string, size: number): { start: number; end: number } | null {
@@ -159,6 +577,25 @@ function parseByteRange(header: string, size: number): { start: number; end: num
 
 function routeKey(method: string, path: string): string {
   return `${method} ${path}`;
+}
+
+function sha256(bytes: Buffer): string {
+  return NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+async function allocateClosedPort(): Promise<number> {
+  const server = NodeNet.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("no refused port");
+  const { port } = address;
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  return port;
 }
 
 async function drainRequest(request: NodeHttp.IncomingMessage): Promise<void> {
