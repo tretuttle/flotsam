@@ -110,6 +110,8 @@ type Random = ReturnType<typeof random>;
 /** Seeds per family. OCH_RECOVERY_CASES raises the main family for a long local run; CI keeps the default. */
 const CASES = Number(process.env["OCH_RECOVERY_CASES"] ?? 1500);
 const EXCLUSION_SEEDS = Math.ceil(CASES / 10);
+/** A long local run outlasts the suite's 60-second default, so the generated tests scale theirs with CASES. */
+const GENERATED_TIMEOUT = Math.max(60_000, CASES * 20);
 
 /** A plan touches an excluded site only through delete-excluded-site: its files are going, whatever their state. */
 function misplanned(plan: readonly reconcile.ReconcileStep[], disk: Disk): string | null {
@@ -313,19 +315,27 @@ const firstFailure = (planner: Planner, seeds: number): string | null => {
 };
 
 describe("recovery after generated crashes", () => {
-  it(`over ${CASES} generated cases, plan, apply, plan again is always empty, and no committed line or the body it names is lost`, () => {
-    expect(firstFailure(reconcile, CASES)).toBeNull();
-  });
+  it(
+    `over ${CASES} generated cases, plan, apply, plan again is always empty, and no committed line or the body it names is lost`,
+    () => {
+      expect(firstFailure(reconcile, CASES)).toBeNull();
+    },
+    GENERATED_TIMEOUT,
+  );
 
-  it(`over ${EXCLUSION_SEEDS} generated archives, an exclusion stopped before any one of its steps recovers`, () => {
-    let cases = 0;
-    for (let seed = 1; seed <= EXCLUSION_SEEDS; seed++) {
-      const result = exclusionCases(reconcile, seed);
-      expect(result.problem).toBeNull();
-      cases += result.cases;
-    }
-    console.info(`exclusion cases: ${cases} interrupt points over ${EXCLUSION_SEEDS} archives`);
-  });
+  it(
+    `over ${EXCLUSION_SEEDS} generated archives, an exclusion stopped before any one of its steps recovers`,
+    () => {
+      let cases = 0;
+      for (let seed = 1; seed <= EXCLUSION_SEEDS; seed++) {
+        const result = exclusionCases(reconcile, seed);
+        expect(result.problem).toBeNull();
+        cases += result.cases;
+      }
+      console.info(`exclusion cases: ${cases} interrupt points over ${EXCLUSION_SEEDS} archives`);
+    },
+    GENERATED_TIMEOUT,
+  );
 
   it.each(Object.keys(reconcile.RECONCILE_STEPS))(
     "planted: without the %s rule a generated crash is left unrecovered",
