@@ -1,9 +1,11 @@
-import { pickCustomFields } from "./internal.ts";
+import { OWNED_FIELDS, pickCustomFields } from "./internal.ts";
 import {
   isHarUrl,
   isIsoDateTime,
   isMimeType,
   isPageId,
+  toIsoDateTime,
+  toPageId,
   type CustomHarFields,
   type HarCache,
   type HarCacheEntry,
@@ -66,7 +68,7 @@ export const HAR_VALIDATION_RULES = [
 
 export type HarValidationRule = (typeof HAR_VALIDATION_RULES)[number];
 
-export type HarValidationSeverity = "error" | "note";
+export type HarValidationSeverity = "error" | "note" | "dropped";
 
 const HAR_VALIDATION_SEVERITY: Record<HarValidationRule, HarValidationSeverity> = {
   "json-syntax": "error",
@@ -132,6 +134,13 @@ type JsonRecord = Record<string, unknown>;
 
 const HAR_VERSION_PATTERN = /^(\d+)\.(\d+)$/u;
 const NUMERIC_STRING_PATTERN = /^\d+$/u;
+function salvageDate(): IsoDateTime {
+  const date = toIsoDateTime("1970-01-01T00:00:00.000Z");
+  if (!date) {
+    throw new RangeError("Salvage date is not ISO 8601.");
+  }
+  return date;
+}
 
 function isPlainRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -148,8 +157,18 @@ function isSizeOrSentinel(value: unknown): value is number {
 class ProblemCollector {
   readonly items: HarProblem[] = [];
 
-  add(path: string, rule: HarValidationRule, message: string): void {
-    this.items.push({ path, rule, severity: HAR_VALIDATION_SEVERITY[rule], message });
+  add(
+    path: string,
+    rule: HarValidationRule,
+    message: string,
+    severity?: HarValidationSeverity,
+  ): void {
+    this.items.push({
+      path,
+      rule,
+      severity: severity ?? HAR_VALIDATION_SEVERITY[rule],
+      message,
+    });
   }
 }
 
@@ -185,15 +204,20 @@ function parseCreatorLike(
   if (typeof name !== "string" || name.length === 0) {
     problems.add(`${path}.name`, rule, "Expected non-empty string name.");
   }
-  if (typeof version !== "string") {
-    problems.add(`${path}.version`, rule, "Expected string version.");
+  if (typeof version !== "string" || version.length === 0) {
+    problems.add(`${path}.version`, rule, "Expected non-empty string version.");
   }
   const comment = readOptionalComment(value, path, rule, problems);
-  if (typeof name !== "string" || name.length === 0 || typeof version !== "string") {
+  if (
+    typeof name !== "string" ||
+    name.length === 0 ||
+    typeof version !== "string" ||
+    version.length === 0
+  ) {
     return null;
   }
   return {
-    ...pickCustomFields(value),
+    ...pickCustomFields(value, OWNED_FIELDS.creator),
     name,
     version,
     ...(comment !== undefined ? { comment } : {}),
@@ -257,7 +281,7 @@ function parsePageTimings(
   }
   const comment = readOptionalComment(value, path, "page-timings-object", problems);
   return {
-    ...pickCustomFields(value),
+    ...pickCustomFields(value, OWNED_FIELDS.pageTimings),
     ...(onContentLoad !== undefined ? { onContentLoad } : {}),
     ...(onLoad !== undefined ? { onLoad } : {}),
     ...(comment !== undefined ? { comment } : {}),
@@ -290,6 +314,11 @@ function parsePages(
       problems.add(`${path}.id`, "page-object", "Expected non-empty string page id.");
     } else if (ids.has(rawId)) {
       problems.add(`${path}.id`, "page-id-unique", `Duplicate page id "${rawId}".`);
+      const renamed = toPageId(`${rawId}__${String(index)}`);
+      if (renamed && !ids.has(renamed)) {
+        ids.add(renamed);
+        validId = renamed;
+      }
     } else {
       ids.add(rawId);
       validId = rawId;
@@ -307,10 +336,11 @@ function parsePages(
     }
     const pageTimings = parsePageTimings(item.pageTimings, `${path}.pageTimings`, problems);
     const comment = readOptionalComment(item, path, "page-object", problems);
-    if (validId && typeof title === "string" && startedDateTime && pageTimings) {
+    const keptStart = startedDateTime ?? salvageDate();
+    if (validId && typeof title === "string" && keptStart && pageTimings) {
       pages.push({
-        ...pickCustomFields(item),
-        startedDateTime,
+        ...pickCustomFields(item, OWNED_FIELDS.page),
+        startedDateTime: keptStart,
         id: validId,
         title,
         pageTimings,
@@ -344,7 +374,7 @@ function parseNameValueArray(
     }
     const comment = readOptionalComment(item, itemPath, "name-value-array", problems);
     result.push({
-      ...pickCustomFields(item),
+      ...pickCustomFields(item, OWNED_FIELDS.nameValue),
       name: item.name,
       value: item.value,
       ...(comment !== undefined ? { comment } : {}),
@@ -394,7 +424,7 @@ function parseCookieArray(
         );
       }
     }
-    let expires: IsoDateTime | null | undefined;
+    let expires: string | null | undefined;
     if (item.expires === null) {
       problems.add(
         `${itemPath}.expires`,
@@ -402,23 +432,25 @@ function parseCookieArray(
         "Session cookie expires is null. Kept because browsers emit null instead of omitting it.",
       );
       expires = null;
-    } else if (item.expires !== undefined) {
-      if (
-        typeof item.expires !== "string" ||
-        (item.expires !== "" && !isIsoDateTime(item.expires))
-      ) {
+    } else if (typeof item.expires === "string") {
+      if (item.expires !== "" && !isIsoDateTime(item.expires)) {
         problems.add(
           `${itemPath}.expires`,
           "iso-datetime",
           "Expected cookie expires to be a valid ISO 8601 timestamp.",
         );
-      } else if (item.expires !== "" && isIsoDateTime(item.expires)) {
-        expires = item.expires;
       }
+      expires = item.expires;
+    } else if (item.expires !== undefined) {
+      problems.add(
+        `${itemPath}.expires`,
+        "iso-datetime",
+        "Expected cookie expires to be a valid ISO 8601 timestamp.",
+      );
     }
     const comment = readOptionalComment(item, itemPath, "cookie-array", problems);
     result.push({
-      ...pickCustomFields(item),
+      ...pickCustomFields(item, OWNED_FIELDS.cookie),
       name: item.name,
       value: item.value,
       ...(typeof item.path === "string" ? { path: item.path } : {}),
@@ -505,7 +537,7 @@ function parsePostData(
           problems,
         );
         params.push({
-          ...pickCustomFields(param),
+          ...pickCustomFields(param, OWNED_FIELDS.postParam),
           name: param.name,
           ...(typeof param.value === "string" ? { value: param.value } : {}),
           ...(typeof param.fileName === "string" ? { fileName: param.fileName } : {}),
@@ -515,8 +547,16 @@ function parsePostData(
       }
     }
   }
-  let text = "";
-  if (hasText) {
+  let text: string | null = "";
+  if (value.text === null) {
+    problems.add(
+      `${path}.text`,
+      "post-data-object",
+      "postData.text is null. Kept because the exporter had no text.",
+      "note",
+    );
+    text = null;
+  } else if (hasText) {
     if (typeof value.text !== "string") {
       problems.add(`${path}.text`, "post-data-object", "Expected postData.text to be a string.");
     } else {
@@ -524,12 +564,9 @@ function parsePostData(
     }
   }
   const comment = readOptionalComment(value, path, "post-data-object", problems);
-  if (mimeType === null) {
-    return undefined;
-  }
   return {
-    ...pickCustomFields(value),
-    mimeType,
+    ...pickCustomFields(value, OWNED_FIELDS.postData),
+    mimeType: mimeType ?? "",
     params,
     text,
     ...(comment !== undefined ? { comment } : {}),
@@ -575,27 +612,22 @@ function parseRequest(value: unknown, path: string, problems: ProblemCollector):
     );
   }
   const comment = readOptionalComment(value, path, "request-object", problems);
-  if (
-    typeof method !== "string" ||
-    method.length === 0 ||
-    !url ||
-    typeof httpVersion !== "string" ||
-    !isSizeOrSentinel(value.headersSize) ||
-    !isSizeOrSentinel(value.bodySize)
-  ) {
+  if (!url) {
     return null;
   }
+  const methodText = typeof method === "string" && method.length > 0 ? method : "";
+  const httpVersionText = typeof httpVersion === "string" ? httpVersion : "";
   return {
-    ...pickCustomFields(value),
-    method,
+    ...pickCustomFields(value, OWNED_FIELDS.request),
+    method: methodText,
     url,
-    httpVersion,
+    httpVersion: httpVersionText,
     cookies,
     headers,
     queryString,
     ...(postData !== undefined ? { postData } : {}),
-    headersSize: value.headersSize,
-    bodySize: value.bodySize,
+    headersSize: isSizeOrSentinel(value.headersSize) ? value.headersSize : -1,
+    bodySize: isSizeOrSentinel(value.bodySize) ? value.bodySize : -1,
     ...(comment !== undefined ? { comment } : {}),
   };
 }
@@ -612,16 +644,17 @@ function parseContent(value: unknown, path: string, problems: ProblemCollector):
       "Expected content.size to be a finite number >= -1.",
     );
   }
-  const mimeType = parseMimeField(value.mimeType, `${path}.mimeType`, problems);
+  const parsedMime = parseMimeField(value.mimeType, `${path}.mimeType`, problems);
+  const mimeType = parsedMime ?? "";
   let compression: number | undefined;
   if (value.compression !== undefined) {
-    if (isNonNegativeNumber(value.compression)) {
+    if (typeof value.compression === "number" && Number.isFinite(value.compression)) {
       compression = value.compression;
     } else {
       problems.add(
         `${path}.compression`,
         "non-negative-number",
-        "Expected content.compression to be a finite number >= 0.",
+        "Expected content.compression to be a finite number.",
       );
     }
   }
@@ -632,12 +665,9 @@ function parseContent(value: unknown, path: string, problems: ProblemCollector):
     problems.add(`${path}.encoding`, "content-object", "Expected content.encoding to be a string.");
   }
   const comment = readOptionalComment(value, path, "content-object", problems);
-  if (!isSizeOrSentinel(value.size) || mimeType === null) {
-    return null;
-  }
   return {
-    ...pickCustomFields(value),
-    size: value.size,
+    ...pickCustomFields(value, OWNED_FIELDS.content),
+    size: isSizeOrSentinel(value.size) ? value.size : -1,
     ...(compression !== undefined ? { compression } : {}),
     mimeType,
     ...(typeof value.text === "string" ? { text: value.text } : {}),
@@ -709,28 +739,17 @@ function parseResponse(
     );
   }
   const comment = readOptionalComment(value, path, "response-object", problems);
-  if (
-    !validStatus ||
-    typeof value.statusText !== "string" ||
-    typeof value.httpVersion !== "string" ||
-    !content ||
-    redirectURL === null ||
-    !isSizeOrSentinel(value.headersSize) ||
-    !isSizeOrSentinel(value.bodySize)
-  ) {
-    return null;
-  }
   return {
-    ...pickCustomFields(value),
-    status,
-    statusText: value.statusText,
-    httpVersion: value.httpVersion,
+    ...pickCustomFields(value, OWNED_FIELDS.response),
+    status: typeof status === "number" && validStatus ? status : 0,
+    statusText: typeof value.statusText === "string" ? value.statusText : "",
+    httpVersion: typeof value.httpVersion === "string" ? value.httpVersion : "",
     cookies,
     headers,
-    content,
-    redirectURL,
-    headersSize: value.headersSize,
-    bodySize: value.bodySize,
+    content: content ?? { size: -1, mimeType: "" },
+    redirectURL: redirectURL ?? "",
+    headersSize: isSizeOrSentinel(value.headersSize) ? value.headersSize : -1,
+    bodySize: isSizeOrSentinel(value.bodySize) ? value.bodySize : -1,
     ...(comment !== undefined ? { comment } : {}),
   };
 }
@@ -782,7 +801,7 @@ function parseCacheEntry(
   }
   const comment = readOptionalComment(value, path, "cache-entry-object", problems);
   return {
-    ...pickCustomFields(value),
+    ...pickCustomFields(value, OWNED_FIELDS.cacheEntry),
     ...(typeof value.expires === "string" ? { expires: value.expires } : {}),
     ...(typeof value.lastAccess === "string" ? { lastAccess: value.lastAccess } : {}),
     ...(typeof value.lastFetched === "string" ? { lastFetched: value.lastFetched } : {}),
@@ -804,7 +823,7 @@ function parseCache(value: unknown, path: string, problems: ProblemCollector): H
   const afterRequest = parseCacheEntry(value.afterRequest, `${path}.afterRequest`, problems);
   const comment = readOptionalComment(value, path, "cache-object", problems);
   return {
-    ...pickCustomFields(value),
+    ...pickCustomFields(value, OWNED_FIELDS.cache),
     ...(beforeRequest !== undefined ? { beforeRequest } : {}),
     ...(afterRequest !== undefined ? { afterRequest } : {}),
     ...(comment !== undefined ? { comment } : {}),
@@ -852,6 +871,7 @@ function parseTimings(value: unknown, path: string, problems: ProblemCollector):
         "non-negative-number",
         `Expected timings.${key} to be a finite number >= 0.`,
       );
+      parsedRequired[key] = 0;
     } else {
       parsedRequired[key] = raw;
     }
@@ -865,7 +885,7 @@ function parseTimings(value: unknown, path: string, problems: ProblemCollector):
     return null;
   }
   return {
-    ...pickCustomFields(value),
+    ...pickCustomFields(value, OWNED_FIELDS.timings),
     ...(parsedOptional.blocked !== undefined ? { blocked: parsedOptional.blocked } : {}),
     ...(parsedOptional.dns !== undefined ? { dns: parsedOptional.dns } : {}),
     ...(parsedOptional.connect !== undefined ? { connect: parsedOptional.connect } : {}),
@@ -934,29 +954,39 @@ function parseEntries(
     const timings = parseTimings(item.timings, `${path}.timings`, problems);
     const comment = readOptionalComment(item, path, "entry-object", problems);
 
-    if (
-      !startedDateTime ||
-      !isNonNegativeNumber(item.time) ||
-      !request ||
-      !response ||
-      !cache ||
-      !timings
-    ) {
+    if (!request) {
+      problems.add(
+        path,
+        "entry-object",
+        "Dropped this entry because the request URL could not be salvaged.",
+        "dropped",
+      );
       continue;
     }
 
-    const custom = pickCustomFields(item) as CustomHarFields & {
+    const custom = pickCustomFields(item, OWNED_FIELDS.entry) as CustomHarFields & {
       readonly _harExport?: HarEntryExtension | undefined;
     };
+    const keptStart = startedDateTime ?? salvageDate();
     entries.push({
       ...custom,
       ...(pageref !== undefined ? { pageref } : {}),
-      startedDateTime,
-      time: item.time,
+      startedDateTime: keptStart,
+      time: isNonNegativeNumber(item.time) ? item.time : 0,
       request,
-      response,
-      cache,
-      timings,
+      response: response ?? {
+        status: 0,
+        statusText: "",
+        httpVersion: "",
+        cookies: [],
+        headers: [],
+        content: { size: -1, mimeType: "" },
+        redirectURL: "",
+        headersSize: -1,
+        bodySize: -1,
+      },
+      cache: cache ?? {},
+      timings: timings ?? { send: 0, wait: 0, receive: 0 },
       ...(typeof item.serverIPAddress === "string"
         ? { serverIPAddress: item.serverIPAddress }
         : {}),
@@ -994,7 +1024,7 @@ export function parseHar(input: unknown): HarParseResult {
     return { ok: false, problems: problems.items };
   }
 
-  const custom = pickCustomFields(rawLog) as CustomHarFields & {
+  const custom = pickCustomFields(rawLog, OWNED_FIELDS.log) as CustomHarFields & {
     readonly _harExport?: HarLogExtension | undefined;
   };
   const log: HarLog = {

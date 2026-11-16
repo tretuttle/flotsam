@@ -132,25 +132,55 @@ function formatTimeSegment(timeRange: HarFilenameTimeRange | null | undefined): 
   return `${startStamp}_to_${endStamp}`;
 }
 
-function assembleFilename(hostPart: string, suffix: string, maxLength: number): string {
-  if (maxLength < 0) {
-    return "";
-  }
-  return `${hostPart}${suffix}`;
+function stripEdgeMarks(value: string): string {
+  return value.replace(/^[._-]+|[._-]+$/gu, "");
 }
 
-function fitFilename(assembled: string, maxLength: number): string {
-  if (assembled.length <= maxLength) {
-    return assembled;
+function renderFilename(hostPart: string, parts: readonly string[], extension: string): string {
+  const middle = parts.length > 0 ? `_${parts.join("_")}` : "";
+  return `${hostPart}${middle}.${extension}`;
+}
+
+function fitFilename(
+  hostPart: string,
+  parts: readonly string[],
+  extension: string,
+  maxLength: number,
+): string {
+  if (maxLength <= 0) {
+    return "";
   }
-  let fitted = assembled.slice(assembled.length - maxLength);
-  if (fitted.startsWith(".") || fitted.startsWith("-")) {
-    const trimmed = fitted.replace(/^[.-]+/u, "");
-    if (trimmed.includes(".")) {
-      fitted = trimmed;
+  const full = renderFilename(hostPart, parts, extension);
+  if (full.length <= maxLength) {
+    return full;
+  }
+  for (let keep = parts.length; keep >= 0; keep -= 1) {
+    const kept = parts.slice(0, keep);
+    const tail = kept.length > 0 ? `_${kept.join("_")}.${extension}` : `.${extension}`;
+    if (tail.length >= maxLength) {
+      continue;
+    }
+    const room = maxLength - tail.length;
+    const hostSlice = stripEdgeMarks(hostPart.slice(0, room));
+    if (hostSlice.length === 0) {
+      continue;
+    }
+    const fitted = `${hostSlice}${tail}`;
+    if (fitted.length <= maxLength) {
+      return fitted;
     }
   }
-  return fitted;
+  for (let start = 0; start <= parts.length; start += 1) {
+    const candidate = stripEdgeMarks(renderFilename("", parts.slice(start), extension));
+    if (candidate.length > 0 && candidate.length <= maxLength) {
+      return candidate;
+    }
+  }
+  const lastSegment = extension.split(".").pop() ?? extension;
+  if (lastSegment.length <= maxLength) {
+    return lastSegment;
+  }
+  return lastSegment.slice(0, maxLength);
 }
 
 export function formatHarFilename(options: HarFilenameOptions): string {
@@ -174,6 +204,5 @@ export function formatHarFilename(options: HarFilenameOptions): string {
     tailParts.push("redacted");
   }
 
-  const suffix = (tailParts.length > 0 ? `_${tailParts.join("_")}` : "") + `.${extension}`;
-  return fitFilename(assembleFilename(hostPart, suffix, maxLength), maxLength);
+  return fitFilename(hostPart, tailParts, extension, maxLength);
 }

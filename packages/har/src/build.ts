@@ -1,4 +1,9 @@
-import { pickCustomFields, safeDecodeQueryComponent, utf8ByteLength } from "./internal.ts";
+import {
+  OWNED_FIELDS,
+  pickCustomFields,
+  safeDecodeQueryComponent,
+  utf8ByteLength,
+} from "./internal.ts";
 import {
   isHarUrl,
   isMimeType,
@@ -40,7 +45,7 @@ export interface BuildHarPageInput extends CustomHarFields {
 export interface BuildHarPostDataInput extends CustomHarFields {
   readonly mimeType?: string | undefined;
   readonly params?: readonly HarPostDataParam[] | undefined;
-  readonly text?: string | undefined;
+  readonly text?: string | null | undefined;
   readonly comment?: string | undefined;
 }
 
@@ -171,7 +176,7 @@ function normalizePageTimings(timings: Partial<HarPageTimings> | undefined): Har
     return { onContentLoad: -1, onLoad: -1 };
   }
   return {
-    ...pickCustomFields(timings),
+    ...pickCustomFields(timings, OWNED_FIELDS.pageTimings),
     onContentLoad: timings.onContentLoad ?? -1,
     onLoad: timings.onLoad ?? -1,
     ...(timings.comment !== undefined ? { comment: timings.comment } : {}),
@@ -199,7 +204,7 @@ function normalizePages(
         index,
         epochMs: Date.parse(page.startedDateTime),
         page: {
-          ...pickCustomFields(page),
+          ...pickCustomFields(page, OWNED_FIELDS.page),
           startedDateTime: page.startedDateTime,
           id,
           title: page.title,
@@ -257,7 +262,7 @@ function resolvePageForEntry(
 }
 
 function normalizeTimings(raw: Partial<HarTimings> | undefined): HarTimings {
-  const custom = raw ? pickCustomFields(raw) : {};
+  const custom = raw ? pickCustomFields(raw, OWNED_FIELDS.timings) : {};
   return {
     ...custom,
     ...(raw?.blocked !== undefined ? { blocked: raw.blocked } : {}),
@@ -292,10 +297,10 @@ function normalizePostData(
   const headerContentType = findHeaderValue(headers, "content-type");
   const fallbackMime = headerContentType && isMimeType(headerContentType) ? headerContentType : "";
   return {
-    ...pickCustomFields(raw),
+    ...pickCustomFields(raw, OWNED_FIELDS.postData),
     mimeType: raw.mimeType ?? fallbackMime,
     params: raw.params ?? [],
-    text: raw.text ?? "",
+    text: raw.text === undefined ? "" : raw.text,
     ...(raw.comment !== undefined ? { comment: raw.comment } : {}),
   };
 }
@@ -305,9 +310,11 @@ function normalizeRequest(raw: BuildHarRequestInput): HarRequest {
   const postData = normalizePostData(raw.postData, headers);
   const bodySize =
     raw.bodySize ??
-    (postData?.text !== undefined && postData.text.length > 0 ? utf8ByteLength(postData.text) : -1);
+    (typeof postData?.text === "string" && postData.text.length > 0
+      ? utf8ByteLength(postData.text)
+      : -1);
   return {
-    ...pickCustomFields(raw),
+    ...pickCustomFields(raw, OWNED_FIELDS.request),
     method: raw.method,
     url: raw.url,
     httpVersion: raw.httpVersion ?? "",
@@ -330,7 +337,7 @@ function normalizeContent(
   const defaultSize =
     raw?.text !== undefined && raw.encoding !== "base64" ? utf8ByteLength(raw.text) : -1;
   return {
-    ...(raw ? pickCustomFields(raw) : {}),
+    ...(raw ? pickCustomFields(raw, OWNED_FIELDS.content) : {}),
     size: raw?.size ?? defaultSize,
     ...(raw?.compression !== undefined ? { compression: raw.compression } : {}),
     mimeType: raw?.mimeType ?? fallbackMime,
@@ -348,7 +355,7 @@ function normalizeResponse(raw: BuildHarResponseInput): HarResponse {
   const content = normalizeContent(raw.content, headers);
   const bodySize = raw.bodySize ?? (status === 304 ? 0 : -1);
   return {
-    ...pickCustomFields(raw),
+    ...pickCustomFields(raw, OWNED_FIELDS.response),
     status,
     statusText: raw.statusText ?? "",
     httpVersion: raw.httpVersion ?? "",
@@ -382,7 +389,7 @@ export function buildHar(input: BuildHarInput): HarDocument {
     const timings = normalizeTimings(entry.timings);
     const pageref = resolvePageForEntry(entry, pages, pageIds);
     return {
-      ...pickCustomFields(entry),
+      ...pickCustomFields(entry, OWNED_FIELDS.entry),
       ...(pageref !== undefined ? { pageref } : {}),
       startedDateTime: entry.startedDateTime,
       time: entry.time ?? sumEntryTimings(timings),
@@ -397,7 +404,7 @@ export function buildHar(input: BuildHarInput): HarDocument {
   });
 
   const log: HarLog = {
-    ...pickCustomFields(input),
+    ...pickCustomFields(input, new Set([...OWNED_FIELDS.log, "defaultPageTitle"])),
     version: input.version && input.version.length > 0 ? input.version : "1.2",
     creator: input.creator,
     ...(input.browser !== undefined ? { browser: input.browser } : {}),

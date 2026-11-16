@@ -208,4 +208,34 @@ describe("summarizeHar", () => {
     expect(empty.bodies.withBody).toBe(0);
     expect(empty.bodies.withoutBody).toBe(0);
   });
+
+  it("counts an empty 304 as empty and a 304 with text as present", () => {
+    const doc = buildHar({
+      creator: { name: "Caller", version: "1" },
+      entries: [
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/empty")! },
+          response: { status: 304, content: { mimeType: toMimeType("text/plain")!, size: 0 } },
+        },
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:01.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/full")! },
+          response: {
+            status: 304,
+            content: { mimeType: toMimeType("text/plain")!, size: 4, text: "keep" },
+          },
+        },
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:02.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/sized")! },
+          response: { status: 304, content: { mimeType: toMimeType("text/plain")!, size: 128 } },
+        },
+      ],
+    });
+    expect(classifyEntryBodyState(doc.log.entries[0]!)).toBe("empty");
+    expect(classifyEntryBodyState(doc.log.entries[1]!)).toBe("present");
+    expect(classifyEntryBodyState(doc.log.entries[2]!)).toBe("empty");
+    expect(summarizeHar(doc).bodies.empty).toBe(2);
+  });
 });

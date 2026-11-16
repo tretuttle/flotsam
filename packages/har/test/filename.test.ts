@@ -50,8 +50,9 @@ describe("formatHarFilename", () => {
       maxLength: 64,
     });
 
-    expect(name.length).toBeLessThanOrEqual(64);
+    expect(name.length).toBe(64);
     expect(name.endsWith("_20261116-050000Z_redacted.har")).toBe(true);
+    expect(name.startsWith(".")).toBe(false);
   });
 
   it("drops URL userinfo and keeps the filename tail inside maxLength", () => {
@@ -69,10 +70,15 @@ describe("formatHarFilename", () => {
       extension: "har.zip",
     });
 
-    expect(name.length).toBeLessThanOrEqual(40);
-    expect(name.endsWith(".har.zip")).toBe(true);
-    expect(name.includes("example.com")).toBe(false);
+    expect(name).toBe("example.com.har.zip");
     expect(name.includes("alice")).toBe(false);
     expect(name.includes("hunter2")).toBe(false);
+    expect(name.startsWith(".")).toBe(false);
+
+    expect(formatHarFilename({ host: "example.com", maxLength: 4 })).toBe("har");
+    expect(formatHarFilename({ host: "example.com", maxLength: 0 })).toBe("");
+    expect(formatHarFilename({ host: "example.com", maxLength: 3, extension: "har.zip" })).toBe(
+      "zip",
+    );
   });
 });

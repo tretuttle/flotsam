@@ -256,4 +256,25 @@ describe("buildHar", () => {
     expect(built.log.entries[0]!.time).toBe(63);
     expect(built.log.entries[0]!.timings.ssl).toBe(100);
   });
+
+  it("does not write defaultPageTitle into the file and rejects an empty creator", () => {
+    const built = buildHar({
+      creator: { name: "Caller", version: "1" },
+      defaultPageTitle: "Untitled",
+      entries: [],
+    });
+    expect(Object.keys(built.log)).not.toContain("defaultPageTitle");
+    expect(() =>
+      buildHar({
+        creator: { name: "", version: "1" },
+        entries: [],
+      }),
+    ).toThrow(/creator/);
+    expect(() =>
+      buildHar({
+        creator: { name: "Caller", version: "" },
+        entries: [],
+      }),
+    ).toThrow(/creator/);
+  });
 });

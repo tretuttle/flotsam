@@ -3,7 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { buildHar } from "../src/build.ts";
 import { toHarUrl, toIsoDateTime, toMimeType } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
-import { DEFAULT_REDACTION_RULES, redactHar } from "../src/redact.ts";
+import { DEFAULT_REDACTION_RULES, REDACTION_LEVEL_TABLE, redactHar } from "../src/redact.ts";
 
 describe("redactHar", () => {
   it("removes every listed secret across headers, cookies, query, and body and records removals", () => {
@@ -90,7 +90,7 @@ describe("redactHar", () => {
       { name: "page", value: "2" },
     ]);
     expect(first.request.headers.find((h) => h.name === "Accept")?.value).toBe("application/json");
-    expect(JSON.parse(first.request.postData!.text)).toEqual({
+    expect(JSON.parse(first.request.postData!.text ?? "")).toEqual({
       user: "alice",
       nested: { password: "[REDACTED]" },
     });
@@ -101,16 +101,13 @@ describe("redactHar", () => {
     );
 
     expect(report.applied).toBe(true);
+    expect(report.level).toBe("default");
+    expect(report.guarantee).toBe(REDACTION_LEVEL_TABLE.default.guarantee);
     expect(report.entriesAffected).toBe(2);
-    expect(report.totalRemoved).toBe(10);
+    expect(report.totalRemoved).toBe(11);
     expect(report.records.some((record) => record.target === "page")).toBe(true);
-    expect(report.notInspected).toEqual([
-      "response-body-other",
-      "websocket",
-      "cache",
-      "comment",
-      "other-custom-field",
-    ]);
+    expect(report.notInspected).toEqual([]);
+    expect(report.places.every((place) => place.status !== "not-examined")).toBe(true);
     expect(redacted.log._harExport?.redaction).toEqual(report);
     expect(first._harExport?.redactedFields).toContain("header:Authorization");
     expect(first._harExport?.redactedFields).toContain("query:access_token");
@@ -156,13 +153,15 @@ describe("redactHar", () => {
       unlistedHeaderSecret,
     );
     expect(defaultEntry.response.content.text).toContain(unlistedResponseBodySecret);
-    expect(defaultRedacted.report.notInspected).toEqual([
-      "response-body-other",
-      "websocket",
-      "cache",
-      "comment",
-      "other-custom-field",
-    ]);
+    const headerPlace = defaultRedacted.report.places.find((place) => place.place === "url-header");
+    const bodyPlace = defaultRedacted.report.places.find(
+      (place) => place.place === "response-body-json",
+    );
+    expect(headerPlace?.status).toBe("examined");
+    expect(headerPlace?.canStillHold).toContain("hyphenated slug");
+    expect(bodyPlace?.status).toBe("examined");
+    expect(bodyPlace?.canStillHold).toContain("hyphenated slug");
+    expect(defaultRedacted.report.notInspected).toEqual([]);
 
     const withExtraRule = redactHar(doc, {
       extraRules: [
@@ -349,13 +348,10 @@ describe("redactHar", () => {
     expect(leaked).toEqual([]);
     expect(keys.filter((key) => !serialized.includes(secret(key)))).toHaveLength(23);
     expect(report.records.some((record) => record.target === "page")).toBe(true);
-    expect(report.notInspected).toEqual([
-      "response-body-other",
-      "websocket",
-      "cache",
-      "comment",
-      "other-custom-field",
-    ]);
+    expect(report.notInspected).toEqual([]);
+    expect(report.places.find((place) => place.place === "request-url-userinfo")?.status).toBe(
+      "removed",
+    );
     expect("_harAnytime" in document.log).toBe(false);
     expect(document.log._harExport?.redaction).toEqual(report);
     expect(parseHar(document).ok).toBe(true);

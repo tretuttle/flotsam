@@ -9,7 +9,7 @@ export type PageId = string & { readonly [PageIdBrand]: true };
 export type MimeType = string & { readonly [MimeTypeBrand]: true };
 
 export type CustomHarFields = {
-  readonly [key: `_${string}`]: unknown;
+  readonly [key: string]: unknown;
 };
 
 const ISO_DATE_TIME_PATTERN =
@@ -137,6 +137,8 @@ export type HarRedactionTarget =
 export const HAR_REDACTION_PLACES = [
   "request-url-query",
   "request-url-userinfo",
+  "request-url-fragment",
+  "request-url-path",
   "named-header",
   "url-header",
   "cookie",
@@ -145,8 +147,10 @@ export const HAR_REDACTION_PLACES = [
   "body-json",
   "body-form",
   "body-multipart",
+  "request-body-other",
   "redirect-url",
   "response-body-json",
+  "response-body-base64",
   "page-title",
   "initiator",
   "response-body-other",
@@ -158,21 +162,50 @@ export const HAR_REDACTION_PLACES = [
 
 export type HarRedactionPlace = (typeof HAR_REDACTION_PLACES)[number];
 
+export const REDACTION_DETECTORS = [
+  "structured-removal",
+  "name-match",
+  "url",
+  "json-walk",
+  "token-shape",
+] as const;
+
+export type RedactionDetector = (typeof REDACTION_DETECTORS)[number];
+
+export const REDACTION_LEVELS = ["default", "strict"] as const;
+
+export type RedactionLevel = (typeof REDACTION_LEVELS)[number];
+
+export type PlaceExamStatus = "removed" | "examined" | "not-examined";
+
+export interface HarPlaceCoverage {
+  readonly place: HarRedactionPlace;
+  readonly status: PlaceExamStatus;
+  readonly detectors: readonly RedactionDetector[];
+  readonly removedBy: readonly RedactionDetector[];
+  readonly canStillHold: string;
+}
+
 export interface HarRedactionRecord {
   readonly entryIndex: number;
   readonly url: HarUrl;
+  readonly place: HarRedactionPlace;
   readonly target: HarRedactionTarget;
   readonly field: string;
   readonly ruleId: string;
+  readonly detector: RedactionDetector;
   readonly count: number;
 }
 
 export interface HarLogRedactionExtension {
   readonly applied: true;
+  readonly level: RedactionLevel;
+  readonly guarantee: string;
   readonly totalRemoved: number;
   readonly entriesAffected: number;
   readonly rules: readonly string[];
   readonly records: readonly HarRedactionRecord[];
+  readonly places: readonly HarPlaceCoverage[];
   readonly notInspected: readonly HarRedactionPlace[];
 }
 
@@ -242,7 +275,7 @@ export interface HarCookie extends CustomHarFields {
   readonly value: string;
   readonly path?: string | undefined;
   readonly domain?: string | undefined;
-  readonly expires?: IsoDateTime | null | undefined;
+  readonly expires?: string | null | undefined;
   readonly httpOnly?: boolean | undefined;
   readonly secure?: boolean | undefined;
   readonly comment?: string | undefined;
@@ -259,7 +292,7 @@ export interface HarPostDataParam extends CustomHarFields {
 export interface HarPostData extends CustomHarFields {
   readonly mimeType: string;
   readonly params: readonly HarPostDataParam[];
-  readonly text: string;
+  readonly text: string | null;
   readonly comment?: string | undefined;
 }
 

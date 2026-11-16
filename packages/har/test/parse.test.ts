@@ -812,7 +812,167 @@ describe("parseHar and parseHarJson", () => {
       return;
     }
     expect(result.problems.some((problem) => problem.rule === "non-negative-number")).toBe(true);
-    expect(result.document.log.entries).toHaveLength(1);
-    expect(result.document.log.entries[0]!.timings.send).toBeGreaterThanOrEqual(0);
+    expect(result.problems.some((problem) => problem.severity === "dropped")).toBe(false);
+    expect(result.document.log.entries).toHaveLength(2);
+    expect(result.document.log.entries[1]!.timings.send).toBe(0);
+    expect(result.document.log.entries[1]!.timings.wait).toBe(0);
+    expect(result.document.log.entries[1]!.timings.receive).toBe(0);
+  });
+
+  it("keeps a good entry that follows one whose request URL cannot be salvaged", () => {
+    const result = parseHar(
+      cloneHar((har) => {
+        const entries = (har.log as Record<string, unknown>).entries as Array<
+          Record<string, unknown>
+        >;
+        const good = JSON.parse(JSON.stringify(entries[0])) as Record<string, unknown>;
+        entries.push({
+          startedDateTime: "2026-11-16T05:00:01.000Z",
+          request: { url: "/relative" },
+        });
+        good.startedDateTime = "2026-11-16T05:00:02.000Z";
+        entries.push(good);
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.document.log.entries.map((entry) => entry.startedDateTime)).toEqual([
+      "2026-11-16T05:00:00.050Z",
+      "2026-11-16T05:00:02.000Z",
+    ]);
+    expect(result.problems.some((problem) => problem.severity === "dropped")).toBe(true);
+  });
+
+  it("keeps unknown keys on postData and headers", () => {
+    const result = parseHar(
+      cloneHar((har) => {
+        const entry = (
+          (har.log as Record<string, unknown>).entries as Array<Record<string, unknown>>
+        )[0]!;
+        const request = entry.request as Record<string, unknown>;
+        request.postData = {
+          mimeType: "text/plain",
+          text: "hello",
+          params: [],
+          vendorTrace: "keep-post",
+        };
+        request.headers = [{ name: "Accept", value: "text/html", size: 12 }];
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    const request = result.document.log.entries[0]!.request;
+    expect(request.postData?.vendorTrace).toBe("keep-post");
+    expect(request.headers[0]?.size).toBe(12);
+  });
+
+  it("reports a page with a bad date and keeps the page", () => {
+    const result = parseHar(
+      cloneHar((har) => {
+        const pages = (har.log as Record<string, unknown>).pages as Array<Record<string, unknown>>;
+        pages[0]!.startedDateTime = "not-a-date";
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.document.log.pages?.[0]?.title).toBe("https://example.com/");
+    expect(result.document.log.pages?.[0]?.startedDateTime).toBe("1970-01-01T00:00:00.000Z");
+    const problem = result.problems.find((item) => item.rule === "iso-datetime");
+    expect(problem?.severity).toBe("error");
+    expect(problem?.severity).not.toBe("dropped");
+  });
+
+  it("rejects an empty creator name or version", () => {
+    const nameless = parseHar(
+      cloneHar((har) => {
+        (har.log as Record<string, unknown>).creator = { name: "", version: "1" };
+      }),
+    );
+    const versionless = parseHar(
+      cloneHar((har) => {
+        (har.log as Record<string, unknown>).creator = { name: "Caller", version: "" };
+      }),
+    );
+    expect(nameless.ok).toBe(false);
+    expect(versionless.ok).toBe(false);
+    if (!nameless.ok) {
+      expect(nameless.problems.some((problem) => problem.rule === "creator-object")).toBe(true);
+    }
+  });
+
+  it("keeps Safari session cookie expires and negative compression", () => {
+    const result = parseHar(
+      cloneHar((har) => {
+        const entry = (
+          (har.log as Record<string, unknown>).entries as Array<Record<string, unknown>>
+        )[0]!;
+        const response = entry.response as Record<string, unknown>;
+        response.cookies = [{ name: "pref", value: "1", expires: "" }];
+        response.content = { size: 4, compression: -12, mimeType: "text/html", text: "inbox" };
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.document.log.entries[0]!.response.cookies[0]?.expires).toBe("");
+    expect(result.document.log.entries[0]!.response.content.compression).toBe(-12);
+    expect(result.problems.some((problem) => problem.path.includes("compression"))).toBe(false);
+  });
+
+  it("keeps a mitmproxy failed request and a null postData text", () => {
+    const result = parseHar(
+      cloneHar((har) => {
+        const entries = (har.log as Record<string, unknown>).entries as Array<
+          Record<string, unknown>
+        >;
+        entries.push({
+          startedDateTime: "2026-11-16T08:00:01.000Z",
+          time: 0,
+          request: {
+            method: "GET",
+            url: "https://down.example/",
+            httpVersion: "HTTP/1.1",
+            cookies: [],
+            headers: [],
+            queryString: [],
+            headersSize: 20,
+            bodySize: 0,
+          },
+          response: {
+            status: 0,
+            statusText: "",
+            httpVersion: "",
+            headers: [],
+            cookies: [],
+            content: {},
+            redirectURL: "",
+            headersSize: -1,
+            bodySize: -1,
+            _error: "Connection refused",
+          },
+          cache: {},
+          timings: { send: 0, wait: 0, receive: 0 },
+        });
+        const request = entries[0]!.request as Record<string, unknown>;
+        request.postData = { mimeType: "application/octet-stream", text: null, params: [] };
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.document.log.entries).toHaveLength(2);
+    expect(result.document.log.entries[1]!.response.content.size).toBe(-1);
+    expect(result.document.log.entries[1]!.response._error).toBe("Connection refused");
+    expect(result.document.log.entries[0]!.request.postData?.text).toBeNull();
+    const nullText = result.problems.find((problem) => problem.path.endsWith("postData.text"));
+    expect(nullText?.severity).toBe("note");
   });
 });

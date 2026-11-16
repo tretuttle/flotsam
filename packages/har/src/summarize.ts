@@ -104,6 +104,11 @@ function base64DecodedLength(encoded: string): number {
 
 export function classifyEntryBodyState(entry: HarEntry): HarBodyState {
   const { content, status, bodySize } = entry.response;
+  if (status === 204 || status === 304) {
+    if (content.text === undefined || content.text.length === 0) {
+      return "empty";
+    }
+  }
   if (content.text !== undefined) {
     return "present";
   }
@@ -111,10 +116,6 @@ export function classifyEntryBodyState(entry: HarEntry): HarBodyState {
   const annotated = entry._harExport?.bodyState;
   if (annotated !== undefined && annotated !== "present") {
     return annotated;
-  }
-
-  if (status === 204 || status === 304) {
-    return "empty";
   }
   if (status === 0) {
     return "aborted";
