@@ -13,7 +13,8 @@ import { pageMinimizers } from "./minify.ts";
 
 const checkScript = NodePath.join(extensionRoot, "scripts", "check-xpi.ts");
 
-// The libraries round 2 of the review found failing the check through one build path or both.
+// The libraries earlier reviews found failing the check through one build path or both. ajv has no `exports` and the
+// parent build's neutral platform ignores `main`, so it is imported by its file.
 const LIBRARIES: Readonly<Record<string, string>> = {
   react: 'import * as a from "react";import * as b from "react-dom/client";globalThis.lib=[a,b];',
   fflate: 'import * as a from "fflate";globalThis.lib=a;',
@@ -23,6 +24,8 @@ const LIBRARIES: Readonly<Record<string, string>> = {
   yaml: 'import * as a from "yaml";globalThis.lib=a;',
   "js-yaml": 'import * as a from "js-yaml";globalThis.lib=a;',
   acorn: 'import * as a from "acorn";globalThis.lib=a;',
+  ajv: 'import * as a from "ajv/dist/ajv.js";globalThis.lib=a;',
+  "libphonenumber-js/max": 'import * as a from "libphonenumber-js/max";globalThis.lib=a;',
 };
 
 /** The rspack production build of the pages, with the minimizers extension.config.js installs. */
@@ -90,7 +93,7 @@ const checkBuilt = async (
   library: string,
   path: keyof typeof BUILD_PATHS,
 ): Promise<{ status: number | null; stderr: string }> => {
-  const dir = NodePath.join(workDir, `${library}-${path.replaceAll(/\W+/g, "-")}`);
+  const dir = NodePath.join(workDir, `${library}-${path}`.replaceAll(/\W+/g, "-"));
   NodeFS.mkdirSync(dir, { recursive: true });
   const entry = NodePath.join(dir, "entry.js");
   NodeFS.writeFileSync(entry, LIBRARIES[library] ?? "");

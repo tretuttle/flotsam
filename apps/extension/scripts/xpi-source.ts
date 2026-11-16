@@ -22,8 +22,10 @@ export interface ScriptFacts {
   /** Strings and template quasis, in source order. */
   readonly strings: readonly TextValue[];
   readonly objects: readonly ObjectShape[];
-  /** True when the script declares a function, a class, a variable or a parameter. Prose never does. */
+  /** True when the script declares a function, a class, a variable or a parameter. */
   readonly declaresBinding: boolean;
+  /** Top-level statements. A text of comments alone has none. */
+  readonly statements: number;
   readonly errors: readonly string[];
 }
 
@@ -98,11 +100,9 @@ const cookedValue = (element: AstNode): string | undefined => {
   return typeof cooked === "string" ? cooked : undefined;
 };
 
-export type Language = "js" | "ts";
-
 /** Parses a script as the build's parser does and keeps what it saw. A text with errors is not a script. */
-export const parseScript = (text: string, lang: Language = "js"): ScriptFacts => {
-  const parsed = parseSync(lang === "js" ? "packed.js" : "packed.ts", text, { lang });
+export const parseScript = (text: string): ScriptFacts => {
+  const parsed = parseSync("packed.js", text, { lang: "js" });
   const strings: TextValue[] = [];
   const objects: ObjectShape[] = [];
   let declaresBinding = false;
@@ -124,6 +124,7 @@ export const parseScript = (text: string, lang: Language = "js"): ScriptFacts =>
     strings: strings.toSorted((a, b) => a.span.start - b.span.start),
     objects,
     declaresBinding,
+    statements: parsed.program.body.length,
     errors: parsed.errors.map(({ message }) => message),
   };
 };

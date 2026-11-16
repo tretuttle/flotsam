@@ -12,8 +12,8 @@ import {
 import { Features, transform, transformStyleAttribute } from "lightningcss";
 
 // extension.js turns reduce_vars and collapse_vars off; this keeps its choice. `passes: 0` runs compress until a pass
-// changes nothing: on the eight libraries in minify.test.ts it writes the same bytes as 6, 8 or 10 passes, and a
-// second run then saves at most 7 bytes, where the 2 passes rspack defaults to left 509 on zod and 468 on vue.
+// changes nothing, the same bytes as 6, 8 or 10 passes on the first eight libraries in minify.test.ts. A second run
+// then saves at most 8 bytes on any library there (vue, parent build); rspack's default of 2 passes left 509 on zod.
 const SCRIPT_OPTIONS = {
   compress: { passes: 0, reduce_vars: false, collapse_vars: false },
   mangle: true,
@@ -31,6 +31,17 @@ export const minifyScript = (code: string): string =>
  */
 export const reminifyScript = (code: string): string =>
   experiments.swc.minifySync(code, { ...SCRIPT_OPTIONS, format: { comments: "some" } }).code;
+
+/**
+ * `reminifyScript` without compress, for the text of a string that parses as a script. A string is data the
+ * build never ran, so compress would delete it as dead code: vue ships 208 bytes of global names in one string.
+ */
+export const reminifyStringScript = (code: string): string =>
+  experiments.swc.minifySync(code, {
+    ...SCRIPT_OPTIONS,
+    compress: false,
+    format: { comments: "some" },
+  }).code;
 
 // No targets: every browser this ships to is a current Gecko, so lightningcss only minifies and never lowers syntax.
 // extension.js also keeps :dir() and :lang() lists as written.

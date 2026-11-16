@@ -13,9 +13,17 @@ import { extensionRoot } from "./manifest.ts";
 import { minifyScript } from "./minify.ts";
 import { RULES, type Changes, type Fixtures } from "./xpi-rules.ts";
 import { renderPng } from "./write-icons.ts";
+import { parseScript } from "./xpi-source.ts";
 
 const checkScript = NodePath.join(extensionRoot, "scripts", "check-xpi.ts");
 const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+/** The legal comments of `code`, a blank line apart, as the page build extracts them into a `.LICENSE.txt`. */
+const legalComments = (code: string): string =>
+  parseScript(code)
+    .comments.map(({ start, end }) => code.slice(start, end))
+    .filter((comment) => /@license|^\/\*!/.test(comment))
+    .join("\n\n");
 
 const inertPage = `<!DOCTYPE html><html><body><a href="#top" onclick="a()" style="margin:0">go</a><a href="javascript:void(0)">x</a><iframe srcdoc="&lt;p&gt;hi&lt;/p&gt;"></iframe></body></html>`;
 
@@ -65,7 +73,9 @@ beforeAll(async () => {
     framework: `/*! LICENSE: framework.js.LICENSE.txt */\n${minifyScript(
       NodeFS.readFileSync(NodePath.join(reactDom, "cjs", "react-dom-client.production.js"), "utf8"),
     )}`,
-    reactLicense: NodeFS.readFileSync(NodePath.join(reactDom, "LICENSE")),
+    reactNotice: legalComments(
+      NodeFS.readFileSync(NodePath.join(reactDom, "cjs", "react-dom-client.production.js"), "utf8"),
+    ),
     png: renderPng(
       NodeFS.readFileSync(NodePath.join(extensionRoot, "src", "icons", "icon.svg"), "utf8"),
       16,
@@ -82,14 +92,37 @@ beforeAll(async () => {
     "action/index.css": encode("body{margin:0}h1{font-size:15px}"),
     "experiment/parent.js": encode(minifiedParent),
     "shared/framework.js": encode(fixtures.framework),
-    "shared/framework.js.LICENSE.txt": fixtures.reactLicense,
+    "shared/framework.js.LICENSE.txt": encode(fixtures.reactNotice),
     "icons/toolbar.svg": encode(toolbarSvg),
     "icons/16.png": fixtures.png,
   };
 });
 
+// Signals whose default action writes a core dump. A test that ends a process with one writes a dump on every
+// machine that runs the suite, so every signal that ends a check or a judge child is recorded and checked here.
+const CORE_DUMP_SIGNALS = new Set([
+  "SIGABRT",
+  "SIGBUS",
+  "SIGFPE",
+  "SIGILL",
+  "SIGQUIT",
+  "SIGSEGV",
+  "SIGSYS",
+  "SIGTRAP",
+  "SIGXCPU",
+  "SIGXFSZ",
+]);
+const stopSignals: string[] = [];
+
+const recordStops = (signal: NodeJS.Signals | null, stderr: string): void => {
+  if (signal !== null) stopSignals.push(signal);
+  for (const [, judgeSignal] of stderr.matchAll(/the judge process was killed by (SIG\w+)/g))
+    if (judgeSignal !== undefined) stopSignals.push(judgeSignal);
+};
+
 afterAll(() => {
   NodeFS.rmSync(workDir, { recursive: true, force: true });
+  expect(stopSignals.filter((signal) => CORE_DUMP_SIGNALS.has(signal))).toEqual([]);
 });
 
 interface Failure {
@@ -143,7 +176,12 @@ const check = async (
     stderr += chunk;
   });
   child.stdout.resume();
-  const status = await new Promise<number | null>((resolve) => child.on("close", resolve));
+  const status = await new Promise<number | null>((resolve) =>
+    child.on("close", (code, signal) => {
+      recordStops(signal, stderr);
+      resolve(code);
+    }),
+  );
   NodeFS.rmSync(xpi, { force: true });
   const failures = [...stderr.matchAll(/^FAIL (\S+): ([\w-]+): /gm)].map(([, path, rule]) => ({
     path: path ?? "",
@@ -261,6 +299,24 @@ describe.concurrent("check-xpi", () => {
       }),
     },
     {
+      // rspack writes a large JSON import as JSON.parse('...'); this is ajv's draft-07 meta-schema, one line.
+      name: "a JSON document in a string, as the page build writes a JSON import",
+      changes: () => ({
+        "shared/payload.js": minifyScript(
+          `var s=JSON.parse(${JSON.stringify(JSON.stringify({ $schema: "http://json-schema.org/draft-07/schema#", definitions: { schemaArray: { type: "array", minItems: 1, items: { $ref: "#" } }, nonNegativeInteger: { type: "integer", minimum: 0 } }, type: ["object", "boolean"], properties: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`property${i}`, { $ref: "#/definitions/nonNegativeInteger", default: {} }])) }))});console.log(s);`,
+        ),
+      }),
+    },
+    {
+      // libphonenumber-js ships phone number patterns like this, over 1,200 bytes on one line.
+      name: "a long regular expression source in a string",
+      changes: () => ({
+        "shared/payload.js": minifyScript(
+          `var p=new RegExp(${JSON.stringify(Array.from({ length: 60 }, (_, i) => `(?:${i}[2-9]\\d{2}|7[0-8]\\d{3})`).join("|") + "{1,3}")});console.log(p);`,
+        ),
+      }),
+    },
+    {
       name: "a two line string of short generated code",
       changes: () => ({
         "shared/payload.js": 'var f=new Function("a","return a+1;\\nreturn a");f(1);',
@@ -294,6 +350,33 @@ describe.concurrent("check-xpi", () => {
     expect(result.status).toBe(0);
   });
 
+  // Hostile text the check does not see, as docs/internals/shipped-output.md states. No build step writes them.
+  const limits: ReadonlyArray<{ readonly name: string; readonly source: string }> = [
+    {
+      name: "A04d readable functions in a string that does not parse",
+      source: `<<<<\n${"function collectHeaders(entries) {\n  return entries;\n}\n".repeat(20)}`,
+    },
+    {
+      name: "M09 TypeScript in a string, which the script parser rejects",
+      source:
+        "function collectHeaders(entries: Array<Entry>): Array<Entry> {\n  return entries;\n}\n".repeat(
+          20,
+        ),
+    },
+    {
+      name: "a string of indented calls that declares no name",
+      source: "\n    collectHeaders(entries);\n    sendHeaders(headers);\n".repeat(20),
+    },
+  ];
+
+  it.each(limits)("passes, as a stated limit, $name", async ({ name, source }) => {
+    const result = await check(name, {
+      "experiment/parent.js": `${fixtures.minifiedParent};eval(${JSON.stringify(source)});`,
+    });
+    expect(result.failures).toEqual([]);
+    expect(result.status).toBe(0);
+  });
+
   describe.each(RULES)("rule $id", (rule) => {
     it("is proven by at least one planted archive", () => {
       expect(rule.plants.length).toBeGreaterThan(0);
@@ -322,24 +405,32 @@ describe.concurrent("check-xpi", () => {
     );
   });
 
-  it("names the file a judge process crashed on, and judges the files after it", async () => {
-    const result = await check(
-      "crash",
-      { "shared/commons.js": "function add ( first , second ) { return first + second ; }" },
-      [],
-      {
-        XPI_JUDGE_ABORT_ON: "experiment/parent.js",
-      },
-    );
-    expect(result.failures.toSorted(bySortKey)).toEqual([
-      { path: "experiment/parent.js", rule: CANNOT_JUDGE },
-      { path: "shared/commons.js", rule: "not-minified" },
-    ]);
-    expect(result.stderr).toMatch(
-      /^FAIL experiment\/parent\.js: cannot-judge: the judge process was killed by SIGABRT while judging this file$/m,
-    );
-    expect(result.status).toBe(1);
-  });
+  // A judge that dies mid-file stands in for a native crash. Both ways end without a core dump.
+  it.each([
+    ["killed by a signal", "signal", "the judge process was killed by SIGKILL"],
+    ["exited without a verdict", "exit", "the judge process exited with code 3"],
+  ])(
+    "names the file a judge process %s was on, and judges the files after it",
+    async (_how, stop, detail) => {
+      const result = await check(
+        `stop-${stop}`,
+        { "shared/commons.js": "function add ( first , second ) { return first + second ; }" },
+        [],
+        { XPI_JUDGE_STOP_ON: `${stop}:experiment/parent.js` },
+      );
+      expect(result.failures.toSorted(bySortKey)).toEqual([
+        { path: "experiment/parent.js", rule: CANNOT_JUDGE },
+        { path: "shared/commons.js", rule: "not-minified" },
+      ]);
+      expect(result.stderr).toMatch(
+        new RegExp(
+          `^FAIL experiment/parent\\.js: cannot-judge: ${detail} while judging this file$`,
+          "m",
+        ),
+      );
+      expect(result.status).toBe(1);
+    },
+  );
 
   it("fails naming the archive when the judge runs out of time before judging a file", async () => {
     const result = await check("timeout", {}, ["--timeout-ms", "1"]);
@@ -353,6 +444,7 @@ describe.concurrent("check-xpi", () => {
     const run = NodeChildProcess.spawnSync(process.execPath, [checkScript, xpi], {
       encoding: "utf8",
     });
+    recordStops(run.signal, run.stderr);
     expect(run.stderr).toMatch(new RegExp(`^FAIL not-a-zip.xpi: ${CANNOT_JUDGE}: .+`, "m"));
     expect(run.status).toBe(1);
   });

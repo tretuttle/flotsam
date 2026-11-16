@@ -2,9 +2,14 @@
 // step runs, and the rules. A file's suffix only says what it claims to be; a reader parses its bytes into facts and
 // the rules judge the facts. Every rule carries the planted archive that proves it, and check-xpi.test.ts runs them.
 import * as NodeZlib from "node:zlib";
-import { experiments } from "@rspack/core";
 import { CANNOT_JUDGE } from "./check-xpi.ts";
-import { minifyScript, minifyStyle, minifyStyleAttribute, reminifyScript } from "./minify.ts";
+import {
+  minifyScript,
+  minifyStyle,
+  minifyStyleAttribute,
+  reminifyScript,
+  reminifyStringScript,
+} from "./minify.ts";
 import { readMarkup, type BodyKind, type Markup } from "./xpi-markup.ts";
 import { classifyComments, lineOf, parseScript, type ScriptFacts } from "./xpi-source.ts";
 
@@ -35,8 +40,8 @@ interface Producer {
 }
 
 // What a second run of the build's own minifier still saves on honest output, measured: 0 bytes on every packed
-// script but 1 on shared/framework.js, and at most 7 (vue) on the eight libraries minify.test.ts builds through both
-// script build paths. 16 is about twice that. One 210 byte readable function saves 89.
+// script but 1 on shared/framework.js, and on the libraries minify.test.ts builds at most 7 through the page build
+// and 8 through the parent build, both vue. 16 is twice that. One 210 byte readable function saves 89.
 const SCRIPT_MARGIN_BYTES = 16;
 // lightningcss reaches a fixed point in one run: 0 bytes on both packed stylesheets and on real 13 and 90 KB sheets.
 const STYLE_MARGIN_BYTES = 0;
@@ -168,7 +173,8 @@ const read = (unit: Unit): Facts => {
     unit.kind === "script" ||
     unit.kind === "style" ||
     unit.kind === "style-attribute" ||
-    unit.kind === "data"
+    unit.kind === "data" ||
+    unit.kind === "notice"
   )
     ensureShallow(text, "it");
   switch (unit.kind) {
@@ -347,60 +353,21 @@ const DEVELOPMENT_MARKERS: ReadonlyArray<string> = [
 const DEV_ONLY_PATH =
   /(^|\/)(node_modules|__tests__|__mocks__|fixtures?|tests?|scripts)\/|\.(test|spec|stories)\.|(^|\/)(package|tsconfig[^/]*)\.json$/;
 
-const CODE_LINE = /[{}]\s*$|=>|^\s*(?:function|const|let|var|import|export|return)\s+\S/;
-const MAX_CODE_LINES = 2;
-
-interface CodeLine {
-  readonly number: number;
-  readonly text: string;
-}
-
-/** The lines that look like code rather than prose. */
-const codeLines = (text: string): readonly CodeLine[] =>
-  text
-    .split(/\r\n|[\n\r\u2028\u2029]/)
-    .flatMap((line, i) => (CODE_LINE.test(line) ? [{ number: i + 1, text: line }] : []));
-
-// Text in a string that parses as no script is judged by its lines. zod's code generator ships template fragments
-// of real code: at most 4 such lines and 85 bytes in one string, the most across the eight libraries in
-// minify.test.ts. 512 bytes is six times that, and about two and a half readable functions.
-const STRING_CODE_LINE_BYTES = 512;
-
 const SOURCE_MAP_REFERENCE = /[#@]\s*sourceMappingURL=/;
 
-// How a string's text is read as code: names shortened and spaces dropped, nothing removed as dead. A string is
-// data the minifier never touched, so dead-code removal would count a table of numbers as savings.
-const readable = (code: string): number =>
-  code.length -
-  experiments.swc.minifySync(code, {
-    compress: false,
-    mangle: true,
-    ecma: 2022,
-    module: false,
-    format: { comments: "all" },
-  }).code.length;
-
 /**
- * Why the text of a string is source code, or undefined when it is data. Prose never declares a binding, so only a
- * string that parses and declares a function, class, variable or parameter is measured. Text that parses only as
- * TypeScript is source. Text that parses as neither is judged by how many of its lines look like code.
+ * Why the text of a string is source code, or undefined when it is data. Only text that parses as a script and
+ * declares a name is judged, by re-minifying it like a script file. Text that does not parse is data. So is a script
+ * that declares nothing: mangling renames labels, and a Thai error message in zod parses as a label and an
+ * identifier, so re-minifying it saves 22 bytes.
  */
 const sourceInString = (value: string): string | undefined => {
   ensureShallow(value, "a string in it");
   const script = parseScript(value);
-  if (script.errors.length === 0) {
-    if (!script.declaresBinding) return undefined;
-    const saved = readable(value);
-    return saved > SCRIPT_MARGIN_BYTES
-      ? `it is a script that declares names, and minifying it saves ${saved} bytes`
-      : undefined;
-  }
-  const typed = parseScript(value, "ts");
-  if (typed.errors.length === 0 && typed.declaresBinding) return "it is TypeScript source";
-  const lines = codeLines(value);
-  const bytes = lines.reduce((total, line) => total + line.text.length, 0);
-  return bytes > STRING_CODE_LINE_BYTES
-    ? `it does not parse (${script.errors[0]}), and ${plural(lines.length, "line")} holding ${bytes} bytes look like code, from line ${lines[0]?.number}`
+  if (script.errors.length > 0 || !script.declaresBinding) return undefined;
+  const saved = value.length - reminifyStringScript(value).length;
+  return saved > SCRIPT_MARGIN_BYTES
+    ? `it parses as a script that declares names, and minifying it saves ${saved} bytes`
     : undefined;
 };
 
@@ -423,8 +390,8 @@ export interface Fixtures {
   readonly toolbarSvg: string;
   /** The shape of shared/framework.js: a legal pointer line, then React's production react-dom minified by the build. */
   readonly framework: string;
-  /** The real framework.js.LICENSE.txt. */
-  readonly reactLicense: Uint8Array;
+  /** framework.js.LICENSE.txt as the page build writes it: React's legal comments, a blank line apart. */
+  readonly reactNotice: string;
   /** A real 16 pixel icon, rendered by write-icons.ts. */
   readonly png: Uint8Array;
 }
@@ -474,19 +441,6 @@ const ONE_LINE_FUNCTION =
 
 /** A table of numbers that a minifier cannot shrink, to put readable source beside. */
 const NUMBER_TABLE = `var table=[${Array.from({ length: 2000 }, (_, i) => i).join(",")}];\n`;
-
-/** The same function in TypeScript, with comments after its braces and lines that start with a keyword. */
-const TYPESCRIPT_FUNCTION = `async function collectHeaders(entries: Array<HeaderEntry>): Promise<Array<HeaderEntry>>
-{ // collect all valid headers
-  for (const entry of entries)
-  { // check each entry
-    if (entry.name !== undefined)
-    { // keep valid entry
-      entries.push({ name: entry.name, value: String(entry.value) });
-    } // end if
-  } // end for
-} // end collectHeaders
-`;
 
 const evalOf = (fixtures: Fixtures, source: string): string =>
   `${fixtures.minifiedParent};eval(${JSON.stringify(source)});`;
@@ -756,6 +710,16 @@ export const RULES: readonly Rule[] = [
         name: "A04e a script the parser accepts and the minifier rejects, then 250 readable functions on one line",
         changes: (fixtures) => ({
           "experiment/parent.js": `${fixtures.minifiedParent};using x=a;${ONE_LINE_FUNCTION.repeat(250)}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a readable ES module in a string, which the script minifier rejects",
+        changes: (fixtures) => ({
+          "experiment/parent.js": evalOf(
+            fixtures,
+            `import { read } from "./read.js";\nexport ${PRETTY_FUNCTION}`,
+          ),
         }),
         path: "experiment/parent.js",
       },
@@ -1138,6 +1102,7 @@ export const RULES: readonly Rule[] = [
         name: "a source map after prose in a license notice",
         changes: () => ({ "shared/framework.js.LICENSE.txt": `MIT License\n\n${SOURCE_MAP}\n` }),
         path: "shared/framework.js.LICENSE.txt",
+        alsoFails: ["notice-carries-code"],
       },
     ],
   },
@@ -1692,7 +1657,7 @@ export const RULES: readonly Rule[] = [
     id: "string-holds-source",
     inspects: "contents",
     decides:
-      "a script string or template quasi parses as a script that declares names and minifying it saves more than the script margin, parses only as TypeScript, or parses as neither and has more than 512 bytes of lines that look like code",
+      "a script string or template quasi parses as a script that declares names, and re-minifying it saves more than the script margin",
     check: (read) => {
       if (!("facts" in read) || read.facts.form !== "script") return undefined;
       const { text, script } = read.facts;
@@ -1748,33 +1713,9 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
       },
       {
-        name: "A04d eval of text the minifier cannot parse, then 200 readable functions",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(fixtures, `<<<<\n${PRETTY_FUNCTION.repeat(200)}`),
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "A04d written with carriage returns and U+2028 line separators",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(
-            fixtures,
-            `<<<<\r${PRETTY_FUNCTION.repeat(200).replaceAll("\n", "\u2028")}\u2028and that is all.`,
-          ),
-        }),
-        path: "experiment/parent.js",
-      },
-      {
         name: "M08 readable functions split across the quasis of one template literal",
         changes: (fixtures) => ({
           "experiment/parent.js": `${fixtures.minifiedParent};var s=\`${PRETTY_FUNCTION.repeat(3)}\${1}${PRETTY_FUNCTION.repeat(3)}\`;console.log(s);`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "M09 eval of TypeScript with comments after its braces",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(fixtures, TYPESCRIPT_FUNCTION.repeat(20)),
         }),
         path: "experiment/parent.js",
       },
@@ -1790,18 +1731,48 @@ export const RULES: readonly Rule[] = [
   {
     id: "notice-carries-code",
     inspects: "contents",
-    decides: `a .LICENSE.txt file has more than ${MAX_CODE_LINES} lines that look like code`,
+    decides:
+      "a .LICENSE.txt file holds anything but legal comments, read with the script parser, that the legal-comment rule accepts",
     check: (read) => {
       if (read.unit.kind !== "notice") return undefined;
-      const lines = codeLines(textOf(read) ?? "");
-      return lines.length > MAX_CODE_LINES
-        ? `${plural(lines.length, "line")} look like code, the first is line ${lines[0]?.number}; a notice is prose`
+      const text = textOf(read) ?? "";
+      // The page build writes a notice as the legal comments it extracted, so it parses as a script of comments only.
+      const notice = parseScript(text);
+      const [error] = notice.errors;
+      if (error !== undefined) return `it does not parse as comments: ${error}`;
+      if (notice.statements > 0)
+        return `it holds ${plural(notice.statements, "statement")} outside comments; the build writes only comments`;
+      const { ordinary, rejected } = classifyComments(text, notice.comments);
+      const [first] = rejected;
+      if (first !== undefined)
+        return `the comment at line ${lineOf(text, first.start)} ${first.reason}`;
+      return ordinary.length > 0
+        ? `${plural(ordinary.length, "comment")} carry no legal marker; the build extracts only legal comments`
         : undefined;
     },
     plants: [
       {
         name: "a function in a license notice",
         changes: () => ({ "shared/framework.js.LICENSE.txt": PRETTY_FUNCTION }),
+        path: "shared/framework.js.LICENSE.txt",
+      },
+      {
+        name: "a license notice of prose outside comments",
+        changes: () => ({ "shared/framework.js.LICENSE.txt": "MIT License\n\nCopyright (c) Meta" }),
+        path: "shared/framework.js.LICENSE.txt",
+      },
+      {
+        name: "a readable function inside a legal comment in a license notice",
+        changes: (fixtures) => ({
+          "shared/framework.js.LICENSE.txt": `${fixtures.reactNotice}\n\n/*! ${ONE_LINE_FUNCTION} */\n`,
+        }),
+        path: "shared/framework.js.LICENSE.txt",
+      },
+      {
+        name: "a comment without a legal marker in a license notice",
+        changes: (fixtures) => ({
+          "shared/framework.js.LICENSE.txt": `${fixtures.reactNotice}\n\n/* build 42 */\n`,
+        }),
         path: "shared/framework.js.LICENSE.txt",
       },
     ],

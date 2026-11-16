@@ -55,12 +55,12 @@ describe("parseScript", () => {
     expect(declares("try{a()}catch(e){}")).toBe(true);
     expect(declares("a.b(c,d)")).toBe(false);
     expect(declares("Infinity,undefined,NaN")).toBe(false);
+    expect(declares("label: text")).toBe(false);
   });
 
-  it("parses TypeScript only when asked to", () => {
-    const text = "const x: number = 1;";
-    expect(parseScript(text).errors).not.toEqual([]);
-    expect(parseScript(text, "ts").errors).toEqual([]);
+  it("counts top-level statements, and none in a text of comments alone", () => {
+    expect(parseScript("/*! a */\n\n// b\n").statements).toBe(0);
+    expect(parseScript("a();b();").statements).toBe(2);
   });
 });
 

@@ -7,7 +7,16 @@
       // extension.js builds the pages src/manifest.json names, and scripts/build-experiment.ts bundles the parent script.
       "entry": ["src/*/main.tsx", "experiment/parent.ts", "scripts/*.ts", "extension.config.js"],
       // scripts/minify.test.ts bundles these from entry text, so each resolves to its browser build.
-      "ignoreDependencies": ["acorn", "effect", "js-yaml", "vue", "yaml", "zod"],
+      "ignoreDependencies": [
+        "acorn",
+        "ajv",
+        "effect",
+        "js-yaml",
+        "libphonenumber-js",
+        "vue",
+        "yaml",
+        "zod",
+      ],
     },
     "packages/*": {
       // Only package.json `exports` and the tests are entries. Knip's default entries include src/index.ts, which

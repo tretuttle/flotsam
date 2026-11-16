@@ -103,8 +103,10 @@ if (import.meta.main) {
     const file = files[index];
     if (file === undefined) break;
     emit({ event: "start", index, path: file.path });
-    // Lets a test prove the crash backstop without depending on where a native stack runs out.
-    if (process.env.XPI_JUDGE_ABORT_ON === file.path) process.abort();
+    // Lets a test prove the crash backstop without a native crash: SIGKILL and a plain exit never write a core dump.
+    if (process.env.XPI_JUDGE_STOP_ON === `signal:${file.path}`)
+      process.kill(process.pid, "SIGKILL");
+    if (process.env.XPI_JUDGE_STOP_ON === `exit:${file.path}`) process.exit(3);
     let done: Extract<JudgeEvent, { event: "done" }>;
     try {
       done = { ...judgeFile(file), index };
