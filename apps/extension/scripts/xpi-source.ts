@@ -44,16 +44,20 @@ const isAstNode = (value: unknown): value is AstNode =>
 /** Parsed scripts keyed by their text. One archive holds a handful of scripts, and five rules read each one. */
 const scriptCache = new Map<string, ScriptFacts>();
 
-const walk = (node: unknown, visit: (node: AstNode) => void): void => {
-  if (Array.isArray(node)) {
-    for (const item of node) walk(item, visit);
-    return;
-  }
-  if (!isAstNode(node)) return;
-  visit(node);
-  for (const [key, value] of Object.entries(node)) {
-    if (key === "type" || key === "start" || key === "end") continue;
-    walk(value, visit);
+/** Visits every node in source order. Iterative, so a deeply nested file cannot overflow the call stack. */
+const walk = (root: unknown, visit: (node: AstNode) => void): void => {
+  const pending: unknown[] = [root];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (Array.isArray(node)) {
+      for (let i = node.length - 1; i >= 0; i--) pending.push(node[i]);
+    } else if (isAstNode(node)) {
+      visit(node);
+      const children = Object.entries(node).filter(
+        ([key]) => key !== "type" && key !== "start" && key !== "end",
+      );
+      for (let i = children.length - 1; i >= 0; i--) pending.push(children[i]?.[1]);
+    }
   }
 };
 
