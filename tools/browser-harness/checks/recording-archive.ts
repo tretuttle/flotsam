@@ -16,16 +16,14 @@ import { startFixtureServer } from "../src/server.ts";
 
 type Status = { readonly recording: boolean; readonly problems: readonly string[] };
 
-const statusOf = async (session: BrowserSession, popupUrl: string): Promise<Status> => {
-  const tab = await session.openTab(popupUrl);
-  try {
-    return JSON.parse(
-      await session.evaluate(tab, "browser.oneClickHar.getRecordingStatus().then(JSON.stringify)"),
-    ) as Status;
-  } finally {
-    await session.closeTab(tab);
-  }
-};
+/** The tab stays open: under real-defaults, Developer Edition 161 refuses the harness's switch back after a close. */
+const statusOf = async (session: BrowserSession, popupUrl: string): Promise<Status> =>
+  JSON.parse(
+    await session.evaluate(
+      await session.openTab(popupUrl),
+      "browser.oneClickHar.getRecordingStatus().then(JSON.stringify)",
+    ),
+  ) as Status;
 
 const downloadTargets = async (session: BrowserSession): Promise<readonly string[]> =>
   (await session.evaluateChrome(
