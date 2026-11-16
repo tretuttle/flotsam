@@ -5,8 +5,22 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { unzipSync } from "fflate";
 import { buildDir, readManifest, xpiPath } from "./manifest.ts";
-import { inlineBodies, kindOf, RULES, syntaxOf, type Unit } from "./xpi-rules.ts";
-import { classifyComments, densestStretch } from "./xpi-source.ts";
+import {
+  inlineBodies,
+  kindOf,
+  minifyMargin,
+  minifySaving,
+  RULES,
+  syntaxOf,
+  type Unit,
+} from "./xpi-rules.ts";
+import {
+  classifyComments,
+  hasLineTerminator,
+  lineBreaksOutsideData,
+  parseScript,
+  readStyle,
+} from "./xpi-source.ts";
 
 export interface Violation {
   readonly path: string;
@@ -57,9 +71,14 @@ export const describeMeasurements = (xpi: Uint8Array): readonly string[] =>
     const syntax = syntaxOf(file);
     if (syntax === undefined) return [];
     const { ordinary, legal } = classifyComments(file.text, syntax);
-    const stretch = densestStretch(file.text, legal);
+    const facts = syntax === "script" ? parseScript(file.text) : readStyle(file.text);
+    const breaks = lineBreaksOutsideData(file.text, [...facts.data, ...facts.comments], legal);
+    const counted =
+      syntax === "vector" ? (hasLineTerminator(file.text.trim()) ? 1 : 0) : breaks.length;
+    const saved = minifySaving(file);
+    const margin = minifyMargin(file.text.length);
     return [
-      `${file.path.padEnd(32)} ${String(file.bytes.length).padStart(7)} B  densest ${stretch.breaks} breaks in ${stretch.characters} chars  comments ${ordinary.length}  legal ${legal.length}`,
+      `${file.path.padEnd(32)} ${String(file.bytes.length).padStart(7)} B  re-minify saves ${String(saved ?? 0).padStart(5)} B (margin ${margin})  line breaks ${counted}  comments ${ordinary.length}  legal ${legal.length}`,
     ];
   });
 

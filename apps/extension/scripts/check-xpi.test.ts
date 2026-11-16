@@ -59,6 +59,7 @@ beforeAll(async () => {
     ),
     toolbarSvg,
     framework: `/*! LICENSE: framework.js.LICENSE.txt */\n${Array.from({ length: 250 }, () => minifiedParent.trim()).join(";")}`,
+    reactLicense: NodeFS.readFileSync(NodePath.join(reactDom, "LICENSE")),
   };
   const master = NodeFS.readFileSync(
     NodePath.join(extensionRoot, "src", "icons", "icon.svg"),
@@ -75,7 +76,7 @@ beforeAll(async () => {
     "action/index.css": encode("body{margin:0}h1{font-size:15px}"),
     "experiment/parent.js": encode(minifiedParent),
     "shared/framework.js": encode(fixtures.framework),
-    "shared/framework.js.LICENSE.txt": NodeFS.readFileSync(NodePath.join(reactDom, "LICENSE")),
+    "shared/framework.js.LICENSE.txt": fixtures.reactLicense,
     "icons/toolbar.svg": encode(toolbarSvg),
     "icons/16.png": renderPng(master, 16),
   };
@@ -122,7 +123,10 @@ describe("check-xpi", () => {
   });
 
   // Production output that looks like what a rule hunts for. Each must pass, or a build would fail on valid output.
-  const legitimate: ReadonlyArray<{ readonly name: string; readonly changes: () => Changes }> = [
+  const legitimate: ReadonlyArray<{
+    readonly name: string;
+    readonly changes: (fixtures: Fixtures) => Changes;
+  }> = [
     {
       name: "F02 one minified line of data over 100 KB",
       changes: () => ({
@@ -130,9 +134,9 @@ describe("check-xpi", () => {
       }),
     },
     {
-      name: "two minified data lines of 100 KB each",
+      name: "one minified line holding two 100 KB strings",
       changes: () => ({
-        "shared/payload.js": `${"a".repeat(100_000)}\n${"b".repeat(100_000)}`,
+        "shared/payload.js": `var a="${"a".repeat(100_000)}",b="${"b".repeat(100_000)}";`,
       }),
     },
     {
@@ -165,19 +169,27 @@ describe("check-xpi", () => {
     },
     {
       name: "a legal pointer line above one long line",
-      changes: () => ({
-        "shared/payload.js": `/*! LICENSE: payload.js.LICENSE.txt */\n${"var x=1;".repeat(500)}`,
+      changes: (fixtures) => ({
+        "shared/payload.js": `/*! LICENSE: payload.js.LICENSE.txt */\n${fixtures.minifiedParent}`,
       }),
     },
     {
       name: "a React style multi-line @license comment above one long line",
-      changes: () => ({
-        "shared/payload.js": `/**\n * @license React v19.3.1\n * react.production.js\n *\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n *\n * This source code is licensed under the MIT license found in the\n * LICENSE file in the root directory of this source tree.\n */\n${"var x=1;".repeat(500)}`,
+      changes: (fixtures) => ({
+        "shared/payload.js": `/**\n * @license React v19.3.1\n * react.production.js\n *\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n *\n * This source code is licensed under the MIT license found in the\n * LICENSE file in the root directory of this source tree.\n */\n${fixtures.minifiedParent}`,
       }),
     },
     {
-      name: "three line breaks in a script",
-      changes: () => ({ "shared/payload.js": "var a=1;\nvar b=2;\nvar c=3;\nvar d=4;" }),
+      name: "E06 a regular expression literal that contains the characters of a function",
+      changes: (fixtures) => ({
+        "experiment/parent.js": `${fixtures.minifiedParent};var r=/function collectHeaders\\(entries\\)\\{return entries\\.map\\(\\(e\\)=>e\\.name\\)\\}/;`,
+      }),
+    },
+    {
+      name: "F04 a 400-entry string table whose values hold comment delimiters",
+      changes: () => ({
+        "shared/payload.js": `var rows=[${Array.from({ length: 400 }, (_, i) => JSON.stringify(`/* row ${i} */`)).join(",")}];var lookup=(i)=>rows[i];console.log(lookup(0));`,
+      }),
     },
     {
       name: "a stylesheet with a url that holds //",
@@ -199,7 +211,7 @@ describe("check-xpi", () => {
   ];
 
   it.each(legitimate)("passes $name", ({ name, changes }) => {
-    const result = check(name, changes());
+    const result = check(name, changes(fixtures));
     expect(result.failures).toEqual([]);
     expect(result.status).toBe(0);
   });

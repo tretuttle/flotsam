@@ -1,5 +1,6 @@
-// What the XPI check measures in a text file: where its comments are, which of them may stay, and how densely it
-// breaks into lines. Pure functions of the text, so they run the same on a whole file and on an inline <script>.
+// Reads a packed file the way the build's tools do: a real parser for scripts, a token walk for styles and vectors.
+// Everything here is a pure function of the text, so a whole file and an inline <script> are judged alike.
+import { parseSync } from "oxc-parser";
 
 export type Syntax = "script" | "style" | "vector";
 
@@ -8,37 +9,100 @@ export interface Span {
   readonly end: number;
 }
 
-const isWordCharacter = (char: string): boolean => /[\w$\u0080-￿]/.test(char);
+export interface TextValue {
+  readonly span: Span;
+  /** The value the runtime sees: escapes decoded, quotes and delimiters removed. */
+  readonly value: string;
+}
 
-/** A `/` after one of these starts a regular expression, not a division. */
-const KEYWORDS_BEFORE_EXPRESSION: ReadonlySet<string> = new Set([
-  "return",
-  "typeof",
-  "instanceof",
-  "in",
-  "of",
-  "new",
-  "delete",
-  "void",
-  "throw",
-  "case",
-  "do",
-  "else",
-  "yield",
-  "await",
-]);
+export interface ScriptFacts {
+  /** Comments the parser found. A `/*` inside a string or a regular expression is data, not a comment. */
+  readonly comments: readonly Span[];
+  /** Spans a minifier cannot rewrite: strings, template quasis and regular expression literals. */
+  readonly data: readonly Span[];
+  readonly strings: readonly TextValue[];
+  readonly errors: readonly string[];
+}
 
 const isLineTerminator = (char: string): boolean =>
   char === "\n" || char === "\r" || char === "\u2028" || char === "\u2029";
 
-const endOfLine = (text: string, from: number): number => {
-  let i = from;
-  while (i < text.length && !isLineTerminator(text.charAt(i))) i++;
-  return i;
+export const hasLineTerminator = (text: string): boolean => /[\n\r\u2028\u2029]/.test(text);
+
+interface AstNode {
+  readonly type: string;
+  readonly start: number;
+  readonly end: number;
+  readonly [key: string]: unknown;
+}
+
+const isAstNode = (value: unknown): value is AstNode =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as { type?: unknown }).type === "string";
+
+/** Parsed scripts keyed by their text. One archive holds a handful of scripts, and five rules read each one. */
+const scriptCache = new Map<string, ScriptFacts>();
+
+const walk = (node: unknown, visit: (node: AstNode) => void): void => {
+  if (Array.isArray(node)) {
+    for (const item of node) walk(item, visit);
+    return;
+  }
+  if (!isAstNode(node)) return;
+  visit(node);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
+    walk(value, visit);
+  }
 };
 
-/** Index after the string that opens at `start`. A string cannot span lines, so a newline ends a broken one. */
-const skipString = (text: string, start: number): number => {
+const cookedValue = (element: AstNode): string | undefined => {
+  const value = element.value;
+  if (typeof value !== "object" || value === null) return undefined;
+  const cooked = (value as { cooked?: unknown }).cooked;
+  return typeof cooked === "string" ? cooked : undefined;
+};
+
+/** Parses a script with the same parser the build runs, and keeps what it saw. */
+export const parseScript = (text: string): ScriptFacts => {
+  const cached = scriptCache.get(text);
+  if (cached !== undefined) return cached;
+  const parsed = parseSync("packed.js", text);
+  const data: Span[] = [];
+  const strings: TextValue[] = [];
+  walk(parsed.program, (node) => {
+    if (node.type === "TemplateElement") {
+      data.push({ start: node.start, end: node.end });
+      const value = cookedValue(node);
+      if (value !== undefined) strings.push({ span: { start: node.start, end: node.end }, value });
+      return;
+    }
+    if (node.type !== "Literal") return;
+    if (typeof node.value === "string") {
+      data.push({ start: node.start, end: node.end });
+      strings.push({ span: { start: node.start, end: node.end }, value: node.value });
+    } else if (typeof node.regex === "object" && node.regex !== null) {
+      data.push({ start: node.start, end: node.end });
+    }
+  });
+  const facts: ScriptFacts = {
+    comments: parsed.comments.map(({ start, end }) => ({ start, end })),
+    data,
+    strings,
+    errors: parsed.errors.map(({ message }) => message),
+  };
+  if (scriptCache.size >= 8) scriptCache.clear();
+  scriptCache.set(text, facts);
+  return facts;
+};
+
+const endOfBlock = (text: string, start: number, close: string): number => {
+  const end = text.indexOf(close, start);
+  return end < 0 ? text.length : end + close.length;
+};
+
+export const skipString = (text: string, start: number): number => {
   const quote = text.charAt(start);
   for (let i = start + 1; i < text.length; i++) {
     const char = text.charAt(i);
@@ -49,111 +113,30 @@ const skipString = (text: string, start: number): number => {
   return text.length;
 };
 
-/** Index after the regular expression that opens at `start`, or -1 when the `/` is a division. */
-const skipRegex = (text: string, start: number): number => {
-  let inClass = false;
-  for (let i = start + 1; i < text.length; i++) {
-    const char = text.charAt(i);
-    if (isLineTerminator(char)) return -1;
-    if (char === "\\") i++;
-    else if (char === "[") inClass = true;
-    else if (char === "]") inClass = false;
-    else if (char === "/" && !inClass) {
-      let end = i + 1;
-      while (/[a-z]/i.test(text.charAt(end))) end++;
-      return end;
-    }
-  }
-  return -1;
-};
-
-const endOfBlock = (text: string, start: number, close: string): number => {
-  const end = text.indexOf(close, start);
-  return end < 0 ? text.length : end + close.length;
-};
-
-class ScriptScanner {
-  readonly comments: Span[] = [];
-  readonly #text: string;
-
-  constructor(text: string) {
-    this.#text = text;
-  }
-
-  /** Walks code from `from`. Inside a `${` of a template literal it returns at the matching `}`. */
-  scanCode(from: number, nested: boolean): number {
-    const text = this.#text;
-    let depth = 0;
-    let regexAllowed = true;
-    let i = from;
-    while (i < text.length) {
-      const char = text.charAt(i);
-      const next = text.charAt(i + 1);
-      if (char === "/" && next === "/") {
-        const end = endOfLine(text, i);
-        this.comments.push({ start: i, end });
-        i = end;
-      } else if (char === "/" && next === "*") {
-        const end = endOfBlock(text, i + 2, "*/");
-        this.comments.push({ start: i, end });
-        i = end;
-      } else if (char === "/") {
-        const end: number = regexAllowed ? skipRegex(text, i) : -1;
-        regexAllowed = end < 0;
-        i = end < 0 ? i + 1 : end;
-      } else if (char === '"' || char === "'") {
-        i = skipString(text, i);
-        regexAllowed = false;
-      } else if (char === "`") {
-        i = this.#scanTemplate(i + 1);
-        regexAllowed = false;
-      } else if (isWordCharacter(char)) {
-        let end = i + 1;
-        while (isWordCharacter(text.charAt(end))) end++;
-        regexAllowed = KEYWORDS_BEFORE_EXPRESSION.has(text.slice(i, end));
-        i = end;
-      } else if (/\s/.test(char)) {
-        i++;
-      } else {
-        if (char === "{") depth++;
-        if (char === "}") {
-          if (nested && depth === 0) return i + 1;
-          depth--;
-        }
-        regexAllowed = char !== ")" && char !== "]";
-        i++;
-      }
-    }
-    return text.length;
-  }
-
-  #scanTemplate(from: number): number {
-    const text = this.#text;
-    let i = from;
-    while (i < text.length) {
-      const char = text.charAt(i);
-      if (char === "\\") i += 2;
-      else if (char === "`") return i + 1;
-      else if (char === "$" && text.charAt(i + 1) === "{") i = this.scanCode(i + 2, true);
-      else i++;
-    }
-    return text.length;
-  }
+export interface StyleFacts {
+  readonly comments: readonly Span[];
+  readonly data: readonly Span[];
 }
 
-const findStyleComments = (text: string): Span[] => {
+/** A stylesheet has quoted strings and comments; everything else is code the minifier rewrites. */
+export const readStyle = (text: string): StyleFacts => {
   const comments: Span[] = [];
+  const data: Span[] = [];
   let i = 0;
   while (i < text.length) {
     const char = text.charAt(i);
-    if (char === "/" && text.charAt(i + 1) === "*") {
+    const next = text.charAt(i + 1);
+    if (char === "/" && next === "*") {
       const end = endOfBlock(text, i + 2, "*/");
       comments.push({ start: i, end });
       i = end;
-    } else if (char === '"' || char === "'") i = skipString(text, i);
-    else i++;
+    } else if (char === '"' || char === "'") {
+      const end = skipString(text, i);
+      data.push({ start: i, end });
+      i = end;
+    } else i++;
   }
-  return comments;
+  return { comments, data };
 };
 
 const findVectorComments = (text: string): Span[] => {
@@ -167,23 +150,18 @@ const findVectorComments = (text: string): Span[] => {
   return comments;
 };
 
-/**
- * Every comment in `text`, found by walking its tokens. A `/*` inside a string, a template literal or a regular
- * expression is data, not a comment.
- */
+/** Every comment in `text`, found by the parser for scripts and by a token walk for styles and vectors. */
 export const findComments = (text: string, syntax: Syntax): readonly Span[] => {
-  if (syntax === "style") return findStyleComments(text);
-  if (syntax === "vector") return findVectorComments(text);
-  const scanner = new ScriptScanner(text);
-  scanner.scanCode(0, false);
-  return scanner.comments;
+  if (syntax === "script") return parseScript(text).comments;
+  if (syntax === "style") return readStyle(text).comments;
+  return findVectorComments(text);
 };
 
 /** A comment that a license can require a bundle to keep. */
 const LEGAL_MARKER = /^(?:\/\*!|\/\/!)|@license|@preserve/;
-/** Punctuation and keywords that prose does not use and code does. */
+/** Punctuation and keywords that prose does not use and code does. `==` catches a comparison without an arrow. */
 const CODE_IN_COMMENT =
-  /[{};]|=>|[^=!<>]=[^=]|\b(?:function|return|const|let|var|class|import|export)\b/;
+  /[{};]|=>|==|[^=!<>]=[^=]|\b(?:function|return|const|let|var|class|import|export)\b/;
 const LEGAL_COMMENT_MAX_CHARACTERS = 400;
 
 export interface Comments {
@@ -216,70 +194,36 @@ export const classifyComments = (text: string, syntax: Syntax): Comments => {
   return { ordinary, legal, rejected };
 };
 
-/** A window of this many characters may hold at most MAX_BREAKS_IN_WINDOW line breaks. */
-export const WINDOW_CHARACTERS = 512;
-export const MAX_BREAKS_IN_WINDOW = 3;
-
-export interface Stretch {
-  /** Line breaks inside the densest window. */
-  readonly breaks: number;
-  readonly firstLine: number;
-  readonly lastLine: number;
-  /** Characters from the first to the last of those breaks, not counting ignored spans. */
-  readonly characters: number;
-}
+const inside = (spans: readonly Span[], offset: number): boolean =>
+  spans.some((span) => span.start <= offset && offset < span.end);
 
 /**
- * The densest run of line breaks in `text`: the most breaks that fit inside any window of WINDOW_CHARACTERS.
- * A break inside an `ignored` span (a legal comment) is not counted, and the span's length is not either.
- * Window, not file, because one long line must not let the lines around it count as minified.
+ * Line terminators a minifier would have removed. A minifier leaves every statement on one line, so a break
+ * outside a string, a regular expression or a comment means the file was not minified. The line holding a kept
+ * legal comment is the one exception: the build puts the license pointer on its own line.
  */
-export const densestStretch = (text: string, ignored: readonly Span[] = []): Stretch => {
-  const spans = ignored.toSorted((a, b) => a.start - b.start);
-  const breaks: Array<{ readonly offset: number; readonly line: number }> = [];
-  let removed = 0;
-  let line = 1;
-  let next = 0;
-  for (
-    let at = text.indexOf("\n");
-    at >= 0 && at < text.length - 1;
-    at = text.indexOf("\n", at + 1)
-  ) {
-    line++;
-    let span = spans[next];
-    while (span !== undefined && span.end <= at) {
-      removed += span.end - span.start;
-      span = spans[++next];
-    }
-    if (span === undefined || at < span.start) breaks.push({ offset: at - removed, line });
+export const lineBreaksOutsideData = (
+  text: string,
+  data: readonly Span[],
+  legal: readonly Span[],
+): readonly number[] => {
+  const breaks: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charAt(i);
+    if (!isLineTerminator(char)) continue;
+    if (inside(data, i)) continue;
+    const nearLegal = legal.some((span) => {
+      if (span.end <= i) return /^[ \t]*$/.test(text.slice(span.end, i));
+      if (span.start >= i) return /^[ \t]*$/.test(text.slice(i + 1, span.start));
+      return false;
+    });
+    if (!nearLegal) breaks.push(i);
   }
-  let densest: Stretch = { breaks: 0, firstLine: 1, lastLine: 1, characters: 0 };
-  let last = 0;
-  for (let first = 0; first < breaks.length; first++) {
-    const start = breaks[first];
-    if (start === undefined) continue;
-    last = Math.max(last, first);
-    while (
-      (breaks[last + 1]?.offset ?? Number.POSITIVE_INFINITY) - start.offset <
-      WINDOW_CHARACTERS
-    ) {
-      last++;
-    }
-    const end = breaks[last];
-    if (end !== undefined && last - first + 1 > densest.breaks) {
-      densest = {
-        breaks: last - first + 1,
-        firstLine: start.line - 1,
-        lastLine: end.line,
-        characters: end.offset - start.offset,
-      };
-    }
-  }
-  return densest;
+  return breaks;
 };
 
 export const lineOf = (text: string, offset: number): number => {
   let line = 1;
-  for (let at = text.indexOf("\n"); at >= 0 && at < offset; at = text.indexOf("\n", at + 1)) line++;
+  for (let i = 0; i < offset; i++) if (isLineTerminator(text.charAt(i))) line++;
   return line;
 };
