@@ -86,7 +86,7 @@ jobs:
         working-directory: tools/browser-harness
         env:
           BROWSER_HARNESS_BINARY: ${{ runner.temp }}/zen-browser/zen/zen
-        run: vp test run --config ../../vite.config.ts --dir . src/namespace-isolation.test.ts
+        run: vp test run --config ../../vite.config.ts --dir . src/namespace-suites.test.ts
 
       - name: Upload browser check results
         if: always()

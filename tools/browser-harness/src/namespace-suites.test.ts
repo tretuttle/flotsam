@@ -31,6 +31,8 @@ describe("namespaced real-signal suites", () => {
     if (run.outcome === "failed") throw new Error(`namespaced suites failed: ${run.detail}`);
     expect(leftover).toEqual([]);
     expect(run.summary).toMatch(/^\s*Test Files\s.*passed.*\n\s*Tests\s.*passed/u);
+    // With a browser named, the live-browser suite must run too, not skip.
+    if (process.env.BROWSER_HARNESS_BINARY) expect(run.summary).not.toMatch(/skipped/u);
     process.stderr.write(`namespaced suites passed inside a PID namespace:\n${run.summary}\n`);
   });
 });
