@@ -7,7 +7,6 @@ import { createLaunchLease, reapOrphanedLaunches, type ActiveLease } from "./orp
 import {
   currentPlatformName,
   killOwnedTree,
-  readProcessIdentity,
   readProcessSnapshot,
   removeDirectoryBounded,
   spawnOwned,
@@ -328,6 +327,7 @@ function spawnLeasedBrowser(
   options: {
     readonly stdio: "ignore" | ["ignore", "ignore", "pipe"];
     readonly env: NodeJS.ProcessEnv;
+    readonly profileDir: string;
     readonly suppressCoreDumps: boolean | undefined;
   },
 ) {
@@ -338,9 +338,9 @@ function spawnLeasedBrowser(
   const spawned = spawnOwned(launch.command, launch.args, {
     stdio: options.stdio,
     env: options.env,
+    profileDir: options.profileDir,
   });
-  const identity = readProcessIdentity(spawned.pid);
-  if (identity !== null) lease.setSpawnedProcess(spawned.pid, identity.startTime);
+  if (spawned.startTime !== null) lease.setSpawnedProcess(spawned.pid, spawned.startTime);
   return { spawned, watcher: watchChildExit(spawned.child) };
 }
 
@@ -395,6 +395,7 @@ export async function launchBrowser(
     const { spawned, watcher } = spawnLeasedBrowser(untouchedRequest.binaryPath, args, lease, {
       stdio: "ignore",
       env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1", MOZ_DISABLE_AUTO_UPDATE: "1" },
+      profileDir: directory,
       suppressCoreDumps: untouchedRequest.suppressCoreDumps,
     });
     stack.defer(() => killOwnedTree(spawned.pid, []));
@@ -446,6 +447,7 @@ export async function launchBrowser(
   const { spawned, watcher } = spawnLeasedBrowser(remoteRequest.binaryPath, args, lease, {
     stdio: ["ignore", "ignore", "pipe"],
     env,
+    profileDir: directory,
     suppressCoreDumps: remoteRequest.suppressCoreDumps,
   });
   const exitedStatus = watcher.exited.then((result) => result.status);

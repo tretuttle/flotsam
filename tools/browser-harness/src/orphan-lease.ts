@@ -4,6 +4,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import {
+  authorizeLeaseTarget,
   commandLineHasPath,
   currentPlatformName,
   killOwnedTree,
@@ -169,11 +170,17 @@ async function killVerifiedOrphan(lease: LaunchLease): Promise<void> {
   ) {
     return;
   }
+  authorizeLeaseTarget(lease.spawnedPid, {
+    startTime: lease.spawnedStartTime,
+    profileDir: lease.profileDir,
+  });
   const members =
     currentPlatformName() === "linux"
       ? linuxVerifiedDescendants(lease.spawnedPid, lease.profileDir)
       : [];
-  await killOwnedTree(lease.spawnedPid, members);
+  await killOwnedTree(lease.spawnedPid, members, {
+    lease: { profileDir: lease.profileDir, spawnedStartTime: lease.spawnedStartTime },
+  });
 }
 
 function linuxVerifiedDescendants(spawnedPid: number, profileDir: string): number[] {
@@ -187,6 +194,7 @@ function linuxVerifiedDescendants(spawnedPid: number, profileDir: string): numbe
   for (const entry of entries) {
     if (!/^\d+$/u.test(entry)) continue;
     const pid = Number(entry);
+    if (pid <= 1) continue;
     if (pid === spawnedPid) {
       matched.push(pid);
       continue;
@@ -233,7 +241,7 @@ async function readLease(filePath: string): Promise<LaunchLease | null> {
     const bothValid =
       typeof spawnedPid === "number" &&
       Number.isInteger(spawnedPid) &&
-      spawnedPid > 0 &&
+      spawnedPid > 1 &&
       typeof spawnedStartTime === "string" &&
       spawnedStartTime.length > 0;
     if (!bothNull && !bothValid) return null;

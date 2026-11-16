@@ -9,10 +9,23 @@ export type ProcessSnapshot = {
 
 export type ProcessIdentity = {
   readonly pid: number;
+  readonly pgrp: number | null;
   readonly startTime: string;
   readonly args: readonly string[];
   readonly commandLine: string;
 };
+
+export type GuardedSignal = "SIGTERM" | "SIGKILL" | 0;
+export type GuardedTargetKind = "process" | "group";
+
+export type AuthorizedTarget = {
+  readonly pid: number;
+  readonly startTime: string;
+  readonly profileDir: string | null;
+  readonly groupLeader: boolean;
+};
+
+const authorizedTargets = new Map<number, AuthorizedTarget>();
 
 export type ProcessPlatformName = "win32" | "linux" | "darwin";
 
@@ -36,10 +49,28 @@ export const PROCESS_PLATFORMS: Readonly<Record<ProcessPlatformName, ProcessPlat
     groupLeader: false,
     // Graceful close attempt on Windows (/T without /F); not observed on Linux.
     terminateTree: (rootPid) => {
-      runTaskkill(["/PID", String(rootPid), "/T"], rootPid);
+      sendVerifiedSignal({
+        id: rootPid,
+        targetKind: "process",
+        signal: "SIGTERM",
+        platform: "win32",
+        send: (rawPid) => {
+          runTaskkill(["/PID", String(rawPid), "/T"], rawPid);
+          return true;
+        },
+      });
     },
     killTree: (rootPid) => {
-      runTaskkill(["/PID", String(rootPid), "/T", "/F"], rootPid);
+      sendVerifiedSignal({
+        id: rootPid,
+        targetKind: "process",
+        signal: "SIGKILL",
+        platform: "win32",
+        send: (rawPid) => {
+          runTaskkill(["/PID", String(rawPid), "/T", "/F"], rawPid);
+          return true;
+        },
+      });
     },
     treeAlive: (rootPid) => pidAlive(rootPid),
     snapshot: (pid) =>
@@ -80,7 +111,13 @@ export const PROCESS_PLATFORMS: Readonly<Record<ProcessPlatformName, ProcessPlat
       const commandLine = line.slice(tab + 1);
       return startTime.length === 0
         ? null
-        : { pid, startTime, args: commandLine.split(/\s+/u).filter(Boolean), commandLine };
+        : {
+            pid,
+            pgrp: null,
+            startTime,
+            args: commandLine.split(/\s+/u).filter(Boolean),
+            commandLine,
+          };
     },
   },
   linux: {
@@ -128,7 +165,7 @@ export const PROCESS_PLATFORMS: Readonly<Record<ProcessPlatformName, ProcessPlat
         cpuTimeMs: cpuTimeText(time ?? "", pid),
       };
     },
-    // macOS equivalent: `ps -o lstart=` start time + `ps -o args=` command line (not observed on Linux).
+    // macOS equivalents: `ps -o lstart=` start time, `ps -o args=` command line, `ps -o pgid=` pgrp (not observed on Linux).
     identity: (pid) => {
       const start = NodeChildProcess.spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
         encoding: "utf8",
@@ -136,11 +173,22 @@ export const PROCESS_PLATFORMS: Readonly<Record<ProcessPlatformName, ProcessPlat
       const argsOut = NodeChildProcess.spawnSync("ps", ["-o", "args=", "-p", String(pid)], {
         encoding: "utf8",
       });
+      const pgidOut = NodeChildProcess.spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], {
+        encoding: "utf8",
+      });
       if (start.status !== 0 || argsOut.status !== 0) return null;
       const startTime = start.stdout.trim();
       const commandLine = argsOut.stdout.trim();
       if (startTime.length === 0) return null;
-      return { pid, startTime, args: commandLine.split(/\s+/u).filter(Boolean), commandLine };
+      const pgidText = pgidOut.status === 0 ? pgidOut.stdout.trim() : "";
+      const pgrp = /^\d+$/u.test(pgidText) ? Number(pgidText) : null;
+      return {
+        pid,
+        pgrp,
+        startTime,
+        args: commandLine.split(/\s+/u).filter(Boolean),
+        commandLine,
+      };
     },
   },
 };
@@ -157,6 +205,7 @@ function processPlatform(): ProcessPlatform {
 export type OwnedChild = {
   readonly child: NodeChildProcess.ChildProcess;
   readonly pid: number;
+  readonly startTime: string | null;
 };
 
 export function spawnOwned(
@@ -165,36 +214,72 @@ export function spawnOwned(
   options: {
     readonly env?: NodeJS.ProcessEnv;
     readonly stdio?: NodeChildProcess.StdioOptions;
+    readonly profileDir?: string | undefined;
   } = {},
 ): OwnedChild {
+  const platform = processPlatform();
   const child = NodeChildProcess.spawn(command, args, {
-    detached: processPlatform().groupLeader,
+    detached: platform.groupLeader,
     env: options.env ?? process.env,
     stdio: options.stdio ?? "ignore",
     windowsHide: true,
   });
   child.on("error", () => undefined);
   if (child.pid === undefined) throw new Error(`could not start ${command}`);
-  return { child, pid: child.pid };
+  const startTime =
+    platform.identity(child.pid)?.startTime ??
+    (currentPlatformName() === "linux" ? readLinuxStartTime(child.pid) : null);
+  if (startTime !== null) {
+    authorizedTargets.set(child.pid, {
+      pid: child.pid,
+      startTime,
+      profileDir: options.profileDir ?? null,
+      groupLeader: platform.groupLeader,
+    });
+  }
+  return { child, pid: child.pid, startTime };
+}
+
+export function authorizeLeaseTarget(
+  pid: number,
+  expected: { readonly startTime: string; readonly profileDir: string },
+): void {
+  assertPid(pid);
+  if (expected.startTime.length === 0 || expected.profileDir.length === 0) {
+    throw new Error(
+      `refusing to authorize lease for pid ${String(pid)}: incomplete lease identity`,
+    );
+  }
+  const live = processPlatform().identity(pid);
+  if (live === null) return;
+  if (live.startTime !== expected.startTime || !commandLineHasPath(live, expected.profileDir)) {
+    throw new Error(
+      `refusing to authorize lease for pid ${String(pid)}: process identity does not match lease`,
+    );
+  }
+  authorizedTargets.set(pid, {
+    pid,
+    startTime: expected.startTime,
+    profileDir: expected.profileDir,
+    groupLeader: live.pgrp === pid,
+  });
 }
 
 function terminateProcessTree(rootPid: number): void {
-  assertPid(rootPid);
   processPlatform().terminateTree(rootPid);
 }
 
 function killProcessTree(rootPid: number): void {
-  assertPid(rootPid);
   processPlatform().killTree(rootPid);
 }
 
 export function readProcessSnapshot(pid: number): ProcessSnapshot {
-  assertPid(pid);
+  assertReadablePid(pid);
   return processPlatform().snapshot(pid);
 }
 
 export function readProcessIdentity(pid: number): ProcessIdentity | null {
-  assertPid(pid);
+  assertReadablePid(pid);
   return processPlatform().identity(pid);
 }
 
@@ -213,23 +298,149 @@ export function commandLineHasPath(identity: ProcessIdentity, targetPath: string
 
 const REAP_MS = 5_000;
 
-export async function killOwnedTree(rootPid: number, memberPids: readonly number[]): Promise<void> {
+export type KillTreeOptions = {
+  readonly lease?: { readonly profileDir: string; readonly spawnedStartTime: string } | undefined;
+};
+
+export async function killOwnedTree(
+  rootPid: number,
+  memberPids: readonly number[],
+  options: KillTreeOptions = {},
+): Promise<void> {
   const platform = processPlatform();
-  const alive = (): number[] =>
-    [rootPid, ...memberPids].filter((pid) =>
-      pid === rootPid ? platform.treeAlive(pid) : pidAlive(pid),
-    );
+  const trackedMembers = captureAuthorizedMembers(rootPid, memberPids, options.lease);
+  const rootAuth = options.lease
+    ? {
+        pid: rootPid,
+        startTime: options.lease.spawnedStartTime,
+        profileDir: options.lease.profileDir,
+        groupLeader: true,
+      }
+    : authorizedTargets.get(rootPid);
+  if (rootAuth === undefined) {
+    // Delegate directly so `sendVerifiedSignal` rejects invalid or unowned targets with a clear reason.
+    terminateProcessTree(rootPid);
+    return;
+  }
+
+  const rootRunning = (): boolean => platform.identity(rootPid) !== null;
+  const alive = (): number[] => {
+    const running: number[] = [];
+    if (rootRunning() && platform.treeAlive(rootPid)) running.push(rootPid);
+    for (const memberPid of trackedMembers) {
+      if (memberPid !== rootPid && pidAlive(memberPid) && !running.includes(memberPid)) {
+        running.push(memberPid);
+      }
+    }
+    return running;
+  };
+  if (alive().length === 0) return;
+
   // Stop cleanly with SIGTERM first, then escalate to SIGKILL after a bounded wait; never send a core-dump signal.
-  terminateProcessTree(rootPid);
+  if (rootRunning()) {
+    if (options.lease !== undefined) {
+      sendVerifiedSignal({
+        id: rootPid,
+        targetKind: platform.groupLeader ? "group" : "process",
+        signal: "SIGTERM",
+        lease: options.lease,
+      });
+    } else {
+      terminateProcessTree(rootPid);
+    }
+  } else {
+    for (const memberPid of trackedMembers) {
+      if (pidAlive(memberPid)) {
+        sendVerifiedSignal({
+          id: memberPid,
+          targetKind: "process",
+          signal: "SIGTERM",
+          lease: options.lease,
+        });
+      }
+    }
+  }
+
   const termDeadline = Date.now() + SIGTERM_WAIT_MS;
   while (alive().length > 0 && Date.now() < termDeadline) await delay(50);
   if (alive().length > 0) {
-    killProcessTree(rootPid);
+    if (rootRunning()) {
+      if (options.lease !== undefined) {
+        sendVerifiedSignal({
+          id: rootPid,
+          targetKind: platform.groupLeader ? "group" : "process",
+          signal: "SIGKILL",
+          lease: options.lease,
+        });
+      } else {
+        killProcessTree(rootPid);
+      }
+    }
+    for (const memberPid of trackedMembers) {
+      if (memberPid !== rootPid && pidAlive(memberPid)) {
+        sendVerifiedSignal({
+          id: memberPid,
+          targetKind: "process",
+          signal: "SIGKILL",
+          lease: options.lease,
+        });
+      }
+    }
     const killDeadline = Date.now() + REAP_MS - SIGTERM_WAIT_MS;
     while (alive().length > 0 && Date.now() < killDeadline) await delay(50);
   }
   const left = alive();
   if (left.length > 0) throw new Error(`owned process still running: ${left.join(", ")}`);
+}
+
+function captureAuthorizedMembers(
+  rootPid: number,
+  memberPids: readonly number[],
+  lease: KillTreeOptions["lease"],
+): number[] {
+  if (!Number.isInteger(rootPid) || rootPid <= 1) return [];
+  const platform = processPlatform();
+  const rootAuth = lease
+    ? {
+        pid: rootPid,
+        startTime: lease.spawnedStartTime,
+        profileDir: lease.profileDir,
+        groupLeader: true,
+      }
+    : authorizedTargets.get(rootPid);
+  if (rootAuth === undefined) return [];
+
+  const candidates = new Set<number>(
+    memberPids.filter((pid) => Number.isInteger(pid) && pid > 1 && pid !== rootPid),
+  );
+  if (currentPlatformName() === "linux" && rootAuth.groupLeader) {
+    try {
+      for (const entry of NodeFS.readdirSync("/proc")) {
+        if (!/^\d+$/u.test(entry)) continue;
+        const pid = Number(entry);
+        if (pid > 1 && pid !== rootPid) candidates.add(pid);
+      }
+    } catch {
+      // Fall back to explicit memberPids if /proc cannot be listed.
+    }
+  }
+
+  const verified: number[] = [];
+  for (const pid of candidates) {
+    const id = platform.identity(pid);
+    if (id === null) continue;
+    const sameGroup = id.pgrp === rootPid;
+    const sameProfile = rootAuth.profileDir !== null && commandLineHasPath(id, rootAuth.profileDir);
+    if (!sameGroup && !sameProfile) continue;
+    authorizedTargets.set(pid, {
+      pid,
+      startTime: id.startTime,
+      profileDir: sameProfile ? rootAuth.profileDir : null,
+      groupLeader: false,
+    });
+    verified.push(pid);
+  }
+  return verified;
 }
 
 export type ChildExitResult = {
@@ -331,21 +542,123 @@ export async function removeDirectoryBounded(directory: string): Promise<void> {
   if (NodeFS.existsSync(directory)) throw new Error(`profile still present at ${directory}`);
 }
 
+export type VerifiedSignalRequest = {
+  readonly id: number;
+  readonly targetKind: GuardedTargetKind;
+  readonly signal: GuardedSignal;
+  readonly lease?: { readonly profileDir: string; readonly spawnedStartTime: string } | undefined;
+  readonly expectedIdentity?: AuthorizedTarget | undefined;
+  readonly platform?: ProcessPlatformName | undefined;
+  readonly selfPid?: number | undefined;
+  readonly parentPid?: number | undefined;
+  readonly readIdentity?: ((pid: number) => ProcessIdentity | null) | undefined;
+  readonly send?: ((rawTarget: number, signal: GuardedSignal) => boolean) | undefined;
+};
+
+export function sendVerifiedSignal(request: VerifiedSignalRequest): boolean {
+  const { rawTarget } = verifySignalTarget(request);
+  if (rawTarget === null) return false;
+  const send = request.send ?? defaultSendSignal;
+  return send(rawTarget, request.signal);
+}
+
+function verifySignalTarget(request: VerifiedSignalRequest): { readonly rawTarget: number | null } {
+  const { id, targetKind, signal } = request;
+  if (!Number.isInteger(id) || id <= 1) {
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: target ID must be an integer greater than 1`,
+    );
+  }
+  const platform = request.platform ?? currentPlatformName();
+  const readIdentity = request.readIdentity ?? PROCESS_PLATFORMS[platform].identity;
+  const selfPid = request.selfPid ?? process.pid;
+  const parentPid = request.parentPid ?? process.ppid;
+  if (id === selfPid) {
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: target matches harness pid`,
+    );
+  }
+  if (parentPid > 0 && id === parentPid) {
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: target matches harness parent pid`,
+    );
+  }
+  const selfIdentity = readIdentity(selfPid);
+  const selfPgrp = selfIdentity?.pgrp ?? null;
+  if (selfPgrp !== null && id === selfPgrp) {
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: target matches harness process group`,
+    );
+  }
+  if (targetKind === "group" && platform !== "win32" && selfPgrp === null) {
+    throw new Error(
+      `refusing signal ${String(signal)} to group ${String(id)}: could not determine harness process group`,
+    );
+  }
+
+  const live = readIdentity(id);
+  let expected: AuthorizedTarget | undefined = request.expectedIdentity;
+  if (expected === undefined && request.lease !== undefined) {
+    if (request.lease.spawnedStartTime.length === 0 || request.lease.profileDir.length === 0) {
+      throw new Error(
+        `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: incomplete lease identity`,
+      );
+    }
+    expected = {
+      pid: id,
+      startTime: request.lease.spawnedStartTime,
+      profileDir: request.lease.profileDir,
+      groupLeader: true,
+    };
+  }
+  if (expected === undefined) {
+    expected = authorizedTargets.get(id);
+  }
+  if (expected === undefined && targetKind === "process" && live !== null && live.pgrp !== null) {
+    const leader = authorizedTargets.get(live.pgrp);
+    if (leader?.groupLeader === true) {
+      expected = { pid: id, startTime: live.startTime, profileDir: null, groupLeader: false };
+    }
+  }
+  if (expected === undefined) {
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: target was not spawned in this run or recorded in a valid lease`,
+    );
+  }
+  if (live === null) {
+    if (signal === 0) return { rawTarget: null };
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: target process identity is unavailable`,
+    );
+  }
+  if (live.startTime !== expected.startTime) {
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: start time ${live.startTime} does not match expected ${expected.startTime}`,
+    );
+  }
+  if (expected.profileDir !== null && !commandLineHasPath(live, expected.profileDir)) {
+    throw new Error(
+      `refusing signal ${String(signal)} to ${targetKind} ${String(id)}: profile path ${expected.profileDir} missing from command line`,
+    );
+  }
+  if (targetKind === "group" && platform !== "win32" && live.pgrp !== id) {
+    throw new Error(
+      `refusing signal ${String(signal)} to group ${String(id)}: process group ${String(live.pgrp)} is not led by ${String(id)}`,
+    );
+  }
+  return { rawTarget: targetKind === "group" ? -id : id };
+}
+
 export function pidAlive(pid: number): boolean {
-  assertPid(pid);
-  return signalReaches(pid);
+  return sendVerifiedSignal({ id: pid, targetKind: "process", signal: 0 });
 }
 
 function groupAlive(rootPid: number): boolean {
-  return signalReaches(-rootPid);
+  return sendVerifiedSignal({ id: rootPid, targetKind: "group", signal: 0 });
 }
 
 function signalGroup(rootPid: number, signal: "SIGTERM" | "SIGKILL"): void {
-  try {
-    process.kill(-rootPid, signal);
-  } catch (error) {
-    if (errorCode(error) !== "ESRCH") throw error;
-  }
+  sendVerifiedSignal({ id: rootPid, targetKind: "group", signal });
 }
 
 function runTaskkill(args: readonly string[], rootPid: number): void {
@@ -369,28 +682,48 @@ function parseLinuxStatFields(text: string, pid: number): readonly string[] {
     .split(" ");
 }
 
-function readLinuxProcessIdentity(pid: number): ProcessIdentity | null {
+function readLinuxStartTime(pid: number): string | null {
   try {
     const stat = NodeFS.readFileSync(`/proc/${String(pid)}/stat`, "utf8");
     const fields = parseLinuxStatFields(stat, pid);
-    // Field 22 in /proc/[pid]/stat is starttime (ticks since boot), index 19 after comm.
+    const state = fields[0] ?? "";
+    if (state === "Z" || state === "X") return null;
     const startTime = fields[19] ?? "";
-    if (!/^\d+$/u.test(startTime)) return null;
-    const rawCmdline = NodeFS.readFileSync(`/proc/${String(pid)}/cmdline`, "utf8");
-    const args = rawCmdline.split("\0").filter((part) => part.length > 0);
-    return { pid, startTime, args, commandLine: args.join(" ") };
+    return /^\d+$/u.test(startTime) ? startTime : null;
   } catch {
     return null;
   }
 }
 
-function signalReaches(target: number): boolean {
+function readLinuxProcessIdentity(pid: number): ProcessIdentity | null {
   try {
-    process.kill(target, 0);
+    const stat = NodeFS.readFileSync(`/proc/${String(pid)}/stat`, "utf8");
+    const fields = parseLinuxStatFields(stat, pid);
+    // Zombies (`Z`) and dead processes (`X`) keep a /proc stat entry briefly with empty cmdline.
+    const state = fields[0] ?? "";
+    if (state === "Z" || state === "X") return null;
+    // Field 5 in /proc/[pid]/stat is pgrp (index 2 after comm); field 22 is starttime (index 19).
+    const pgrpText = fields[2] ?? "";
+    const pgrp = /^\d+$/u.test(pgrpText) ? Number(pgrpText) : null;
+    const startTime = fields[19] ?? "";
+    if (!/^\d+$/u.test(startTime)) return null;
+    const rawCmdline = NodeFS.readFileSync(`/proc/${String(pid)}/cmdline`, "utf8");
+    const args = rawCmdline.split("\0").filter((part) => part.length > 0);
+    // Exiting processes (`exit_mm()` before `Z` state) and kernel threads have an empty cmdline.
+    if (args.length === 0) return null;
+    return { pid, pgrp, startTime, args, commandLine: args.join(" ") };
+  } catch {
+    return null;
+  }
+}
+
+function defaultSendSignal(rawTarget: number, signal: GuardedSignal): boolean {
+  try {
+    process.kill(rawTarget, signal);
     return true;
   } catch (error) {
     if (errorCode(error) === "ESRCH") return false;
-    if (errorCode(error) === "EPERM") return true;
+    if (signal === 0 && errorCode(error) === "EPERM") return true;
     throw error;
   }
 }
@@ -443,8 +776,12 @@ function run(command: string, args: readonly string[]): string {
   return result.stdout;
 }
 
-function assertPid(pid: number): void {
+function assertReadablePid(pid: number): void {
   if (!Number.isInteger(pid) || pid <= 0) throw new Error(`invalid pid ${String(pid)}`);
+}
+
+function assertPid(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 1) throw new Error(`invalid pid ${String(pid)}`);
 }
 
 function delay(ms: number): Promise<void> {

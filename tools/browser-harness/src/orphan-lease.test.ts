@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { createLaunchLease, leaseDirectory, reapOrphanedLaunches } from "./orphan-lease.ts";
 import { killOwnedTree, pidAlive, readProcessIdentity, spawnOwned } from "./owned-process.ts";
+import { registerPidNamespaceSuite } from "./pid-namespace.ts";
 
 const cleanupPids: number[] = [];
 const cleanupDirs: string[] = [];
@@ -30,6 +31,77 @@ describe("orphan launch leases", () => {
     await lease.remove();
   });
 
+  it("refuses to reap a profile directory outside safe bounds", async () => {
+    const tmpdir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-lease-"));
+    cleanupDirs.push(tmpdir);
+    const lease = await createLaunchLease("/home/u/.mozilla/one-click-har-browser-bad", tmpdir);
+    await NodeFSP.writeFile(
+      lease.filePath,
+      JSON.stringify({
+        version: 2,
+        harnessPid: 999_999_999,
+        harnessStartTime: "1",
+        spawnedPid: null,
+        spawnedStartTime: null,
+        profileDir: "/home/u/.mozilla/one-click-har-browser-bad",
+        createdAt: new Date().toISOString(),
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    await expect(
+      reapOrphanedLaunches((dir) => {
+        if (dir.includes(".mozilla")) throw new Error("refusing live profile root");
+      }, tmpdir),
+    ).rejects.toThrow("refusing live profile root");
+  });
+
+  it("warns instead of blocking future launches if removing an orphaned profile fails", async () => {
+    if (process.platform === "win32") return;
+    const tmpdir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-lease-"));
+    cleanupDirs.push(tmpdir);
+    const parent = await NodeFSP.mkdtemp(NodePath.join(tmpdir, "locked-parent-"));
+    const profileDir = NodePath.join(parent, "one-click-har-browser-stuck");
+    await NodeFSP.mkdir(profileDir);
+    await NodeFSP.writeFile(NodePath.join(profileDir, "lock"), "busy");
+    await NodeFSP.chmod(profileDir, 0o555);
+    await NodeFSP.chmod(parent, 0o555);
+
+    const leaseDir = leaseDirectory(tmpdir);
+    await NodeFSP.mkdir(leaseDir, { recursive: true, mode: 0o700 });
+    const leaseFile = NodePath.join(leaseDir, "stuck-rm.json");
+    await NodeFSP.writeFile(
+      leaseFile,
+      JSON.stringify({
+        version: 2,
+        harnessPid: 999_999_999,
+        harnessStartTime: "1",
+        spawnedPid: null,
+        spawnedStartTime: null,
+        profileDir,
+        createdAt: new Date().toISOString(),
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const warnings: string[] = [];
+    try {
+      const reaped = await reapOrphanedLaunches(
+        () => undefined,
+        tmpdir,
+        (msg) => warnings.push(msg),
+      );
+      expect(reaped).toBe(1);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/warning: failed to reap orphaned browser/);
+      expect(NodeFS.existsSync(leaseFile)).toBe(false);
+    } finally {
+      await NodeFSP.chmod(parent, 0o755);
+      await NodeFSP.chmod(profileDir, 0o755);
+    }
+  });
+});
+
+registerPidNamespaceSuite(import.meta.filename, "orphan lease reaping (real signals)", () => {
   it("reaps an orphaned browser process and profile directory after a dead harness pid", async () => {
     const tmpdir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-lease-"));
     cleanupDirs.push(tmpdir);
@@ -187,72 +259,30 @@ describe("orphan launch leases", () => {
     expect(NodeFS.existsSync(leaseFile)).toBe(true);
   });
 
-  it("refuses to reap a profile directory outside safe bounds", async () => {
+  it("ignores a forged lease targeting PID 1 and refuses direct kill on PID 1", async () => {
     const tmpdir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-lease-"));
     cleanupDirs.push(tmpdir);
-    const lease = await createLaunchLease("/home/u/.mozilla/one-click-har-browser-bad", tmpdir);
-    await NodeFSP.writeFile(
-      lease.filePath,
-      JSON.stringify({
-        version: 2,
-        harnessPid: 999_999_999,
-        harnessStartTime: "1",
-        spawnedPid: null,
-        spawnedStartTime: null,
-        profileDir: "/home/u/.mozilla/one-click-har-browser-bad",
-        createdAt: new Date().toISOString(),
-      }),
-      { encoding: "utf8", mode: 0o600 },
-    );
-    await expect(
-      reapOrphanedLaunches((dir) => {
-        if (dir.includes(".mozilla")) throw new Error("refusing live profile root");
-      }, tmpdir),
-    ).rejects.toThrow("refusing live profile root");
-  });
-
-  it("warns instead of blocking future launches if removing an orphaned profile fails", async () => {
-    if (process.platform === "win32") return;
-    const tmpdir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-lease-"));
-    cleanupDirs.push(tmpdir);
-    const parent = await NodeFSP.mkdtemp(NodePath.join(tmpdir, "locked-parent-"));
-    const profileDir = NodePath.join(parent, "one-click-har-browser-stuck");
-    await NodeFSP.mkdir(profileDir);
-    await NodeFSP.writeFile(NodePath.join(profileDir, "lock"), "busy");
-    await NodeFSP.chmod(profileDir, 0o555);
-    await NodeFSP.chmod(parent, 0o555);
-
+    const profileDir = await NodeFSP.mkdtemp(NodePath.join(tmpdir, "one-click-har-browser-"));
     const leaseDir = leaseDirectory(tmpdir);
     await NodeFSP.mkdir(leaseDir, { recursive: true, mode: 0o700 });
-    const leaseFile = NodePath.join(leaseDir, "stuck-rm.json");
+    const forged = NodePath.join(leaseDir, "forged-pid-1.json");
     await NodeFSP.writeFile(
-      leaseFile,
+      forged,
       JSON.stringify({
         version: 2,
         harnessPid: 999_999_999,
         harnessStartTime: "1",
-        spawnedPid: null,
-        spawnedStartTime: null,
+        spawnedPid: 1,
+        spawnedStartTime: "1",
         profileDir,
         createdAt: new Date().toISOString(),
       }),
       { encoding: "utf8", mode: 0o600 },
     );
 
-    const warnings: string[] = [];
-    try {
-      const reaped = await reapOrphanedLaunches(
-        () => undefined,
-        tmpdir,
-        (msg) => warnings.push(msg),
-      );
-      expect(reaped).toBe(1);
-      expect(warnings).toHaveLength(1);
-      expect(warnings[0]).toMatch(/warning: failed to reap orphaned browser/);
-      expect(NodeFS.existsSync(leaseFile)).toBe(false);
-    } finally {
-      await NodeFSP.chmod(parent, 0o755);
-      await NodeFSP.chmod(profileDir, 0o755);
-    }
+    const reaped = await reapOrphanedLaunches(() => undefined, tmpdir);
+    expect(reaped).toBe(0);
+    expect(NodeFS.existsSync(forged)).toBe(true);
+    await expect(killOwnedTree(1, [])).rejects.toThrow(/integer greater than 1/);
   });
 });
