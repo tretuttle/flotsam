@@ -40,3 +40,16 @@ jobs:
 
       - name: Check
         run: vp run check
+
+      - name: Pack extension
+        run: vp run @har-anytime/extension#pack
+
+      - name: Test XPI archive
+        run: unzip -t apps/extension/dist/har-anytime-*.xpi
+
+      - name: Upload XPI
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: har-anytime-xpi
+          path: apps/extension/dist/har-anytime-*.xpi
+          if-no-files-found: error
