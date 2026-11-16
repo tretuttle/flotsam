@@ -41,7 +41,7 @@
       "includeEntryExports": true,
     },
     "tools/browser-harness": {
-      "includeEntryExports": true,
+      "entry": ["src/cli.ts", "checks/*.ts"],
       // Knip does not resolve these platform process tools.
       "ignoreBinaries": ["taskkill.exe", "powershell.exe", "getconf"],
     },

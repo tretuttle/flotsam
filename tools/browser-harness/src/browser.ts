@@ -46,6 +46,7 @@ export const LAUNCH_PREFS: readonly Pref[] = [
 ];
 
 export type BrowserDisplay = "headless" | "window";
+export type BrowserLaunchMode = "recommended" | "real-defaults" | "none";
 
 export type BrowserIdentity = {
   readonly binaryPath: string;
@@ -61,6 +62,7 @@ export type BrowserSession = AsyncDisposable & {
   readonly spawnedPid: number;
   readonly browserPid: number;
   readonly profileDir: string;
+  readonly launchMode: "recommended" | "real-defaults";
   readonly identity: BrowserIdentity;
   readonly openTab: (url: string) => Promise<string>;
   readonly navigateTab: (context: string, url: string) => Promise<void>;
@@ -70,6 +72,13 @@ export type BrowserSession = AsyncDisposable & {
   readonly takeChromeScreenshot: (selector?: string) => Promise<Buffer>;
   readonly closeTab: (context: string) => Promise<void>;
   readonly quit: () => Promise<void>;
+};
+
+export type UntouchedBrowserSession = AsyncDisposable & {
+  readonly spawnedPid: number;
+  readonly profileDir: string;
+  readonly launchMode: "none";
+  readonly exited: Promise<string>;
 };
 
 type LiveRootBase = "HOME" | "APPDATA" | "LOCALAPPDATA" | "XDG_CONFIG_HOME" | "XDG_CACHE_HOME";
@@ -203,12 +212,13 @@ function assertSafeProfileDirectory(directory: string): void {
 export async function prepareProfile(
   extensionPath: string | null,
   extraPrefs: readonly Pref[] = [],
+  basePrefs: readonly Pref[] = LAUNCH_PREFS,
 ): Promise<string> {
   const directory = NodeOS.tmpdir();
   assertSafeProfileDirectory(directory);
   const profile = await NodeFSP.mkdtemp(NodePath.join(directory, "one-click-har-browser-"));
   try {
-    await writeProfilePrefs(profile, extraPrefs);
+    await writeProfilePrefs(profile, extraPrefs, basePrefs);
     if (extensionPath !== null) await installExtension(profile, extensionPath);
     return profile;
   } catch (error) {
@@ -217,10 +227,14 @@ export async function prepareProfile(
   }
 }
 
-async function writeProfilePrefs(profile: string, extraPrefs: readonly Pref[]): Promise<void> {
+async function writeProfilePrefs(
+  profile: string,
+  extraPrefs: readonly Pref[],
+  basePrefs: readonly Pref[] = LAUNCH_PREFS,
+): Promise<void> {
   await NodeFSP.writeFile(
     NodePath.join(profile, "user.js"),
-    renderUserJs([...LAUNCH_PREFS, ...extraPrefs]),
+    renderUserJs([...basePrefs, ...extraPrefs]),
     "utf8",
   );
 }
@@ -236,37 +250,97 @@ const REMOTE_LAUNCH: Record<
   }),
 };
 
-export async function launchBrowser(request: {
+const REMOTE_PREF_NAMES = new Set(["devtools.debugger.remote-enabled", "remote.active-protocols"]);
+const UNTOUCHED_BASE_PREFS: readonly Pref[] = LAUNCH_PREFS.filter(
+  (pref) => !REMOTE_PREF_NAMES.has(pref.name),
+);
+
+type CommonLaunchRequest = {
   readonly binaryPath: string;
   readonly extensionPath: string | null;
   readonly display: BrowserDisplay;
-  readonly protocol?: RemoteProtocol;
   readonly profileDir?: string;
   readonly extraPrefs?: readonly Pref[];
-  readonly allowSystemAccess?: boolean;
   readonly signal: AbortSignal;
-}): Promise<BrowserSession> {
-  const protocol = request.protocol ?? "bidi";
+};
+
+export type RemoteLaunchRequest = CommonLaunchRequest & {
+  readonly launchMode?: "recommended" | "real-defaults";
+  readonly protocol?: RemoteProtocol;
+  readonly allowSystemAccess?: boolean;
+};
+
+export type UntouchedLaunchRequest = CommonLaunchRequest & {
+  readonly launchMode: "none";
+  readonly urls?: readonly string[];
+};
+
+export function launchBrowser(request: RemoteLaunchRequest): Promise<BrowserSession>;
+export function launchBrowser(request: UntouchedLaunchRequest): Promise<UntouchedBrowserSession>;
+export async function launchBrowser(
+  request: RemoteLaunchRequest | UntouchedLaunchRequest,
+): Promise<BrowserSession | UntouchedBrowserSession> {
+  const launchMode: BrowserLaunchMode = request.launchMode ?? "recommended";
   await reapOrphanedLaunches(assertSafeProfileDirectory);
   await using stack = new AsyncDisposableStack();
+
+  if (launchMode === "none") {
+    const untouchedRequest = request as UntouchedLaunchRequest;
+    const prefs = untouchedRequest.extraPrefs ?? [];
+    const directory = await resolveProfileDir(
+      stack,
+      untouchedRequest.profileDir,
+      untouchedRequest.extensionPath,
+      prefs,
+      UNTOUCHED_BASE_PREFS,
+    );
+    const lease = await createLaunchLease(directory);
+    stack.defer(() => lease.remove());
+    const args = [
+      ...(untouchedRequest.display === "headless" ? ["-headless"] : []),
+      "-no-remote",
+      "-profile",
+      directory,
+      ...BROWSER_PLATFORMS[currentPlatformName()].launcherArgs,
+      ...(untouchedRequest.urls ?? []),
+    ];
+    const spawned = spawnOwned(untouchedRequest.binaryPath, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1", MOZ_DISABLE_AUTO_UPDATE: "1" },
+    });
+    await lease.setSpawnedPid(spawned.pid);
+    stack.defer(() => killOwnedTree(spawned.pid, []));
+    const exited = waitForChildExit(spawned.child, null).then(
+      () => exitStatus(spawned.child) ?? "code 0",
+    );
+    const owned = stack.move();
+    return {
+      spawnedPid: spawned.pid,
+      profileDir: directory,
+      launchMode: "none",
+      exited,
+      [Symbol.asyncDispose]: () => owned.disposeAsync(),
+    };
+  }
+
+  const remoteRequest = request as RemoteLaunchRequest;
+  const protocol = remoteRequest.protocol ?? "bidi";
   const port = await freePort();
   const remoteLaunch = REMOTE_LAUNCH[protocol](port);
-  const prefs = [...remoteLaunch.prefs, ...(request.extraPrefs ?? [])];
-  const ownProfile = request.profileDir === undefined;
-  let directory: string;
-  if (ownProfile) {
-    directory = await prepareProfile(request.extensionPath, prefs);
-    stack.defer(() => removeDirectoryBounded(directory));
-  } else {
-    directory = request.profileDir;
-    assertSafeProfileDirectory(directory);
-    await writeProfilePrefs(directory, prefs);
-    if (request.extensionPath !== null) await installExtension(directory, request.extensionPath);
-  }
+  const modePrefs: readonly Pref[] =
+    launchMode === "real-defaults" ? [{ name: "remote.prefs.recommended", value: false }] : [];
+  const prefs = [...remoteLaunch.prefs, ...modePrefs, ...(remoteRequest.extraPrefs ?? [])];
+  const directory = await resolveProfileDir(
+    stack,
+    remoteRequest.profileDir,
+    remoteRequest.extensionPath,
+    prefs,
+    LAUNCH_PREFS,
+  );
   const lease = await createLaunchLease(directory);
   stack.defer(() => lease.remove());
   const args = [
-    ...(request.display === "headless" ? ["-headless"] : []),
+    ...(remoteRequest.display === "headless" ? ["-headless"] : []),
     "-no-remote",
     "-profile",
     directory,
@@ -277,9 +351,9 @@ export async function launchBrowser(request: {
     ...process.env,
     MOZ_CRASHREPORTER_DISABLE: "1",
     MOZ_DISABLE_AUTO_UPDATE: "1",
-    ...(request.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
+    ...(remoteRequest.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
   };
-  const spawned = spawnOwned(request.binaryPath, args, {
+  const spawned = spawnOwned(remoteRequest.binaryPath, args, {
     stdio: ["ignore", "ignore", "pipe"],
     env,
   });
@@ -295,7 +369,7 @@ export async function launchBrowser(request: {
     port,
     exitStatus: () => exitStatus(spawned.child),
     stderr: () => stderrTail,
-    signal: request.signal,
+    signal: remoteRequest.signal,
   });
   stack.defer(() => remote.dispose());
   browserPid = remote.browserPid;
@@ -305,14 +379,15 @@ export async function launchBrowser(request: {
     spawnedPid: spawned.pid,
     browserPid: remote.browserPid,
     profileDir: directory,
+    launchMode,
     identity: {
-      binaryPath: request.binaryPath,
+      binaryPath: remoteRequest.binaryPath,
       name: remote.browserName,
       version: remote.version,
       buildId: remote.buildId,
       userAgent: remote.userAgent,
       remoteProtocol: remote.protocol,
-      headless: request.display === "headless",
+      headless: remoteRequest.display === "headless",
     },
     openTab: (url) => remote.openTab(url),
     navigateTab: (context, url) => remote.navigateTab(context, url),
@@ -330,20 +405,38 @@ export async function launchBrowser(request: {
   };
 }
 
+async function resolveProfileDir(
+  stack: AsyncDisposableStack,
+  profileDir: string | undefined,
+  extensionPath: string | null,
+  prefs: readonly Pref[],
+  basePrefs: readonly Pref[],
+): Promise<string> {
+  if (profileDir === undefined) {
+    const directory = await prepareProfile(extensionPath, prefs, basePrefs);
+    stack.defer(() => removeDirectoryBounded(directory));
+    return directory;
+  }
+  assertSafeProfileDirectory(profileDir);
+  await writeProfilePrefs(profileDir, prefs, basePrefs);
+  if (extensionPath !== null) await installExtension(profileDir, extensionPath);
+  return profileDir;
+}
+
 function waitForChildExit(
   child: {
     exitCode: number | null;
     signalCode: string | null;
     once: (event: "exit", cb: () => void) => void;
   },
-  timeoutMs: number,
+  timeoutMs: number | null,
 ): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
-    timer.unref();
+    const timer = timeoutMs === null ? null : setTimeout(resolve, timeoutMs);
+    timer?.unref();
     child.once("exit", () => {
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       resolve();
     });
   });

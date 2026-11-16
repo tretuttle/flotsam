@@ -1,0 +1,325 @@
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
+import {
+  launchBrowser,
+  readExtensionId,
+  type BrowserIdentity,
+  type BrowserSession,
+} from "../src/browser.ts";
+import type { CheckContext, CheckResult, HarnessCheck } from "../src/checks.ts";
+import { readZipEntry } from "../src/zip.ts";
+
+export type ReportedEnvironment = {
+  readonly browser: {
+    readonly name: string;
+    readonly version: string;
+    readonly buildId: string;
+  };
+  readonly toolbox:
+    | { readonly open: true; readonly host: string }
+    | { readonly open: false; readonly reason: string };
+};
+
+const SCHEMA_REFUSAL = "Incorrect argument types for oneClickHar.getEnvironment.";
+
+const REFUSED_CALLS: ReadonlyArray<{
+  readonly call: string;
+  readonly argumentList: string;
+  readonly message: string;
+}> = [
+  { call: "no argument", argumentList: "", message: SCHEMA_REFUSAL },
+  {
+    call: "a negative integer",
+    argumentList: "-1",
+    message: "Integer -1 is too small (must be at least 0)",
+  },
+  { call: "a float", argumentList: "1.5", message: SCHEMA_REFUSAL },
+  { call: "a numeric string", argumentList: '"1"', message: SCHEMA_REFUSAL },
+  { call: "a path string", argumentList: '"/etc/passwd"', message: SCHEMA_REFUSAL },
+  { call: "null", argumentList: "null", message: SCHEMA_REFUSAL },
+  {
+    call: "an object whose toString returns 1",
+    argumentList: '{ toString() { return "1" } }',
+    message: SCHEMA_REFUSAL,
+  },
+  { call: "an extra argument", argumentList: "0, 'extra'", message: SCHEMA_REFUSAL },
+];
+
+const STEPS: ReadonlyArray<{
+  readonly step: string;
+  readonly act?: string;
+  readonly toolbox: (host: string) => ReportedEnvironment["toolbox"];
+  readonly text: (host: string) => string;
+}> = [
+  {
+    step: "before DevTools starts",
+    toolbox: () => ({ open: false, reason: "devtools-not-started" }),
+    text: () => "Not opened since the browser started",
+  },
+  {
+    step: "toolbox open on the tab",
+    act: `const done = arguments[arguments.length - 1];
+          const { require } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs");
+          const { gDevTools } = require("resource://devtools/client/framework/devtools.js");
+          gDevTools.showToolboxForTab(window.gBrowser.selectedTab, { toolId: "netmonitor" })
+            .then((tb) => done(tb.hostType), (err) => done({ error: String(err) }));`,
+    toolbox: (host) => ({ open: true, host }),
+    text: (host) => `Open on this tab (${host})`,
+  },
+  {
+    step: "toolbox closed again",
+    act: `const done = arguments[arguments.length - 1];
+          const { require } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs");
+          const { gDevTools } = require("resource://devtools/client/framework/devtools.js");
+          gDevTools.closeToolboxForTab(window.gBrowser.selectedTab)
+            .then(() => done(null), (err) => done({ error: String(err) }));`,
+    toolbox: () => ({ open: false, reason: "no-toolbox-for-tab" }),
+    text: () => "Not open on this tab",
+  },
+];
+
+export async function readExtensionPopupPath(extensionPath: string): Promise<string> {
+  const absolute = NodePath.resolve(extensionPath);
+  const stat = await NodeFSP.stat(absolute);
+  const raw = stat.isDirectory()
+    ? await NodeFSP.readFile(NodePath.join(absolute, "manifest.json"), "utf8")
+    : (await readZipEntry(absolute, "manifest.json")).toString("utf8");
+  const parsed: unknown = JSON.parse(raw);
+  if (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    "action" in parsed &&
+    typeof parsed.action === "object" &&
+    parsed.action !== null &&
+    "default_popup" in parsed.action &&
+    typeof parsed.action.default_popup === "string"
+  ) {
+    return parsed.action.default_popup;
+  }
+  throw new Error(`manifest.json in ${extensionPath} has no action.default_popup`);
+}
+
+export async function waitForActiveExtensionUrl(
+  session: Pick<BrowserSession, "evaluateChrome">,
+  addonId: string,
+  popupPath: string,
+  timeoutMs = 15_000,
+): Promise<string> {
+  const result = await session.evaluateChrome(
+    `const done = arguments[arguments.length - 1];
+     const [addonId, popupPath, timeoutMs] = arguments;
+     const deadline = Date.now() + timeoutMs;
+     const poll = () => {
+       try {
+         const policy = WebExtensionPolicy.getByID(addonId);
+         if (policy && policy.active) {
+           done({ url: policy.getURL(popupPath) });
+           return;
+         }
+       } catch (error) {
+         done({ error: String(error) });
+         return;
+       }
+       if (Date.now() >= deadline) {
+         const policy = WebExtensionPolicy.getByID(addonId);
+         done({ error: policy ? "extension policy did not become active" : "extension policy missing for " + addonId });
+         return;
+       }
+       setTimeout(poll, 50);
+     };
+     poll();`,
+    [addonId, popupPath, timeoutMs],
+  );
+  if (typeof result === "object" && result !== null) {
+    if ("error" in result && typeof result.error === "string") {
+      throw new Error(result.error);
+    }
+    if ("url" in result && typeof result.url === "string" && result.url.length > 0) {
+      return result.url;
+    }
+  }
+  throw new Error(`unexpected policy result: ${JSON.stringify(result)}`);
+}
+
+export function verifyBrowserIdentity(
+  actual: ReportedEnvironment["browser"],
+  oracle: Pick<BrowserIdentity, "name" | "version" | "buildId">,
+): string | null {
+  const mismatches: string[] = [];
+  if (actual.name.toLowerCase() !== oracle.name.toLowerCase()) {
+    mismatches.push(`name expected ${oracle.name} got ${actual.name}`);
+  }
+  if (actual.version !== oracle.version) {
+    mismatches.push(`version expected ${oracle.version} got ${actual.version}`);
+  }
+  if (actual.buildId !== oracle.buildId) {
+    mismatches.push(`buildId expected ${oracle.buildId} got ${actual.buildId}`);
+  }
+  return mismatches.length === 0 ? null : mismatches.join("; ");
+}
+
+export async function callGetEnvironment(
+  session: Pick<BrowserSession, "evaluate">,
+  context: string,
+  argumentList: string | null,
+): Promise<ReportedEnvironment | { readonly error: string }> {
+  const expression = `(async () => {
+    try {
+      const list = ${argumentList === null ? "[(await browser.tabs.query({ active: true, currentWindow: true }))[0].id]" : `[${argumentList}]`};
+      const env = await browser.oneClickHar.getEnvironment(...list);
+      return JSON.stringify(env);
+    } catch (error) {
+      return JSON.stringify({ error: String(error) });
+    }
+  })()`;
+  return JSON.parse(await session.evaluate(context, expression)) as
+    | ReportedEnvironment
+    | { error: string };
+}
+
+export async function readPopupFacts(
+  session: Pick<BrowserSession, "evaluate">,
+  context: string,
+): Promise<string> {
+  return session.evaluate(
+    context,
+    `new Promise((resolve, reject) => {
+      const read = () => {
+        const el = document.querySelector("dl.facts, p.facts");
+        if (!el) return null;
+        return el.innerText || el.textContent || "";
+      };
+      const immediate = read();
+      if (immediate !== null) { resolve(immediate); return; }
+      const observer = new MutationObserver(() => {
+        const text = read();
+        if (text !== null) {
+          clearTimeout(timer);
+          observer.disconnect();
+          resolve(text);
+        }
+      });
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error("popup facts element not found"));
+      }, 15000);
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+    })`,
+  );
+}
+
+export async function runEnvironmentVerification(
+  context: CheckContext,
+  overrides: {
+    readonly oracle?: Pick<BrowserIdentity, "name" | "version" | "buildId">;
+    readonly mutateEnvironment?: (env: ReportedEnvironment) => ReportedEnvironment;
+  } = {},
+): Promise<CheckResult> {
+  const started = Date.now();
+  if (context.extensionPath === null || !NodeFS.existsSync(context.extensionPath)) {
+    return {
+      name: "environment",
+      ok: false,
+      durationMs: Date.now() - started,
+      detail: "missing --extension path for environment check",
+    };
+  }
+  const addonId = await readExtensionId(context.extensionPath);
+  const popupPath = await readExtensionPopupPath(context.extensionPath);
+  await using session = await launchBrowser({
+    binaryPath: context.binaryPath,
+    extensionPath: context.extensionPath,
+    display: context.display,
+    protocol: "marionette",
+    allowSystemAccess: true,
+    signal: context.signal,
+  });
+
+  const popupUrl = await waitForActiveExtensionUrl(session, addonId, popupPath);
+  const tab = await session.openTab(popupUrl);
+  const failures: string[] = [];
+  const checkEqual = (label: string, actual: unknown, expected: unknown): void => {
+    if (!NodeUtil.isDeepStrictEqual(actual, expected)) {
+      failures.push(`${label}: got ${JSON.stringify(actual)} expected ${JSON.stringify(expected)}`);
+    }
+  };
+
+  try {
+    const oracle = overrides.oracle ?? session.identity;
+    const unknownTab = await callGetEnvironment(session, tab, "2147483647");
+    checkEqual(
+      "unknown tab ID: toolbox",
+      "toolbox" in unknownTab ? unknownTab.toolbox : unknownTab,
+      { open: false, reason: "no-such-tab" },
+    );
+    const smallestTab = await callGetEnvironment(session, tab, "0");
+    checkEqual("tab ID 0: toolbox", "toolbox" in smallestTab ? smallestTab.toolbox : smallestTab, {
+      open: false,
+      reason: "no-such-tab",
+    });
+
+    for (const { call, argumentList, message } of REFUSED_CALLS) {
+      const result = await callGetEnvironment(session, tab, argumentList);
+      const actual =
+        "error" in result
+          ? result.error.includes(message)
+            ? `refused: ${message}`
+            : result.error
+          : result;
+      checkEqual(`${call} refused by schema`, actual, `refused: ${message}`);
+    }
+
+    let host = "";
+    for (const step of STEPS) {
+      if (step.act !== undefined) {
+        const nextHost = await session.evaluateChrome(step.act);
+        if (typeof nextHost === "object" && nextHost !== null && "error" in nextHost) {
+          throw new Error(`chrome action failed in ${step.step}: ${JSON.stringify(nextHost)}`);
+        }
+        if (typeof nextHost === "string") host = nextHost;
+      }
+      await session.reloadTab(tab);
+      const popupText = await readPopupFacts(session, tab);
+      const rawEnv = await callGetEnvironment(session, tab, null);
+      if ("error" in rawEnv) {
+        failures.push(`${step.step}: getEnvironment failed: ${rawEnv.error}`);
+        continue;
+      }
+      const env = overrides.mutateEnvironment ? overrides.mutateEnvironment(rawEnv) : rawEnv;
+      const identityProblem = verifyBrowserIdentity(env.browser, oracle);
+      if (identityProblem !== null) failures.push(`${step.step}: browser: ${identityProblem}`);
+      checkEqual(`${step.step}: toolbox`, env.toolbox, step.toolbox(host));
+      const lines = popupText
+        .trim()
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      checkEqual(`${step.step}: popup DevTools line`, lines.at(-1), step.text(host));
+    }
+  } finally {
+    await session.closeTab(tab).catch(() => undefined);
+    await session.quit().catch(() => undefined);
+  }
+
+  return {
+    name: "environment",
+    ok: failures.length === 0,
+    durationMs: Date.now() - started,
+    detail:
+      failures.length === 0
+        ? `verified ${session.identity.name} ${session.identity.version} (${session.identity.buildId})`
+        : failures.join("; "),
+    data: { identity: session.identity, failures },
+  };
+}
+
+const check: HarnessCheck = {
+  name: "environment",
+  description:
+    "verifies getEnvironment() against session capabilities, schema refusals, and DevTools state",
+  run: (context) => runEnvironmentVerification(context),
+};
+
+export default check;

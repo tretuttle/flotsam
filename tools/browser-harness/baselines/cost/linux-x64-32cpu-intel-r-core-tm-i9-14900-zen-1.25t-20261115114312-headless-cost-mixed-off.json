@@ -1,0 +1,112 @@
+{
+  "capturedAt": "2026-11-16T12:08:17.240Z",
+  "scenario": "cost-mixed",
+  "arm": "off",
+  "rounds": 6,
+  "warmupDropped": 1,
+  "runCount": 5,
+  "errors": 0,
+  "failures": [],
+  "samples": [
+    {
+      "round": 1,
+      "arm": "off",
+      "lastResourceFinishedMs": 352,
+      "parentWorkingSetBytes": 562679808,
+      "parentCpuMs": 900,
+      "wallMs": 387.814909,
+      "requestCount": 2001
+    },
+    {
+      "round": 2,
+      "arm": "off",
+      "lastResourceFinishedMs": 380,
+      "parentWorkingSetBytes": 551923712,
+      "parentCpuMs": 1030,
+      "wallMs": 405.226732,
+      "requestCount": 2001
+    },
+    {
+      "round": 3,
+      "arm": "off",
+      "lastResourceFinishedMs": 376,
+      "parentWorkingSetBytes": 554381312,
+      "parentCpuMs": 990,
+      "wallMs": 398.095931,
+      "requestCount": 2001
+    },
+    {
+      "round": 4,
+      "arm": "off",
+      "lastResourceFinishedMs": 390,
+      "parentWorkingSetBytes": 553799680,
+      "parentCpuMs": 1250,
+      "wallMs": 421.57092,
+      "requestCount": 2001
+    },
+    {
+      "round": 5,
+      "arm": "off",
+      "lastResourceFinishedMs": 376,
+      "parentWorkingSetBytes": 586076160,
+      "parentCpuMs": 1060,
+      "wallMs": 406.430088,
+      "requestCount": 2001
+    }
+  ],
+  "lastResourceFinishedMs": {
+    "median": 376,
+    "spread": 38,
+    "min": 352,
+    "max": 390,
+    "runCount": 5
+  },
+  "parentCpuMs": {
+    "median": 1030,
+    "spread": 350,
+    "min": 900,
+    "max": 1250,
+    "runCount": 5
+  },
+  "parentWorkingSetBytes": {
+    "median": 554381312,
+    "spread": 34152448,
+    "min": 551923712,
+    "max": 586076160,
+    "runCount": 5
+  },
+  "wallMs": {
+    "median": 405.226732,
+    "spread": 33.756011,
+    "min": 387.814909,
+    "max": 421.57092,
+    "runCount": 5
+  },
+  "browser": {
+    "binaryPath": "/tmp/och-harness-ci/twilight/zen/zen",
+    "name": "zen",
+    "version": "1.25t",
+    "buildId": "20261115114312",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:160.0) Gecko/20100101 Firefox/160.0",
+    "remoteProtocol": "marionette",
+    "headless": true
+  },
+  "machine": {
+    "platform": "linux",
+    "release": "7.2.15-2-omarchy",
+    "arch": "x64",
+    "cpuModel": "Intel(R) Core(TM) i9-14900",
+    "cpuCount": 32,
+    "totalMemoryBytes": 67019108352
+  },
+  "load": {
+    "before": {
+      "cpuBusyPercent": 42.5,
+      "loadAverage": [8.32, 3.64, 1.97]
+    },
+    "after": {
+      "cpuBusyPercent": 0.5,
+      "loadAverage": [8.54, 4.38, 2.3]
+    }
+  }
+}

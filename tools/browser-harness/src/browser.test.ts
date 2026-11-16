@@ -229,6 +229,52 @@ describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
       expect(NodeFS.existsSync(profile)).toBe(false);
     },
   );
+
+  it("writes remote.prefs.recommended=false in real-defaults mode and omits remote flags/prefs in none mode", async () => {
+    const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-mode-"));
+    directories.push(scratch);
+    const argsFile = NodePath.join(scratch, "args");
+    const prefsFile = NodePath.join(scratch, "user.js");
+    const binary = NodePath.join(scratch, "browser");
+    await NodeFSP.writeFile(
+      binary,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > '${argsFile}'\ncp "$4/user.js" '${prefsFile}' 2>/dev/null || true\nexit 0\n`,
+      { mode: 0o755 },
+    );
+
+    await expect(
+      launchBrowser({
+        binaryPath: binary,
+        extensionPath: null,
+        display: "headless",
+        protocol: "marionette",
+        launchMode: "real-defaults",
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(/browser exited with code 0/);
+    expect(await NodeFSP.readFile(prefsFile, "utf8")).toContain(
+      'user_pref("remote.prefs.recommended", false);',
+    );
+
+    const session = await launchBrowser({
+      binaryPath: binary,
+      extensionPath: null,
+      display: "headless",
+      launchMode: "none",
+      urls: ["file:///tmp/example.html"],
+      signal: new AbortController().signal,
+    });
+    expect(await session.exited).toBe("code 0");
+    const noneArgs = (await NodeFSP.readFile(argsFile, "utf8")).trim().split("\n");
+    const nonePrefs = await NodeFSP.readFile(prefsFile, "utf8");
+    expect(noneArgs).toContain("file:///tmp/example.html");
+    expect(noneArgs).not.toContain("-marionette");
+    expect(noneArgs).not.toContain("--remote-debugging-port");
+    expect(nonePrefs).not.toContain("devtools.debugger.remote-enabled");
+    expect(nonePrefs).not.toContain("remote.active-protocols");
+    expect(nonePrefs).not.toContain("marionette.port");
+    await session[Symbol.asyncDispose]();
+  });
 });
 
 function restoreEnv(previous: Record<string, string | undefined>): void {
