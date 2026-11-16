@@ -7,14 +7,24 @@ import {
   namespace,
   type Environment,
   type OneClickHarApi,
+  type RecordingStatus,
 } from "./contract.ts";
 import { toGeckoSchema } from "./gecko-schema.ts";
-import { createOneClickHarApi } from "./parent-api.ts";
+import { createOneClickHarApi, recordingStatus, type RecordingFacts } from "./parent-api.ts";
+
+const healthy: RecordingFacts = {
+  archive: null,
+  strictOriginPolicy: true,
+  settingsRejected: false,
+  writeFailures: 0,
+  liveOverflow: 0,
+};
 
 const api = createOneClickHarApi({
   identity: () => ({ name: "Zen", version: "1.25t", buildId: "20261115114312" }),
   toolbox: (tabId) =>
     tabId === 1 ? { open: true, host: "bottom" } : { open: false, reason: "no-such-tab" },
+  recording: () => healthy,
 });
 
 /** The contract test's own check, so the planted negative case proves it can see an extra key. */
@@ -34,13 +44,17 @@ describe("oneClickHar contract", () => {
             async: true,
             parameters: [{ name: "tabId", type: "integer", minimum: 0 }],
           },
+          { name: "getRecordingStatus", type: "function", async: true, parameters: [] },
         ],
       },
     ]);
   });
 
   it("types exactly the functions in the table, for callers and for the parent script", () => {
-    expectTypeOf<keyof OneClickHarApi>().toEqualTypeOf<"getEnvironment">();
+    expectTypeOf<keyof OneClickHarApi>().toEqualTypeOf<"getEnvironment" | "getRecordingStatus">();
+    expectTypeOf<OneClickHarApi["getRecordingStatus"]>().toEqualTypeOf<
+      () => Promise<RecordingStatus>
+    >();
     expectTypeOf<OneClickHarApi["getEnvironment"]>().toEqualTypeOf<
       (tabId: number) => Promise<Environment>
     >();
@@ -58,6 +72,20 @@ describe("oneClickHar contract", () => {
     assertKeys(open.browser, environmentKeys.browser);
     if (!open.toolbox.open) throw new Error("tab 1 has a toolbox");
     assertKeys(open.toolbox, environmentKeys.toolboxOpen);
+
+    assertKeys(await api.getRecordingStatus(), environmentKeys.recordingStatus);
+  });
+
+  it("reports a file:// page's way into the archive as a problem, and recording as on while the archive opened", () => {
+    expect(recordingStatus(healthy)).toEqual({ recording: true, problems: [] });
+    expect(recordingStatus({ ...healthy, strictOriginPolicy: false })).toEqual({
+      recording: true,
+      problems: ["file-pages-can-read-files"],
+    });
+    expect(recordingStatus({ ...healthy, archive: "refused", writeFailures: 2 })).toEqual({
+      recording: false,
+      problems: ["archive-refused", "write-failed"],
+    });
   });
 
   it("fails the key comparison when a returned variable carries an extra property", async () => {
