@@ -137,10 +137,6 @@ const read = (unit: Unit): Facts => {
   } catch {
     throw new Unreadable("is not valid UTF-8");
   }
-  const isScriptOrStyle =
-    unit.kind === "script" || unit.kind === "style" || unit.kind === "style-attribute";
-  if (unit.where === undefined && isScriptOrStyle && text.trim() === "")
-    throw new Unreadable("is empty; the build writes no empty script or stylesheet");
   switch (unit.kind) {
     case "script": {
       const script = parseScript(text);
@@ -1669,7 +1665,7 @@ export const RULES: readonly Rule[] = [
         changes: (fixtures) => ({
           "experiment/parent.js": evalOf(
             fixtures,
-            `<<<<\r${PRETTY_FUNCTION.repeat(200).replaceAll("\n", "\u2028")}`,
+            `<<<<\r${PRETTY_FUNCTION.repeat(200).replaceAll("\n", "\u2028")}\u2028and that is all.`,
           ),
         }),
         path: "experiment/parent.js",
