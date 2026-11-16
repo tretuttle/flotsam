@@ -14,15 +14,29 @@ export type RemoteControl = {
   readonly buildId: string;
   readonly userAgent: string;
   readonly openTab: (url: string) => Promise<string>;
+  readonly navigateTab: (context: string, url: string) => Promise<void>;
+  readonly reloadTab: (context: string) => Promise<void>;
   readonly evaluate: (context: string, expression: string) => Promise<string>;
+  readonly evaluateChrome: (script: string, args?: readonly unknown[]) => Promise<unknown>;
+  readonly takeChromeScreenshot: (selector?: string) => Promise<Buffer>;
   readonly closeTab: (context: string) => Promise<void>;
+  readonly quit: () => Promise<void>;
   readonly dispose: () => void;
 };
+
+type ExitInfo = {
+  readonly exitStatus: () => string | null;
+  readonly waitForExit?: () => Promise<string>;
+  readonly stderr: () => string;
+};
+
+const EXIT_STATUS_WAIT_MS = 500;
 
 export async function connectRemote(options: {
   readonly protocol: RemoteProtocol;
   readonly port: number;
   readonly exitStatus: () => string | null;
+  readonly waitForExit?: () => Promise<string>;
   readonly stderr: () => string;
   readonly signal: AbortSignal;
   readonly deadlineMs?: number;
@@ -39,23 +53,29 @@ export async function connectRemote(options: {
     }
   };
   throwIfExited();
+  const exitInfo: ExitInfo = {
+    exitStatus: options.exitStatus,
+    ...(options.waitForExit === undefined ? {} : { waitForExit: options.waitForExit }),
+    stderr: options.stderr,
+  };
   const open = options.protocol === "bidi" ? openBidi : openMarionette;
   while (Date.now() < deadline) {
     throwIfExited();
     if (await tcpOpen(options.port)) {
       try {
-        return await open(options.port);
+        return await open(options.port, exitInfo);
       } catch (error) {
         detail = errorMessage(error);
       }
     }
     await delay(100);
   }
+  throwIfExited();
   throw new Error(`timed out waiting for ${options.protocol}\n${detail}\n${options.stderr()}`);
 }
 
-async function openBidi(port: number): Promise<RemoteControl> {
-  const bidi = await connectBidi(port);
+async function openBidi(port: number, exitInfo: ExitInfo): Promise<RemoteControl> {
+  const bidi = await connectBidi(port, exitInfo);
   try {
     const identity = readBidiSession(
       await bidi.call("session.new", { capabilities: { alwaysMatch: {} } }, SOCKET_MS),
@@ -69,6 +89,12 @@ async function openBidi(port: number): Promise<RemoteControl> {
         await bidi.call("browsingContext.navigate", { context, url, wait: "complete" });
         return context;
       },
+      navigateTab: async (context, url) => {
+        await bidi.call("browsingContext.navigate", { context, url, wait: "complete" });
+      },
+      reloadTab: async (context) => {
+        await bidi.call("browsingContext.reload", { context, wait: "complete" });
+      },
       evaluate: async (context, expression) =>
         readBidiString(
           await bidi.call("script.evaluate", {
@@ -77,8 +103,14 @@ async function openBidi(port: number): Promise<RemoteControl> {
             target: { context },
           }),
         ),
+      evaluateChrome: () => Promise.reject(new Error("chrome evaluation requires marionette")),
+      takeChromeScreenshot: () =>
+        Promise.reject(new Error("chrome screenshot requires marionette")),
       closeTab: async (context) => {
         await bidi.call("browsingContext.close", { context });
+      },
+      quit: async () => {
+        await bidi.call("browser.close", {}).catch(() => undefined);
       },
       dispose: () => bidi.close(),
     };
@@ -88,8 +120,8 @@ async function openBidi(port: number): Promise<RemoteControl> {
   }
 }
 
-async function openMarionette(port: number): Promise<RemoteControl> {
-  const marionette = await connectMarionette(port);
+async function openMarionette(port: number, exitInfo: ExitInfo): Promise<RemoteControl> {
+  const marionette = await connectMarionette(port, exitInfo);
   try {
     const created = await marionette.call(
       "WebDriver:NewSession",
@@ -129,6 +161,14 @@ async function openMarionette(port: number): Promise<RemoteControl> {
         await marionette.call("WebDriver:Navigate", { url });
         return handle;
       },
+      navigateTab: async (context, url) => {
+        await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
+        await marionette.call("WebDriver:Navigate", { url });
+      },
+      reloadTab: async (context) => {
+        await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
+        await marionette.call("WebDriver:Refresh", {});
+      },
       evaluate: async (context, expression) => {
         await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
         const value = await marionette.call("WebDriver:ExecuteAsyncScript", {
@@ -137,10 +177,57 @@ async function openMarionette(port: number): Promise<RemoteControl> {
         });
         return readMarionetteString(value);
       },
+      evaluateChrome: async (script, args = []) => {
+        await marionette.call("Marionette:SetContext", { value: "chrome" });
+        try {
+          const result = await marionette.call("WebDriver:ExecuteAsyncScript", {
+            script,
+            args: [...args],
+          });
+          return unwrapMarionette(result);
+        } finally {
+          await marionette
+            .call("Marionette:SetContext", { value: "content" })
+            .catch(() => undefined);
+        }
+      },
+      takeChromeScreenshot: async (selector) => {
+        await marionette.call("Marionette:SetContext", { value: "chrome" });
+        try {
+          const params: Record<string, unknown> =
+            selector === undefined
+              ? { full: false, hash: false }
+              : {
+                  id: readMarionetteElementId(
+                    await marionette.call("WebDriver:FindElement", {
+                      using: "css selector",
+                      value: selector,
+                    }),
+                  ),
+                  hash: false,
+                };
+          const result = unwrapMarionette(
+            await marionette.call("WebDriver:TakeScreenshot", params),
+          );
+          if (typeof result !== "string") {
+            throw new Error(`WebDriver:TakeScreenshot returned ${JSON.stringify(result)}`);
+          }
+          return Buffer.from(result, "base64");
+        } finally {
+          await marionette
+            .call("Marionette:SetContext", { value: "content" })
+            .catch(() => undefined);
+        }
+      },
       closeTab: async (context) => {
         await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
         await marionette.call("WebDriver:CloseWindow", {});
         await marionette.call("WebDriver:SwitchToWindow", { handle: initialWindow, focus: true });
+      },
+      quit: async () => {
+        await marionette
+          .call("Marionette:Quit", { flags: ["eAttemptQuit"] })
+          .catch(() => undefined);
       },
       dispose: () => marionette.close(),
     };
@@ -164,7 +251,7 @@ type CommandSocket = {
   close: () => void;
 };
 
-function connectBidi(port: number): Promise<CommandSocket> {
+function connectBidi(port: number, exitInfo: ExitInfo): Promise<CommandSocket> {
   const ws = new WebSocket(`ws://127.0.0.1:${String(port)}/session`);
   const pending = new Map<
     number,
@@ -172,9 +259,12 @@ function connectBidi(port: number): Promise<CommandSocket> {
   >();
   let nextId = 1;
   let failed: Error | null = null;
+  let closingPromise: Promise<Error> | null = null;
+  let closedIntentionally = false;
   const socket: CommandSocket = {
     call(method, params, timeoutMs = COMMAND_MS) {
       if (failed !== null) return Promise.reject(failed);
+      if (closingPromise !== null) return closingPromise.then((error) => Promise.reject(error));
       const id = nextId;
       nextId += 1;
       const result = new Promise<unknown>((resolve, reject) => {
@@ -197,6 +287,7 @@ function connectBidi(port: number): Promise<CommandSocket> {
       return result;
     },
     close() {
+      closedIntentionally = true;
       ws.close();
     },
   };
@@ -214,9 +305,19 @@ function connectBidi(port: number): Promise<CommandSocket> {
     waiter.resolve(message.result);
   });
   ws.addEventListener("close", () => {
-    failed = new Error("BiDi socket closed");
-    for (const waiter of pending.values()) waiter.reject(failed);
-    pending.clear();
+    if (closingPromise !== null || failed !== null) return;
+    if (closedIntentionally) {
+      failed = new Error("BiDi socket closed");
+      for (const waiter of pending.values()) waiter.reject(failed);
+      pending.clear();
+      return;
+    }
+    closingPromise = buildSocketClosedError("BiDi socket closed", exitInfo).then((error) => {
+      failed = error;
+      for (const waiter of pending.values()) waiter.reject(error);
+      pending.clear();
+      return error;
+    });
   });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -242,7 +343,7 @@ function connectBidi(port: number): Promise<CommandSocket> {
   });
 }
 
-function connectMarionette(port: number): Promise<CommandSocket> {
+function connectMarionette(port: number, exitInfo: ExitInfo): Promise<CommandSocket> {
   const socket = NodeNet.connect(port, "127.0.0.1");
   let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   const pending = new Map<
@@ -251,6 +352,8 @@ function connectMarionette(port: number): Promise<CommandSocket> {
   >();
   let nextId = 1;
   let failed: Error | null = null;
+  let closingPromise: Promise<Error> | null = null;
+  let closedIntentionally = false;
   let opened = false;
 
   function send(value: unknown): void {
@@ -261,6 +364,7 @@ function connectMarionette(port: number): Promise<CommandSocket> {
   const commands: CommandSocket = {
     call(name, params, timeoutMs = COMMAND_MS) {
       if (failed !== null) return Promise.reject(failed);
+      if (closingPromise !== null) return closingPromise.then((error) => Promise.reject(error));
       const id = nextId;
       nextId += 1;
       const result = new Promise<unknown>((resolve, reject) => {
@@ -283,6 +387,7 @@ function connectMarionette(port: number): Promise<CommandSocket> {
       return result;
     },
     close() {
+      closedIntentionally = true;
       socket.destroy();
     },
   };
@@ -293,6 +398,18 @@ function connectMarionette(port: number): Promise<CommandSocket> {
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
     socket.destroy();
+  }
+
+  function failAfterClose(label: string): void {
+    if (closingPromise !== null || failed !== null) return;
+    if (closedIntentionally) {
+      fail(new Error(label));
+      return;
+    }
+    closingPromise = buildSocketClosedError(label, exitInfo).then((error) => {
+      fail(error);
+      return error;
+    });
   }
 
   function onMessage(message: unknown, ready: (value: CommandSocket) => void): void {
@@ -341,14 +458,31 @@ function connectMarionette(port: number): Promise<CommandSocket> {
     });
     socket.on("error", () => {
       clearTimeout(timer);
+      if (opened) {
+        failAfterClose("Marionette socket failed");
+        return;
+      }
       const error = new Error("Marionette socket failed");
       fail(error);
       reject(error);
     });
     socket.on("close", () => {
-      if (opened) fail(new Error("Marionette socket closed"));
+      if (opened) failAfterClose("Marionette socket closed");
     });
   });
+}
+
+async function buildSocketClosedError(label: string, exitInfo: ExitInfo): Promise<Error> {
+  let status = exitInfo.exitStatus();
+  if (status === null && exitInfo.waitForExit !== undefined) {
+    await Promise.race([exitInfo.waitForExit(), delay(EXIT_STATUS_WAIT_MS)]);
+    status = exitInfo.exitStatus();
+  }
+  const tail = exitInfo.stderr().trim();
+  if (status === null) {
+    return new Error(tail.length > 0 ? `${label}\n${tail}` : label);
+  }
+  return new Error(`${label} (browser exited with ${status})${tail.length > 0 ? `\n${tail}` : ""}`);
 }
 
 function takeLengthMessage(
@@ -415,6 +549,15 @@ function readMarionetteHandle(value: unknown): string {
     throw new Error(`WebDriver:GetWindowHandle returned ${JSON.stringify(value)}`);
   }
   return handle;
+}
+
+function readMarionetteElementId(value: unknown): string {
+  const unwrapped = unwrapMarionette(value);
+  if (isRecord(unwrapped)) {
+    const first = Object.values(unwrapped)[0];
+    if (typeof first === "string" && first.length > 0) return first;
+  }
+  throw new Error(`WebDriver:FindElement returned ${JSON.stringify(value)}`);
 }
 
 function unwrapMarionette(value: unknown): unknown {

@@ -38,6 +38,11 @@ jobs:
           cache: true
           run-install: true
 
+      # The *.namespace.test.ts suites need an unprivileged PID and user namespace and fail under CI
+      # without one. This runner's AppArmor default refuses it (write failed /proc/self/uid_map).
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Check
         run: vp run check
 

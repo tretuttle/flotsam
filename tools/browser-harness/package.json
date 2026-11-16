@@ -8,7 +8,8 @@
   "scripts": {
     "test": "vp test run --config ../../vite.config.ts --dir .",
     "typecheck": "effect-tsgo tsrs --noEmit",
-    "browser-harness": "node src/cli.ts"
+    "browser-harness": "node src/cli.ts",
+    "mutation:guard": "node mutation/guard-mutation.ts"
   },
   "devDependencies": {
     "@types/node": "catalog:",

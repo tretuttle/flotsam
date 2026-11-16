@@ -2,11 +2,16 @@ import "vite-plus/test/config";
 import { defineConfig } from "vite-plus";
 
 const TEST_EXCLUDE = ["**/node_modules/**", "**/dist/**", "**/.{idea,git,cache,output,temp}/**"];
+// Suites that can reach a real signal run only inside the PID namespace that
+// tools/browser-harness/src/namespace-suites.test.ts starts, and each proves its isolation first.
+const NAMESPACE_SUITES = "**/*.namespace.test.ts";
+const namespaceRun = process.env.ONE_CLICK_HAR_NAMESPACE_RUN === "1";
 
 export default defineConfig({
   test: {
     environment: "node",
-    exclude: TEST_EXCLUDE,
+    ...(namespaceRun ? { include: [NAMESPACE_SUITES] } : {}),
+    exclude: namespaceRun ? TEST_EXCLUDE : [...TEST_EXCLUDE, NAMESPACE_SUITES],
     // Unset, Vitest shares one cache at the monorepo root, and parallel workspace runs fail on it with ENOTEMPTY.
     fsModuleCachePath: "node_modules/.vitest-cache",
     hookTimeout: 60_000,

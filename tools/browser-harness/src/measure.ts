@@ -9,9 +9,9 @@ import {
 } from "./browser.ts";
 import type { RemoteProtocol } from "./remote.ts";
 import { FIXTURE_SEED, SMALL_KINDS, SMALL_PER_KIND } from "./fixtures.ts";
-import { readProcessSnapshot, type ProcessSnapshot } from "./owned-process.ts";
-import { SCENARIOS, type Scenario } from "./scenarios.ts";
-import { startFixtureServer, type FixtureServer } from "./server.ts";
+import { readProcessSnapshot, type ProcessSnapshot } from "./process-table.ts";
+import { SCENARIOS, type MeasuredScenario } from "./scenarios.ts";
+import { startFixtureServer } from "./server.ts";
 
 const SAMPLE_DEFINITION = "last-resource-finished";
 
@@ -57,7 +57,7 @@ export type MachineLoad = {
 };
 
 export type MeasureResult = {
-  readonly scenario: Scenario["name"];
+  readonly scenario: string;
   readonly sampleDefinition: typeof SAMPLE_DEFINITION;
   readonly runCount: number;
   readonly errors: number;
@@ -90,7 +90,10 @@ export type MeasureTarget = Pick<
   BrowserSession,
   "browserPid" | "openTab" | "evaluate" | "closeTab"
 >;
-export type RequestLog = Pick<FixtureServer, "origin" | "takeRequests">;
+export type RequestLog = {
+  readonly origin: string;
+  readonly takeRequests: () => readonly { readonly method: string; readonly path: string }[];
+};
 
 export function summarize(values: readonly number[]): Summary | null {
   if (values.length === 0) return null;
@@ -106,7 +109,7 @@ export function summarize(values: readonly number[]): Summary | null {
 export async function measureRuns(options: {
   readonly browser: MeasureTarget;
   readonly server: RequestLog;
-  readonly scenario: Scenario;
+  readonly scenario: MeasuredScenario;
   readonly runs: number;
   readonly inspect: (pid: number) => ProcessSnapshot;
   readonly signal: AbortSignal;
@@ -305,7 +308,7 @@ type PageReport = {
 function runProblem(
   report: PageReport,
   served: readonly { readonly method: string; readonly path: string }[],
-  scenario: Scenario,
+  scenario: MeasuredScenario,
 ): string | null {
   const problems: string[] = [];
   if (report.failed.length > 0) problems.push(`page failed ${report.failed.join(" ")}`);

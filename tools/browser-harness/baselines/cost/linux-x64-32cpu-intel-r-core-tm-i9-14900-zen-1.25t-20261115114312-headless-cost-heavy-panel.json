@@ -1,0 +1,131 @@
+{
+  "capturedAt": "2026-11-16T14:30:22.032Z",
+  "scenario": "cost-heavy",
+  "cpuMetric": "parent-main-thread",
+  "arm": "panel",
+  "rounds": 6,
+  "warmupDropped": 1,
+  "discardedRounds": [],
+  "runCount": 5,
+  "errors": 0,
+  "failures": [],
+  "samples": [
+    {
+      "round": 1,
+      "arm": "panel",
+      "lastResourceFinishedMs": 227,
+      "parentWorkingSetBytes": 507310080,
+      "parentMainThreadMs": 191.3,
+      "parentProcessCpuMs": 331.2,
+      "wallMs": 229.55098,
+      "settleMs": 3074,
+      "requestCount": 74
+    },
+    {
+      "round": 2,
+      "arm": "panel",
+      "lastResourceFinishedMs": 300,
+      "parentWorkingSetBytes": 550694912,
+      "parentMainThreadMs": 275.3,
+      "parentProcessCpuMs": 495.4,
+      "wallMs": 302.618382,
+      "settleMs": 3827,
+      "requestCount": 74
+    },
+    {
+      "round": 3,
+      "arm": "panel",
+      "lastResourceFinishedMs": 234,
+      "parentWorkingSetBytes": 584536064,
+      "parentMainThreadMs": 198.3,
+      "parentProcessCpuMs": 335.2,
+      "wallMs": 236.226732,
+      "settleMs": 3065,
+      "requestCount": 74
+    },
+    {
+      "round": 4,
+      "arm": "panel",
+      "lastResourceFinishedMs": 225,
+      "parentWorkingSetBytes": 484179968,
+      "parentMainThreadMs": 187.4,
+      "parentProcessCpuMs": 347.7,
+      "wallMs": 227.621164,
+      "settleMs": 3831,
+      "requestCount": 74
+    },
+    {
+      "round": 5,
+      "arm": "panel",
+      "lastResourceFinishedMs": 209,
+      "parentWorkingSetBytes": 581697536,
+      "parentMainThreadMs": 176.1,
+      "parentProcessCpuMs": 294.5,
+      "wallMs": 210.563113,
+      "settleMs": 3069,
+      "requestCount": 74
+    }
+  ],
+  "lastResourceFinishedMs": {
+    "median": 227,
+    "spread": 91,
+    "min": 209,
+    "max": 300,
+    "runCount": 5
+  },
+  "parentMainThreadMs": {
+    "median": 191.3,
+    "spread": 99.20000000000002,
+    "min": 176.1,
+    "max": 275.3,
+    "runCount": 5
+  },
+  "parentProcessCpuMs": {
+    "median": 335.2,
+    "spread": 200.89999999999998,
+    "min": 294.5,
+    "max": 495.4,
+    "runCount": 5
+  },
+  "parentWorkingSetBytes": {
+    "median": 550694912,
+    "spread": 100356096,
+    "min": 484179968,
+    "max": 584536064,
+    "runCount": 5
+  },
+  "wallMs": {
+    "median": 229.55098,
+    "spread": 92.05526900000001,
+    "min": 210.563113,
+    "max": 302.618382,
+    "runCount": 5
+  },
+  "browser": {
+    "binaryPath": "/home/trent/och-work/browsers/zen-twilight-1.25t-20261115114312/zen",
+    "name": "zen",
+    "version": "1.25t",
+    "buildId": "20261115114312",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:160.0) Gecko/20100101 Firefox/160.0",
+    "remoteProtocol": "marionette",
+    "headless": true
+  },
+  "machine": {
+    "platform": "linux",
+    "release": "7.2.15-2-omarchy",
+    "arch": "x64",
+    "cpuModel": "Intel(R) Core(TM) i9-14900",
+    "cpuCount": 32,
+    "totalMemoryBytes": 67019108352
+  },
+  "load": {
+    "before": {
+      "cpuBusyPercent": 6,
+      "loadAverage": [3.16, 4.53, 3.64]
+    },
+    "after": {
+      "cpuBusyPercent": 0.6,
+      "loadAverage": [3.52, 4.22, 3.62]
+    }
+  }
+}

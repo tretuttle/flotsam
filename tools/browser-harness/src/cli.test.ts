@@ -1,6 +1,6 @@
 import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { BINARY_ENV, parseCommand, report } from "./cli.ts";
+import { BINARY_ENV, GECKO_BINARY_ENV, parseCommand, report } from "./cli.ts";
 import type { MeasureResult } from "./measure.ts";
 import { parseScenarioName } from "./scenarios.ts";
 
@@ -33,6 +33,23 @@ describe("command line", () => {
     expect(
       parseCommand(["--", "baseline", "--binary", executable, "--show-window"], {}),
     ).toMatchObject({ kind: "baseline", binaryPath: executable, display: "window" });
+    expect(parseCommand(["check"], { [GECKO_BINARY_ENV]: executable })).toMatchObject({
+      kind: "check",
+      binaryPath: executable,
+      display: "headless",
+      short: false,
+    });
+    expect(
+      parseCommand(["--", "cost", "--extension", "a.xpi", "--short"], {
+        [GECKO_BINARY_ENV]: executable,
+      }),
+    ).toMatchObject({
+      kind: "cost",
+      binaryPath: executable,
+      extensionPath: "a.xpi",
+      rounds: 3,
+      scenarios: ["cost-images"],
+    });
   });
 
   it("needs a scenario for har-check", () => {

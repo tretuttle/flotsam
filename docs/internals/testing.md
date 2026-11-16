@@ -11,6 +11,16 @@ Rules for writing tests, and for asking for them in review.
 - Behavior changes in `packages/*` ship with focused tests for that behavior.
 - Proof for a bug fix depends on the bug. Logic, data, and state bugs get a failing test first, then the fix. Purely visual bugs get before/after captures as their proof and no test.
 
+## Tests that can send a signal
+
+A test that can reach a real signal lives in a `*.namespace.test.ts` file and runs only inside a fresh PID namespace; a refusal is tested on the pure decision with fixed data instead. [Browser harness](browser-harness.md#tests-that-can-send-a-signal) explains the check that enforces this, and [mutation testing of the guard](browser-harness.md#mutation-testing-of-the-guard) the run that fails when a guard rule has no test.
+
+## Real-browser checks
+
+- Real-browser checks live under `tools/browser-harness/checks/*.ts` and are found by file discovery. A new check is one file exporting a `HarnessCheck` whose `name` matches its filename, with no shared registry edit.
+- Every browser check compares extension behavior against the running browser's own reported session capabilities or the fixture server's `X-Seq` ground truth and request log, and ships with a unit test covering a planted failure.
+- `apps/extension` invokes the same harness via `pnpm --filter @one-click-har/extension run verify:browser -- --binary <path>` (or `GECKO_BINARY`).
+
 ## Waiting for work
 
 Never wait on sleeps or polling. A test that needs a timeout to pass is wrong.

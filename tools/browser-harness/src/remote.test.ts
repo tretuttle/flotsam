@@ -28,8 +28,13 @@ describe("remote control", () => {
     expect(remote.browserName).toBe("zen");
     expect(remote.userAgent).toBe("ZenTest");
     const context = await remote.openTab("http://127.0.0.1/");
+    await remote.navigateTab(context, "http://127.0.0.1/next");
+    await remote.reloadTab(context);
     expect(await remote.evaluate(context, "window.__harnessReady")).toBe(READY);
+    await expect(remote.evaluateChrome("done(1)")).rejects.toThrow(/requires marionette/);
+    await expect(remote.takeChromeScreenshot()).rejects.toThrow(/requires marionette/);
     await remote.closeTab(context);
+    await remote.quit();
     remote.dispose();
   });
 
@@ -48,11 +53,17 @@ describe("remote control", () => {
     expect(remote.browserName).toBe("zen");
     expect(remote.userAgent).toBe("ZenMarionette");
     const first = await remote.openTab("http://127.0.0.1/");
+    await remote.navigateTab(first, "http://127.0.0.1/next");
+    await remote.reloadTab(first);
     expect(await remote.evaluate(first, "window.__harnessReady")).toBe(READY);
+    expect(await remote.evaluateChrome("done('chrome-ok')")).toBe("chrome-ok");
+    const png = await remote.takeChromeScreenshot("#toolbar");
+    expect(png.toString("utf8")).toBe("fake-png");
     await remote.closeTab(first);
     const second = await remote.openTab("http://127.0.0.1/again");
     expect(await remote.evaluate(second, "window.__harnessReady")).toBe(READY);
     await remote.closeTab(second);
+    await remote.quit();
     remote.dispose();
   });
 
@@ -162,7 +173,14 @@ function bidiResult(method: string): unknown {
   if (method === "script.evaluate") {
     return { type: "success", result: { type: "string", value: READY } };
   }
-  if (method === "browsingContext.navigate" || method === "browsingContext.close") return {};
+  if (
+    method === "browsingContext.navigate" ||
+    method === "browsingContext.reload" ||
+    method === "browsingContext.close" ||
+    method === "browser.close"
+  ) {
+    return {};
+  }
   throw new Error(`unexpected BiDi method ${method}`);
 }
 
@@ -194,7 +212,7 @@ async function startMarionette(): Promise<{ port: number }> {
         if (name === "WebDriver:NewSession") {
           session.waitsForLoad = JSON.stringify(params).includes('"pageLoadStrategy":"normal"');
         }
-        if (name === "WebDriver:Navigate") {
+        if (name === "WebDriver:Navigate" || name === "WebDriver:Refresh") {
           session.loaded = false;
           const finish = (): void => {
             session.loaded = true;
@@ -274,7 +292,17 @@ function marionetteResult(name: string, params: unknown, session: MarionetteSess
     session.current = handle;
     return { value: { handle, type: "tab" } };
   }
-  if (name === "WebDriver:ExecuteAsyncScript") return { value: READY };
+  if (name === "WebDriver:ExecuteAsyncScript") {
+    const script = isRecord(params) && typeof params.script === "string" ? params.script : "";
+    if (script.includes("chrome-ok")) return { value: "chrome-ok" };
+    return { value: READY };
+  }
+  if (name === "Marionette:SetContext") return {};
+  if (name === "WebDriver:FindElement") return { value: { element: "el-1" } };
+  if (name === "WebDriver:TakeScreenshot") {
+    return { value: Buffer.from("fake-png", "utf8").toString("base64") };
+  }
+  if (name === "Marionette:Quit") return {};
   if (name === "WebDriver:SwitchToWindow") {
     const handle = isRecord(params) && typeof params.handle === "string" ? params.handle : "";
     if (!session.handles.includes(handle)) {
