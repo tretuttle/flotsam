@@ -14,5 +14,10 @@
       // These workspace packages are private to this monorepo.
       "includeEntryExports": true,
     },
+    "tools/browser-harness": {
+      "includeEntryExports": true,
+      // Knip does not resolve these platform process tools.
+      "ignoreBinaries": ["taskkill.exe", "powershell.exe", "getconf"],
+    },
   },
 }
