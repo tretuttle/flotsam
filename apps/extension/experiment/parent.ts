@@ -1,4 +1,5 @@
-import { namespace, type Environment, type OneClickHarApi, type ToolboxState } from "./contract.ts";
+import { namespace, type OneClickHarApi, type ToolboxState } from "./contract.ts";
+import { createOneClickHarApi } from "./parent-api.ts";
 
 const nativeTab = (context: ExtensionContext, tabId: number): NativeTab | undefined => {
   try {
@@ -27,19 +28,17 @@ const toolboxState = (context: ExtensionContext, tabId: number): ToolboxState =>
 };
 
 class OneClickHarParent extends ExtensionAPI {
-  override getAPI(context: ExtensionContext) {
-    // TypeScript skips the excess property check on a returned object unless the return type is written out.
-    const api = {
-      getEnvironment: async (tabId): Promise<Environment> => ({
-        browser: {
+  override getAPI(context: ExtensionContext): Record<string, OneClickHarApi> {
+    return {
+      [namespace]: createOneClickHarApi({
+        identity: () => ({
           name: Services.appinfo.name,
           version: Services.appinfo.version,
           buildId: Services.appinfo.appBuildID,
-        },
-        toolbox: toolboxState(context, tabId),
+        }),
+        toolbox: (tabId) => toolboxState(context, tabId),
       }),
-    } satisfies OneClickHarApi;
-    return { [namespace]: api };
+    };
   }
 }
 
