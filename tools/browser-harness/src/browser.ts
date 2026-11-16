@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import { createLaunchLease, reapOrphanedLaunches, type ActiveLease } from "./orphan-lease.ts";
 import {
   hostProcessIo,
+  killOwnedTree,
   removeDirectoryBounded,
   spawnOwned,
   stopOwnedTree,
@@ -67,6 +68,9 @@ export type BrowserSession = AsyncDisposable & {
   readonly spawnedPid: number;
   readonly browserPid: number;
   readonly profileDir: string;
+  readonly dataHome: string;
+  /** SIGKILL to the browser's tree now, through decideSignal. Only namespace tests call it. */
+  readonly kill: () => Promise<void>;
   readonly launchMode: "recommended" | "real-defaults";
   readonly identity: BrowserIdentity;
   readonly openTab: (url: string) => Promise<string>;
@@ -82,6 +86,7 @@ export type BrowserSession = AsyncDisposable & {
 export type UntouchedBrowserSession = AsyncDisposable & {
   readonly spawnedPid: number;
   readonly profileDir: string;
+  readonly dataHome: string;
   readonly launchMode: "none";
   readonly exited: Promise<string>;
 };
@@ -305,6 +310,11 @@ type CommonLaunchRequest = {
   readonly cache?: boolean;
   readonly suppressCoreDumps?: boolean;
   readonly extraPrefs?: readonly Pref[];
+  /**
+   * XDG_DATA_HOME for the browser. Each launch gets its own folder, so the extension's archive never lands in the
+   * user's data folder; a relaunch that must find the same archive passes the same folder.
+   */
+  readonly dataHome?: string;
   readonly signal: AbortSignal;
 };
 
@@ -389,6 +399,7 @@ export async function launchBrowser(
       prefs,
       UNTOUCHED_BASE_PREFS,
     );
+    const dataHome = await resolveDataHome(io, stack, untouchedRequest.dataHome);
     const lease = await createLaunchLease(directory);
     stack.defer(() => lease.remove());
     const args = [
@@ -402,7 +413,12 @@ export async function launchBrowser(
     // Never open a pipe when output is not consumed; avoids filling the pipe buffer under MOZ_LOG.
     const { spawned, watcher } = spawnLeasedBrowser(untouchedRequest.binaryPath, args, lease, {
       stdio: "ignore",
-      env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1", MOZ_DISABLE_AUTO_UPDATE: "1" },
+      env: {
+        ...process.env,
+        MOZ_CRASHREPORTER_DISABLE: "1",
+        MOZ_DISABLE_AUTO_UPDATE: "1",
+        XDG_DATA_HOME: dataHome,
+      },
       profileDir: directory,
       suppressCoreDumps: untouchedRequest.suppressCoreDumps,
     });
@@ -411,6 +427,7 @@ export async function launchBrowser(
     return {
       spawnedPid: spawned.pid,
       profileDir: directory,
+      dataHome,
       launchMode: "none",
       exited: watcher.exited.then((result) => result.status),
       [Symbol.asyncDispose]: () => owned.disposeAsync(),
@@ -437,6 +454,7 @@ export async function launchBrowser(
     prefs,
     LAUNCH_PREFS,
   );
+  const dataHome = await resolveDataHome(io, stack, remoteRequest.dataHome);
   const lease = await createLaunchLease(directory);
   stack.defer(() => lease.remove());
   const args = [
@@ -451,6 +469,7 @@ export async function launchBrowser(
     ...process.env,
     MOZ_CRASHREPORTER_DISABLE: "1",
     MOZ_DISABLE_AUTO_UPDATE: "1",
+    XDG_DATA_HOME: dataHome,
     ...(remoteRequest.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
   };
   const { spawned, watcher } = spawnLeasedBrowser(remoteRequest.binaryPath, args, lease, {
@@ -476,6 +495,8 @@ export async function launchBrowser(
     spawnedPid: spawned.pid,
     browserPid: remote.browserPid,
     profileDir: directory,
+    dataHome,
+    kill: () => killOwnedTree(io, spawned.ownership),
     launchMode,
     identity: {
       binaryPath: remoteRequest.binaryPath,
@@ -518,6 +539,17 @@ async function resolveProfileDir(
   await writeProfilePrefs(profileDir, prefs, basePrefs);
   if (extensionPath !== null) await installExtension(profileDir, extensionPath);
   return profileDir;
+}
+
+async function resolveDataHome(
+  io: ProcessIo,
+  stack: AsyncDisposableStack,
+  dataHome: string | undefined,
+): Promise<string> {
+  if (dataHome !== undefined) return dataHome;
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-data-"));
+  stack.defer(() => removeDirectoryBounded(io, directory));
+  return directory;
 }
 
 function raceTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
