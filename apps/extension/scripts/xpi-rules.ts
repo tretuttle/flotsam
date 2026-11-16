@@ -3,15 +3,9 @@
 // the rules judge the facts. Every rule carries the planted archive that proves it, and check-xpi.test.ts runs them.
 import * as NodeZlib from "node:zlib";
 import { CANNOT_JUDGE } from "./check-xpi.ts";
-import {
-  minifyScript,
-  minifyStyle,
-  minifyStyleAttribute,
-  reminifyScript,
-  reminifyStringScript,
-} from "./minify.ts";
+import { minifyScript, minifyStyle, minifyStyleAttribute, reminifyScript } from "./minify.ts";
 import { readMarkup, type BodyKind, type Markup } from "./xpi-markup.ts";
-import { classifyComments, lineOf, parseScript, type ScriptFacts } from "./xpi-source.ts";
+import { lineOf, parseScript, type ScriptFacts } from "./xpi-source.ts";
 
 export type Kind = BodyKind | "notice" | "source-map" | "source";
 
@@ -355,22 +349,6 @@ const DEV_ONLY_PATH =
 
 const SOURCE_MAP_REFERENCE = /[#@]\s*sourceMappingURL=/;
 
-/**
- * Why the text of a string is source code, or undefined when it is data. Only text that parses as a script and
- * declares a name is judged, by re-minifying it like a script file. Text that does not parse is data. So is a script
- * that declares nothing: mangling renames labels, and a Thai error message in zod parses as a label and an
- * identifier, so re-minifying it saves 22 bytes.
- */
-const sourceInString = (value: string): string | undefined => {
-  ensureShallow(value, "a string in it");
-  const script = parseScript(value);
-  if (script.errors.length > 0 || !script.declaresBinding) return undefined;
-  const saved = value.length - reminifyStringScript(value).length;
-  return saved > SCRIPT_MARGIN_BYTES
-    ? `it parses as a script that declares names, and minifying it saves ${saved} bytes`
-    : undefined;
-};
-
 const excerpt = (text: string): string => {
   const line = text.split("\n")[0] ?? "";
   return line.length > 48 ? `${line.slice(0, 48)}...` : line;
@@ -438,12 +416,6 @@ const PRETTY_FUNCTION = `function collectHeaders(entries) {
 /** The same function on one line: no line break to find, so only re-minifying can tell it is not minified. */
 const ONE_LINE_FUNCTION =
   "function collectHeaders(entries) { const result = []; for (const entry of entries) { if (entry.name === undefined) { continue; } result.push({ name: entry.name, value: String(entry.value) }); } return result; }";
-
-/** A table of numbers that a minifier cannot shrink, to put readable source beside. */
-const NUMBER_TABLE = `var table=[${Array.from({ length: 2000 }, (_, i) => i).join(",")}];\n`;
-
-const evalOf = (fixtures: Fixtures, source: string): string =>
-  `${fixtures.minifiedParent};eval(${JSON.stringify(source)});`;
 
 const inPage = (body: string): string => `<!DOCTYPE html><html><body>${body}</body></html>`;
 
@@ -665,9 +637,9 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
       },
       {
-        name: "parentheses nested 600 deep inside a string, written as escapes",
+        name: "braces nested 600 deep inside a string, written as escapes, which a rule reads as JSON",
         changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent};console.log("${"\\x28".repeat(600)}1${"\\x29".repeat(600)}");`,
+          "experiment/parent.js": `${fixtures.minifiedParent};console.log("${"\\x7b".repeat(600)}1${"\\x7d".repeat(600)}");`,
         }),
         path: "experiment/parent.js",
         alsoFails: ["not-minified"],
@@ -710,23 +682,6 @@ export const RULES: readonly Rule[] = [
         name: "A04e a script the parser accepts and the minifier rejects, then 250 readable functions on one line",
         changes: (fixtures) => ({
           "experiment/parent.js": `${fixtures.minifiedParent};using x=a;${ONE_LINE_FUNCTION.repeat(250)}`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "a readable ES module in a string, which the script minifier rejects",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(
-            fixtures,
-            `import { read } from "./read.js";\nexport ${PRETTY_FUNCTION}`,
-          ),
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "a string the parser reads as a script and the minifier rejects, so a rule throws",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent};${minifyScript(`console.log(${JSON.stringify("using x=a();function f(b){return b}")})`)}`,
         }),
         path: "experiment/parent.js",
       },
@@ -893,7 +848,7 @@ export const RULES: readonly Rule[] = [
           [DUPLICATE_OF("experiment/parent.js")]: fixtures.unminifiedParent,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["comment", "not-minified"],
+        alsoFails: ["not-minified"],
       },
     ],
   },
@@ -1102,7 +1057,6 @@ export const RULES: readonly Rule[] = [
         name: "a source map after prose in a license notice",
         changes: () => ({ "shared/framework.js.LICENSE.txt": `MIT License\n\n${SOURCE_MAP}\n` }),
         path: "shared/framework.js.LICENSE.txt",
-        alsoFails: ["notice-carries-code"],
       },
     ],
   },
@@ -1127,7 +1081,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}\n//# sourceMappingURL=parent.js.map\n`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["comment", "not-minified"],
+        alsoFails: ["not-minified"],
       },
       {
         name: "N03 an inline data: source map on the minified parent script",
@@ -1135,7 +1089,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}\n//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ==\n`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["comment", "not-minified"],
+        alsoFails: ["not-minified"],
       },
       {
         name: "E17 a sourceMappingURL hidden after a division-looking comment opener",
@@ -1143,7 +1097,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}a++/2;//# sourceMappingURL=parent.js.map`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["comment", "not-minified"],
+        alsoFails: ["not-minified"],
       },
       {
         name: "E18 an inline data: source map hidden after a division-looking comment opener",
@@ -1151,7 +1105,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}a++/2;/*# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ== */0`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["comment", "not-minified"],
+        alsoFails: ["not-minified"],
       },
     ],
   },
@@ -1185,7 +1139,7 @@ export const RULES: readonly Rule[] = [
         name: "V15 React's development build named like the bundle",
         changes: (fixtures) => ({ "vendor/react.js": fixtures.reactDevelopment }),
         path: "vendor/react.js",
-        alsoFails: ["comment", "not-minified"],
+        alsoFails: ["not-minified"],
       },
       {
         name: "N07 React's development build renamed to a .json file",
@@ -1220,32 +1174,17 @@ export const RULES: readonly Rule[] = [
     id: "comment",
     inspects: "contents",
     decides:
-      "the script parser finds a comment that is not a legal notice, or the HTML parser finds a comment in a page or vector",
+      "the HTML parser finds a comment in a page or vector, which the build writes without comments",
     check: (read) => {
       if (!("facts" in read)) return undefined;
       const { facts } = read;
-      if (facts.form === "markup") {
-        const [first] = facts.markup.comments;
-        return first === undefined
-          ? undefined
-          : `${plural(facts.markup.comments.length, "comment")}; the first is <!--${excerpt(first)}-->`;
-      }
-      if (facts.form !== "script") return undefined;
-      const { ordinary } = classifyComments(facts.text, facts.script.comments);
-      const first = ordinary[0];
+      if (facts.form !== "markup") return undefined;
+      const [first] = facts.markup.comments;
       return first === undefined
         ? undefined
-        : `${plural(ordinary.length, "comment")}, a minifier removes them all; first at line ${lineOf(facts.text, first.start)}: ${excerpt(facts.text.slice(first.start, first.end))}`;
+        : `${plural(facts.markup.comments.length, "comment")}; the first is <!--${excerpt(first)}-->`;
     },
     plants: [
-      {
-        name: "a line comment after the minified parent script",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent}\n// tidy this up later\n`,
-        }),
-        path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
-      },
       {
         name: "a comment in a vector image",
         changes: (fixtures) => ({
@@ -1254,61 +1193,9 @@ export const RULES: readonly Rule[] = [
         path: "icons/toolbar.svg",
       },
       {
-        name: "E16 a readable function in a comment after an increment and a division",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent}a++/2;/* function readHeaders(entries) { return entries.map((entry) => entry.name); } */0`,
-        }),
-        path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
-      },
-      {
         name: "A13 an HTML comment holding readable source 30 times",
         changes: () => ({ "action/index.html": inPage(`<!--${PRETTY_FUNCTION.repeat(30)}-->`) }),
         path: "action/index.html",
-      },
-    ],
-  },
-  {
-    id: "legal-comment",
-    inspects: "contents",
-    decides:
-      "a script comment with a legal marker is over 400 characters or has code punctuation or keywords",
-    check: (read) => {
-      if (!("facts" in read) || read.facts.form !== "script") return undefined;
-      const { text, script } = read.facts;
-      const [first] = classifyComments(text, script.comments).rejected;
-      return first === undefined
-        ? undefined
-        : `the legal comment at line ${lineOf(text, first.start)} ${first.reason}`;
-    },
-    plants: [
-      {
-        name: "N01 a readable function inside a one-line /*! comment",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `/*! function readHeaders(entries) { return entries.map((entry) => entry.name); } */\n${fixtures.minifiedParent}`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "a /*! comment of prose over 400 characters",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `/*! ${"This notice is far longer than a pointer to a license file needs to be. ".repeat(8)}*/\n${fixtures.minifiedParent}`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "a @license comment that assigns a value",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `/** @license token = readHeaders(entries) */\n${fixtures.minifiedParent}`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "E20 a legal comment of calls and comparisons",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `/*! ${"readHeaders(entries)===entries.length&&check(entries)===true&&".repeat(5)}*/\n${fixtures.minifiedParent}`,
-        }),
-        path: "experiment/parent.js",
       },
     ],
   },
@@ -1333,10 +1220,23 @@ export const RULES: readonly Rule[] = [
     },
     plants: [
       {
+        name: "a line comment after the minified parent script",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent}\n// tidy this up later\n`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "E16 a readable function in a comment after an increment and a division",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent}a++/2;/* function readHeaders(entries) { return entries.map((entry) => entry.name); } */0`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
         name: "V01 an unminified parent script",
         changes: (fixtures) => ({ "experiment/parent.js": fixtures.unminifiedParent }),
         path: "experiment/parent.js",
-        alsoFails: ["comment"],
       },
       {
         name: "V09 a pretty stylesheet",
@@ -1650,130 +1550,6 @@ export const RULES: readonly Rule[] = [
           ),
         }),
         path: "icons/icon.svg",
-      },
-    ],
-  },
-  {
-    id: "string-holds-source",
-    inspects: "contents",
-    decides:
-      "a script string or template quasi parses as a script that declares names, and re-minifying it saves more than the script margin",
-    check: (read) => {
-      if (!("facts" in read) || read.facts.form !== "script") return undefined;
-      const { text, script } = read.facts;
-      for (const { span, value } of script.strings) {
-        if (value.length <= SCRIPT_MARGIN_BYTES) continue;
-        const reason = sourceInString(value);
-        if (reason !== undefined)
-          return `the string at line ${lineOf(text, span.start)} holds readable source: ${reason}`;
-      }
-      return undefined;
-    },
-    plants: [
-      {
-        name: "E05 a readable function hidden in a template literal with escaped newlines",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent};var worker=\`${PRETTY_FUNCTION.replaceAll("\n", "\\n")}\`;`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "E26 a readable function in a template literal with real newlines",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent};var worker=\`${PRETTY_FUNCTION}\`;`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "A03 eval of a number table followed by 40 readable functions",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(fixtures, NUMBER_TABLE + PRETTY_FUNCTION.repeat(40)),
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "A03b eval of a number table followed by 80 readable functions (20320 bytes)",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(fixtures, NUMBER_TABLE + PRETTY_FUNCTION.repeat(80)),
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "M07 eval of a number table followed by one readable function",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(fixtures, NUMBER_TABLE + PRETTY_FUNCTION),
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "A04b new Function of a readable function alone",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent};new Function(${JSON.stringify(PRETTY_FUNCTION)});`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "M08 readable functions split across the quasis of one template literal",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent};var s=\`${PRETTY_FUNCTION.repeat(3)}\${1}${PRETTY_FUNCTION.repeat(3)}\`;console.log(s);`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "M10 eval of 100 readable functions on one line",
-        changes: (fixtures) => ({
-          "experiment/parent.js": evalOf(fixtures, ONE_LINE_FUNCTION.repeat(100)),
-        }),
-        path: "experiment/parent.js",
-      },
-    ],
-  },
-  {
-    id: "notice-carries-code",
-    inspects: "contents",
-    decides:
-      "a .LICENSE.txt file holds anything but legal comments, read with the script parser, that the legal-comment rule accepts",
-    check: (read) => {
-      if (read.unit.kind !== "notice") return undefined;
-      const text = textOf(read) ?? "";
-      // The page build writes a notice as the legal comments it extracted, so it parses as a script of comments only.
-      const notice = parseScript(text);
-      const [error] = notice.errors;
-      if (error !== undefined) return `it does not parse as comments: ${error}`;
-      if (notice.statements > 0)
-        return `it holds ${plural(notice.statements, "statement")} outside comments; the build writes only comments`;
-      const { ordinary, rejected } = classifyComments(text, notice.comments);
-      const [first] = rejected;
-      if (first !== undefined)
-        return `the comment at line ${lineOf(text, first.start)} ${first.reason}`;
-      return ordinary.length > 0
-        ? `${plural(ordinary.length, "comment")} carry no legal marker; the build extracts only legal comments`
-        : undefined;
-    },
-    plants: [
-      {
-        name: "a function in a license notice",
-        changes: () => ({ "shared/framework.js.LICENSE.txt": PRETTY_FUNCTION }),
-        path: "shared/framework.js.LICENSE.txt",
-      },
-      {
-        name: "a license notice of prose outside comments",
-        changes: () => ({ "shared/framework.js.LICENSE.txt": "MIT License\n\nCopyright (c) Meta" }),
-        path: "shared/framework.js.LICENSE.txt",
-      },
-      {
-        name: "a readable function inside a legal comment in a license notice",
-        changes: (fixtures) => ({
-          "shared/framework.js.LICENSE.txt": `${fixtures.reactNotice}\n\n/*! ${ONE_LINE_FUNCTION} */\n`,
-        }),
-        path: "shared/framework.js.LICENSE.txt",
-      },
-      {
-        name: "a comment without a legal marker in a license notice",
-        changes: (fixtures) => ({
-          "shared/framework.js.LICENSE.txt": `${fixtures.reactNotice}\n\n/* build 42 */\n`,
-        }),
-        path: "shared/framework.js.LICENSE.txt",
       },
     ],
   },

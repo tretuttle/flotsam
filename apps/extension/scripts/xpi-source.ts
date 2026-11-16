@@ -22,10 +22,6 @@ export interface ScriptFacts {
   /** Strings and template quasis, in source order. */
   readonly strings: readonly TextValue[];
   readonly objects: readonly ObjectShape[];
-  /** True when the script declares a function, a class, a variable or a parameter. */
-  readonly declaresBinding: boolean;
-  /** Top-level statements. A text of comments alone has none. */
-  readonly statements: number;
   readonly errors: readonly string[];
 }
 
@@ -40,16 +36,6 @@ const isAstNode = (value: unknown): value is AstNode =>
   typeof value === "object" &&
   value !== null &&
   typeof (value as { type?: unknown }).type === "string";
-
-const BINDING_NODES = new Set([
-  "FunctionDeclaration",
-  "FunctionExpression",
-  "ArrowFunctionExpression",
-  "ClassDeclaration",
-  "ClassExpression",
-  "VariableDeclaration",
-  "CatchClause",
-]);
 
 /** Visits every node. Iterative, so a deeply nested file cannot overflow the call stack. */
 const walk = (root: unknown, visit: (node: AstNode) => void): void => {
@@ -105,9 +91,7 @@ export const parseScript = (text: string): ScriptFacts => {
   const parsed = parseSync("packed.js", text, { lang: "js" });
   const strings: TextValue[] = [];
   const objects: ObjectShape[] = [];
-  let declaresBinding = false;
   walk(parsed.program, (node) => {
-    if (BINDING_NODES.has(node.type)) declaresBinding = true;
     const span = { start: node.start, end: node.end };
     if (node.type === "TemplateElement") {
       const value = cookedValue(node);
@@ -123,43 +107,8 @@ export const parseScript = (text: string): ScriptFacts => {
     comments: parsed.comments.map(({ start, end }) => ({ start, end })),
     strings: strings.toSorted((a, b) => a.span.start - b.span.start),
     objects,
-    declaresBinding,
-    statements: parsed.program.body.length,
     errors: parsed.errors.map(({ message }) => message),
   };
-};
-
-/** A comment that a license can require a bundle to keep. */
-const LEGAL_MARKER = /^(?:\/\*!|\/\/!)|@license|@preserve/;
-/** Punctuation and keywords that prose does not use and code does. `==` catches a comparison without an arrow. */
-const CODE_IN_COMMENT =
-  /[{};]|=>|==|[^=!<>]=[^=]|\b(?:function|return|const|let|var|class|import|export)\b/;
-const LEGAL_COMMENT_MAX_CHARACTERS = 400;
-
-export interface Comments {
-  /** Comments with no legal marker. A minifier removes all of them. */
-  readonly ordinary: readonly Span[];
-  /** Comments that claim to be legal and are too long or carry code. */
-  readonly rejected: ReadonlyArray<Span & { readonly reason: string }>;
-}
-
-export const classifyComments = (text: string, comments: readonly Span[]): Comments => {
-  const ordinary: Span[] = [];
-  const rejected: Array<Span & { readonly reason: string }> = [];
-  for (const span of comments) {
-    const comment = text.slice(span.start, span.end);
-    if (!LEGAL_MARKER.test(comment)) ordinary.push(span);
-    else if (comment.length > LEGAL_COMMENT_MAX_CHARACTERS) {
-      rejected.push({
-        ...span,
-        reason: `${comment.length} characters, a legal comment may have at most ${LEGAL_COMMENT_MAX_CHARACTERS}`,
-      });
-    } else {
-      const code = CODE_IN_COMMENT.exec(comment);
-      if (code !== null) rejected.push({ ...span, reason: `carries code (\`${code[0].trim()}\`)` });
-    }
-  }
-  return { ordinary, rejected };
 };
 
 export const lineOf = (text: string, offset: number): number =>

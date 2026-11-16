@@ -18,6 +18,9 @@ import { parseScript } from "./xpi-source.ts";
 const checkScript = NodePath.join(extensionRoot, "scripts", "check-xpi.ts");
 const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
 
+const PRETTY_SOURCE =
+  "function collectHeaders(entries) {\n  const result = [];\n  for (const entry of entries) result.push(entry.name);\n  return result;\n}\n";
+
 /** The legal comments of `code`, a blank line apart, as the page build extracts them into a `.LICENSE.txt`. */
 const legalComments = (code: string): string =>
   parseScript(code)
@@ -350,29 +353,33 @@ describe.concurrent("check-xpi", () => {
     expect(result.status).toBe(0);
   });
 
-  // Hostile text the check does not see, as docs/internals/shipped-output.md states. No build step writes them.
-  const limits: ReadonlyArray<{ readonly name: string; readonly source: string }> = [
+  // What the check does not judge, as docs/internals/shipped-output.md states: the contents of a string and the
+  // comments the minifier keeps. The minifier cannot shrink either, so the question "is this the minifier's output"
+  // does not reach them. No build step writes source into them.
+  const limits: ReadonlyArray<{
+    readonly name: string;
+    readonly changes: (fixtures: Fixtures) => Changes;
+  }> = [
     {
-      name: "A04d readable functions in a string that does not parse",
-      source: `<<<<\n${"function collectHeaders(entries) {\n  return entries;\n}\n".repeat(20)}`,
+      name: "a readable function in a string",
+      changes: (fixtures) => ({
+        "experiment/parent.js": `${fixtures.minifiedParent};eval(${JSON.stringify(PRETTY_SOURCE)});`,
+      }),
     },
     {
-      name: "M09 TypeScript in a string, which the script parser rejects",
-      source:
-        "function collectHeaders(entries: Array<Entry>): Array<Entry> {\n  return entries;\n}\n".repeat(
-          20,
-        ),
+      name: "a readable function in a legal comment",
+      changes: (fixtures) => ({
+        "experiment/parent.js": `/*! ${PRETTY_SOURCE} */\n${fixtures.minifiedParent}`,
+      }),
     },
     {
-      name: "a string of indented calls that declares no name",
-      source: "\n    collectHeaders(entries);\n    sendHeaders(headers);\n".repeat(20),
+      name: "a readable function in a license notice",
+      changes: () => ({ "shared/framework.js.LICENSE.txt": PRETTY_SOURCE }),
     },
   ];
 
-  it.each(limits)("passes, as a stated limit, $name", async ({ name, source }) => {
-    const result = await check(name, {
-      "experiment/parent.js": `${fixtures.minifiedParent};eval(${JSON.stringify(source)});`,
-    });
+  it.each(limits)("passes, as a stated limit, $name", async ({ name, changes }) => {
+    const result = await check(name, changes(fixtures));
     expect(result.failures).toEqual([]);
     expect(result.status).toBe(0);
   });
@@ -396,12 +403,12 @@ describe.concurrent("check-xpi", () => {
 
   it("names the rule that threw on a file", async () => {
     const thrown = RULES.find(({ id }) => id === CANNOT_JUDGE)?.plants.find(({ name }) =>
-      name.includes("a rule throws"),
+      name.includes("which a rule reads as JSON"),
     );
     if (thrown === undefined) throw new Error("the plant for a throwing rule is missing");
     const result = await check("thrown", thrown.changes(fixtures));
     expect(result.stderr).toMatch(
-      /^FAIL experiment\/parent\.js: cannot-judge: the string-holds-source rule could not judge it: /m,
+      /^FAIL experiment\/parent\.js: cannot-judge: the source-map-signature rule could not judge it: JSON in it is nested 600 brackets deep/m,
     );
   });
 

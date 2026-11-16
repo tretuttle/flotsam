@@ -32,17 +32,6 @@ export const minifyScript = (code: string): string =>
 export const reminifyScript = (code: string): string =>
   experiments.swc.minifySync(code, { ...SCRIPT_OPTIONS, format: { comments: "some" } }).code;
 
-/**
- * `reminifyScript` without compress, for the text of a string that parses as a script. A string is data the
- * build never ran, so compress would delete it as dead code: vue ships 208 bytes of global names in one string.
- */
-export const reminifyStringScript = (code: string): string =>
-  experiments.swc.minifySync(code, {
-    ...SCRIPT_OPTIONS,
-    compress: false,
-    format: { comments: "some" },
-  }).code;
-
 // No targets: every browser this ships to is a current Gecko, so lightningcss only minifies and never lowers syntax.
 // extension.js also keeps :dir() and :lang() lists as written.
 const STYLE_OPTIONS = {

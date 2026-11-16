@@ -13,8 +13,9 @@ import { pageMinimizers } from "./minify.ts";
 
 const checkScript = NodePath.join(extensionRoot, "scripts", "check-xpi.ts");
 
-// The libraries earlier reviews found failing the check through one build path or both. ajv has no `exports` and the
-// parent build's neutral platform ignores `main`, so it is imported by its file.
+// Every library a review built against the check, through both paths. Several ship their own runtime source as
+// strings (ejs, handlebars, djv), which the check does not judge. Packages without `exports` are imported by file,
+// because the parent build's neutral platform ignores `main`.
 const LIBRARIES: Readonly<Record<string, string>> = {
   react: 'import * as a from "react";import * as b from "react-dom/client";globalThis.lib=[a,b];',
   fflate: 'import * as a from "fflate";globalThis.lib=a;',
@@ -26,6 +27,20 @@ const LIBRARIES: Readonly<Record<string, string>> = {
   acorn: 'import * as a from "acorn";globalThis.lib=a;',
   ajv: 'import * as a from "ajv/dist/ajv.js";globalThis.lib=a;',
   "libphonenumber-js/max": 'import * as a from "libphonenumber-js/max";globalThis.lib=a;',
+  dayjs: 'import * as a from "dayjs/dayjs.min.js";globalThis.lib=a;',
+  zustand: 'import * as a from "zustand/vanilla";globalThis.lib=a;',
+  marked: 'import * as a from "marked";globalThis.lib=a;',
+  pako: 'import * as a from "pako";globalThis.lib=a;',
+  "lru-cache": 'import * as a from "lru-cache";globalThis.lib=a;',
+  "lit-html": 'import * as a from "lit-html";globalThis.lib=a;',
+  ejs: 'import * as a from "ejs/ejs.js";globalThis.lib=a;',
+  handlebars: 'import * as a from "handlebars/dist/cjs/handlebars.js";globalThis.lib=a;',
+  djv: 'import * as a from "djv/lib/djv.js";globalThis.lib=a;',
+  kysely: 'import * as a from "kysely";globalThis.lib=a;',
+  prismjs: 'import * as a from "prismjs/prism.js";globalThis.lib=a;',
+  greenlet: 'import * as a from "greenlet/dist/greenlet.m.js";globalThis.lib=a;',
+  "sql.js": 'import * as a from "sql.js/dist/sql-wasm.js";globalThis.lib=a;',
+  jsonschema: 'import * as a from "jsonschema/lib/index.js";globalThis.lib=a;',
 };
 
 /** The rspack production build of the pages, with the minimizers extension.config.js installs. */
@@ -36,6 +51,8 @@ const buildPage = (entry: string, outDir: string): Promise<void> =>
       target: "web",
       entry,
       output: { path: outDir, filename: "vendor.js" },
+      // sql.js and jsonschema refer to Node modules they only use under Node; a page build leaves them out.
+      resolve: { fallback: { crypto: false, fs: false, path: false, url: false } },
       plugins: [new DefinePlugin({ "process.env.NODE_ENV": JSON.stringify("production") })],
       optimization: { minimize: true, minimizer: pageMinimizers() },
     });
