@@ -176,11 +176,18 @@ export function currentRunKeys(index: ActivityIndex, tab: TabKey | null): Readon
 
 /** One stretch of minutes for one key. A selection resolves to one window (popup) or several (history multi-select). */
 export type ActivityKey = { readonly tab: TabKey } | { readonly site: Site } | "all";
+declare const nonEmpty: unique symbol;
 export interface Window {
   readonly key: ActivityKey;
-  /** Inclusive start minute, exclusive end minute. from < to always: resolveSelection never builds an empty window. */
+  /** Inclusive start minute, exclusive end minute. */
   readonly from: Minute;
   readonly to: Minute;
+  /** Built only by windowOf, so from < to: an empty or inverted window cannot be passed. */
+  readonly [nonEmpty]: true;
+}
+
+export function windowOf(key: ActivityKey, from: Minute, to: Minute): Window | null {
+  return from < to ? ({ key, from, to } as Window) : null;
 }
 
 export interface Counts {

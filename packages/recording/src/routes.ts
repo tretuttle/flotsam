@@ -63,15 +63,6 @@ export type NotKeptReason =
  */
 export type CaptureAction = "memory-tee" | "file-tee" | "stream-filter";
 
-export type BodyRouteId =
-  | "no-body"
-  | "redirect"
-  | "awaiting-merge"
-  | "streaming"
-  | "media-details"
-  | "small"
-  | "large-or-unknown";
-
 /** Which topic delivered the response head. "service-worker" is service-worker-synthesized-response. */
 export type ResponseSource = "network" | "cache" | "revalidated" | "service-worker";
 
@@ -98,19 +89,34 @@ export interface CompiledRoutes {
   readonly supported: ReadonlySet<CaptureAction>;
 }
 
-/** What a row does with the body. The union makes "copy with no action" and "empty with a reason" unwritable. */
-export type RouteOutcome =
-  | { readonly kind: "empty" }
-  | { readonly kind: "awaiting-merge" }
-  | { readonly kind: "not-kept"; readonly reason: NotKeptReason }
-  | { readonly kind: "copy"; readonly actions: NonEmpty<CaptureAction> };
+type CopyOutcome = { readonly kind: "copy"; readonly actions: NonEmpty<CaptureAction> };
 
-export interface BodyRoute {
-  readonly id: BodyRouteId;
-  readonly when: (f: RouteFacts, c: CompiledRoutes) => boolean;
-  readonly outcome: RouteOutcome;
-  readonly evidence: MeasurementId;
+/**
+ * What each row does with the body. Keyed by row, so a row cannot be given another row's outcome, "copy with no
+ * action" and "empty with a reason" are unwritable, and Route and the log line derive their pairings from it.
+ */
+interface RowOutcomes {
+  readonly "no-body": { readonly kind: "empty" };
+  readonly redirect: { readonly kind: "empty" };
+  readonly "awaiting-merge": { readonly kind: "awaiting-merge" };
+  readonly streaming: { readonly kind: "not-kept"; readonly reason: "streaming-response" };
+  readonly "media-details": { readonly kind: "not-kept"; readonly reason: "media-setting" };
+  readonly small: CopyOutcome;
+  readonly "large-or-unknown": CopyOutcome;
 }
+
+export type BodyRouteId = keyof RowOutcomes;
+export type RouteOutcome = RowOutcomes[BodyRouteId];
+
+type BodyRouteOf<Id extends BodyRouteId = BodyRouteId> = {
+  [P in Id]: {
+    readonly id: P;
+    readonly when: (f: RouteFacts, c: CompiledRoutes) => boolean;
+    readonly outcome: RowOutcomes[P];
+    readonly evidence: MeasurementId;
+  };
+}[Id];
+export type BodyRoute = BodyRouteOf;
 
 const STREAMING_MIME: readonly string[] = ["text/event-stream", "multipart/x-mixed-replace"];
 const REDIRECT_STATUS: readonly number[] = [301, 302, 303, 307, 308];
@@ -184,16 +190,19 @@ export const BODY_ROUTES: readonly BodyRoute[] = [
   LARGE_OR_UNKNOWN,
 ];
 
-/** What the recorder acts on: a row resolved against the backend's actions. Each sink kind carries its own cap. */
-export type Route =
-  | { readonly id: BodyRouteId; readonly kind: "empty" }
-  | { readonly id: BodyRouteId; readonly kind: "awaiting-merge" }
-  | { readonly id: BodyRouteId; readonly kind: "not-kept"; readonly reason: NotKeptReason }
+/** A copy row resolved against the backend: a sink with its own cap, or not-recordable-here when it has no action. */
+type CopyResolution =
   /** cap is the declared Content-Length: the storage stream cannot hold more, and the count must equal it. */
-  | { readonly id: BodyRouteId; readonly kind: "memory-tee"; readonly cap: ByteCount }
+  | { readonly kind: "memory-tee"; readonly cap: ByteCount }
   /** cap is CompiledRoutes.bodyFileCap: the watchdog closes the stream there and only the first part is kept. */
-  | { readonly id: BodyRouteId; readonly kind: "file-tee"; readonly cap: ByteCount }
-  | { readonly id: BodyRouteId; readonly kind: "stream-filter"; readonly cap: ByteCount };
+  | { readonly kind: "file-tee"; readonly cap: ByteCount }
+  | { readonly kind: "stream-filter"; readonly cap: ByteCount }
+  | { readonly kind: "not-kept"; readonly reason: "not-recordable-here" };
+type Resolved<O> = O extends CopyOutcome ? CopyResolution : O;
+type RouteFor = { readonly [Id in BodyRouteId]: { readonly id: Id } & Resolved<RowOutcomes[Id]> };
+
+/** What the recorder acts on: a row resolved against the backend's actions. Only the row's own outcomes pair with its id. */
+export type Route = RouteFor[BodyRouteId];
 
 export function compileRoutes(input: {
   readonly platform: Platform;
@@ -213,21 +222,47 @@ export function compileRoutes(input: {
 }
 
 /**
- * A row against the backend's actions: the first action the backend has wins. A memory tee needs a declared length
- * to cap its storage stream (proto-lifecycle: closing one does not stop the tee), so without one it is skipped. A
- * copy row with no usable action resolves to not-recordable-here.
+ * A copy row against the backend's actions: the first action the backend has wins. A memory tee needs a declared
+ * length to cap its storage stream (proto-lifecycle: closing one does not stop the tee), so without one it is
+ * skipped. A copy row with no usable action resolves to not-recordable-here.
  */
-export function resolveRow(row: BodyRoute, compiled: CompiledRoutes, facts: RouteFacts): Route {
-  const { id, outcome } = row;
-  if (outcome.kind === "empty" || outcome.kind === "awaiting-merge")
-    return { id, kind: outcome.kind };
-  if (outcome.kind === "not-kept") return { id, kind: "not-kept", reason: outcome.reason };
+function resolveCopy<Id extends BodyRouteId>(
+  id: Id,
+  outcome: CopyOutcome,
+  compiled: CompiledRoutes,
+  facts: RouteFacts,
+): { readonly id: Id } & CopyResolution {
   for (const action of outcome.actions) {
     if (!compiled.supported.has(action)) continue;
     if (action !== "memory-tee") return { id, kind: action, cap: compiled.bodyFileCap };
     if (facts.contentLength !== null) return { id, kind: action, cap: facts.contentLength };
   }
   return { id, kind: "not-kept", reason: "not-recordable-here" };
+}
+
+type Resolver<Id extends BodyRouteId> = (
+  row: BodyRouteOf<Id>,
+  compiled: CompiledRoutes,
+  facts: RouteFacts,
+) => RouteFor[Id];
+const RESOLVE: { readonly [Id in BodyRouteId]: Resolver<Id> } = {
+  "no-body": (row) => ({ id: row.id, ...row.outcome }),
+  redirect: (row) => ({ id: row.id, ...row.outcome }),
+  "awaiting-merge": (row) => ({ id: row.id, ...row.outcome }),
+  streaming: (row) => ({ id: row.id, ...row.outcome }),
+  "media-details": (row) => ({ id: row.id, ...row.outcome }),
+  small: (row, compiled, facts) => resolveCopy(row.id, row.outcome, compiled, facts),
+  "large-or-unknown": (row, compiled, facts) => resolveCopy(row.id, row.outcome, compiled, facts),
+};
+
+/** A row against the backend's actions. A row that does not copy is its own outcome. */
+export function resolveRow<Id extends BodyRouteId>(
+  row: BodyRouteOf<Id>,
+  compiled: CompiledRoutes,
+  facts: RouteFacts,
+): RouteFor[Id] {
+  const resolve: Resolver<Id> = RESOLVE[row.id];
+  return resolve(row, compiled, facts);
 }
 
 /** Hot path, once per examined response: the first matching row of BODY_ROUTES, resolved. */

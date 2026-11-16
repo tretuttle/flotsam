@@ -2,16 +2,18 @@
 // accepts one, its @ts-expect-error is unused and typecheck fails with TS2578. Each legal twin follows its case, so a
 // type that rejects everything cannot pass either. test/planted-types.test.ts weakens the types and expects failure.
 
+import { windowOf, type Window } from "../src/activity.ts";
 import type {
   AbandonedExchange,
   AnsweredExchange,
   BodyLocation,
   Capture,
   SettledBody,
+  SettleInput,
 } from "../src/exchange.ts";
-import type { ByteCount, PositiveMinutes, TabId } from "../src/ids.ts";
+import type { ByteCount, Minute, PositiveMinutes, TabId } from "../src/ids.ts";
 import type { ArchiveRootRow } from "../src/layout.ts";
-import type { RouteOutcome } from "../src/routes.ts";
+import type { BodyRoute, Route, RouteOutcome } from "../src/routes.ts";
 import { facts, ID, request, response, SITE, stop } from "./fixtures.ts";
 
 const at: BodyLocation = { kind: "file", site: SITE, id: ID, length: 14 as ByteCount };
@@ -31,7 +33,7 @@ export const legalAbandoned: AbandonedExchange = {
   request,
   response,
   reason: "recording-stopped",
-  body: { kind: "incomplete", reason: "recording-stopped" },
+  body: { kind: "incomplete" },
   upload: { kind: "none" },
 };
 
@@ -120,3 +122,104 @@ export const legalAwaiting: Capture = {
   facts,
   upload: { kind: "none" },
 };
+
+// Verifier round 1, state 1: an abandoned exchange whose body names the other abandon reason (deepseek F5).
+export const abandonReasonsDisagree: AbandonedExchange = {
+  kind: "abandoned",
+  request,
+  response,
+  reason: "browser-closed",
+  // @ts-expect-error an interrupted body names no reason; the exchange's own reason is the only one
+  body: { kind: "incomplete", reason: "recording-stopped" },
+  upload: { kind: "none" },
+};
+
+// Verifier round 1, state 2: abandoned before any head, yet with a decided route's body and a stored upload.
+export const headlessButDecided: AbandonedExchange = {
+  kind: "abandoned",
+  request,
+  response: null,
+  reason: "browser-closed",
+  // @ts-expect-error with no response no route was decided and no upload was read
+  body: { kind: "not-kept", reason: "media-setting" },
+  upload: { kind: "stored", at, mimeType: null },
+};
+export const legalHeadless: AbandonedExchange = {
+  kind: "abandoned",
+  request,
+  response: null,
+  reason: "browser-closed",
+  body: { kind: "incomplete" },
+  upload: { kind: "none" },
+};
+
+// Verifier round 1, state 3: a 204 on the no-body route, stopped as failed, yet with a stored body.
+export const noBodyButStored: AnsweredExchange = {
+  kind: "answered",
+  request,
+  response: { ...response, status: 204 },
+  stop: { ...stop, status: { kind: "failed", error: "NS_BINDING_ABORTED" as never } },
+  route: "no-body",
+  // @ts-expect-error the no-body route settles to an empty body only
+  body: { kind: "stored", at, encoding: null, check: "length-matched" },
+  upload: { kind: "none" },
+};
+export const legalNoBody: AnsweredExchange = {
+  kind: "answered",
+  request,
+  response: { ...response, status: 204 },
+  stop,
+  route: "no-body",
+  body: { kind: "empty" },
+  upload: { kind: "none" },
+};
+// The same rule for the reason: the streaming route never settles as the media setting.
+// @ts-expect-error a not-kept route settles to its own reason
+export const streamingAsMedia: AnsweredExchange = {
+  kind: "answered",
+  request,
+  response,
+  stop,
+  route: "streaming",
+  body: { kind: "not-kept", reason: "media-setting" },
+  upload: { kind: "none" },
+};
+
+// Verifier round 1, state 4: a route whose id cannot produce its kind, and a row given another row's outcome.
+// @ts-expect-error the no-body row never copies
+export const noBodyTee: Route = { id: "no-body", kind: "file-tee", cap: 1024 as ByteCount };
+// @ts-expect-error the large-or-unknown row copies or is not recordable here; it is never empty
+export const largeEmpty: Route = { id: "large-or-unknown", kind: "empty" };
+export const legalLarge: Route = {
+  id: "large-or-unknown",
+  kind: "file-tee",
+  cap: 1024 as ByteCount,
+};
+// @ts-expect-error the small row copies
+export const smallRowEmpty: BodyRoute = {
+  id: "small",
+  when: () => true,
+  outcome: { kind: "empty" },
+  evidence: "design",
+};
+
+// Verifier round 1, state 5: a copying capture settled without its sink's report.
+const copyingCapture = {
+  phase: "copying",
+  id: ID,
+  facts,
+  route: { id: "small", kind: "memory-tee", cap: 14 as ByteCount },
+  upload: { kind: "none" },
+} as const satisfies Capture;
+// @ts-expect-error a copying capture always has its sink's report
+export const copyingWithoutSink: SettleInput = { capture: copyingCapture, stop, sink: null };
+export const legalCopying: SettleInput = {
+  capture: copyingCapture,
+  stop,
+  sink: { kind: "closed", bytes: 14 as ByteCount, cappedAt: null },
+};
+
+// Verifier round 1, state 6: an inverted window, which would select nothing.
+// @ts-expect-error a window is built by windowOf, which refuses from >= to
+export const invertedWindow: Window = { key: "all", from: 120_000 as Minute, to: 60_000 as Minute };
+export const legalWindow: Window | null = windowOf("all", 60_000 as Minute, 120_000 as Minute);

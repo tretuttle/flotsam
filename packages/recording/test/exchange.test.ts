@@ -13,7 +13,6 @@ import {
   type Capture,
   type DiskInventory,
   type ExamineTopic,
-  type ExaminedCapture,
   type NetError,
   type SettledBody,
   type SettledExchange,
@@ -36,7 +35,8 @@ const failed = (error: string): StopFacts["status"] => ({
   error: error as NetError,
 });
 
-const decided = (route: Extract<Route, { kind: "empty" | "not-kept" }>): ExaminedCapture => ({
+type Phase<P extends Capture["phase"]> = Extract<Capture, { readonly phase: P }>;
+const decided = (route: Extract<Route, { kind: "empty" | "not-kept" }>): Phase<"decided"> => ({
   phase: "decided",
   id: ID,
   facts,
@@ -46,7 +46,7 @@ const decided = (route: Extract<Route, { kind: "empty" | "not-kept" }>): Examine
 const copying = (
   route: Extract<Route, { kind: "memory-tee" | "file-tee" }>,
   contentLength: number | null = 14,
-): ExaminedCapture => ({
+): Phase<"copying"> => ({
   phase: "copying",
   id: ID,
   facts: {
@@ -69,9 +69,11 @@ interface SettleCase {
   readonly label: string;
   readonly input: SettleInput;
   readonly at: BodyLocation | null;
+  /** The sketch's row. The first three read only the capture's phase and route; SETTLE_RULES holds the rest. */
   readonly rule: string;
   readonly body: SettledBody;
 }
+const BY_PHASE = ["decided-empty", "decided-not-kept", "unmerged-304"];
 
 // Expected values are BODY-ROUTES.md's settle table, row for row, written out by hand.
 const SETTLE_CASES: readonly SettleCase[] = [
@@ -191,14 +193,45 @@ const SETTLE_CASES: readonly SettleCase[] = [
 
 describe("settle", () => {
   it.each(SETTLE_CASES)("$label settles by $rule", ({ input, at, rule, body }) => {
-    expect(SETTLE_RULES.find((r) => r.when(input))?.id).toBe(rule);
+    expect(
+      input.sink === null ? BY_PHASE.includes(rule) : SETTLE_RULES.find((r) => r.when(input))?.id,
+    ).toBe(input.sink === null ? true : rule);
     expect(settle(input, at).body).toEqual(body);
   });
 
   it("every settle rule is reached by a case", () => {
     expect(new Set(SETTLE_CASES.map((c) => c.rule))).toEqual(
-      new Set(SETTLE_RULES.map((r) => r.id)),
+      new Set([...BY_PHASE, ...SETTLE_RULES.map((r) => r.id)]),
     );
+  });
+
+  it.each([
+    ["no-body", { id: "no-body", kind: "empty" }, { kind: "empty" }],
+    ["redirect", { id: "redirect", kind: "empty" }, { kind: "empty" }],
+    [
+      "streaming",
+      { id: "streaming", kind: "not-kept", reason: "streaming-response" },
+      { kind: "not-kept", reason: "streaming-response" },
+    ],
+    [
+      "media-details",
+      { id: "media-details", kind: "not-kept", reason: "media-setting" },
+      { kind: "not-kept", reason: "media-setting" },
+    ],
+    [
+      "large-or-unknown",
+      { id: "large-or-unknown", kind: "not-kept", reason: "not-recordable-here" },
+      { kind: "not-kept", reason: "not-recordable-here" },
+    ],
+  ] satisfies readonly (readonly [
+    string,
+    Extract<Route, { kind: "empty" | "not-kept" }>,
+    SettledBody,
+  ])[])("a decided %s route settles to its own outcome, under its own id", (id, route, body) => {
+    expect(settle({ capture: decided(route), stop, sink: null }, null)).toMatchObject({
+      route: id,
+      body,
+    });
   });
 
   it("an answered exchange carries the capture's facts, stop and route", () => {
@@ -214,10 +247,10 @@ describe("settle", () => {
   });
 
   it("a stored body keeps its Content-Encoding so the export can decode it", () => {
-    const gzip: ExaminedCapture = {
+    const gzip: Phase<"copying"> = {
       ...memoryTee,
       facts: { request, response: { ...response, contentEncoding: "gzip" } },
-    } as ExaminedCapture;
+    };
     expect(settle({ capture: gzip, stop, sink: closed(14) }, inPack).body).toEqual({
       kind: "stored",
       at: inPack,
@@ -345,20 +378,10 @@ describe("unanswered and abandon", () => {
   });
 
   it.each([
-    ["browser-closed", "opened", null, { kind: "incomplete", reason: "browser-closed" }],
-    ["recording-stopped", "opened", null, { kind: "incomplete", reason: "recording-stopped" }],
-    [
-      "browser-closed",
-      "awaiting-merge",
-      response,
-      { kind: "incomplete", reason: "browser-closed" },
-    ],
-    [
-      "recording-stopped",
-      "copying",
-      { ...response, contentLength: 14 },
-      { kind: "incomplete", reason: "recording-stopped" },
-    ],
+    ["browser-closed", "opened", null, { kind: "incomplete" }],
+    ["recording-stopped", "opened", null, { kind: "incomplete" }],
+    ["browser-closed", "awaiting-merge", response, { kind: "incomplete" }],
+    ["recording-stopped", "copying", { ...response, contentLength: 14 }, { kind: "incomplete" }],
     ["browser-closed", "decided", response, { kind: "empty" }],
   ] as const)("deepseek F5: %s during %s", (reason, phase, wantResponse, body) => {
     const abandoned = abandon(PHASES[phase], request, reason);
@@ -393,7 +416,9 @@ describe("bodyAvailability", () => {
           : "pack-short",
     hasFile: (site: Site, id) => files.includes(`${site}/${id}`),
   });
-  const answered = (body: SettledBody): SettledExchange => ({
+  const answered = (
+    body: Extract<SettledExchange, { readonly route: "small" }>["body"],
+  ): SettledExchange => ({
     kind: "answered",
     request,
     response,
@@ -444,7 +469,15 @@ describe("bodyAvailability", () => {
     ["an empty body", answered({ kind: "empty" }), disk(null, []), { kind: "empty" }],
     [
       "a body not kept by rule",
-      answered({ kind: "not-kept", reason: "media-setting" }),
+      {
+        kind: "answered",
+        request,
+        response,
+        stop,
+        route: "media-details",
+        body: { kind: "not-kept", reason: "media-setting" },
+        upload: none,
+      },
       disk(null, []),
       { kind: "missing", reason: "media-setting" },
     ],
@@ -465,6 +498,22 @@ describe("bodyAvailability", () => {
       abandon(fileTee, request, "browser-closed"),
       disk(null, []),
       { kind: "missing", reason: "browser-closed" },
+    ],
+    [
+      "a download abandoned when the add-on stopped",
+      abandon(fileTee, request, "recording-stopped"),
+      disk(null, []),
+      { kind: "missing", reason: "recording-stopped" },
+    ],
+    [
+      "an abandoned decided body keeps its rule's reason",
+      abandon(
+        decided({ id: "media-details", kind: "not-kept", reason: "media-setting" }),
+        request,
+        "browser-closed",
+      ),
+      disk(null, []),
+      { kind: "missing", reason: "media-setting" },
     ],
   ] satisfies readonly (readonly [string, SettledExchange, DiskInventory, BodyAvailability])[])(
     "%s",

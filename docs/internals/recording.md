@@ -10,7 +10,7 @@ No body is left in the browser's HTTP cache or read back from it. A cache entry'
 
 An exchange is a state machine in `exchange.ts`: opened at `http-on-opening-request`, decided or copying at the first examine topic, settled at stop. A channel that stops with no head is `unanswered`; one still live at shutdown is `abandoned`, with `browser-closed` or `recording-stopped`, never a guess between the two. A 304 from the network waits in `awaiting-merge` and takes its body from the merged response on the same channel, keeping the 304's head.
 
-`SETTLE_RULES` is first match wins. A body the watchdog cut at the body cap keeps its first part, stored with `check: "first-part"` (coordinator decision, 2026-11-16). That row comes before `stop-failed`: an endless stream that passed the cap is usually aborted later by a navigation, and its first part is still exact.
+A line pairs each route with only the bodies its row can produce, and an abandoned body names no reason of its own, so a contradictory line is a type error and `decodeLine` refuses it. That is why a decided capture settles to its route's own outcome and an unmerged 304 to empty before any rule: `SETTLE_RULES` holds the rows that read a sink, and is first match wins. A body the watchdog cut at the body cap keeps its first part, stored with `check: "first-part"` (coordinator decision, 2026-11-16). That row comes before `stop-failed`: an endless stream that passed the cap is usually aborted later by a navigation, and its first part is still exact.
 
 ## Files and the commit point
 

@@ -64,7 +64,7 @@ const abandoned: SettledExchange = {
   },
   response: null,
   reason: "recording-stopped",
-  body: { kind: "incomplete", reason: "recording-stopped" },
+  body: { kind: "incomplete" },
   upload: { kind: "none" },
 };
 const LINES: readonly LogLine[] = [answered, unanswered, abandoned].map((exchange) => ({
@@ -178,6 +178,56 @@ describe("reading a segment", () => {
   });
 });
 
+interface RawSummary {
+  lines: number;
+  firstStartedAt: number | null;
+  lastStartedAt: number | null;
+  buckets: { requests: number; fetchOrXhr: number }[];
+}
+const edited = (edit: (s: RawSummary) => void) => (text: string) => {
+  const raw = JSON.parse(text) as RawSummary;
+  edit(raw);
+  return JSON.stringify(raw);
+};
+const second = (s: RawSummary) => s.buckets[1] ?? { requests: 0, fetchOrXhr: 0 };
+// The summary of LINES has 3 lines in buckets of 2 and 1 requests. Each edit breaks one count and keeps the rest true.
+const COUNT_DAMAGE: readonly (readonly [string, (s: RawSummary) => void])[] = [
+  [
+    "a bucket with a negative request count",
+    (s) => {
+      second(s).requests = -1;
+      second(s).fetchOrXhr = 0;
+      s.lines = 1;
+    },
+  ],
+  [
+    "a bucket with no request",
+    (s) => {
+      second(s).requests = 0;
+      s.lines = 2;
+    },
+  ],
+  ["a negative fetch or XHR count", (s) => void (second(s).fetchOrXhr = -1)],
+  ["more fetch or XHR requests than requests", (s) => void (second(s).fetchOrXhr = 2)],
+  [
+    "a negative line count",
+    (s) => {
+      s.lines = -1;
+      s.buckets = [];
+      s.firstStartedAt = null;
+      s.lastStartedAt = null;
+    },
+  ],
+  ["a line count the buckets disagree with", (s) => void (s.lines = 4)],
+  ["lines with no first start", (s) => void (s.firstStartedAt = null)],
+  [
+    "a last start before the first",
+    (s) => {
+      [s.firstStartedAt, s.lastStartedAt] = [s.lastStartedAt, s.firstStartedAt];
+    },
+  ],
+];
+
 describe("segment summaries", () => {
   const size = bytes(LINES.map(encodeLine).join("").length);
 
@@ -229,7 +279,7 @@ describe("segment summaries", () => {
     expect(decodeSummary(encodeSummary(summary), size)).toEqual(summary);
   });
 
-  it.each([
+  it.each<readonly [string, (s: string) => string, number]>([
     ["opus 7: a segment that grew after its summary", (s: string) => s, size + 1],
     ["a torn summary", (s: string) => s.slice(0, -1), size],
     [
@@ -238,9 +288,15 @@ describe("segment summaries", () => {
       size,
     ],
     ["a zero-filled file after a power loss", (s: string) => "\0".repeat(s.length), size],
+    ...COUNT_DAMAGE.map(([label, edit]) => [label, edited(edit), size] as const),
   ])("%s decodes to null", (_label, damage, segmentBytes) => {
     expect(
       decodeSummary(damage(encodeSummary(summarize(SEGMENT, LINES, size))), bytes(segmentBytes)),
     ).toBeNull();
+  });
+
+  it("the empty summary, the legal twin of the count checks, round-trips", () => {
+    const empty = summarize(SEGMENT, [], bytes(0));
+    expect(decodeSummary(encodeSummary(empty), bytes(0))).toEqual(empty);
   });
 });

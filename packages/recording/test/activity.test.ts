@@ -14,6 +14,7 @@ import {
   type ActivityIndex,
   type ActivityKey,
   type Window,
+  windowOf,
 } from "../src/activity.ts";
 import type { SettledExchange } from "../src/exchange.ts";
 import type {
@@ -36,6 +37,11 @@ const RUN = "mhz02" as RunId;
 const OLD = "mhz01" as RunId;
 const at = (minute: number, second = 0) => (BASE + minute * MINUTE + second * 1000) as EpochMs;
 const m = (minute: number) => (BASE + minute * MINUTE) as Minute;
+const window = (key: ActivityKey, from: number, to: number): Window => {
+  const w = windowOf(key, m(from), m(to));
+  if (w === null) throw new Error(`window ${from} to ${to} is empty`);
+  return w;
+};
 const tab = (run: RunId, browserId: number): TabKey => ({ run, browserId });
 
 interface Made {
@@ -155,7 +161,7 @@ describe("counts against a brute-force count over the same lines", () => {
     for (let trial = 0; trial < 60; trial++) {
       const windows: Window[] = Array.from({ length: 1 + r.int(3) }, () => {
         const from = r.int(180);
-        return { key: r.pick(keys), from: m(from), to: m(from + 1 + r.int(60)) };
+        return window(r.pick(keys), from, from + 1 + r.int(60));
       });
       const hit = made.filter((x) => windows.some((w) => matches(x.exchange, w)));
       expect(countWindows(index, windows)).toEqual({
@@ -193,6 +199,16 @@ describe("counts against a brute-force count over the same lines", () => {
   });
 });
 
+describe("windows", () => {
+  it.each([
+    [0, 1, true],
+    [5, 5, false],
+    [6, 5, false],
+  ])("from minute %i to %i builds a window: %s", (from, to, built) => {
+    expect(windowOf("all", m(from), m(to)) !== null).toBe(built);
+  });
+});
+
 describe("events", () => {
   const e1 = exchange({
     run: RUN,
@@ -219,7 +235,7 @@ describe("events", () => {
     index = applyActivity(index, { kind: "settled", segment: seg, exchange: e1 });
     return applyActivity(index, { kind: "settled", segment: segB, exchange: e2 });
   };
-  const all: readonly Window[] = [{ key: "all", from: m(-10), to: m(100) }];
+  const all: readonly Window[] = [window("all", -10, 100)];
 
   it("a summary replaces what the segment's lines added, so applying it twice counts once", () => {
     let index = fresh();

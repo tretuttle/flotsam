@@ -197,7 +197,7 @@ export class Run {
         request: req,
         response,
         reason: "browser-closed",
-        body: { kind: "incomplete", reason: "browser-closed" },
+        body: { kind: "incomplete" },
         upload: { kind: "none" },
       };
     if (body === "answered")

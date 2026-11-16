@@ -100,23 +100,46 @@ export type AbandonReason = "browser-closed" | "recording-stopped";
  */
 export type BodyCheck = "length-matched" | "sink-only" | "first-part";
 
-export type SettledBody =
-  /** The protocol has no body: HEAD, 1xx, 204, 205, a redirect hop, a 304 that was not merged, or zero bytes. */
-  | { readonly kind: "empty" }
+/** The protocol has no body: HEAD, 1xx, 204, 205, a redirect hop, a 304 that was not merged, or zero bytes. */
+type EmptyBody = { readonly kind: "empty" };
+type NotKeptBody<R extends NotKeptReason = NotKeptReason> = {
+  readonly kind: "not-kept";
+  readonly reason: R;
+};
+/** What a copy settles to at stop: its bytes, nothing for a declared empty body, or why the copy failed. */
+export type CopiedBody =
+  | EmptyBody
   | {
       readonly kind: "stored";
       readonly at: BodyLocation;
       readonly encoding: string | null;
       readonly check: BodyCheck;
     }
-  | { readonly kind: "not-kept"; readonly reason: NotKeptReason }
   | { readonly kind: "incomplete"; readonly reason: IncompleteReason };
+export type SettledBody = CopiedBody | NotKeptBody;
 
-/** An abandoned exchange never stored a body: "abandoned but complete" cannot be built (deepseek F7). */
-export type AbandonedBody =
-  | { readonly kind: "empty" }
-  | { readonly kind: "not-kept"; readonly reason: NotKeptReason }
-  | { readonly kind: "incomplete"; readonly reason: AbandonReason };
+/**
+ * The bodies a route can settle to. A route decided at examine settles to its own outcome; a copy route to what the
+ * copy gave. Derived from Route, so a row's id pairs only with the bodies that row can produce.
+ */
+type BodyOf<R> = R extends { readonly kind: "empty" | "awaiting-merge" }
+  ? EmptyBody
+  : R extends { readonly kind: "not-kept"; readonly reason: infer N extends NotKeptReason }
+    ? NotKeptBody<N>
+    : CopiedBody;
+/** A route and the body it settled to, as the answered line stores them. */
+export type RoutedBody = {
+  [Id in BodyRouteId]: {
+    readonly route: Id;
+    readonly body: BodyOf<Extract<Route, { readonly id: Id }>>;
+  };
+}[BodyRouteId];
+
+/**
+ * An abandoned exchange never stored a body: "abandoned but complete" cannot be built (deepseek F7). An interrupted
+ * body carries no reason of its own; the exchange's `reason` says why, so the two cannot disagree.
+ */
+export type AbandonedBody = EmptyBody | NotKeptBody | { readonly kind: "incomplete" };
 
 export type UploadOutcome =
   | { readonly kind: "none" }
@@ -253,28 +276,36 @@ export function examine(
 
 /** What settle may be given: never an "opened" capture, which settles through unanswered. */
 export type ExaminedCapture = Exclude<Capture, { readonly phase: "opened" }>;
+type CopyingCapture = Extract<Capture, { readonly phase: "copying" }>;
 
-/** The rows settle applies, first match wins. Data, so the table in BODY-ROUTES.md is this array. */
-export interface SettleInput {
-  readonly capture: ExaminedCapture;
-  readonly stop: StopFacts;
-  /** null for every phase but copying. */
-  readonly sink: SinkResult | null;
-}
+/** A copying capture always has its sink's report; a decided or awaiting capture never had a sink. */
+export type SettleInput =
+  | {
+      readonly capture: Exclude<ExaminedCapture, CopyingCapture>;
+      readonly stop: StopFacts;
+      readonly sink: null;
+    }
+  | { readonly capture: CopyingCapture; readonly stop: StopFacts; readonly sink: SinkResult };
+export type CopySettleInput = Extract<SettleInput, { readonly sink: SinkResult }>;
+
+/**
+ * The rows settle applies to a copying capture, first match wins. Data, so the table in BODY-ROUTES.md is this
+ * array. A decided capture settles to its route's own outcome and an unmerged 304 to empty, before any row.
+ */
 export interface SettleRule {
   readonly id: string;
-  readonly when: (i: SettleInput) => boolean;
+  readonly when: (i: CopySettleInput) => boolean;
   /** `at` is where the store put the copied bytes; null when nothing was copied. */
-  readonly body: (i: SettleInput, at: BodyLocation | null) => SettledBody;
+  readonly body: (i: CopySettleInput, at: BodyLocation | null) => CopiedBody;
   readonly why: string;
 }
 
 /** encodedBodySize when above 0, else Content-Length when known, else null. */
-const expectedLength = (i: SettleInput): number | null =>
+const expectedLength = (i: CopySettleInput): number | null =>
   i.stop.encodedBodySize > 0 ? i.stop.encodedBodySize : i.capture.facts.response.contentLength;
-const sinkBytes = (i: SettleInput): number | null =>
-  i.sink?.kind === "closed" ? i.sink.bytes : null;
-const storedAt = (i: SettleInput, at: BodyLocation | null, check: BodyCheck): SettledBody =>
+const sinkBytes = (i: CopySettleInput): number | null =>
+  i.sink.kind === "closed" ? i.sink.bytes : null;
+const storedAt = (i: CopySettleInput, at: BodyLocation | null, check: BodyCheck): CopiedBody =>
   at === null
     ? { kind: "incomplete", reason: "write-failed" }
     : { kind: "stored", at, encoding: i.capture.facts.response.contentEncoding, check };
@@ -289,29 +320,8 @@ const SINK_ONLY: SettleRule = {
 /** First match wins. Tested row for row; rendered into BODY-ROUTES.md. The last row matches anything. */
 export const SETTLE_RULES: readonly SettleRule[] = [
   {
-    id: "decided-empty",
-    when: (i) => i.capture.phase === "decided" && i.capture.route.kind === "empty",
-    body: () => ({ kind: "empty" }),
-    why: "HEAD, 1xx, 204, 205 or a redirect hop. A hop stops with NS_BINDING_REDIRECTED, which is its normal end.",
-  },
-  {
-    id: "decided-not-kept",
-    when: (i) => i.capture.phase === "decided" && i.capture.route.kind === "not-kept",
-    body: (i) =>
-      i.capture.phase === "decided" && i.capture.route.kind === "not-kept"
-        ? { kind: "not-kept", reason: i.capture.route.reason }
-        : { kind: "empty" },
-    why: "The route's own reason.",
-  },
-  {
-    id: "unmerged-304",
-    when: (i) => i.capture.phase === "awaiting-merge",
-    body: () => ({ kind: "empty" }),
-    why: "The page received the 304 itself, with no body.",
-  },
-  {
     id: "capped",
-    when: (i) => i.sink?.kind === "closed" && i.sink.cappedAt !== null,
+    when: (i) => i.sink.kind === "closed" && i.sink.cappedAt !== null,
     body: (i, at) => storedAt(i, at, "first-part"),
     why: "The watchdog closed the file at the body cap and the page was not affected (proto-premise 9). Its first part is kept, however the request ended.",
   },
@@ -323,7 +333,7 @@ export const SETTLE_RULES: readonly SettleRule[] = [
   },
   {
     id: "prepare-failed",
-    when: (i) => i.sink?.kind === "prepare-failed",
+    when: (i) => i.sink.kind === "prepare-failed",
     body: () => ({ kind: "incomplete", reason: "write-failed" }),
     why: "The sink could not be created.",
   },
@@ -348,17 +358,44 @@ export const SETTLE_RULES: readonly SettleRule[] = [
   SINK_ONLY,
 ];
 
+/** A route decided at examine settles to its own outcome. One case per row, so each id keeps its own reason. */
+function decidedBody(route: Extract<Route, { readonly kind: "empty" | "not-kept" }>): RoutedBody {
+  switch (route.id) {
+    case "no-body":
+    case "redirect":
+      return { route: route.id, body: { kind: "empty" } };
+    case "streaming":
+      return { route: route.id, body: { kind: "not-kept", reason: route.reason } };
+    case "media-details":
+      return { route: route.id, body: { kind: "not-kept", reason: route.reason } };
+    case "small":
+    case "large-or-unknown":
+      return { route: route.id, body: { kind: "not-kept", reason: route.reason } };
+  }
+}
+
+const isCopying = (input: SettleInput): input is CopySettleInput =>
+  input.capture.phase === "copying";
+
+function routedBody(input: SettleInput, at: BodyLocation | null): RoutedBody {
+  if (isCopying(input)) {
+    const rule = SETTLE_RULES.find((r) => r.when(input)) ?? SINK_ONLY;
+    return { route: input.capture.route.id, body: rule.body(input, at) };
+  }
+  return input.capture.phase === "awaiting-merge"
+    ? { route: "awaiting-merge", body: { kind: "empty" } }
+    : decidedBody(input.capture.route);
+}
+
 export function settle(input: SettleInput, at: BodyLocation | null): AnsweredExchange {
-  const rule = SETTLE_RULES.find((r) => r.when(input)) ?? SINK_ONLY;
   const { capture } = input;
   return {
     kind: "answered",
     request: capture.facts.request,
     response: capture.facts.response,
     stop: input.stop,
-    route: capture.phase === "awaiting-merge" ? "awaiting-merge" : capture.route.id,
-    body: rule.body(input, at),
     upload: capture.upload,
+    ...routedBody(input, at),
   };
 }
 
@@ -387,13 +424,13 @@ export function abandon(
       request,
       response: null,
       reason,
-      body: { kind: "incomplete", reason },
+      body: { kind: "incomplete" },
       upload: { kind: "none" },
     };
   const { facts, upload } = capture;
   const body: AbandonedBody =
     capture.phase !== "decided"
-      ? { kind: "incomplete", reason }
+      ? { kind: "incomplete" }
       : capture.route.kind === "empty"
         ? { kind: "empty" }
         : { kind: "not-kept", reason: capture.route.reason };
@@ -407,30 +444,36 @@ export function abandon(
   };
 }
 
-export interface AnsweredExchange {
+export type AnsweredExchange = {
   readonly kind: "answered";
   readonly request: RequestFacts;
   readonly response: ResponseFacts;
   readonly stop: StopFacts;
-  readonly route: BodyRouteId;
-  readonly body: SettledBody;
   readonly upload: UploadOutcome;
-}
+} & RoutedBody;
 export interface UnansweredExchange {
   readonly kind: "unanswered";
   readonly request: RequestFacts;
   readonly stop: StopFacts;
   readonly upload: UploadOutcome;
 }
-export interface AbandonedExchange {
+export type AbandonedExchange = {
   readonly kind: "abandoned";
   readonly request: RequestFacts;
-  /** null when the browser closed before the response head arrived. */
-  readonly response: ResponseFacts | null;
   readonly reason: AbandonReason;
-  readonly body: AbandonedBody;
-  readonly upload: UploadOutcome;
-}
+} & (
+  | {
+      /** Shut down before the response head arrived: no route was decided and no upload was read. */
+      readonly response: null;
+      readonly body: { readonly kind: "incomplete" };
+      readonly upload: { readonly kind: "none" };
+    }
+  | {
+      readonly response: ResponseFacts;
+      readonly body: AbandonedBody;
+      readonly upload: UploadOutcome;
+    }
+);
 
 /** One line in a site's log. Written once at stop (or at shutdown), never rewritten. */
 export type SettledExchange = AnsweredExchange | UnansweredExchange | AbandonedExchange;
@@ -485,6 +528,11 @@ function locationAvailability(
  */
 export function bodyAvailability(settled: SettledExchange, disk: DiskInventory): BodyAvailability {
   if (settled.kind === "unanswered") return { kind: "missing", reason: "no-response" };
+  if (settled.kind === "abandoned") {
+    const { body } = settled;
+    if (body.kind === "incomplete") return { kind: "missing", reason: settled.reason };
+    return body.kind === "empty" ? body : { kind: "missing", reason: body.reason };
+  }
   const { body } = settled;
   switch (body.kind) {
     case "empty":

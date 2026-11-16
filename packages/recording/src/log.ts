@@ -7,12 +7,13 @@ import type {
   AbandonReason,
   BodyCheck,
   BodyLocation,
+  CopiedBody,
   Header,
   IncompleteReason,
   NetError,
   RequestFacts,
   ResponseFacts,
-  SettledBody,
+  RoutedBody,
   SettledExchange,
   StopFacts,
   StopStatus,
@@ -181,7 +182,18 @@ function location(raw: unknown): BodyLocation {
     : reject();
 }
 
-function settledBody(raw: unknown): SettledBody {
+const empty = (raw: unknown): { readonly kind: "empty" } =>
+  fields(raw)["kind"] === "empty" ? { kind: "empty" } : reject();
+const notKept =
+  <R extends NotKeptReason>(reasons: readonly R[]) =>
+  (raw: unknown): { readonly kind: "not-kept"; readonly reason: R } => {
+    const f = fields(raw);
+    return f["kind"] === "not-kept"
+      ? { kind: "not-kept", reason: member(reasons)(f["reason"]) }
+      : reject();
+  };
+
+function copiedBody(raw: unknown): CopiedBody {
   const f = fields(raw);
   switch (f["kind"]) {
     case "empty":
@@ -193,8 +205,6 @@ function settledBody(raw: unknown): SettledBody {
         encoding: nullable(text)(f["encoding"]),
         check: member(CHECKS)(f["check"]),
       };
-    case "not-kept":
-      return { kind: "not-kept", reason: member(NOT_KEPT)(f["reason"]) };
     case "incomplete":
       return { kind: "incomplete", reason: member(INCOMPLETE)(f["reason"]) };
     default:
@@ -202,14 +212,44 @@ function settledBody(raw: unknown): SettledBody {
   }
 }
 
+/** The runtime twin of RoutedBody: each route reads only the bodies its row can settle to. */
+function routedBody(rawRoute: unknown, rawBody: unknown): RoutedBody {
+  const route = member(ROUTE_IDS)(rawRoute);
+  switch (route) {
+    case "no-body":
+    case "redirect":
+    case "awaiting-merge":
+      return { route, body: empty(rawBody) };
+    case "streaming":
+      return { route, body: notKept(["streaming-response"] as const)(rawBody) };
+    case "media-details":
+      return { route, body: notKept(["media-setting"] as const)(rawBody) };
+    case "small":
+    case "large-or-unknown":
+      return {
+        route,
+        body:
+          fields(rawBody)["kind"] === "not-kept"
+            ? notKept(["not-recordable-here"] as const)(rawBody)
+            : copiedBody(rawBody),
+      };
+  }
+}
+
+/** An interrupted body names no reason; the exchange's own reason is the only one. */
+function interrupted(raw: unknown): { readonly kind: "incomplete" } {
+  const f = fields(raw);
+  return f["kind"] === "incomplete" && !("reason" in f) ? { kind: "incomplete" } : reject();
+}
+
 function abandonedBody(raw: unknown): AbandonedBody {
   const f = fields(raw);
   if (f["kind"] === "empty") return { kind: "empty" };
-  if (f["kind"] === "not-kept") return { kind: "not-kept", reason: member(NOT_KEPT)(f["reason"]) };
-  return f["kind"] === "incomplete"
-    ? { kind: "incomplete", reason: member(ABANDON)(f["reason"]) }
-    : reject();
+  return f["kind"] === "not-kept" ? notKept(NOT_KEPT)(raw) : interrupted(raw);
 }
+
+const noUpload = (raw: unknown): { readonly kind: "none" } =>
+  fields(raw)["kind"] === "none" ? { kind: "none" } : reject();
 
 function upload(raw: unknown): UploadOutcome {
   const f = fields(raw);
@@ -232,9 +272,8 @@ function exchange(raw: unknown): SettledExchange {
         request: request(f["request"]),
         response: response(f["response"]),
         stop: stop(f["stop"]),
-        route: member(ROUTE_IDS)(f["route"]),
-        body: settledBody(f["body"]),
         upload: upload(f["upload"]),
+        ...routedBody(f["route"], f["body"]),
       };
     case "unanswered":
       return {
@@ -243,15 +282,21 @@ function exchange(raw: unknown): SettledExchange {
         stop: stop(f["stop"]),
         upload: upload(f["upload"]),
       };
-    case "abandoned":
-      return {
+    case "abandoned": {
+      const head = {
         kind: "abandoned",
         request: request(f["request"]),
-        response: nullable(response)(f["response"]),
         reason: member(ABANDON)(f["reason"]),
-        body: abandonedBody(f["body"]),
-        upload: upload(f["upload"]),
-      };
+      } as const;
+      return f["response"] === null
+        ? { ...head, response: null, body: interrupted(f["body"]), upload: noUpload(f["upload"]) }
+        : {
+            ...head,
+            response: response(f["response"]),
+            body: abandonedBody(f["body"]),
+            upload: upload(f["upload"]),
+          };
+    }
     default:
       return reject();
   }
@@ -322,18 +367,34 @@ const minute = (raw: unknown): Minute => {
   return start === value ? start : reject();
 };
 
+const atLeast =
+  (min: number, max = Number.MAX_SAFE_INTEGER) =>
+  (raw: unknown): number => {
+    const value = integer(raw);
+    return value >= min && value <= max ? value : reject();
+  };
+
+/** A bucket holds at least the one request that made it, and fetch or XHR requests are a subset of its requests. */
 function bucket(raw: unknown): ActivityBucket {
   const f = fields(raw);
+  const requests = atLeast(1)(f["requests"]);
   return {
     minute: minute(f["minute"]),
     tab: nullable(tabKey)(f["tab"]),
     site: nullable(aSite)(f["site"]),
-    requests: integer(f["requests"]),
-    fetchOrXhr: integer(f["fetchOrXhr"]),
+    requests,
+    fetchOrXhr: atLeast(0, requests)(f["fetchOrXhr"]),
     bodyBytesRecorded: byteCount(f["bodyBytesRecorded"]),
     topUrl: text(f["topUrl"]),
   };
 }
+
+/** What summarize guarantees: one request per line across the buckets, and start times exactly when there are lines. */
+const consistent = (s: SegmentSummary): boolean =>
+  s.buckets.reduce((sum, b) => sum + b.requests, 0) === s.lines &&
+  (s.lines === 0
+    ? s.firstStartedAt === null && s.lastStartedAt === null
+    : s.firstStartedAt !== null && s.lastStartedAt !== null && s.firstStartedAt <= s.lastStartedAt);
 
 /**
  * null for a summary that does not decode or whose `bytes` differs from the segment's size on disk. Reconcile then
@@ -346,10 +407,10 @@ export function decodeSummary(raw: string, segmentBytes: ByteCount): SegmentSumm
       segment: parsed(parseLogSegmentId)(f["segment"]),
       firstStartedAt: nullable(epochMs)(f["firstStartedAt"]),
       lastStartedAt: nullable(epochMs)(f["lastStartedAt"]),
-      lines: integer(f["lines"]),
+      lines: atLeast(0)(f["lines"]),
       bytes: byteCount(f["bytes"]),
       buckets: list(f["buckets"], bucket),
     };
-    return summary.bytes === segmentBytes ? summary : reject();
+    return summary.bytes === segmentBytes && consistent(summary) ? summary : reject();
   });
 }
