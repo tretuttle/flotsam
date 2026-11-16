@@ -1,0 +1,5 @@
+ts	phase	decision	why	evidence	result
+2026-11-16T03:49:39Z	frame	named it Flotsam: keeps the big files that float past while you browse	short, unclaimed on GitHub under tretuttle, says what it does	gh repo view tretuttle/flotsam -> not found	open
+2026-11-16T03:49:40Z	frame	recorder core is a Firefox experiment API paired with an extension.js extension	experiment APIs are the one extension mechanism that runs code with the system principal in the parent process, and only the declaring extension can call it	Zen AddonSettings.sys.mjs:104 EXPERIMENTS_ENABLED follows pref because MOZ_REQUIRE_SIGNING=false (AppConstants.sys.mjs:113)	open
+2026-11-16T03:49:40Z	frame	Gecko-family only for the recorder (Zen, Firefox Nightly/Dev Edition/unbranded, forks without forced signing)	Chromium has no parent-process extension hook; chrome.debugger shows a banner on every tab, which breaks always-on	reasoning, to confirm in research	open
+2026-11-16T03:49:40Z	frame	toolchain copied from parkpal-monorepo, which copies t3code	user named both as the guardrails to follow	parkpal-monorepo/AGENTS.md, t3code/AGENTS.md	open
