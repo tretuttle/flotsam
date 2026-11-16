@@ -25,12 +25,6 @@ export type Fixture = {
   readonly body: BodySpec;
 };
 
-export type DigestEntry = {
-  readonly id: string;
-  readonly sha256: string;
-  readonly byteLength: number;
-};
-
 const NO_STORE = "no-store";
 
 const VIDEO_PREFIX = Uint8Array.from([
@@ -45,8 +39,11 @@ const SMALL_CONTENT_TYPE: Record<SmallKind, string> = {
   json: "application/json",
 };
 
+export const PAGE_PATH = "/";
+export const FIXTURES_PAGE_PATH = "/fixtures/";
+
 export function listFixtures(): readonly Fixture[] {
-  return [...fixedFixtures(), pageFixture(), ...smallFixtures()];
+  return [...fixedFixtures(), pageFixture(), fixturesPageFixture(), ...smallFixtures()];
 }
 
 export function buildBody(fixture: Fixture): Buffer {
@@ -63,34 +60,32 @@ export function buildBody(fixture: Fixture): Buffer {
   return buffer;
 }
 
-export function buildDigestTable(
-  fixtures: readonly Fixture[] = listFixtures(),
-): readonly DigestEntry[] {
-  return fixtures.map((fixture) => {
-    const bytes = buildBody(fixture);
-    return { id: fixture.id, sha256: sha256Hex(bytes), byteLength: bytes.length };
-  });
-}
-
-export function assertDigestMatch(id: string, expected: string, observed: string): void {
-  if (expected !== observed) {
-    throw new Error(`digest mismatch for ${id}: expected ${expected}, observed ${observed}`);
-  }
-}
-
 export function expectedResourceCount(): number {
   return SMALL_KINDS.length * SMALL_PER_KIND;
 }
 
 export function smallResourcePaths(): readonly string[] {
-  const paths: string[] = [];
-  for (const kind of SMALL_KINDS) {
-    for (let index = 0; index < SMALL_PER_KIND; index += 1) {
-      paths.push(`/r/${kind}/${String(index)}`);
-    }
-  }
-  return paths;
+  return smallFixtures().map((fixture) => fixture.path);
 }
+
+export type PageRequest = {
+  readonly fixtureId: string;
+  readonly method: FixtureMethod;
+  readonly path: string;
+  readonly range: { readonly start: number; readonly end: number } | null;
+};
+
+// What the fixtures page fetches, in order. The range request asks for a slice, so its
+// expected response is that 206 slice, not the full body.
+export const FIXTURES_PAGE_REQUESTS: readonly PageRequest[] = [
+  { fixtureId: "binary", method: "GET", path: "/fixtures/binary", range: null },
+  { fixtureId: "chunked", method: "GET", path: "/fixtures/chunked", range: null },
+  { fixtureId: "gzip", method: "GET", path: "/fixtures/gzip", range: null },
+  { fixtureId: "video", method: "GET", path: "/fixtures/video", range: null },
+  { fixtureId: "range", method: "GET", path: "/fixtures/range", range: { start: 1000, end: 1999 } },
+  { fixtureId: "post-json", method: "POST", path: "/fixtures/post", range: null },
+  { fixtureId: "no-store", method: "GET", path: "/fixtures/no-store", range: null },
+];
 
 function fixedFixtures(): readonly Fixture[] {
   return [
@@ -164,14 +159,22 @@ function fixedFixtures(): readonly Fixture[] {
 }
 
 function pageFixture(): Fixture {
+  return htmlFixture("page", PAGE_PATH, pageHtml());
+}
+
+function fixturesPageFixture(): Fixture {
+  return htmlFixture("fixtures-page", FIXTURES_PAGE_PATH, fixturesPageHtml());
+}
+
+function htmlFixture(id: string, path: string, html: string): Fixture {
   return {
-    id: "page",
+    id,
     method: "GET",
-    path: "/",
+    path,
     contentType: "text/html; charset=utf-8",
     cacheControl: NO_STORE,
     transfer: "identity",
-    body: { kind: "text", text: pageHtml() },
+    body: { kind: "text", text: html },
   };
 }
 
@@ -193,70 +196,85 @@ function smallFixtures(): Fixture[] {
   return fixtures;
 }
 
+// One sample runs from navigation start (performance.now() is 0 there) to the moment the last of
+// the 200 resources finished: stylesheet applied, script executed, image loaded, JSON body read.
+// The page reports it, so fetches that end after the load event still count.
 function pageHtml(): string {
-  const tags: string[] = ['<link rel="icon" href="data:,">'];
+  const total = expectedResourceCount();
+  const head = [
+    "<script>",
+    "const finished = new Map(); const failed = new Set(); let settle;",
+    "window.__harnessReady = new Promise((resolve) => { settle = resolve; });",
+    "function report() {",
+    `  if (finished.size + failed.size < ${String(total)}) return;`,
+    "  settle(JSON.stringify({",
+    "    lastResourceFinishedMs: Math.max(0, ...finished.values()),",
+    "    finished: [...finished.keys()],",
+    "    failed: [...failed],",
+    "  }));",
+    "}",
+    "window.__harnessFinish = (path) => { finished.set(path, performance.now()); report(); };",
+    "window.__harnessFail = (path) => { failed.add(path); report(); };",
+    "</script>",
+    '<link rel="icon" href="data:,">',
+  ];
+  const body: string[] = [];
   const jsonPaths: string[] = [];
   for (let index = 0; index < SMALL_PER_KIND; index += 1) {
     const name = String(index);
-    tags.push(`<link rel="stylesheet" href="/r/css/${name}">`);
-    tags.push(`<script src="/r/js/${name}"></script>`);
-    tags.push(`<img src="/r/image/${name}" alt="">`);
+    head.push(`<link rel="stylesheet" href="/r/css/${name}"${handlers(`/r/css/${name}`)}>`);
+    head.push(`<script src="/r/js/${name}" onerror="__harnessFail('/r/js/${name}')"></script>`);
+    body.push(`<img src="/r/image/${name}" alt=""${handlers(`/r/image/${name}`)}>`);
     jsonPaths.push(`/r/json/${name}`);
   }
+  body.push(
+    [
+      "<script>",
+      `for (const path of ${JSON.stringify(jsonPaths)}) {`,
+      '  fetch(path, { cache: "no-store" })',
+      "    .then((response) => { if (!response.ok) throw new Error(String(response.status)); return response.arrayBuffer(); })",
+      "    .then(() => __harnessFinish(path), () => __harnessFail(path));",
+      "}",
+      "</script>",
+    ].join(""),
+  );
+  return `<!doctype html><html><head><meta charset="utf-8">${head.join("")}</head><body>${body.join("")}</body></html>`;
+}
+
+function handlers(path: string): string {
+  return ` onload="__harnessFinish('${path}')" onerror="__harnessFail('${path}')"`;
+}
+
+function fixturesPageHtml(): string {
+  const requests = FIXTURES_PAGE_REQUESTS.map((request) => ({
+    method: request.method,
+    path: request.path,
+    headers:
+      request.range === null
+        ? {}
+        : { Range: `bytes=${String(request.range.start)}-${String(request.range.end)}` },
+  }));
   const script = [
     "window.__harnessReady = (async () => {",
-    `  const jsonPaths = ${JSON.stringify(jsonPaths)};`,
-    "  const jsonMissing = [];",
-    "  let jsonOk = 0;",
-    "  await Promise.all(jsonPaths.map(async (path) => {",
-    "    try {",
-    "      const response = await fetch(path);",
-    "      if (!response.ok) jsonMissing.push(path);",
-    "      else jsonOk += 1;",
-    "      await response.arrayBuffer();",
-    "    } catch {",
-    "      jsonMissing.push(path);",
-    "    }",
-    "  }));",
-    '  if (document.readyState !== "complete") {',
-    '    await new Promise((resolve) => addEventListener("load", () => resolve(), { once: true }));',
+    `  const requests = ${JSON.stringify(requests)};`,
+    "  const results = [];",
+    "  for (const request of requests) {",
+    '    const init = { method: request.method, headers: request.headers, cache: "no-store" };',
+    '    if (request.method === "POST") init.body = "{}";',
+    "    const response = await fetch(request.path, init);",
+    "    const bytes = await response.arrayBuffer();",
+    "    results.push({ path: request.path, status: response.status, byteLength: bytes.byteLength });",
     "  }",
-    "  const cssMissing = [];",
-    "  let cssOk = 0;",
-    "  for (const link of document.querySelectorAll('link[rel=\"stylesheet\"]')) {",
-    "    const path = new URL(link.href).pathname;",
-    "    if (link.sheet === null) cssMissing.push(path);",
-    "    else cssOk += 1;",
-    "  }",
-    "  const imageMissing = [];",
-    "  let imageOk = 0;",
-    "  await Promise.all([...document.images].map(async (image) => {",
-    "    const path = new URL(image.currentSrc || image.src).pathname;",
-    "    try {",
-    "      await image.decode();",
-    "      imageOk += 1;",
-    "    } catch {",
-    "      imageMissing.push(path);",
-    "    }",
-    "  }));",
-    "  const jsOk = globalThis.__harnessResources ?? 0;",
-    "  const missing = cssMissing.concat(imageMissing, jsonMissing);",
-    `  if (jsOk !== ${String(SMALL_PER_KIND)}) missing.push("js-executed:" + String(jsOk));`,
-    '  const navigation = performance.getEntriesByType("navigation")[0];',
-    "  return JSON.stringify({",
-    "    loadTimeMs: navigation.loadEventEnd - navigation.startTime,",
-    "    resourceCount: cssOk + jsOk + imageOk + jsonOk,",
-    "    missing: missing,",
-    "  });",
+    "  return JSON.stringify({ results });",
     "})();",
   ].join("");
-  return `<!doctype html><html><head><meta charset="utf-8">${tags.join("")}</head><body><script>${script}</script></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"></head><body><script>${script}</script></body></html>`;
 }
 
 function smallText(kind: SmallKind, index: number): string {
   const name = String(index);
   if (kind === "css") return `.r-${name}{color:#010101}\n`;
-  if (kind === "js") return `globalThis.__harnessResources=(globalThis.__harnessResources??0)+1;\n`;
+  if (kind === "js") return `__harnessFinish("/r/js/${name}");\n`;
   if (kind === "image") {
     return `<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="#${name.padStart(6, "0")}"/></svg>`;
   }
@@ -265,10 +283,6 @@ function smallText(kind: SmallKind, index: number): string {
 
 function prngKey(id: string): string {
   return `${FIXTURE_SEED}\0${id}`;
-}
-
-function sha256Hex(bytes: Buffer): string {
-  return NodeCrypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 function fillPrng(buffer: Buffer, offset: number, key: string): void {

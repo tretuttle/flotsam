@@ -9,6 +9,7 @@ export type RemoteProtocol = "bidi" | "marionette";
 export type RemoteControl = {
   readonly protocol: RemoteProtocol;
   readonly browserPid: number;
+  readonly browserName: string;
   readonly version: string;
   readonly buildId: string;
   readonly userAgent: string;
@@ -21,18 +22,20 @@ export type RemoteControl = {
 export async function connectRemote(options: {
   readonly bidiPort: number;
   readonly marionettePort: number;
-  readonly exitCode: () => number | null;
+  readonly exitStatus: () => string | null;
   readonly stderr: () => string;
+  readonly signal: AbortSignal;
   readonly deadlineMs?: number;
 }): Promise<RemoteControl> {
   const deadline = Date.now() + (options.deadlineMs ?? CONNECT_MS);
   let bidiError = "BiDi port did not open";
   let marionetteError = "Marionette port did not open";
   const throwIfExited = (): void => {
-    const exitCode = options.exitCode();
-    if (exitCode !== null) {
+    options.signal.throwIfAborted();
+    const status = options.exitStatus();
+    if (status !== null) {
       throw new Error(
-        `Browser exited with code ${String(exitCode)} before remote control opened\n${options.stderr()}`,
+        `browser exited with ${status} before remote control opened\n${options.stderr()}`,
       );
     }
   };
@@ -114,6 +117,7 @@ async function openMarionette(port: number): Promise<RemoteControl> {
     return {
       protocol: "marionette",
       browserPid: identity.browserPid,
+      browserName: identity.browserName,
       version: identity.version,
       buildId: identity.buildId,
       userAgent,
@@ -363,6 +367,7 @@ function takeLengthMessage(
 
 type BrowserIdentity = {
   browserPid: number;
+  browserName: string;
   version: string;
   buildId: string;
   userAgent: string;
@@ -373,6 +378,7 @@ function readBidiSession(result: unknown): BrowserIdentity {
   if (!isRecord(capabilities)) throw new Error("session.new returned no capabilities");
   return {
     browserPid: readPid(capabilities["moz:processID"], "session.new"),
+    browserName: readText(capabilities.browserName, "browser name"),
     version: readText(capabilities.browserVersion, "browser version"),
     buildId: readText(capabilities["moz:buildID"], "build id"),
     userAgent: readText(capabilities.userAgent, "user agent"),
@@ -385,6 +391,7 @@ function readMarionetteSession(result: unknown): BrowserIdentity {
   const userAgent = capabilities.userAgent;
   return {
     browserPid: readPid(capabilities["moz:processID"], "WebDriver:NewSession"),
+    browserName: readText(capabilities.browserName, "browser name"),
     version: readText(capabilities.browserVersion, "browser version"),
     buildId: readText(capabilities["moz:buildID"], "build id"),
     userAgent: typeof userAgent === "string" ? userAgent : "",

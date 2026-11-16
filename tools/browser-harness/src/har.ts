@@ -1,97 +1,89 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
-import { buildDigestTable, listFixtures, type Fixture } from "./fixtures.ts";
+import type { ExpectedResponse, Scenario } from "./scenarios.ts";
 
-export type ExpectedBody = {
-  readonly id: string;
-  readonly method: string;
-  readonly path: string;
-  readonly sha256: string;
-};
-
-export type HarEntryBytes = {
+export type HarEntry = {
   readonly method: string;
   readonly path: string;
   readonly url: string;
-  readonly bytes: Buffer;
+  readonly status: number | null;
+  readonly contentSize: number | null;
+  readonly body: Buffer | null;
+};
+
+export type Difference = {
+  readonly field: "status" | "content.size" | "decoded length" | "sha256";
+  readonly expected: string;
+  readonly observed: string;
 };
 
 export type HarProblem =
-  | { readonly kind: "missing"; readonly id: string }
+  | {
+      readonly kind: "missing";
+      readonly id: string;
+      readonly method: string;
+      readonly path: string;
+    }
+  | { readonly kind: "extra"; readonly method: string; readonly url: string }
+  | { readonly kind: "empty"; readonly id: string; readonly url: string }
   | {
       readonly kind: "mismatched";
       readonly id: string;
-      readonly expected: string;
-      readonly observed: string;
-    }
-  | { readonly kind: "unexpected"; readonly method: string; readonly url: string };
+      readonly url: string;
+      readonly differences: readonly Difference[];
+    };
 
 export type HarCheckResult = {
   readonly ok: boolean;
+  readonly scenario: string;
   readonly entryCount: number;
   readonly expectedCount: number;
   readonly problems: readonly HarProblem[];
 };
 
-export function expectedBodies(
-  fixtures: readonly Fixture[] = listFixtures(),
-  digests: ReadonlyMap<string, string> = digestMap(fixtures),
-): readonly ExpectedBody[] {
-  return fixtures.map((fixture) => {
-    const sha256 = digests.get(fixture.id);
-    if (sha256 === undefined) throw new Error(`missing digest for ${fixture.id}`);
-    return { id: fixture.id, method: fixture.method, path: fixture.path, sha256 };
-  });
-}
-
-export function parseHarEntries(value: unknown): readonly HarEntryBytes[] {
+export function parseHarEntries(value: unknown): readonly HarEntry[] {
   if (!isRecord(value) || !isRecord(value.log) || !Array.isArray(value.log.entries)) {
     throw new Error("HAR is missing log.entries");
   }
   return value.log.entries.map((entry) => parseEntry(entry));
 }
 
-export function checkBodies(
-  entries: readonly HarEntryBytes[],
-  expected: readonly ExpectedBody[],
-): HarCheckResult {
+export function checkEntries(entries: readonly HarEntry[], scenario: Scenario): HarCheckResult {
   const problems: HarProblem[] = [];
   const used = new Set<number>();
-  for (const item of expected) {
+  for (const item of scenario.responses) {
     const index = entries.findIndex(
       (entry, entryIndex) =>
         !used.has(entryIndex) && entry.method === item.method && entry.path === item.path,
     );
-    if (index === -1) {
-      problems.push({ kind: "missing", id: item.id });
+    const entry = entries[index];
+    if (entry === undefined) {
+      problems.push({ kind: "missing", id: item.id, method: item.method, path: item.path });
       continue;
     }
     used.add(index);
-    const entry = entries[index];
-    if (entry === undefined) throw new Error(`missing HAR entry ${String(index)}`);
-    const observed = sha256Hex(entry.bytes);
-    if (observed !== item.sha256) {
-      problems.push({ kind: "mismatched", id: item.id, expected: item.sha256, observed });
+    if (entry.body === null || entry.body.length === 0) {
+      problems.push({ kind: "empty", id: item.id, url: entry.url });
+      continue;
+    }
+    const differences = compare(entry, entry.body, item);
+    if (differences.length > 0) {
+      problems.push({ kind: "mismatched", id: item.id, url: entry.url, differences });
     }
   }
-  for (let index = 0; index < entries.length; index += 1) {
-    if (used.has(index)) continue;
-    const entry = entries[index];
-    if (entry === undefined) continue;
-    problems.push({ kind: "unexpected", method: entry.method, url: entry.url });
-  }
+  entries.forEach((entry, index) => {
+    if (!used.has(index)) problems.push({ kind: "extra", method: entry.method, url: entry.url });
+  });
   return {
     ok: problems.length === 0,
+    scenario: scenario.name,
     entryCount: entries.length,
-    expectedCount: expected.length,
+    expectedCount: scenario.responses.length,
     problems,
   };
 }
 
-export async function checkHarFile(
-  file: string,
-  expected: readonly ExpectedBody[],
-): Promise<HarCheckResult> {
+export async function checkHarFile(file: string, scenario: Scenario): Promise<HarCheckResult> {
   const text = await NodeFSP.readFile(file, "utf8");
   let parsed: unknown;
   try {
@@ -99,45 +91,68 @@ export async function checkHarFile(
   } catch {
     throw new Error(`HAR is not JSON: ${file}`);
   }
-  return checkBodies(parseHarEntries(parsed), expected);
+  return checkEntries(parseHarEntries(parsed), scenario);
 }
 
 export function formatHarCheck(result: HarCheckResult): string {
-  if (result.ok) return `har-check passed, entry count ${String(result.entryCount)}`;
-  const lines = [
-    `har-check failed, entry count ${String(result.entryCount)}, expected ${String(result.expectedCount)}`,
-  ];
-  for (const problem of result.problems) {
-    if (problem.kind === "missing") lines.push(`missing ${problem.id}`);
-    else if (problem.kind === "mismatched") {
-      lines.push(
-        `mismatched ${problem.id} expected ${problem.expected} observed ${problem.observed}`,
-      );
-    } else lines.push(`unexpected ${problem.method} ${problem.url}`);
+  const counts = `scenario ${result.scenario}, ${String(result.entryCount)} entries, ${String(result.expectedCount)} expected`;
+  if (result.ok) return `har-check passed, ${counts}`;
+  const lines = [`har-check failed, ${counts}`];
+  for (const kind of ["missing", "extra", "empty", "mismatched"] as const) {
+    const matching = result.problems.filter((problem) => problem.kind === kind);
+    if (matching.length === 0) continue;
+    lines.push(`${kind}: ${String(matching.length)}`);
+    for (const problem of matching) lines.push(`  ${describe(problem)}`);
   }
   return lines.join("\n");
 }
 
-function digestMap(fixtures: readonly Fixture[]): Map<string, string> {
-  return new Map(buildDigestTable(fixtures).map((entry) => [entry.id, entry.sha256]));
+function compare(entry: HarEntry, body: Buffer, item: ExpectedResponse): Difference[] {
+  const differences: Difference[] = [];
+  const check = (field: Difference["field"], expected: string, observed: string): void => {
+    if (expected !== observed) differences.push({ field, expected, observed });
+  };
+  check("status", String(item.status), String(entry.status));
+  check("content.size", String(item.byteLength), String(entry.contentSize));
+  check("decoded length", String(item.byteLength), String(body.length));
+  check("sha256", item.sha256, NodeCrypto.createHash("sha256").update(body).digest("hex"));
+  return differences;
 }
 
-function parseEntry(value: unknown): HarEntryBytes {
-  if (!isRecord(value) || !isRecord(value.request))
+function describe(problem: HarProblem): string {
+  if (problem.kind === "missing") return `${problem.id} ${problem.method} ${problem.path}`;
+  if (problem.kind === "extra") return `${problem.method} ${problem.url}`;
+  if (problem.kind === "empty") return `${problem.id} ${problem.url}`;
+  const fields = problem.differences
+    .map(
+      (difference) =>
+        `${difference.field} expected ${difference.expected} observed ${difference.observed}`,
+    )
+    .join("; ");
+  return `${problem.id} ${problem.url}: ${fields}`;
+}
+
+function parseEntry(value: unknown): HarEntry {
+  if (!isRecord(value) || !isRecord(value.request)) {
     throw new Error("HAR entry is missing a request");
+  }
   const method = value.request.method;
   const url = value.request.url;
   if (typeof method !== "string" || method.length === 0) {
     throw new Error("HAR entry is missing a request method");
   }
-  if (typeof url !== "string" || url.length === 0)
+  if (typeof url !== "string" || url.length === 0) {
     throw new Error("HAR entry is missing a request url");
+  }
   const response = isRecord(value.response) ? value.response : {};
+  const content = isRecord(response.content) ? response.content : {};
   return {
     method: method.toUpperCase(),
     url,
     path: pathname(url),
-    bytes: contentBytes(response.content),
+    status: typeof response.status === "number" ? response.status : null,
+    contentSize: typeof content.size === "number" ? content.size : null,
+    body: contentBytes(content),
   };
 }
 
@@ -149,14 +164,10 @@ function pathname(url: string): string {
   }
 }
 
-function contentBytes(content: unknown): Buffer {
-  if (!isRecord(content) || typeof content.text !== "string") return Buffer.alloc(0);
+function contentBytes(content: Record<string, unknown>): Buffer | null {
+  if (typeof content.text !== "string") return null;
   if (content.encoding === "base64") return Buffer.from(content.text, "base64");
   return Buffer.from(content.text, "utf8");
-}
-
-function sha256Hex(bytes: Buffer): string {
-  return NodeCrypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

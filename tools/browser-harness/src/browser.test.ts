@@ -1,3 +1,4 @@
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -5,11 +6,15 @@ import * as NodeZlib from "node:zlib";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
   assertOutsideLiveProfiles,
+  BROWSER_PLATFORMS,
   browserIsOwned,
   LAUNCH_PREFS,
+  launchBrowser,
+  liveProfileRoots,
   prepareProfile,
   renderUserJs,
 } from "./browser.ts";
+import { currentPlatformName } from "./owned-process.ts";
 
 const directories: string[] = [];
 
@@ -21,18 +26,71 @@ afterEach(async () => {
   );
 });
 
+const LIVE_PROFILES = {
+  linux: {
+    home: "/home/u",
+    env: {},
+    refused: [
+      "/home/u/.zen/abc.Default (release)",
+      "/home/u/.mozilla/firefox/x.default-release",
+      "/home/u/.librewolf/y.default-default",
+      "/home/u/.floorp/z.default",
+      "/home/u/.waterfox/w.default",
+      "/home/u/.config/mozilla/firefox/p.default",
+      "/home/u/.cache/mozilla/firefox/p.default",
+      "/home/u/.var/app/app.zen_browser.zen/.zen/p",
+      "/home/u/.var/app/org.mozilla.firefox/.mozilla/firefox/p",
+      "/home/u/snap/firefox/common/.mozilla/firefox/p",
+    ],
+    accepted: [
+      "/tmp/har-anytime-browser-abc",
+      "/home/u/.zenith/p",
+      "/home/u/projects/.mozilla-notes",
+    ],
+  },
+  darwin: {
+    home: "/Users/u",
+    env: {},
+    refused: [
+      "/Users/u/Library/Application Support/zen/Profiles/p.Default (release)",
+      "/Users/u/Library/Application Support/Firefox/Profiles/p.default-release",
+      "/Users/u/Library/Application Support/librewolf/Profiles/p",
+      "/Users/u/Library/Caches/Firefox/Profiles/p",
+      "/Users/u/Library/Caches/zen/Profiles/p",
+    ],
+    accepted: [
+      "/var/folders/xy/T/har-anytime-browser-abc",
+      "/Users/u/Library/Application Support/Code",
+    ],
+  },
+  win32: {
+    home: "C:\\Users\\u",
+    env: {
+      APPDATA: "C:\\Users\\u\\AppData\\Roaming",
+      LOCALAPPDATA: "C:\\Users\\u\\AppData\\Local",
+    },
+    refused: [
+      "C:\\Users\\u\\AppData\\Roaming\\zen\\Profiles\\p.Default (release)",
+      "C:\\Users\\u\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\p.default-release",
+      "C:\\Users\\u\\AppData\\Local\\Mozilla\\Firefox\\Profiles\\p.default-release",
+      "C:\\Users\\u\\AppData\\Roaming\\librewolf\\Profiles\\p",
+      "C:\\Users\\u\\AppData\\Roaming\\Floorp\\Profiles\\p",
+      "C:\\Users\\u\\AppData\\Roaming\\Waterfox\\Profiles\\p",
+      "C:\\Users\\u\\AppData\\Local\\zen\\Profiles\\p",
+    ],
+    accepted: ["C:\\Users\\u\\AppData\\Local\\Temp\\har-anytime-browser-abc"],
+  },
+} as const;
+
 describe("browser profile", () => {
-  it("writes the prefs that let an isolated window load an experiment", async () => {
+  it("writes the prefs that let an isolated browser load an experiment", async () => {
     const directory = await prepareProfile(null);
     directories.push(directory);
     const userJs = await NodeFSP.readFile(NodePath.join(directory, "user.js"), "utf8");
     expect(userJs).toBe(renderUserJs(LAUNCH_PREFS));
     expect(userJs).toContain('user_pref("extensions.experiments.enabled", true);');
     expect(userJs).toContain('user_pref("xpinstall.signatures.required", false);');
-    expect(userJs).toContain('user_pref("extensions.autoDisableScopes", 0);');
-    expect(userJs).toContain('user_pref("devtools.debugger.remote-enabled", true);');
     expect(userJs).toContain('user_pref("remote.active-protocols", 2);');
-    expect(directory.startsWith(NodeOS.tmpdir())).toBe(true);
   });
 
   it("treats the browser as owned only when it is the spawned process or its child", () => {
@@ -41,11 +99,29 @@ describe("browser profile", () => {
     expect(browserIsOwned(6, 5, 4)).toBe(false);
   });
 
-  it("refuses a directory inside the live Zen profiles folder", () => {
-    const env = { APPDATA: NodePath.join(NodeOS.tmpdir(), "FlotsamAppData") };
-    const live = NodePath.join(env.APPDATA, "zen", "Profiles", "abc.default");
-    expect(() => assertOutsideLiveProfiles(live, env)).toThrow(/live Zen profile/);
-    expect(() => assertOutsideLiveProfiles(NodeOS.tmpdir(), env)).not.toThrow();
+  it.each(Object.entries(LIVE_PROFILES))(
+    "on %s refuses every live Zen and Firefox family profile and nothing else",
+    (platform, sample) => {
+      const name = platform as keyof typeof LIVE_PROFILES;
+      const roots = liveProfileRoots(name, sample.env, sample.home);
+      const path = BROWSER_PLATFORMS[name].path;
+      for (const directory of sample.refused) {
+        expect(() => assertOutsideLiveProfiles(directory, roots, path), directory).toThrow(
+          /inside the live profile root/,
+        );
+      }
+      for (const directory of sample.accepted) {
+        expect(() => assertOutsideLiveProfiles(directory, roots, path), directory).not.toThrow();
+      }
+    },
+  );
+
+  it("follows XDG_CONFIG_HOME and refuses when Windows cannot name its profile roots", () => {
+    const roots = liveProfileRoots("linux", { XDG_CONFIG_HOME: "/xdg" }, "/home/u");
+    expect(() =>
+      assertOutsideLiveProfiles("/xdg/mozilla/firefox/p", roots, NodePath.posix),
+    ).toThrow();
+    expect(() => liveProfileRoots("win32", {}, "C:\\Users\\u")).toThrow(/APPDATA is not set/);
   });
 
   it("sideloads an unpacked extension and an xpi by gecko id", async () => {
@@ -65,6 +141,36 @@ describe("browser profile", () => {
       NodePath.join(packedProfile, "extensions", "packed@har-anytime.xpi"),
     );
     expect(copied.isFile()).toBe(true);
+  });
+});
+
+// A POSIX shell script stands in for the browser. Windows cannot spawn a script without a shell,
+// so this case runs where the platform starts children as process group leaders.
+describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
+  it("asks for a headless browser and leaves no profile or process when the browser exits at startup", async () => {
+    const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-fake-"));
+    directories.push(scratch);
+    const argsFile = NodePath.join(scratch, "args");
+    const binary = NodePath.join(scratch, "browser");
+    await NodeFSP.writeFile(
+      binary,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > '${argsFile}'\necho "fake browser refused to start" >&2\nexit 3\n`,
+      { mode: 0o755 },
+    );
+    await expect(
+      launchBrowser({
+        binaryPath: binary,
+        extensionPath: null,
+        display: "headless",
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(/browser exited with code 3[\s\S]*fake browser refused to start/);
+    const args = (await NodeFSP.readFile(argsFile, "utf8")).trim().split("\n");
+    expect(args[0]).toBe("-headless");
+    expect(args).toContain("-no-remote");
+    const profile = args[args.indexOf("-profile") + 1] ?? "";
+    expect(profile.startsWith(NodeOS.tmpdir())).toBe(true);
+    expect(NodeFS.existsSync(profile)).toBe(false);
   });
 });
 

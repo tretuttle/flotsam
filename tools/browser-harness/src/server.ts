@@ -7,13 +7,15 @@ import { buildBody, listFixtures, WEBSOCKET_PATH, type Fixture } from "./fixture
 const CHUNK_BYTES = 64 * 1024;
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-export type FixtureServer = {
+export type ServedRequest = {
+  readonly method: string;
+  readonly path: string;
+};
+
+export type FixtureServer = AsyncDisposable & {
   readonly origin: string;
   readonly port: number;
-  readonly requestCount: () => number;
-  readonly requestPaths: () => readonly string[];
-  readonly resetRequestCount: () => void;
-  readonly close: () => Promise<void>;
+  readonly takeRequests: () => readonly ServedRequest[];
 };
 
 export async function startFixtureServer(): Promise<FixtureServer> {
@@ -21,11 +23,9 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   for (const fixture of listFixtures()) {
     routes.set(routeKey(fixture.method, fixture.path), fixture);
   }
-  let requests = 0;
-  let paths: string[] = [];
+  let served: ServedRequest[] = [];
   const server = NodeHttp.createServer((request, response) => {
-    requests += 1;
-    paths.push(request.url?.split("?")[0] ?? "/");
+    served.push({ method: request.method ?? "GET", path: request.url?.split("?")[0] ?? "/" });
     void handle(routes, request, response).catch(() => {
       if (!response.headersSent) response.writeHead(500);
       response.end();
@@ -45,13 +45,12 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   return {
     origin: `http://127.0.0.1:${String(address.port)}`,
     port: address.port,
-    requestCount: () => requests,
-    requestPaths: () => paths.slice(),
-    resetRequestCount: () => {
-      requests = 0;
-      paths = [];
+    takeRequests: () => {
+      const taken = served;
+      served = [];
+      return taken;
     },
-    close: () =>
+    [Symbol.asyncDispose]: () =>
       new Promise((resolve, reject) => {
         server.closeAllConnections();
         server.close((error) => (error ? reject(error) : resolve()));

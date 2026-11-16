@@ -1,100 +1,219 @@
-import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { afterEach, describe, expect, it } from "vite-plus/test";
-import {
-  checkBodies,
-  checkHarFile,
-  formatHarCheck,
-  parseHarEntries,
-  type ExpectedBody,
-} from "./har.ts";
+import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
+import { FIXTURES_PAGE_REQUESTS } from "./fixtures.ts";
+import { checkEntries, checkHarFile, formatHarCheck, parseHarEntries } from "./har.ts";
+import { SCENARIOS, type Scenario } from "./scenarios.ts";
+import { startFixtureServer, type FixtureServer } from "./server.ts";
 
-const directories: string[] = [];
+type Entry = {
+  request: { method: string; url: string };
+  response: { status: number; content: { size?: number; text?: string; encoding?: string } };
+};
 
-afterEach(async () => {
-  await Promise.all(
-    directories
-      .splice(0)
-      .map((directory) => NodeFSP.rm(directory, { recursive: true, force: true })),
-  );
+let server: FixtureServer;
+const received = new Map<string, readonly Entry[]>();
+
+beforeAll(async () => {
+  server = await startFixtureServer();
+  for (const scenario of Object.values(SCENARIOS))
+    received.set(scenario.name, await receive(scenario));
+});
+
+afterAll(async () => {
+  await server[Symbol.asyncDispose]();
 });
 
 describe("har-check", () => {
-  it("passes a hand-built HAR and names a flipped byte and a missing entry", async () => {
-    const alpha = Buffer.from("alpha body\n");
-    const beta = Buffer.from("beta body\n");
-    const expected = [body("alpha", "/a", alpha), body("beta", "/b", beta)];
-    const passed = checkBodies(
-      parseHarEntries(
-        document([
-          entry("GET", "http://127.0.0.1/a", alpha, "base64"),
-          entry("GET", "http://127.0.0.1/b", beta, "text"),
-        ]),
-      ),
-      expected,
-    );
-    expect(passed.ok).toBe(true);
-    expect(passed.entryCount).toBe(2);
-    expect(passed.expectedCount).toBe(2);
-    expect(formatHarCheck(passed)).toBe("har-check passed, entry count 2");
+  it.each(Object.values(SCENARIOS))(
+    "passes a HAR of the bytes the $name scenario receives over HTTP",
+    (scenario) => {
+      const result = checkEntries(parseHarEntries(document(entries(scenario.name))), scenario);
+      expect(result.problems).toEqual([]);
+      expect(result.ok).toBe(true);
+      expect(result.entryCount).toBe(scenario.responses.length);
+    },
+  );
 
-    const flipped = Buffer.from(alpha);
-    flipped[0] = (flipped[0] ?? 0) ^ 0xff;
-    const mismatched = await checkFile(
-      document([
-        entry("GET", "http://127.0.0.1/a", flipped, "base64"),
-        entry("GET", "http://127.0.0.1/b", beta, "text"),
-      ]),
-      expected,
+  it.each([
+    {
+      label: "a dropped entry as missing",
+      edit: (list: Entry[]) => list.filter((entry) => !entry.request.url.endsWith("/r/js/7")),
+      expected: () => [{ kind: "missing", id: "r-js-7", method: "GET", path: "/r/js/7" }],
+    },
+    {
+      label: "a repeated entry as extra",
+      edit: (list: Entry[]) => [...list, at(list, 3)],
+      expected: () => [{ kind: "extra", method: "GET", url: urlAt(3) }],
+    },
+    {
+      label: "an entry with an empty body as empty",
+      edit: (list: Entry[]) =>
+        replace(list, 5, (entry) => ({ ...entry.response.content, text: "" })),
+      expected: () => [{ kind: "empty", id: idAt(5), url: urlAt(5) }],
+    },
+    {
+      label: "an entry with no body text as empty",
+      edit: (list: Entry[]) =>
+        replace(list, 6, (entry) => {
+          const { text: _text, ...content } = entry.response.content;
+          return content;
+        }),
+      expected: () => [{ kind: "empty", id: idAt(6), url: urlAt(6) }],
+    },
+    {
+      label: "a wrong content.size alone as mismatched",
+      edit: (list: Entry[]) =>
+        replace(list, 8, (entry) => ({
+          ...entry.response.content,
+          size: (entry.response.content.size ?? 0) + 1,
+        })),
+      expected: () => [mismatch(8, ["content.size"])],
+    },
+    {
+      label: "a truncated body as mismatched in length and digest",
+      edit: (list: Entry[]) =>
+        replace(list, 9, (entry) => ({
+          ...entry.response.content,
+          text: Buffer.from(entry.response.content.text ?? "", "base64")
+            .subarray(1)
+            .toString("base64"),
+        })),
+      expected: () => [mismatch(9, ["decoded length", "sha256"])],
+    },
+    {
+      label: "a flipped byte as mismatched in digest only",
+      edit: (list: Entry[]) =>
+        replace(list, 10, (entry) => {
+          const bytes = Buffer.from(entry.response.content.text ?? "", "base64");
+          bytes[0] = (bytes[0] ?? 0) ^ 0xff;
+          return { ...entry.response.content, text: bytes.toString("base64") };
+        }),
+      expected: () => [mismatch(10, ["sha256"])],
+    },
+  ])("reports $label", ({ edit, expected }) => {
+    const result = checkEntries(
+      parseHarEntries(document(edit([...entries("page")]))),
+      SCENARIOS.page,
     );
-    expect(mismatched.ok).toBe(false);
-    expect(mismatched.problems).toEqual([
+    expect(result.ok).toBe(false);
+    expect(result.problems).toMatchObject(expected());
+  });
+
+  it("expects the 206 slice for the range request, not the full body", async () => {
+    const full = await fetch(`${server.origin}/fixtures/range`);
+    const bytes = Buffer.from(await full.arrayBuffer());
+    const list = entries("fixtures").map((entry) =>
+      entry.request.url.endsWith("/fixtures/range")
+        ? harEntry("GET", "/fixtures/range", 200, bytes)
+        : entry,
+    );
+    const result = checkEntries(parseHarEntries(document(list)), SCENARIOS.fixtures);
+    expect(result.problems).toMatchObject([
       {
         kind: "mismatched",
-        id: "alpha",
-        expected: sha256(alpha),
-        observed: sha256(flipped),
+        id: "range@1000-1999",
+        differences: [
+          { field: "status", expected: "206", observed: "200" },
+          { field: "content.size", expected: "1000", observed: "65536" },
+          { field: "decoded length", expected: "1000", observed: "65536" },
+          { field: "sha256" },
+        ],
       },
     ]);
-    expect(formatHarCheck(mismatched)).toContain("mismatched alpha");
+  });
 
-    const missing = checkBodies(
-      parseHarEntries(document([entry("GET", "http://127.0.0.1/b", beta, "text")])),
-      expected,
-    );
-    expect(missing.ok).toBe(false);
-    expect(missing.problems).toEqual([{ kind: "missing", id: "alpha" }]);
-    expect(formatHarCheck(missing)).toContain("missing alpha");
-    expect(missing.entryCount).toBe(1);
+  it("reads a HAR file and groups its problems by kind", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-har-"));
+    const file = NodePath.join(directory, "capture.har");
+    const list = entries("page").filter((entry) => !entry.request.url.endsWith("/r/json/0"));
+    await NodeFSP.writeFile(file, JSON.stringify(document([...list, at(list, 1)])), "utf8");
+    const result = await checkHarFile(file, SCENARIOS.page);
+    await NodeFSP.rm(directory, { recursive: true, force: true });
+    expect(formatHarCheck(result).split("\n").slice(0, 5)).toEqual([
+      "har-check failed, scenario page, 201 entries, 201 expected",
+      "missing: 1",
+      "  r-json-0 GET /r/json/0",
+      "extra: 1",
+      `  GET ${at(list, 1).request.url}`,
+    ]);
   });
 });
 
-function body(id: string, path: string, bytes: Buffer): ExpectedBody {
-  return { id, method: "GET", path, sha256: sha256(bytes) };
+async function receive(scenario: Scenario): Promise<readonly Entry[]> {
+  const list: Entry[] = [];
+  for (const response of scenario.responses) {
+    const request = FIXTURES_PAGE_REQUESTS.find((item) => item.path === response.path);
+    const range = request?.range ?? null;
+    const reply = await fetch(`${server.origin}${response.path}`, {
+      method: response.method,
+      headers: range === null ? {} : { Range: `bytes=${String(range.start)}-${String(range.end)}` },
+      ...(response.method === "POST" ? { body: "{}" } : {}),
+    });
+    list.push(
+      harEntry(
+        response.method,
+        response.path,
+        reply.status,
+        Buffer.from(await reply.arrayBuffer()),
+      ),
+    );
+  }
+  return list;
 }
 
-function sha256(bytes: Buffer): string {
-  return NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+function harEntry(method: string, path: string, status: number, bytes: Buffer): Entry {
+  return {
+    request: { method, url: `${server.origin}${path}` },
+    response: {
+      status,
+      content: { size: bytes.length, text: bytes.toString("base64"), encoding: "base64" },
+    },
+  };
 }
 
-function document(entries: readonly unknown[]): unknown {
-  return { log: { version: "1.2", entries } };
+function entries(name: string): readonly Entry[] {
+  const list = received.get(name);
+  if (list === undefined) throw new Error(`no entries for ${name}`);
+  return list;
 }
 
-function entry(method: string, url: string, bytes: Buffer, encoding: "base64" | "text"): unknown {
-  const content =
-    encoding === "base64"
-      ? { mimeType: "application/octet-stream", text: bytes.toString("base64"), encoding: "base64" }
-      : { mimeType: "text/plain", text: bytes.toString("utf8") };
-  return { request: { method, url }, response: { content } };
+function at(list: readonly Entry[], index: number): Entry {
+  const entry = list[index];
+  if (entry === undefined) throw new Error(`no entry ${String(index)}`);
+  return entry;
 }
 
-async function checkFile(value: unknown, expected: readonly ExpectedBody[]) {
-  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-har-"));
-  directories.push(directory);
-  const file = NodePath.join(directory, "capture.har");
-  await NodeFSP.writeFile(file, JSON.stringify(value), "utf8");
-  return checkHarFile(file, expected);
+function urlAt(index: number): string {
+  return at(entries("page"), index).request.url;
+}
+
+function idAt(index: number): string {
+  return SCENARIOS.page.responses[index]?.id ?? "";
+}
+
+function mismatch(index: number, fields: readonly string[]) {
+  return {
+    kind: "mismatched",
+    id: idAt(index),
+    differences: fields.map((field) => ({ field })),
+  };
+}
+
+function replace(
+  list: Entry[],
+  index: number,
+  content: (entry: Entry) => Entry["response"]["content"],
+): Entry[] {
+  const entry = at(list, index);
+  return list.map((item, position) =>
+    position === index
+      ? { ...entry, response: { ...entry.response, content: content(entry) } }
+      : item,
+  );
+}
+
+function document(list: readonly Entry[]): unknown {
+  return { log: { version: "1.2", entries: list } };
 }

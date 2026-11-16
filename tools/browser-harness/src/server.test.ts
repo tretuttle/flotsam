@@ -4,27 +4,43 @@ import * as NodeNet from "node:net";
 import * as NodeZlib from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import {
-  assertDigestMatch,
   BINARY_BYTE_LENGTH,
-  buildDigestTable,
+  buildBody,
   expectedResourceCount,
   GZIP_BYTE_LENGTH,
+  listFixtures,
   WEBSOCKET_PATH,
-  type DigestEntry,
 } from "./fixtures.ts";
-import { checkBodies, formatHarCheck, parseHarEntries } from "./har.ts";
+import { PINNED_RESPONSES } from "./pinned-responses.ts";
+import { SCENARIOS } from "./scenarios.ts";
 import { startFixtureServer, type FixtureServer } from "./server.ts";
 
 let server: FixtureServer;
-let digests: ReadonlyMap<string, DigestEntry>;
 
 beforeAll(async () => {
-  digests = new Map(buildDigestTable().map((entry) => [entry.id, entry]));
   server = await startFixtureServer();
 });
 
 afterAll(async () => {
-  await server.close();
+  await server[Symbol.asyncDispose]();
+});
+
+describe("fixture generator", () => {
+  it("builds every fixture body with the pinned digest and length", () => {
+    const fixtures = listFixtures();
+    expect(fixtures.map((fixture) => fixture.id).sort()).toEqual(
+      Object.keys(PINNED_RESPONSES)
+        .filter((id) => !id.includes("@"))
+        .sort(),
+    );
+    for (const fixture of fixtures) {
+      const body = buildBody(fixture);
+      expect({ id: fixture.id, sha256: hashBuffer(body), byteLength: body.length }).toEqual({
+        id: fixture.id,
+        ...pin(fixture.id),
+      });
+    }
+  });
 });
 
 describe("fixture server", () => {
@@ -34,46 +50,42 @@ describe("fixture server", () => {
 
   it("serves the 50 MB fixture with Content-Length and the digest of those bytes", async () => {
     const response = await readHttp(server.port, "/fixtures/binary");
-    const entry = digest("binary");
     expect(response.status).toBe(200);
     expect(response.headers["content-length"]).toBe(String(BINARY_BYTE_LENGTH));
     expect(response.headers["transfer-encoding"]).toBeUndefined();
     expect(response.body.length).toBe(BINARY_BYTE_LENGTH);
-    assertDigestMatch("binary", entry.sha256, hashBuffer(response.body));
+    expectPinned("binary", response.body);
   });
 
   it("serves the chunked fixture with no Content-Length and the digest of the decoded bytes", async () => {
     const raw = await readRaw(server.port, "/fixtures/chunked");
-    const entry = digest("chunked");
     expect(raw.status).toBe(200);
     expect(raw.headerText).not.toMatch(/^content-length:/imu);
     expect(raw.headerText).toMatch(/^transfer-encoding:\s*chunked/imu);
     const body = decodeChunked(raw.body);
     expect(body.length).toBe(BINARY_BYTE_LENGTH);
-    assertDigestMatch("chunked", entry.sha256, hashBuffer(body));
+    expectPinned("chunked", body);
   });
 
   it("serves gzip that decodes to the digest", async () => {
     const response = await readHttp(server.port, "/fixtures/gzip");
-    const entry = digest("gzip");
     expect(response.status).toBe(200);
     expect(response.headers["content-encoding"]).toBe("gzip");
     const decoded = NodeZlib.gunzipSync(response.body);
     expect(decoded.length).toBeGreaterThanOrEqual(GZIP_BYTE_LENGTH);
-    expect(decoded.length).toBe(entry.byteLength);
-    assertDigestMatch("gzip", entry.sha256, hashBuffer(decoded));
+    expectPinned("gzip", decoded);
   });
 
   it("returns 206 with the requested bytes", async () => {
     const full = await readHttp(server.port, "/fixtures/range");
-    const entry = digest("range");
-    assertDigestMatch("range", entry.sha256, hashBuffer(full.body));
+    expectPinned("range", full.body);
     const partial = await readHttp(server.port, "/fixtures/range", {
       headers: { Range: "bytes=1000-1999" },
     });
     expect(partial.status).toBe(206);
     expect(partial.headers["content-range"]).toBe(`bytes 1000-1999/${String(full.body.length)}`);
     expect(Buffer.compare(partial.body, full.body.subarray(1000, 2000))).toBe(0);
+    expectPinned("range@1000-1999", partial.body);
   });
 
   it("returns JSON from POST", async () => {
@@ -81,35 +93,22 @@ describe("fixture server", () => {
       method: "POST",
       body: Buffer.from("{}"),
     });
-    const entry = digest("post-json");
     expect(response.status).toBe(200);
     expect(response.headers["content-type"]).toBe("application/json");
     expect(JSON.parse(response.body.toString("utf8"))).toMatchObject({ fixture: "post-json" });
-    assertDigestMatch("post-json", entry.sha256, hashBuffer(response.body));
+    expectPinned("post-json", response.body);
   });
 
   it("sends Cache-Control no-store", async () => {
     const response = await readHttp(server.port, "/fixtures/no-store");
-    const entry = digest("no-store");
     expect(response.headers["cache-control"]).toBe("no-store");
-    assertDigestMatch("no-store", entry.sha256, hashBuffer(response.body));
+    expectPinned("no-store", response.body);
   });
 
   it("serves video bytes that match the digest", async () => {
     const response = await readHttp(server.port, "/fixtures/video");
-    const entry = digest("video");
     expect(response.headers["content-type"]).toBe("video/mp4");
-    assertDigestMatch("video", entry.sha256, hashBuffer(response.body));
-  });
-
-  it("fails when the expected digest does not match the bytes on the wire", async () => {
-    const response = await readHttp(server.port, "/fixtures/no-store");
-    const observed = hashBuffer(response.body);
-    const wrong = observed.startsWith("0") ? `1${observed.slice(1)}` : `0${observed.slice(1)}`;
-    expect(wrong).not.toBe(observed);
-    expect(() => assertDigestMatch("no-store", wrong, observed)).toThrow(
-      /digest mismatch for no-store/,
-    );
+    expectPinned("video", response.body);
   });
 
   it("echoes a websocket payload", async () => {
@@ -135,67 +134,36 @@ describe("fixture server", () => {
     socket.close();
   });
 
-  it("accepts a hand-built HAR of the bytes received over HTTP", async () => {
-    const response = await readHttp(server.port, "/fixtures/no-store");
-    const sha = hashBuffer(response.body);
-    assertDigestMatch("no-store", digest("no-store").sha256, sha);
-    const expected = [{ id: "no-store", method: "GET", path: "/fixtures/no-store", sha256: sha }];
-    const passed = checkBodies(parseHarEntries(harDocument(response.body)), expected);
-    expect(passed.ok).toBe(true);
-    expect(passed.entryCount).toBe(1);
-    expect(formatHarCheck(passed)).toBe("har-check passed, entry count 1");
-
-    const flipped = Buffer.from(response.body);
-    flipped[0] = (flipped[0] ?? 0) ^ 0xff;
-    const mismatched = checkBodies(parseHarEntries(harDocument(flipped)), expected);
-    expect(mismatched.ok).toBe(false);
-    expect(mismatched.problems.map((problem) => problem.kind)).toEqual(["mismatched"]);
-
-    const missing = checkBodies([], expected);
-    expect(missing.problems).toEqual([{ kind: "missing", id: "no-store" }]);
-    expect(formatHarCheck(missing)).toContain("missing no-store");
-  });
-
   it("serves a page that references 200 small resources with matching digests", async () => {
     const page = await readHttp(server.port, "/");
     expect(page.headers["content-type"]).toContain("text/html");
     const urls = page.body.toString("utf8").match(/\/r\/(?:css|js|image|json)\/\d+/gu);
-    expect(urls?.length).toBe(expectedResourceCount());
+    expect(new Set(urls).size).toBe(expectedResourceCount());
+    expect([...new Set(urls)].sort()).toEqual(
+      SCENARIOS.page.responses
+        .map((response) => response.path)
+        .filter((path) => path !== "/")
+        .sort(),
+    );
     for (const kind of ["css", "js", "image", "json"]) {
       for (let index = 0; index < 50; index += 1) {
         const id = `r-${kind}-${String(index)}`;
         const response = await readHttp(server.port, `/r/${kind}/${String(index)}`);
         expect(response.status).toBe(200);
-        assertDigestMatch(id, digest(id).sha256, hashBuffer(response.body));
+        expectPinned(id, response.body);
       }
     }
   });
 });
 
-function harDocument(body: Buffer): unknown {
-  return {
-    log: {
-      version: "1.2",
-      entries: [
-        {
-          request: { method: "GET", url: "http://127.0.0.1/fixtures/no-store" },
-          response: {
-            content: {
-              mimeType: "text/plain",
-              text: body.toString("base64"),
-              encoding: "base64",
-            },
-          },
-        },
-      ],
-    },
-  };
+function pin(id: string): { sha256: string; byteLength: number } {
+  const pinned = PINNED_RESPONSES[id];
+  if (pinned === undefined) throw new Error(`no pin for ${id}`);
+  return { sha256: pinned.sha256, byteLength: pinned.byteLength };
 }
 
-function digest(id: string): DigestEntry {
-  const entry = digests.get(id);
-  if (entry === undefined) throw new Error(`missing digest ${id}`);
-  return entry;
+function expectPinned(id: string, body: Buffer): void {
+  expect({ sha256: hashBuffer(body), byteLength: body.length }).toEqual(pin(id));
 }
 
 function hashBuffer(bytes: Buffer): string {

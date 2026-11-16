@@ -13,38 +13,42 @@ afterEach(async () => {
 });
 
 describe("remote control", () => {
-  it("uses BiDi when that socket accepts a session", async () => {
+  it("uses BiDi when that socket accepts a session and evaluates after navigation finished", async () => {
     const bidi = await startBidi();
     const marionette = await startMarionette();
     const remote = await connectRemote({
       bidiPort: bidi.port,
       marionettePort: marionette.port,
-      exitCode: () => null,
+      exitStatus: () => null,
       stderr: () => "",
+      signal: new AbortController().signal,
     });
     expect(remote.protocol).toBe("bidi");
     expect(remote.browserPid).toBe(77);
+    expect(remote.browserName).toBe("zen");
     expect(remote.userAgent).toBe("ZenTest");
     const context = await remote.openTab("http://127.0.0.1/");
-    expect(await remote.evaluate(context, "window.__harnessReady")).toBe('{"ok":true}');
+    expect(await remote.evaluate(context, "window.__harnessReady")).toBe(READY);
     await remote.closeTab(context);
     remote.dispose();
   });
 
-  it("uses Marionette when BiDi does not answer", async () => {
+  it("uses Marionette when BiDi does not answer and evaluates after navigation finished", async () => {
     const bidi = await startClosedPort();
     const marionette = await startMarionette();
     const remote = await connectRemote({
       bidiPort: bidi,
       marionettePort: marionette.port,
-      exitCode: () => null,
+      exitStatus: () => null,
       stderr: () => "",
+      signal: new AbortController().signal,
     });
     expect(remote.protocol).toBe("marionette");
     expect(remote.browserPid).toBe(88);
+    expect(remote.browserName).toBe("zen");
     expect(remote.userAgent).toBe("ZenMarionette");
     const context = await remote.openTab("http://127.0.0.1/");
-    expect(await remote.evaluate(context, "window.__harnessReady")).toBe('{"ok":true}');
+    expect(await remote.evaluate(context, "window.__harnessReady")).toBe(READY);
     await remote.closeTab(context);
     remote.dispose();
   });
@@ -54,11 +58,12 @@ describe("remote control", () => {
       connectRemote({
         bidiPort: 1,
         marionettePort: 1,
-        exitCode: () => 9,
+        exitStatus: () => "code 9",
         stderr: () => "startup failed",
+        signal: new AbortController().signal,
         deadlineMs: 0,
       }),
-    ).rejects.toThrow(/exited with code 9/);
+    ).rejects.toThrow(/exited with code 9[\s\S]*startup failed/);
   });
 });
 
@@ -89,17 +94,28 @@ async function startBidi(): Promise<{ port: number }> {
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
     let buffer: Buffer<ArrayBufferLike> = Buffer.from(head);
+    const page = { loaded: false };
     const consume = (): void => {
       while (true) {
         const frame = readClientFrame(buffer);
         if (frame === null) return;
         buffer = frame.rest;
         if (frame.opcode !== 0x1) continue;
-        const message = JSON.parse(frame.payload.toString("utf8")) as {
-          id: number;
-          method: string;
+        const message = JSON.parse(frame.payload.toString("utf8")) as BidiCommand;
+        const reply = (): void => {
+          socket.write(encodeServerText(Buffer.from(JSON.stringify(bidiResponse(message, page)))));
         };
-        socket.write(encodeServerText(Buffer.from(JSON.stringify(bidiResponse(message)))));
+        if (message.method === "browsingContext.navigate") {
+          page.loaded = false;
+          if (message.params.wait === "complete") {
+            setImmediate(() => {
+              page.loaded = true;
+              reply();
+            });
+          } else reply();
+          continue;
+        }
+        reply();
       }
     };
     socket.on("data", (chunk: Buffer) => {
@@ -119,7 +135,20 @@ async function startBidi(): Promise<{ port: number }> {
   return { port: portOf(server) };
 }
 
-function bidiResponse(message: { id: number; method: string }): unknown {
+// The page script is only there once navigation finished, so a caller that evaluates before the
+// navigation reply sees no ready value, as a real browser would.
+const READY = '{"ok":true}';
+
+type BidiCommand = { id: number; method: string; params: Record<string, unknown> };
+
+function bidiResponse(message: BidiCommand, page: { loaded: boolean }): unknown {
+  if (message.method === "script.evaluate" && !page.loaded) {
+    return {
+      id: message.id,
+      type: "success",
+      result: { type: "exception", exceptionDetails: { text: "page is still loading" } },
+    };
+  }
   const result = bidiResult(message.method);
   return { id: message.id, type: "success", result };
 }
@@ -129,6 +158,7 @@ function bidiResult(method: string): unknown {
     return {
       capabilities: {
         "moz:processID": 77,
+        browserName: "zen",
         browserVersion: "160.0",
         "moz:buildID": "20261113100328",
         userAgent: "ZenTest",
@@ -137,7 +167,7 @@ function bidiResult(method: string): unknown {
   }
   if (method === "browsingContext.create") return { context: "tab-1" };
   if (method === "script.evaluate") {
-    return { type: "success", result: { type: "string", value: '{"ok":true}' } };
+    return { type: "success", result: { type: "string", value: READY } };
   }
   if (method === "browsingContext.navigate" || method === "browsingContext.close") return {};
   throw new Error(`unexpected BiDi method ${method}`);
@@ -150,6 +180,7 @@ async function startMarionette(): Promise<{ port: number }> {
     socket.on("error", () => undefined);
     writeLength(socket, { applicationType: "gecko", marionetteProtocol: 3 });
     let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    const page = { loaded: false, waitsForLoad: false };
     socket.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
       while (buffer.length > 0) {
@@ -159,7 +190,35 @@ async function startMarionette(): Promise<{ port: number }> {
         if (!Array.isArray(next.message)) continue;
         const id: unknown = next.message[1];
         const name: unknown = next.message[2];
+        const params: unknown = next.message[3];
         if (typeof id !== "number" || typeof name !== "string") continue;
+        if (name === "WebDriver:NewSession") {
+          page.waitsForLoad = JSON.stringify(params).includes('"pageLoadStrategy":"normal"');
+        }
+        if (name === "WebDriver:Navigate") {
+          page.loaded = false;
+          const finish = (): void => {
+            page.loaded = true;
+          };
+          if (page.waitsForLoad) {
+            setImmediate(() => {
+              finish();
+              writeLength(socket, [1, id, null, {}]);
+            });
+          } else {
+            writeLength(socket, [1, id, null, {}]);
+          }
+          continue;
+        }
+        if (name === "WebDriver:ExecuteAsyncScript" && !page.loaded) {
+          writeLength(socket, [
+            1,
+            id,
+            { error: "javascript error", message: "page is still loading" },
+            null,
+          ]);
+          continue;
+        }
         writeLength(socket, [1, id, null, marionetteResult(name)]);
       }
     });
@@ -180,6 +239,7 @@ function marionetteResult(name: string): unknown {
     return {
       capabilities: {
         "moz:processID": 88,
+        browserName: "zen",
         browserVersion: "160.0",
         "moz:buildID": "20261113100328",
       },
@@ -187,12 +247,8 @@ function marionetteResult(name: string): unknown {
   }
   if (name === "WebDriver:ExecuteScript") return "ZenMarionette";
   if (name === "WebDriver:NewWindow") return { handle: "win-1", type: "tab" };
-  if (name === "WebDriver:ExecuteAsyncScript") return '{"ok":true}';
-  if (
-    name === "WebDriver:SwitchToWindow" ||
-    name === "WebDriver:Navigate" ||
-    name === "WebDriver:CloseWindow"
-  ) {
+  if (name === "WebDriver:ExecuteAsyncScript") return READY;
+  if (name === "WebDriver:SwitchToWindow" || name === "WebDriver:CloseWindow") {
     return {};
   }
   throw new Error(`unexpected Marionette command ${name}`);

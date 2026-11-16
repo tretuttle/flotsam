@@ -1,15 +1,25 @@
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
-import { killProcessTree, readWorkingSetBytes, releaseOwnedProfile } from "./owned-process.ts";
+import {
+  currentPlatformName,
+  killOwnedTree,
+  pidAlive,
+  PROCESS_PLATFORMS,
+  removeDirectoryBounded,
+  spawnOwned,
+  type OwnedChild,
+  type ProcessPlatformName,
+} from "./owned-process.ts";
 
-const leftover: number[] = [];
+const owned: number[] = [];
 const directories: string[] = [];
 
 afterEach(async () => {
-  for (const pid of leftover.splice(0)) killProcessTree(pid);
+  for (const pid of owned.splice(0)) await killOwnedTree(pid, []);
   await Promise.all(
     directories
       .splice(0)
@@ -17,108 +27,148 @@ afterEach(async () => {
   );
 });
 
-describe("owned processes", () => {
-  it("reads a positive working set for this process", () => {
-    expect(readWorkingSetBytes(process.pid)).toBeGreaterThan(0);
+const ALLOCATED_BYTES = 200 * 1024 * 1024;
+const PROBE_TITLE = "a) b (c) d";
+const PROBE = `
+process.title = ${JSON.stringify(PROBE_TITLE)};
+const held = Buffer.alloc(${String(ALLOCATED_BYTES)}, 7);
+const start = process.cpuUsage();
+while (true) { const used = process.cpuUsage(start); if (used.user + used.system >= 300000) break; }
+const cpu = process.cpuUsage();
+process.stdout.write(JSON.stringify({ ppid: process.ppid, rss: process.memoryUsage().rss, cpuMs: (cpu.user + cpu.system) / 1000, held: held.length }) + "\\n");
+setInterval(() => {}, 1000);
+`;
+
+// Only this machine's row runs live. The other rows are covered by their sample output until
+// a run on that platform.
+const RUNNABLE_ROWS: readonly ProcessPlatformName[] = [currentPlatformName()];
+
+describe("process inspection table", () => {
+  it.each(RUNNABLE_ROWS)(
+    "the %s row reads what a live process reports about itself",
+    async (row) => {
+      const probe = spawnOwned(process.execPath, ["-e", PROBE], {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      owned.push(probe.pid);
+      const reported = JSON.parse(await firstLine(probe)) as {
+        ppid: number;
+        rss: number;
+        cpuMs: number;
+      };
+      if (row === "linux") {
+        expect(NodeFS.readFileSync(`/proc/${String(probe.pid)}/stat`, "utf8")).toContain(
+          `(${PROBE_TITLE})`,
+        );
+      }
+      const snapshot = PROCESS_PLATFORMS[row].snapshot(probe.pid);
+      expect(snapshot.parentPid).toBe(process.pid);
+      expect(reported.ppid).toBe(process.pid);
+      expect(snapshot.workingSetBytes).toBeGreaterThanOrEqual(ALLOCATED_BYTES);
+      expect(snapshot.workingSetBytes).toBeLessThanOrEqual(reported.rss * 1.25);
+      expect(snapshot.cpuTimeMs).toBeGreaterThanOrEqual(reported.cpuMs - 20);
+      expect(snapshot.cpuTimeMs).toBeLessThanOrEqual(reported.cpuMs + 1000);
+    },
+  );
+
+  it.each(
+    [
+      {
+        row: "linux" as const,
+        text: "4242 (Web Content) (x) S 4100 4100 4100 0 -1 4194560 1 0 0 0 250 50 0 0 20 0 30 0 99 1000 2560 18446744073709551615\n",
+        parentPid: 4100,
+      },
+      { row: "win32" as const, text: "4100 104857600 52000000\r\n", parentPid: 4100 },
+      { row: "darwin" as const, text: " 4100  2048   0:03.00\n", parentPid: 4100 },
+    ].filter((sample) => sample.row !== "linux" || process.platform === "linux"),
+  )("the $row row parses documented sample output", ({ row, text, parentPid }) => {
+    const snapshot = PROCESS_PLATFORMS[row].parseSnapshot(text, 4242);
+    expect(snapshot.parentPid).toBe(parentPid);
+    expect(snapshot.cpuTimeMs).toBeCloseTo(row === "win32" ? 5200 : 3000, 6);
+    if (row === "win32") expect(snapshot.workingSetBytes).toBe(104_857_600);
+    if (row === "darwin") expect(snapshot.workingSetBytes).toBe(2048 * 1024);
   });
 
-  it("kills the spawned process tree and leaves an unrelated process running", async () => {
-    const owned = await spawnSleeperTree();
-    const unrelated = spawnSleeper();
-    leftover.push(unrelated, owned.childPid);
-    killProcessTree(owned.parentPid);
-    await exited(owned.parent);
-    expect(alive(owned.parentPid)).toBe(false);
-    expect(alive(owned.childPid)).toBe(false);
-    expect(alive(unrelated)).toBe(true);
-    killProcessTree(owned.parentPid);
+  it("parses BSD and procps cumulative CPU time with hours and days", () => {
+    const cpu = (time: string): number =>
+      PROCESS_PLATFORMS.darwin.parseSnapshot(`1 1 ${time}`, 1).cpuTimeMs;
+    expect(cpu("61:02.50")).toBeCloseTo(3_662_500, 6);
+    expect(cpu("01:01:02")).toBeCloseTo(3_662_000, 6);
+    expect(cpu("2-00:00:01")).toBeCloseTo(172_801_000, 6);
   });
 
-  it("deletes a directory only after the process holding a file in it is dead", async () => {
-    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-profile-"));
-    directories.push(directory);
-    const lock = NodePath.join(directory, "parent.lock");
-    const owned = NodeChildProcess.spawn(
-      process.execPath,
-      [
-        "-e",
-        'const fs=require("node:fs"); const fd=fs.openSync(process.argv[1],"w"); fs.writeSync(fd,"lock"); process.stdout.write("ready\\n"); setInterval(()=>{},1000);',
-        lock,
-      ],
-      { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
-    );
-    if (owned.pid === undefined) throw new Error("lock holder did not start");
-    leftover.push(owned.pid);
-    await readReady(owned);
-    const unrelated = spawnSleeper();
-    leftover.push(unrelated);
-    await releaseOwnedProfile([owned.pid], directory);
-    await releaseOwnedProfile([owned.pid], directory);
-    expect(alive(owned.pid)).toBe(false);
-    expect(alive(unrelated)).toBe(true);
-    await expect(NodeFSP.stat(directory)).rejects.toThrow();
-    killProcessTree(unrelated);
+  it("refuses a platform outside the table", () => {
+    expect(() => currentPlatformName("aix")).toThrow(/unsupported platform aix/);
   });
 });
 
-async function spawnSleeperTree(): Promise<{
-  parent: NodeChildProcess.ChildProcess;
-  parentPid: number;
-  childPid: number;
-}> {
-  const parent = NodeChildProcess.spawn(
+describe("owned process trees", () => {
+  it("kills the spawned tree and leaves an unrelated process running", async () => {
+    const tree = await spawnTree();
+    const unrelated = spawnOwned(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+    owned.push(unrelated.pid);
+    await killOwnedTree(tree.leader.pid, []);
+    expect(pidAlive(tree.leader.pid)).toBe(false);
+    expect(pidAlive(tree.descendantPid)).toBe(false);
+    expect(pidAlive(unrelated.pid)).toBe(true);
+  });
+
+  it.each(RUNNABLE_ROWS.filter((row) => PROCESS_PLATFORMS[row].groupLeader))(
+    "on %s kills a descendant that outlived its parent",
+    async () => {
+      const tree = await spawnTree();
+      process.kill(tree.leader.pid, "SIGKILL");
+      await exited(tree.leader.child);
+      expect(pidAlive(tree.descendantPid)).toBe(true);
+      await killOwnedTree(tree.leader.pid, [tree.descendantPid]);
+      expect(pidAlive(tree.descendantPid)).toBe(false);
+    },
+  );
+
+  it("removes a profile directory once the process holding a file in it is gone", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-profile-"));
+    directories.push(directory);
+    const holder = spawnOwned(
+      process.execPath,
+      [
+        "-e",
+        'const fs = require("node:fs"); fs.writeSync(fs.openSync(process.argv[1], "w"), "lock"); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
+        NodePath.join(directory, "parent.lock"),
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    owned.push(holder.pid);
+    expect(await firstLine(holder)).toBe("ready");
+    await killOwnedTree(holder.pid, []);
+    await removeDirectoryBounded(directory);
+    expect(NodeFS.existsSync(directory)).toBe(false);
+  });
+});
+
+async function spawnTree(): Promise<{ leader: OwnedChild; descendantPid: number }> {
+  const leader = spawnOwned(
     process.execPath,
     [
       "-e",
-      'const {spawn}=require("node:child_process"); const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",windowsHide:true}); if(!child.pid) process.exit(2); process.stdout.write(String(child.pid)+"\\n"); setInterval(()=>{},1000);',
+      'const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", "process.on(\\"SIGHUP\\", () => {}); process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" }); process.stdout.write(String(child.pid) + "\\n"); setInterval(() => {}, 1000);',
     ],
-    {
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "ignore"],
-      windowsHide: true,
-    },
+    { stdio: ["ignore", "pipe", "ignore"] },
   );
-  if (parent.pid === undefined) throw new Error("sleeper did not start");
-  leftover.push(parent.pid);
-  const childPid = await readPidLine(parent);
-  return { parent, parentPid: parent.pid, childPid };
+  owned.push(leader.pid);
+  const descendantPid = Number(await firstLine(leader));
+  return { leader, descendantPid };
 }
 
-function spawnSleeper(): number {
-  const child = NodeChildProcess.spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  if (child.pid === undefined) throw new Error("unrelated sleeper did not start");
-  child.unref();
-  return child.pid;
-}
-
-function readReady(child: NodeChildProcess.ChildProcess): Promise<void> {
+function firstLine(owner: OwnedChild): Promise<string> {
   return new Promise((resolve, reject) => {
     let text = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
+    owner.child.stdout?.on("data", (chunk: Buffer) => {
       text += chunk.toString("utf8");
-      if (text.includes("ready\n")) resolve();
+      const end = text.indexOf("\n");
+      if (end !== -1) resolve(text.slice(0, end).trim());
     });
-    child.once("error", reject);
-    child.once("exit", (code) => reject(new Error(`lock holder exited ${String(code)}`)));
-  });
-}
-
-function readPidLine(child: NodeChildProcess.ChildProcess): Promise<number> {
-  return new Promise((resolve, reject) => {
-    let text = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      text += chunk.toString("utf8");
-      const line = text.split("\n")[0];
-      if (line !== undefined && line.length > 0 && text.includes("\n")) {
-        resolve(Number(line));
-      }
-    });
-    child.once("error", reject);
-    child.once("exit", (code) =>
-      reject(new Error(`sleeper exited ${String(code)} before printing a pid`)),
+    owner.child.once("exit", (code) =>
+      reject(new Error(`child exited ${String(code)} before a line`)),
     );
   });
 }
@@ -126,14 +176,4 @@ function readPidLine(child: NodeChildProcess.ChildProcess): Promise<number> {
 function exited(child: NodeChildProcess.ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => child.once("exit", () => resolve()));
-}
-
-function alive(pid: number | undefined): boolean {
-  if (pid === undefined) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
