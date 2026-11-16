@@ -175,11 +175,28 @@ export function guardFolder(
   return { ok: true, folder: joined as SafeFolder };
 }
 
-/** `<appFolder>/<archiveId>`: archiveId is the first 16 hex chars of sha256(profile path). One archive per profile. */
-export function archiveDirName(profilePathSha256: string): string {
-  if (!/^[0-9a-f]{64}$/i.test(profilePathSha256))
-    throw new RangeError("archiveDirName takes a SHA-256 digest in hex");
-  return profilePathSha256.slice(0, 16).toLowerCase();
+declare const archiveKey: unique symbol;
+/**
+ * The archive's directory name under the app folder: 128 random bits in lowercase hex, generated once and kept in the
+ * profile. A page that can test whether a `file://` path exists cannot guess any path below it (issue 13).
+ */
+export type ArchiveKey = string & { readonly [archiveKey]: true };
+
+/** The profile file that keeps the key. Losing it starts a new, empty archive; the old one is left untouched. */
+export const ARCHIVE_KEY_FILE = "one-click-har.archive-key";
+const ARCHIVE_KEY_BYTES = 16;
+const ARCHIVE_KEY_TEXT = /^[0-9a-f]{32}$/;
+
+export function archiveKeyFromBytes(bytes: Uint8Array): ArchiveKey {
+  if (bytes.length !== ARCHIVE_KEY_BYTES)
+    throw new RangeError(`an archive key is ${String(ARCHIVE_KEY_BYTES)} random bytes`);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("") as ArchiveKey;
+}
+
+/** The key file's text, one trailing newline allowed. Anything else is null, and the host makes a new key. */
+export function parseArchiveKey(raw: string): ArchiveKey | null {
+  const text = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  return ARCHIVE_KEY_TEXT.test(text) ? (text as ArchiveKey) : null;
 }
 
 const MAX_DIR_NAME = 64;

@@ -3,7 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { parseSite, type ExchangeId, type RunId, type Site } from "../src/ids.ts";
 import type * as layout from "../src/layout.ts";
 import {
-  archiveDirName,
+  archiveKeyFromBytes,
   ARCHIVE_ROOTS,
   bodyFilePath,
   guardFolder,
@@ -14,6 +14,7 @@ import {
   logSummaryPath,
   packId,
   packPath,
+  parseArchiveKey,
   parseArchiveName,
   parseLogSegmentId,
   parsePackId,
@@ -229,12 +230,21 @@ describe("guardFolder", () => {
   });
 });
 
-describe("archiveDirName", () => {
-  it("is the first 16 hex characters of the profile path's SHA-256", () => {
-    expect(archiveDirName("9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08")).toBe(
+describe("archive key", () => {
+  it("is the 16 random bytes in lowercase hex, and only that text parses back", () => {
+    const bytes = Uint8Array.from({ length: 16 }, (_, i) => i * 17);
+    const key = archiveKeyFromBytes(bytes);
+    expect(key).toBe("00112233445566778899aabbccddeeff");
+    expect(parseArchiveKey(`${key}\n`)).toBe(key);
+    expect(() => archiveKeyFromBytes(bytes.subarray(0, 8))).toThrow(RangeError);
+    for (const refused of [
       "9f86d081884c7d65",
-    );
-    expect(() => archiveDirName("/home/u/.zen/abc.default")).toThrow(RangeError);
+      key.toUpperCase(),
+      `${key}0`,
+      ` ${key}`,
+      `${key}\n\n`,
+    ])
+      expect(parseArchiveKey(refused)).toBeNull();
   });
 });
 
