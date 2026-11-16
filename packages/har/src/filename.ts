@@ -18,7 +18,6 @@ export interface HarFilenameOptions {
 }
 
 const DEFAULT_MAX_LENGTH = 180;
-const MIN_HOST_LENGTH = 8;
 
 const WINDOWS_RESERVED_NAMES = new Set([
   "con",
@@ -95,6 +94,10 @@ function sanitizeHostSegment(
       candidate = candidate.slice(0, pathIndex);
     }
   }
+  const userinfoIndex = candidate.lastIndexOf("@");
+  if (userinfoIndex !== -1) {
+    candidate = candidate.slice(userinfoIndex + 1);
+  }
 
   candidate = candidate
     .replace(/[\u0000-\u001f\u007f]/gu, "")
@@ -129,11 +132,32 @@ function formatTimeSegment(timeRange: HarFilenameTimeRange | null | undefined): 
   return `${startStamp}_to_${endStamp}`;
 }
 
+function assembleFilename(hostPart: string, suffix: string, maxLength: number): string {
+  if (maxLength < 0) {
+    return "";
+  }
+  return `${hostPart}${suffix}`;
+}
+
+function fitFilename(assembled: string, maxLength: number): string {
+  if (assembled.length <= maxLength) {
+    return assembled;
+  }
+  let fitted = assembled.slice(assembled.length - maxLength);
+  if (fitted.startsWith(".") || fitted.startsWith("-")) {
+    const trimmed = fitted.replace(/^[.-]+/u, "");
+    if (trimmed.includes(".")) {
+      fitted = trimmed;
+    }
+  }
+  return fitted;
+}
+
 export function formatHarFilename(options: HarFilenameOptions): string {
   const extension = options.extension ?? "har";
-  const maxLength = Math.max(32, options.maxLength ?? DEFAULT_MAX_LENGTH);
-
-  let hostPart = sanitizeHostSegment(options.host, options.scope);
+  const maxLength =
+    options.maxLength === undefined ? DEFAULT_MAX_LENGTH : Math.max(0, options.maxLength);
+  const hostPart = sanitizeHostSegment(options.host, options.scope);
   const tailParts: string[] = [];
 
   const timeSegment = formatTimeSegment(options.timeRange);
@@ -151,13 +175,5 @@ export function formatHarFilename(options: HarFilenameOptions): string {
   }
 
   const suffix = (tailParts.length > 0 ? `_${tailParts.join("_")}` : "") + `.${extension}`;
-  const availableHostChars = Math.max(MIN_HOST_LENGTH, maxLength - suffix.length);
-  if (hostPart.length > availableHostChars) {
-    hostPart = hostPart.slice(0, availableHostChars).replace(/[.-]+$/gu, "");
-    if (hostPart.length === 0) {
-      hostPart = "capture";
-    }
-  }
-
-  return `${hostPart}${suffix}`;
+  return fitFilename(assembleFilename(hostPart, suffix, maxLength), maxLength);
 }

@@ -1,6 +1,8 @@
 import { safeDecodeQueryComponent } from "./internal.ts";
 import {
+  HAR_REDACTION_PLACES,
   toHarUrl,
+  type HarContent,
   type HarCookie,
   type HarDocument,
   type HarEntry,
@@ -8,6 +10,7 @@ import {
   type HarNameValue,
   type HarPostData,
   type HarPostDataParam,
+  type HarRedactionPlace,
   type HarRedactionRecord,
   type HarRedactionTarget,
   type HarUrl,
@@ -16,8 +19,8 @@ import {
 export interface HarRedactionRule {
   readonly id: string;
   readonly target: HarRedactionTarget;
-  // Empty list on a cookie rule matches every cookie name.
   readonly names: readonly string[];
+  readonly matchAll?: boolean | undefined;
 }
 
 export interface RedactHarOptions {
@@ -36,7 +39,7 @@ export const DEFAULT_REDACTION_RULES: readonly HarRedactionRule[] = [
   { id: "header:set-cookie", target: "header", names: ["set-cookie"] },
   { id: "header:authorization", target: "header", names: ["authorization"] },
   { id: "header:proxy-authorization", target: "header", names: ["proxy-authorization"] },
-  { id: "cookie:all", target: "cookie", names: [] },
+  { id: "cookie:all", target: "cookie", names: [], matchAll: true },
   {
     id: "query:secrets",
     target: "query",
@@ -73,7 +76,54 @@ export const DEFAULT_REDACTION_RULES: readonly HarRedactionRule[] = [
       "code",
     ],
   },
+  { id: "header:x-api-key", target: "header", names: ["x-api-key", "api-key", "x-api-token"] },
+  {
+    id: "header:x-csrf-token",
+    target: "header",
+    names: ["x-csrf-token", "x-xsrf-token", "csrf-token"],
+  },
+  { id: "header:location", target: "header-url", names: ["location"] },
+  { id: "header:referer", target: "header-url", names: ["referer", "referrer"] },
+  { id: "header:path", target: "header-url", names: [":path"] },
+  { id: "url:userinfo", target: "url-userinfo", names: ["userinfo"] },
+  { id: "initiator:url", target: "initiator", names: ["url"] },
 ];
+
+const PLACE_TARGETS: readonly {
+  readonly place: HarRedactionPlace;
+  readonly targets: readonly HarRedactionTarget[];
+}[] = [
+  { place: "request-url-query", targets: ["query"] },
+  { place: "request-url-userinfo", targets: ["url-userinfo"] },
+  { place: "named-header", targets: ["header"] },
+  { place: "url-header", targets: ["header-url"] },
+  { place: "cookie", targets: ["cookie"] },
+  { place: "query-string", targets: ["query"] },
+  { place: "body-param", targets: ["body"] },
+  { place: "body-json", targets: ["body"] },
+  { place: "body-form", targets: ["body"] },
+  { place: "body-multipart", targets: ["body"] },
+  { place: "redirect-url", targets: ["query"] },
+  { place: "response-body-json", targets: ["body"] },
+  { place: "page-title", targets: ["query"] },
+  { place: "initiator", targets: ["initiator"] },
+  { place: "response-body-other", targets: [] },
+  { place: "websocket", targets: [] },
+  { place: "cache", targets: [] },
+  { place: "comment", targets: [] },
+  { place: "other-custom-field", targets: [] },
+];
+
+function notInspectedPlaces(rules: readonly HarRedactionRule[]): readonly HarRedactionPlace[] {
+  const targets = new Set(rules.map((rule) => rule.target));
+  return HAR_REDACTION_PLACES.filter((place) => {
+    const covered = PLACE_TARGETS.find((item) => item.place === place);
+    if (!covered || covered.targets.length === 0) {
+      return true;
+    }
+    return covered.targets.every((target) => !targets.has(target));
+  });
+}
 
 const DEFAULT_REPLACEMENT = "[REDACTED]";
 
@@ -94,11 +144,37 @@ function findMatchingRule(
     if (rule.target !== target) {
       continue;
     }
-    if (target === "cookie" && rule.names.length === 0) {
+    if (rule.matchAll === true) {
       return rule;
     }
     for (const candidate of rule.names) {
       if (candidate.toLowerCase() === lower) {
+        return rule;
+      }
+    }
+  }
+  return undefined;
+}
+
+function foldKey(name: string): string {
+  return name.replace(/[_-]/gu, "").toLowerCase();
+}
+
+function findBodyRule(
+  rules: readonly HarRedactionRule[],
+  fieldName: string,
+): HarRedactionRule | undefined {
+  const direct = findMatchingRule(rules, "body", fieldName);
+  if (direct) {
+    return direct;
+  }
+  const folded = foldKey(fieldName);
+  for (const rule of rules) {
+    if (rule.target !== "body" || rule.matchAll === true) {
+      continue;
+    }
+    for (const candidate of rule.names) {
+      if (foldKey(candidate) === folded) {
         return rule;
       }
     }
@@ -149,14 +225,26 @@ function redactHeaders(
 ): readonly HarNameValue[] {
   return headers.map((header) => {
     const rule = findMatchingRule(rules, "header", header.name);
-    if (!rule) {
+    if (rule) {
+      tracker.record("header", header.name, rule.id);
+      return {
+        ...header,
+        value: replacement,
+        comment: appendComment(header.comment, `redacted by ${rule.id}`),
+      };
+    }
+    const urlRule = findMatchingRule(rules, "header-url", header.name);
+    if (!urlRule) {
       return header;
     }
-    tracker.record("header", header.name, rule.id);
+    const nextValue = redactTextUrl(header.value, rules, replacement, tracker, new Set());
+    if (nextValue === header.value) {
+      return header;
+    }
     return {
       ...header,
-      value: replacement,
-      comment: appendComment(header.comment, `redacted by ${rule.id}`),
+      value: nextValue,
+      comment: appendComment(header.comment, `redacted by ${urlRule.id}`),
     };
   });
 }
@@ -204,24 +292,42 @@ function redactQueryString(
   return { pairs, trackedNames };
 }
 
-function redactUrlQuery(
-  url: HarUrl,
+function redactUserinfo(
+  text: string,
+  rules: readonly HarRedactionRule[],
+  replacement: string,
+  tracker: EntryRedactionTracker,
+): string {
+  const rule = findMatchingRule(rules, "url-userinfo", "userinfo");
+  if (!rule) {
+    return text;
+  }
+  const match = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/?#@]*)@/u.exec(text);
+  if (!match) {
+    return text;
+  }
+  tracker.record("url-userinfo", "userinfo", rule.id);
+  return `${match[1] ?? ""}${encodeURIComponent(replacement)}@${text.slice(match[0].length)}`;
+}
+
+function redactQueryText(
+  text: string,
   rules: readonly HarRedactionRule[],
   replacement: string,
   alreadyTrackedNames: ReadonlySet<string>,
   tracker: EntryRedactionTracker,
-): HarUrl {
-  const queryStart = url.indexOf("?");
+): string {
+  const queryStart = text.indexOf("?");
   if (queryStart === -1) {
-    return url;
+    return text;
   }
-  const hashStart = url.indexOf("#", queryStart + 1);
-  const base = url.slice(0, queryStart + 1);
+  const hashStart = text.indexOf("#", queryStart + 1);
+  const base = text.slice(0, queryStart + 1);
   const querySlice =
-    hashStart === -1 ? url.slice(queryStart + 1) : url.slice(queryStart + 1, hashStart);
-  const suffix = hashStart === -1 ? "" : url.slice(hashStart);
+    hashStart === -1 ? text.slice(queryStart + 1) : text.slice(queryStart + 1, hashStart);
+  const suffix = hashStart === -1 ? "" : text.slice(hashStart);
   if (querySlice.length === 0) {
-    return url;
+    return text;
   }
 
   const encodedReplacement = encodeURIComponent(replacement);
@@ -245,9 +351,36 @@ function redactUrlQuery(
   });
 
   if (!changed) {
-    return url;
+    return text;
   }
-  return toHarUrl(`${base}${segments.join("&")}${suffix}`) ?? url;
+  return `${base}${segments.join("&")}${suffix}`;
+}
+
+function redactTextUrl(
+  text: string,
+  rules: readonly HarRedactionRule[],
+  replacement: string,
+  tracker: EntryRedactionTracker,
+  alreadyTrackedNames: ReadonlySet<string>,
+): string {
+  return redactQueryText(
+    redactUserinfo(text, rules, replacement, tracker),
+    rules,
+    replacement,
+    alreadyTrackedNames,
+    tracker,
+  );
+}
+
+function redactUrlQuery(
+  url: HarUrl,
+  rules: readonly HarRedactionRule[],
+  replacement: string,
+  alreadyTrackedNames: ReadonlySet<string>,
+  tracker: EntryRedactionTracker,
+): HarUrl {
+  const next = redactTextUrl(url, rules, replacement, tracker, alreadyTrackedNames);
+  return toHarUrl(next) ?? url;
 }
 
 function redactJsonValue(
@@ -271,7 +404,7 @@ function redactJsonValue(
     let changed = false;
     const next: Record<string, unknown> = {};
     for (const [key, fieldVal] of Object.entries(value)) {
-      const rule = findMatchingRule(rules, "body", key);
+      const rule = findBodyRule(rules, key);
       if (rule) {
         changed = true;
         tracker.record("body", key, rule.id);
@@ -305,7 +438,7 @@ function redactFormText(
     const eqIndex = segment.indexOf("=");
     const rawName = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
     const decodedName = safeDecodeQueryComponent(rawName);
-    const rule = findMatchingRule(rules, "body", decodedName);
+    const rule = findBodyRule(rules, decodedName);
     if (!rule) {
       return segment;
     }
@@ -316,6 +449,79 @@ function redactFormText(
     return `${rawName}=${encodedReplacement}`;
   });
   return changed ? segments.join("&") : text;
+}
+
+function redactMultipartText(
+  text: string,
+  rules: readonly HarRedactionRule[],
+  replacement: string,
+  tracker: EntryRedactionTracker,
+): string {
+  return text.replace(
+    /(content-disposition:[^\r\n]*\bname="([^"]+)"[^\r\n]*\r\n(?:[^\r\n]+\r\n)*\r\n)([\s\S]*?)(?=\r\n--|$)/giu,
+    (match, headers: string, name: string) => {
+      const rule = findBodyRule(rules, name);
+      if (!rule) {
+        return match;
+      }
+      tracker.record("body", name, rule.id);
+      return `${headers}${replacement}`;
+    },
+  );
+}
+
+function redactResponseContent(
+  content: HarContent,
+  rules: readonly HarRedactionRule[],
+  replacement: string,
+  tracker: EntryRedactionTracker,
+): HarContent {
+  const text = content.text;
+  if (text === undefined || text.length === 0 || content.encoding?.toLowerCase() === "base64") {
+    return content;
+  }
+  const mime = content.mimeType.toLowerCase();
+  const trimmed = text.trimStart();
+  const looksJson = mime.includes("json") || trimmed.startsWith("{") || trimmed.startsWith("[");
+  if (!looksJson) {
+    return content;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    const redacted = redactJsonValue(parsed, rules, replacement, tracker);
+    if (!redacted.changed) {
+      return content;
+    }
+    const nextText = JSON.stringify(redacted.value);
+    return { ...content, text: nextText };
+  } catch {
+    return content;
+  }
+}
+
+function redactInitiatorValue(
+  value: unknown,
+  rules: readonly HarRedactionRule[],
+  replacement: string,
+  tracker: EntryRedactionTracker,
+): unknown {
+  if (typeof value === "string") {
+    if (!value.includes("?") && !value.includes("@")) {
+      return value;
+    }
+    return redactTextUrl(value, rules, replacement, tracker, new Set());
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactInitiatorValue(item, rules, replacement, tracker));
+  }
+  if (typeof value === "object" && value !== null) {
+    const next: Record<string, unknown> = {};
+    for (const [key, field] of Object.entries(value)) {
+      next[key] = redactInitiatorValue(field, rules, replacement, tracker);
+    }
+    return next;
+  }
+  return value;
 }
 
 function redactPostData(
@@ -330,7 +536,7 @@ function redactPostData(
 
   const trackedParams = new Set<string>();
   const params: HarPostDataParam[] = postData.params.map((param) => {
-    const rule = findMatchingRule(rules, "body", param.name);
+    const rule = findBodyRule(rules, param.name);
     if (!rule || param.value === undefined) {
       return param;
     }
@@ -358,6 +564,8 @@ function redactPostData(
       }
     } else if (mimeLower.includes("x-www-form-urlencoded")) {
       text = redactFormText(text, rules, replacement, trackedParams, tracker);
+    } else if (mimeLower.includes("multipart/")) {
+      text = redactMultipartText(text, rules, replacement, tracker);
     }
   }
 
@@ -389,13 +597,25 @@ function redactEntry(
 
   const responseHeaders = redactHeaders(entry.response.headers, rules, replacement, tracker);
   const responseCookies = redactCookies(entry.response.cookies, rules, replacement, tracker);
+  const redirectURL = redactTextUrl(
+    entry.response.redirectURL,
+    rules,
+    replacement,
+    tracker,
+    new Set(),
+  );
+  const content = redactResponseContent(entry.response.content, rules, replacement, tracker);
+  const inspectInitiator = rules.some((rule) => rule.target === "initiator");
+  const initiator = inspectInitiator
+    ? redactInitiatorValue(entry._initiator, rules, replacement, tracker)
+    : entry._initiator;
 
   const records = tracker.buildRecords(url);
   if (records.length === 0) {
     return { entry, records };
   }
 
-  const existingFields = entry._harAnytime?.redactedFields ?? [];
+  const existingFields = entry._harExport?.redactedFields ?? [];
   const mergedFields = [...new Set([...existingFields, ...tracker.fields])];
 
   const updatedEntry: HarEntry = {
@@ -412,9 +632,12 @@ function redactEntry(
       ...entry.response,
       headers: responseHeaders,
       cookies: responseCookies,
+      redirectURL,
+      content,
     },
-    _harAnytime: {
-      ...entry._harAnytime,
+    ...(initiator !== undefined ? { _initiator: initiator as HarEntry["_initiator"] } : {}),
+    _harExport: {
+      ...entry._harExport,
       redactedFields: mergedFields,
     },
   };
@@ -435,6 +658,25 @@ function redactPageTitle(
   return redactUrlQuery(titleUrl, rules, replacement, new Set(), tracker);
 }
 
+function pageTitleRecords(
+  before: string,
+  after: string,
+  rules: readonly HarRedactionRule[],
+  replacement: string,
+): readonly HarRedactionRecord[] {
+  if (before === after) {
+    return [];
+  }
+  const tracker = new EntryRedactionTracker(-1);
+  const titleUrl = toHarUrl(before);
+  if (!titleUrl) {
+    return [];
+  }
+  const redacted = redactUrlQuery(titleUrl, rules, replacement, new Set(), tracker);
+  const url = toHarUrl(String(redacted)) ?? titleUrl;
+  return tracker.buildRecords(url).map((record) => ({ ...record, target: "page" as const }));
+}
+
 export function redactHar(document: HarDocument, options?: RedactHarOptions): RedactHarResult {
   const rules = [...(options?.rules ?? DEFAULT_REDACTION_RULES), ...(options?.extraRules ?? [])];
   const replacement = options?.replacement ?? DEFAULT_REPLACEMENT;
@@ -445,7 +687,14 @@ export function redactHar(document: HarDocument, options?: RedactHarOptions): Re
 
   const pages = document.log.pages?.map((page) => {
     const nextTitle = redactPageTitle(page.title, rules, replacement);
-    return nextTitle === page.title ? page : { ...page, title: nextTitle };
+    if (nextTitle === page.title) {
+      return page;
+    }
+    for (const record of pageTitleRecords(page.title, nextTitle, rules, replacement)) {
+      allRecords.push(record);
+      appliedRules.add(record.ruleId);
+    }
+    return { ...page, title: nextTitle };
   });
 
   const entries = document.log.entries.map((entry, index) => {
@@ -467,6 +716,7 @@ export function redactHar(document: HarDocument, options?: RedactHarOptions): Re
     entriesAffected,
     rules: [...appliedRules],
     records: allRecords,
+    notInspected: notInspectedPlaces(rules),
   };
 
   const redactedDocument: HarDocument = {
@@ -474,8 +724,8 @@ export function redactHar(document: HarDocument, options?: RedactHarOptions): Re
       ...document.log,
       ...(pages !== undefined ? { pages } : {}),
       entries,
-      _harAnytime: {
-        ...document.log._harAnytime,
+      _harExport: {
+        ...document.log._harExport,
         redaction: report,
       },
     },

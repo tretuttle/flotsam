@@ -11,7 +11,7 @@ function makeValidHar(): Record<string, unknown> {
   return {
     log: {
       version: "1.2",
-      creator: { name: "HAR Anytime", version: "1.0.0" },
+      creator: { name: "Caller", version: "1.0.0" },
       browser: { name: "Zen", version: "160.0" },
       pages: [
         {
@@ -705,7 +705,52 @@ describe("parseHar and parseHarJson", () => {
           }),
         ),
     },
+    "browser-timings": {
+      pass: () => parseHar(makeValidHar()),
+      fail: () =>
+        parseHar(
+          cloneHar((har) => {
+            const entries = (har.log as Record<string, unknown>).entries as Array<
+              Record<string, unknown>
+            >;
+            const timings = entries[0]!.timings as Record<string, unknown>;
+            delete timings.send;
+            delete timings.wait;
+            delete timings.receive;
+          }),
+        ),
+    },
+    "browser-cookie-expires": {
+      pass: () => parseHar(makeValidHar()),
+      fail: () =>
+        parseHar(
+          cloneHar((har) => {
+            const entries = (har.log as Record<string, unknown>).entries as Array<
+              Record<string, unknown>
+            >;
+            (entries[0]!.request as Record<string, unknown>).cookies = [
+              { name: "sid", value: "a", expires: null },
+            ];
+          }),
+        ),
+    },
   };
+
+  const DOCUMENT_RULES = new Set<HarValidationRule>([
+    "json-syntax",
+    "root-object",
+    "log-object",
+    "log-version",
+    "creator-object",
+    "entries-array",
+  ]);
+
+  const NOTE_RULES = new Set<HarValidationRule>([
+    "redirect-url",
+    "mime-type",
+    "browser-timings",
+    "browser-cookie-expires",
+  ]);
 
   it("covers every validator rule with a passing and a failing fixture", () => {
     expect(Object.keys(ruleFixtures).sort()).toEqual([...HAR_VALIDATION_RULES].sort());
@@ -716,13 +761,58 @@ describe("parseHar and parseHarJson", () => {
       expect(passed.ok, `expected rule ${rule} pass fixture to succeed`).toBe(true);
 
       const failed = pair.fail();
-      expect(failed.ok, `expected rule ${rule} fail fixture to fail`).toBe(false);
-      if (!failed.ok) {
-        expect(
-          failed.problems.some((problem) => problem.rule === rule),
-          `expected failure for rule ${rule}, got ${failed.problems.map((p) => p.rule).join(", ")}`,
-        ).toBe(true);
-      }
+      expect(failed.ok, `rule ${rule} ok flag`).toBe(!DOCUMENT_RULES.has(rule));
+      const match = failed.problems.find((problem) => problem.rule === rule);
+      expect(
+        match,
+        `expected a ${rule} problem, got ${failed.problems.map((problem) => problem.rule).join(", ")}`,
+      ).toBeDefined();
+      expect(match?.severity).toBe(NOTE_RULES.has(rule) ? "note" : "error");
     }
+  });
+
+  it("keeps the other entries when one entry is unusable", () => {
+    const result = parseHar(
+      cloneHar((har) => {
+        const entries = (har.log as Record<string, unknown>).entries as Array<unknown>;
+        entries.push({ startedDateTime: "not-a-date" });
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.document.log.entries).toHaveLength(1);
+    expect(
+      result.problems.some(
+        (problem) => problem.rule === "entry-object" || problem.rule === "iso-datetime",
+      ),
+    ).toBe(true);
+  });
+
+  it("reports negative send, wait, and receive and drops only that entry", () => {
+    const result = parseHar(
+      cloneHar((har) => {
+        const entries = (har.log as Record<string, unknown>).entries as Array<
+          Record<string, unknown>
+        >;
+        const bad = JSON.parse(JSON.stringify(entries[0])) as Record<string, unknown>;
+        bad.startedDateTime = "2026-11-16T05:00:01.000Z";
+        const timings = bad.timings as Record<string, unknown>;
+        timings.send = -1;
+        timings.wait = -1;
+        timings.receive = -1;
+        entries.push(bad);
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.problems.some((problem) => problem.rule === "non-negative-number")).toBe(true);
+    expect(result.document.log.entries).toHaveLength(1);
+    expect(result.document.log.entries[0]!.timings.send).toBeGreaterThanOrEqual(0);
   });
 });

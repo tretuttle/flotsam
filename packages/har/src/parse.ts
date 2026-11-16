@@ -25,7 +25,6 @@ import {
   type HarTimings,
   type HarUrl,
   type IsoDateTime,
-  type MimeType,
   type PageId,
 } from "./model.ts";
 
@@ -61,18 +60,72 @@ export const HAR_VALIDATION_RULES = [
   "cache-object",
   "cache-entry-object",
   "timings-object",
+  "browser-timings",
+  "browser-cookie-expires",
 ] as const;
 
 export type HarValidationRule = (typeof HAR_VALIDATION_RULES)[number];
 
+export type HarValidationSeverity = "error" | "note";
+
+const HAR_VALIDATION_SEVERITY: Record<HarValidationRule, HarValidationSeverity> = {
+  "json-syntax": "error",
+  "root-object": "error",
+  "log-object": "error",
+  "log-version": "error",
+  "creator-object": "error",
+  "browser-object": "error",
+  "pages-array": "error",
+  "page-object": "error",
+  "page-id-unique": "error",
+  "page-timings-object": "error",
+  "entries-array": "error",
+  "entry-object": "error",
+  "entry-pageref-exists": "error",
+  "iso-datetime": "error",
+  "non-negative-number": "error",
+  "size-or-sentinel": "error",
+  "timing-or-sentinel": "error",
+  "request-object": "error",
+  "request-url": "error",
+  "response-object": "error",
+  "response-status": "error",
+  "redirect-url": "note",
+  "content-object": "error",
+  "mime-type": "note",
+  "post-data-object": "error",
+  "post-data-param-object": "error",
+  "name-value-array": "error",
+  "cookie-array": "error",
+  "cache-object": "error",
+  "cache-entry-object": "error",
+  "timings-object": "error",
+  "browser-timings": "note",
+  "browser-cookie-expires": "note",
+};
+
+const DOCUMENT_REJECTION_RULES = new Set<HarValidationRule>([
+  "json-syntax",
+  "root-object",
+  "log-object",
+  "log-version",
+  "creator-object",
+  "entries-array",
+]);
+
 export interface HarProblem {
   readonly path: string;
   readonly rule: HarValidationRule;
+  readonly severity: HarValidationSeverity;
   readonly message: string;
 }
 
 export type HarParseResult =
-  | { readonly ok: true; readonly document: HarDocument }
+  | {
+      readonly ok: true;
+      readonly document: HarDocument;
+      readonly problems: readonly HarProblem[];
+    }
   | { readonly ok: false; readonly problems: readonly HarProblem[] };
 
 type JsonRecord = Record<string, unknown>;
@@ -96,7 +149,7 @@ class ProblemCollector {
   readonly items: HarProblem[] = [];
 
   add(path: string, rule: HarValidationRule, message: string): void {
-    this.items.push({ path, rule, message });
+    this.items.push({ path, rule, severity: HAR_VALIDATION_SEVERITY[rule], message });
   }
 }
 
@@ -341,8 +394,15 @@ function parseCookieArray(
         );
       }
     }
-    let expires: IsoDateTime | undefined;
-    if (item.expires !== undefined) {
+    let expires: IsoDateTime | null | undefined;
+    if (item.expires === null) {
+      problems.add(
+        `${itemPath}.expires`,
+        "browser-cookie-expires",
+        "Session cookie expires is null. Kept because browsers emit null instead of omitting it.",
+      );
+      expires = null;
+    } else if (item.expires !== undefined) {
       if (
         typeof item.expires !== "string" ||
         (item.expires !== "" && !isIsoDateTime(item.expires))
@@ -372,11 +432,7 @@ function parseCookieArray(
   return result;
 }
 
-function parseMimeField(
-  raw: unknown,
-  path: string,
-  problems: ProblemCollector,
-): MimeType | "" | null {
+function parseMimeField(raw: unknown, path: string, problems: ProblemCollector): string | null {
   if (typeof raw !== "string") {
     problems.add(path, "mime-type", "Expected MIME type string.");
     return null;
@@ -385,8 +441,12 @@ function parseMimeField(
     return "";
   }
   if (!isMimeType(raw)) {
-    problems.add(path, "mime-type", `Invalid MIME type "${raw}".`);
-    return null;
+    problems.add(
+      path,
+      "mime-type",
+      `Content type "${raw}" is not a type/subtype. Kept because browsers and servers emit it.`,
+    );
+    return raw;
   }
   return raw;
 }
@@ -586,11 +646,7 @@ function parseContent(value: unknown, path: string, problems: ProblemCollector):
   };
 }
 
-function parseRedirectUrl(
-  value: unknown,
-  path: string,
-  problems: ProblemCollector,
-): HarUrl | "" | null {
+function parseRedirectUrl(value: unknown, path: string, problems: ProblemCollector): string | null {
   if (typeof value !== "string") {
     problems.add(path, "redirect-url", "Expected redirectURL to be a string.");
     return null;
@@ -602,9 +658,9 @@ function parseRedirectUrl(
     problems.add(
       path,
       "redirect-url",
-      `Expected empty string or valid redirect URL, got "${value}".`,
+      `Redirect URL "${value}" is not absolute. Kept because browsers copy Location raw.`,
     );
-    return null;
+    return value;
   }
   return value;
 }
@@ -781,6 +837,15 @@ function parseTimings(value: unknown, path: string, problems: ProblemCollector):
   const parsedRequired: Partial<Record<(typeof requiredPhases)[number], number>> = {};
   for (const key of requiredPhases) {
     const raw = value[key];
+    if (raw === undefined) {
+      problems.add(
+        `${path}.${key}`,
+        "browser-timings",
+        `Missing timings.${key}. Kept as 0 because browsers omit phases they did not measure.`,
+      );
+      parsedRequired[key] = 0;
+      continue;
+    }
     if (!isNonNegativeNumber(raw)) {
       problems.add(
         `${path}.${key}`,
@@ -881,7 +946,7 @@ function parseEntries(
     }
 
     const custom = pickCustomFields(item) as CustomHarFields & {
-      readonly _harAnytime?: HarEntryExtension | undefined;
+      readonly _harExport?: HarEntryExtension | undefined;
     };
     entries.push({
       ...custom,
@@ -924,12 +989,13 @@ export function parseHar(input: unknown): HarParseResult {
   const entries = parseEntries(rawLog.entries, ids, problems);
   const comment = readOptionalComment(rawLog, "$.log", "log-object", problems);
 
-  if (problems.items.length > 0 || version === null || !creator) {
+  const rejectsDocument = problems.items.some((item) => DOCUMENT_REJECTION_RULES.has(item.rule));
+  if (rejectsDocument || version === null || !creator) {
     return { ok: false, problems: problems.items };
   }
 
   const custom = pickCustomFields(rawLog) as CustomHarFields & {
-    readonly _harAnytime?: HarLogExtension | undefined;
+    readonly _harExport?: HarLogExtension | undefined;
   };
   const log: HarLog = {
     ...custom,
@@ -941,7 +1007,7 @@ export function parseHar(input: unknown): HarParseResult {
     ...(comment !== undefined ? { comment } : {}),
   };
 
-  return { ok: true, document: { log } };
+  return { ok: true, document: { log }, problems: problems.items };
 }
 
 export function parseHarJson(jsonText: string): HarParseResult {
@@ -953,7 +1019,14 @@ export function parseHarJson(jsonText: string): HarParseResult {
     const message = error instanceof Error ? error.message : String(error);
     return {
       ok: false,
-      problems: [{ path: "$", rule: "json-syntax", message: `Invalid JSON: ${message}` }],
+      problems: [
+        {
+          path: "$",
+          rule: "json-syntax",
+          severity: "error",
+          message: `Invalid JSON: ${message}`,
+        },
+      ],
     };
   }
   return parseHar(parsed);

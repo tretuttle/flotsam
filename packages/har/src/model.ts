@@ -114,7 +114,8 @@ export type HarMissingBodyReason =
   | "aborted"
   | "media-skipped"
   | "size-limit"
-  | "unavailable";
+  | "unavailable"
+  | "unknown";
 
 export type HarBodyState = "present" | "empty" | HarMissingBodyReason;
 
@@ -123,7 +124,39 @@ export interface HarEntryExtension {
   readonly redactedFields?: readonly string[] | undefined;
 }
 
-export type HarRedactionTarget = "header" | "cookie" | "query" | "body";
+export type HarRedactionTarget =
+  | "header"
+  | "header-url"
+  | "cookie"
+  | "query"
+  | "body"
+  | "url-userinfo"
+  | "initiator"
+  | "page";
+
+export const HAR_REDACTION_PLACES = [
+  "request-url-query",
+  "request-url-userinfo",
+  "named-header",
+  "url-header",
+  "cookie",
+  "query-string",
+  "body-param",
+  "body-json",
+  "body-form",
+  "body-multipart",
+  "redirect-url",
+  "response-body-json",
+  "page-title",
+  "initiator",
+  "response-body-other",
+  "websocket",
+  "cache",
+  "comment",
+  "other-custom-field",
+] as const;
+
+export type HarRedactionPlace = (typeof HAR_REDACTION_PLACES)[number];
 
 export interface HarRedactionRecord {
   readonly entryIndex: number;
@@ -140,6 +173,7 @@ export interface HarLogRedactionExtension {
   readonly entriesAffected: number;
   readonly rules: readonly string[];
   readonly records: readonly HarRedactionRecord[];
+  readonly notInspected: readonly HarRedactionPlace[];
 }
 
 export interface HarLogExtension {
@@ -208,7 +242,7 @@ export interface HarCookie extends CustomHarFields {
   readonly value: string;
   readonly path?: string | undefined;
   readonly domain?: string | undefined;
-  readonly expires?: IsoDateTime | undefined;
+  readonly expires?: IsoDateTime | null | undefined;
   readonly httpOnly?: boolean | undefined;
   readonly secure?: boolean | undefined;
   readonly comment?: string | undefined;
@@ -223,7 +257,7 @@ export interface HarPostDataParam extends CustomHarFields {
 }
 
 export interface HarPostData extends CustomHarFields {
-  readonly mimeType: MimeType | "";
+  readonly mimeType: string;
   readonly params: readonly HarPostDataParam[];
   readonly text: string;
   readonly comment?: string | undefined;
@@ -245,7 +279,7 @@ export interface HarRequest extends CustomHarFields {
 export interface HarContent extends CustomHarFields {
   readonly size: number;
   readonly compression?: number | undefined;
-  readonly mimeType: MimeType | "";
+  readonly mimeType: string;
   readonly text?: string | undefined;
   readonly encoding?: "base64" | (string & {}) | undefined;
   readonly comment?: string | undefined;
@@ -258,7 +292,7 @@ export interface HarResponse extends CustomHarFields {
   readonly cookies: readonly HarCookie[];
   readonly headers: readonly HarNameValue[];
   readonly content: HarContent;
-  readonly redirectURL: HarUrl | "";
+  readonly redirectURL: string;
   readonly headersSize: number;
   readonly bodySize: number;
   readonly comment?: string | undefined;
@@ -321,7 +355,7 @@ export interface HarEntry extends CustomHarFields {
   readonly _fromCache?: "disk" | "memory" | (string & {}) | undefined;
   readonly _connectionId?: string | undefined;
   readonly _webSocketMessages?: readonly ChromeWebSocketMessage[] | undefined;
-  readonly _harAnytime?: HarEntryExtension | undefined;
+  readonly _harExport?: HarEntryExtension | undefined;
 }
 
 export interface HarLog extends CustomHarFields {
@@ -331,7 +365,7 @@ export interface HarLog extends CustomHarFields {
   readonly pages?: readonly HarPage[] | undefined;
   readonly entries: readonly HarEntry[];
   readonly comment?: string | undefined;
-  readonly _harAnytime?: HarLogExtension | undefined;
+  readonly _harExport?: HarLogExtension | undefined;
 }
 
 export interface HarDocument {

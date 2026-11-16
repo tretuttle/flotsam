@@ -26,7 +26,6 @@ import {
   type HarTimings,
   type HarUrl,
   type IsoDateTime,
-  type MimeType,
   type PageId,
 } from "./model.ts";
 
@@ -39,7 +38,7 @@ export interface BuildHarPageInput extends CustomHarFields {
 }
 
 export interface BuildHarPostDataInput extends CustomHarFields {
-  readonly mimeType?: MimeType | "" | undefined;
+  readonly mimeType?: string | undefined;
   readonly params?: readonly HarPostDataParam[] | undefined;
   readonly text?: string | undefined;
   readonly comment?: string | undefined;
@@ -61,7 +60,7 @@ export interface BuildHarRequestInput extends CustomHarFields {
 export interface BuildHarContentInput extends CustomHarFields {
   readonly size?: number | undefined;
   readonly compression?: number | undefined;
-  readonly mimeType?: MimeType | "" | undefined;
+  readonly mimeType?: string | undefined;
   readonly text?: string | undefined;
   readonly encoding?: "base64" | (string & {}) | undefined;
   readonly comment?: string | undefined;
@@ -74,7 +73,7 @@ export interface BuildHarResponseInput extends CustomHarFields {
   readonly cookies?: readonly HarCookie[] | undefined;
   readonly headers?: readonly HarNameValue[] | undefined;
   readonly content?: BuildHarContentInput | undefined;
-  readonly redirectURL?: HarUrl | "" | undefined;
+  readonly redirectURL?: string | undefined;
   readonly headersSize?: number | undefined;
   readonly bodySize?: number | undefined;
   readonly comment?: string | undefined;
@@ -100,24 +99,19 @@ export interface BuildHarEntryInput extends CustomHarFields {
   readonly _fromCache?: "disk" | "memory" | (string & {}) | undefined;
   readonly _connectionId?: string | undefined;
   readonly _webSocketMessages?: readonly ChromeWebSocketMessage[] | undefined;
-  readonly _harAnytime?: HarEntryExtension | undefined;
+  readonly _harExport?: HarEntryExtension | undefined;
 }
 
 export interface BuildHarInput extends CustomHarFields {
   readonly version?: string | undefined;
-  readonly creator?: HarCreator | undefined;
+  readonly creator: HarCreator;
   readonly browser?: HarCreator | undefined;
   readonly pages?: readonly BuildHarPageInput[] | undefined;
   readonly entries: readonly BuildHarEntryInput[];
   readonly defaultPageTitle?: string | undefined;
   readonly comment?: string | undefined;
-  readonly _harAnytime?: HarLogExtension | undefined;
+  readonly _harExport?: HarLogExtension | undefined;
 }
-
-const DEFAULT_CREATOR: HarCreator = {
-  name: "HAR Anytime",
-  version: "0.0.0",
-};
 
 const SPEC_TIME_PHASES = ["blocked", "dns", "connect", "send", "wait", "receive"] as const;
 
@@ -369,6 +363,9 @@ function normalizeResponse(raw: BuildHarResponseInput): HarResponse {
 }
 
 export function buildHar(input: BuildHarInput): HarDocument {
+  if (input.creator.name.length === 0 || input.creator.version.length === 0) {
+    throw new TypeError("buildHar requires a creator name and version.");
+  }
   const sortedInputs = input.entries
     .map((entry, index) => ({
       entry,
@@ -402,7 +399,7 @@ export function buildHar(input: BuildHarInput): HarDocument {
   const log: HarLog = {
     ...pickCustomFields(input),
     version: input.version && input.version.length > 0 ? input.version : "1.2",
-    creator: input.creator ?? DEFAULT_CREATOR,
+    creator: input.creator,
     ...(input.browser !== undefined ? { browser: input.browser } : {}),
     pages,
     entries,

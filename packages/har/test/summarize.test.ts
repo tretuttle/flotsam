@@ -8,6 +8,7 @@ import { classifyEntryBodyState, summarizeEntries, summarizeHar } from "../src/s
 describe("summarizeHar", () => {
   it("reports counts, byte totals, hosts, time range, and missing bodies by reason", () => {
     const doc = buildHar({
+      creator: { name: "Caller", version: "1" },
       entries: [
         {
           startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
@@ -48,7 +49,7 @@ describe("summarizeHar", () => {
               mimeType: toMimeType("video/mp4")!,
             },
           },
-          _harAnytime: { bodyState: "media-skipped" },
+          _harExport: { bodyState: "media-skipped" },
         },
         {
           startedDateTime: toIsoDateTime("2026-11-16T05:00:02.000Z")!,
@@ -68,7 +69,7 @@ describe("summarizeHar", () => {
               mimeType: toMimeType("application/wasm")!,
             },
           },
-          _harAnytime: { bodyState: "evicted" },
+          _harExport: { bodyState: "evicted" },
         },
         {
           startedDateTime: toIsoDateTime("2026-11-16T05:00:03.000Z")!,
@@ -172,13 +173,14 @@ describe("summarizeHar", () => {
       empty: 1,
       missing: 4,
       missingByReason: {
-        "not-included": 1,
+        "not-included": 0,
         evicted: 1,
         discarded: 0,
         aborted: 1,
         "media-skipped": 1,
         "size-limit": 0,
         unavailable: 0,
+        unknown: 1,
       },
     });
 

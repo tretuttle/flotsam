@@ -1,9 +1,76 @@
 import type { CustomHarFields, HarUrl } from "./model.ts";
 
+// Spec-owned names are parsed explicitly. Every other key is kept so a round trip
+// still has fields the HAR 1.2 spec does not name, such as a cookie sameSite.
+const HAR_OWNED_FIELDS = new Set([
+  "name",
+  "version",
+  "comment",
+  "browser",
+  "pages",
+  "entries",
+  "id",
+  "title",
+  "startedDateTime",
+  "pageTimings",
+  "onContentLoad",
+  "onLoad",
+  "value",
+  "path",
+  "domain",
+  "expires",
+  "httpOnly",
+  "secure",
+  "fileName",
+  "contentType",
+  "mimeType",
+  "params",
+  "text",
+  "method",
+  "url",
+  "httpVersion",
+  "cookies",
+  "headers",
+  "queryString",
+  "postData",
+  "headersSize",
+  "bodySize",
+  "status",
+  "statusText",
+  "content",
+  "redirectURL",
+  "size",
+  "compression",
+  "encoding",
+  "beforeRequest",
+  "afterRequest",
+  "lastAccess",
+  "lastFetched",
+  "eTag",
+  "hitCount",
+  "fetchCount",
+  "blocked",
+  "dns",
+  "connect",
+  "send",
+  "wait",
+  "receive",
+  "ssl",
+  "pageref",
+  "time",
+  "request",
+  "response",
+  "cache",
+  "timings",
+  "serverIPAddress",
+  "connection",
+  "log",
+]);
+
 export function pickCustomFields(record: object): CustomHarFields {
   const custom: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (key.startsWith("_")) {
+    if (!HAR_OWNED_FIELDS.has(key)) {
       custom[key] = value;
     }
   }

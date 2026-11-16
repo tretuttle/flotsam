@@ -53,4 +53,26 @@ describe("formatHarFilename", () => {
     expect(name.length).toBeLessThanOrEqual(64);
     expect(name.endsWith("_20261116-050000Z_redacted.har")).toBe(true);
   });
+
+  it("drops URL userinfo and keeps the filename tail inside maxLength", () => {
+    expect(formatHarFilename({ host: "https://alice:hunter2@example.com/x" })).toBe(
+      "example.com.har",
+    );
+
+    const name = formatHarFilename({
+      host: "example.com",
+      maxLength: 40,
+      timeRange: { start: 0, end: 3_600_000 },
+      scope: "tab",
+      includeBodies: false,
+      redacted: true,
+      extension: "har.zip",
+    });
+
+    expect(name.length).toBeLessThanOrEqual(40);
+    expect(name.endsWith(".har.zip")).toBe(true);
+    expect(name.includes("example.com")).toBe(false);
+    expect(name.includes("alice")).toBe(false);
+    expect(name.includes("hunter2")).toBe(false);
+  });
 });

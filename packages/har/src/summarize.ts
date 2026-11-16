@@ -72,6 +72,7 @@ const MISSING_REASONS: readonly HarMissingBodyReason[] = [
   "media-skipped",
   "size-limit",
   "unavailable",
+  "unknown",
 ];
 
 function createEmptyMissingByReason(): Record<HarMissingBodyReason, number> {
@@ -83,6 +84,7 @@ function createEmptyMissingByReason(): Record<HarMissingBodyReason, number> {
     "media-skipped": 0,
     "size-limit": 0,
     unavailable: 0,
+    unknown: 0,
   };
 }
 
@@ -106,7 +108,7 @@ export function classifyEntryBodyState(entry: HarEntry): HarBodyState {
     return "present";
   }
 
-  const annotated = entry._harAnytime?.bodyState;
+  const annotated = entry._harExport?.bodyState;
   if (annotated !== undefined && annotated !== "present") {
     return annotated;
   }
@@ -118,19 +120,11 @@ export function classifyEntryBodyState(entry: HarEntry): HarBodyState {
     return "aborted";
   }
 
-  const commentLower = content.comment?.toLowerCase() ?? "";
-  if (commentLower.includes("discarded")) {
-    return "discarded";
-  }
-  if (commentLower.includes("not included")) {
-    return "not-included";
-  }
-
   if (content.size === 0 || (content.size === -1 && bodySize === 0)) {
     return "empty";
   }
 
-  return "unavailable";
+  return "unknown";
 }
 
 function addNonNegative(current: number, value: number): number {
@@ -283,6 +277,6 @@ export function summarizeEntries(
 export function summarizeHar(document: HarDocument): HarSummary {
   return summarizeEntries(document.log.entries, {
     pageCount: document.log.pages?.length ?? 0,
-    redaction: document.log._harAnytime?.redaction,
+    redaction: document.log._harExport?.redaction,
   });
 }

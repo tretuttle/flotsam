@@ -57,7 +57,7 @@ describe("buildHar", () => {
     };
 
     const built = buildHar({
-      creator: { name: "HAR Anytime", version: "1.0.0" },
+      creator: { name: "Caller", version: "1.0.0" },
       entries: [largestLater, mediumMiddle, smallestEarliest],
     });
 
@@ -87,6 +87,7 @@ describe("buildHar", () => {
 
   it("synthesizes an initial page when entries precede the earliest declared page", () => {
     const built = buildHar({
+      creator: { name: "Caller", version: "1" },
       pages: [
         {
           id: toPageId("page_nav")!,
@@ -204,5 +205,55 @@ describe("buildHar", () => {
     expect(built2).toEqual(built1);
     expect(parsed3.document).toEqual(parsed2.document);
     expect(parsed2.document).toEqual(parsed1.document);
+  });
+
+  it("replaces a pageref that names no page with a page that exists", () => {
+    const built = buildHar({
+      creator: { name: "Caller", version: "1" },
+      pages: [
+        {
+          id: toPageId("p1")!,
+          title: "one",
+          startedDateTime: toIsoDateTime("2026-01-01T00:00:00.000Z")!,
+        },
+      ],
+      entries: [
+        {
+          pageref: toPageId("missing")!,
+          startedDateTime: toIsoDateTime("2026-01-01T00:00:01.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/")! },
+          response: { status: 200 },
+        },
+      ],
+    });
+
+    const pageIds = new Set((built.log.pages ?? []).map((page) => page.id));
+    expect(built.log.entries[0]!.pageref).toBe("p1");
+    expect(pageIds.has(built.log.entries[0]!.pageref!)).toBe(true);
+  });
+
+  it("sets a missing entry time to the sum of timings and leaves ssl out of that sum", () => {
+    const built = buildHar({
+      creator: { name: "Caller", version: "1" },
+      entries: [
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/")! },
+          response: { status: 200 },
+          timings: {
+            blocked: 1,
+            dns: 2,
+            connect: 4,
+            ssl: 100,
+            send: 8,
+            wait: 16,
+            receive: 32,
+          },
+        },
+      ],
+    });
+
+    expect(built.log.entries[0]!.time).toBe(63);
+    expect(built.log.entries[0]!.timings.ssl).toBe(100);
   });
 });
