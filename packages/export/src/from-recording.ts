@@ -162,6 +162,13 @@ function uploadCandidates(outcome: UploadOutcome, avail: BodyAvailability): Body
   return toCandidates(avail);
 }
 
+/** A request still in flight carries a body when its head says so: a positive Content-Length or any Transfer-Encoding. */
+function liveUpload(headers: readonly Header[]): BodyCandidates {
+  const length = Number(findHeader(headers, "content-length") ?? "0");
+  const chunked = findHeader(headers, "transfer-encoding") !== null;
+  return chunked || length > 0 ? { kind: "none", reason: "in-progress" } : { kind: "empty" };
+}
+
 function responseMimeType(response: ResponseFacts): string {
   return findHeader(response.headers, "content-type") ?? response.mimeType ?? "";
 }
@@ -226,7 +233,11 @@ export function materialFromRecording(
         ? { _fromCache: FROM_CACHE_BY_SOURCE[response.source] }
         : {}),
     });
-    return { entry, body: { kind: "none", reason: "in-progress" }, upload: { kind: "empty" } };
+    return {
+      entry,
+      body: { kind: "none", reason: "in-progress" },
+      upload: liveUpload(request.headers),
+    };
   }
 
   const { settled, body, upload } = exchange;

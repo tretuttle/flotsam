@@ -3,7 +3,6 @@
 import type { BodyLocation } from "@one-click-har/recording/exchange";
 import type {
   ByteCount,
-  EpochMs,
   ExchangeId,
   Minute,
   PositiveMinutes,
@@ -13,10 +12,8 @@ import type {
 import type { ExportRequest } from "../src/jobs.ts";
 import { FIELD_RULES } from "../src/merge.ts";
 import { MISSING_REASONS } from "../src/missing.ts";
-import { pageFor, startPages } from "../src/pages.ts";
 import type { MinuteSpan, Selection, SessionRef } from "../src/selection.ts";
 import type { BodyCandidates, BodySource } from "../src/source.ts";
-import type { WrittenUrl } from "../src/written.ts";
 
 const site = "app.example" as Site;
 const at: BodyLocation = {
@@ -33,7 +30,6 @@ const stored: BodySource = {
 };
 const tab = 7 as TabId;
 const span = { from: 0 as Minute, to: 60_000 as Minute } as MinuteSpan;
-const writtenUrl = "https://app.example/" as WrittenUrl;
 
 // deepseek F7: a body with a candidate and a "no body" reason at once.
 export const completeAndMissing: BodyCandidates = {
@@ -108,28 +104,23 @@ export const legalTab: Selection = {
   include: "all",
 };
 
-// deepseek F3: a page title built from a URL that did not pass the redaction port.
-pageFor(startPages(), {
-  tab: null,
-  startedAt: 0 as EpochMs,
-  navigation: true,
-  // @ts-expect-error pageFor takes a WrittenUrl, which only the redaction port makes
-  url: "https://example.com/callback?code=secret",
-});
-pageFor(startPages(), {
-  tab: null,
-  startedAt: 0 as EpochMs,
-  navigation: true,
-  url: writtenUrl,
-});
-
 // issue 13 / jobs: an export request cannot carry an unparsed selection or bad packaging.
 export const badPackaging: ExportRequest = {
   selection: legalTab,
   bodies: "include",
-  secrets: "remove",
+  redaction: "standard",
   // @ts-expect-error packaging must be one of Packaging
   packaging: "tar",
+  fileName: null,
+};
+
+// The redaction level is @one-click-har/har's by name, or none. The export has no level of its own.
+export const ownLevel: ExportRequest = {
+  selection: legalTab,
+  bodies: "include",
+  // @ts-expect-error redaction must be a RedactionChoice
+  redaction: "remove",
+  packaging: "har",
   fileName: null,
 };
 

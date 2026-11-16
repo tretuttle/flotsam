@@ -22,8 +22,8 @@ import type { BodyCandidates, Material, SourceItem, SourceName, SourceRef } from
 
 export const RUN_ID = "mhz02" as RunId;
 export const OLD_RUN_ID = "mhz01" as RunId;
-export const SITE = "app.example" as Site;
-export const TAB_KEY: TabKey = { run: RUN_ID, browserId: 7 };
+const SITE = "app.example" as Site;
+const TAB_KEY: TabKey = { run: RUN_ID, browserId: 7 };
 export const T0 = 1_794_800_040_000 as EpochMs;
 export const M0 = toMinute(T0);
 

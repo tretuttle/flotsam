@@ -57,9 +57,9 @@ const MUTATIONS: readonly Mutation[] = [
     id: "missing-reason-row-removed",
     target: "export",
     file: "src/missing.ts",
-    from: /^  "over-body-cap": \{[\s\S]*?\n  \},\n/m,
+    from: /^  "no-response": \{[\s\S]*?\n  \},\n/m,
     to: "",
-    expect: "over-body-cap",
+    expect: "no-response",
   },
   {
     id: "range-rule-row-removed",
@@ -134,11 +134,11 @@ const MUTATIONS: readonly Mutation[] = [
     expect: "TS2578",
   },
   {
-    id: "page-title-any-string",
+    id: "redaction-any-string",
     target: "export",
-    file: "src/pages.ts",
-    from: "readonly url: WrittenUrl;",
-    to: "readonly url: string;",
+    file: "src/jobs.ts",
+    from: "readonly redaction: RedactionChoice;",
+    to: "readonly redaction: string;",
     expect: "TS2578",
   },
   {

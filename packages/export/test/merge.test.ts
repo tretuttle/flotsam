@@ -9,7 +9,7 @@ import {
   mergeEntry,
   pairItems,
 } from "../src/merge.ts";
-import type { BodyCandidates, DevtoolsBodyRef } from "../src/source.ts";
+import type { BodyCandidates, DevtoolsBodyRef, SourceItem } from "../src/source.ts";
 import {
   EX_ID,
   OLD_RUN_ID,
@@ -73,13 +73,53 @@ describe("pairItems joins on ExchangeId only", () => {
     expect(result.pairs[3]).toEqual({ kind: "both", recording: curRec, devtools: curDt });
   });
 
+  it("writes one entry per key: within a source the settled row wins and the rest are counted", () => {
+    const key = exchangeId(RUN_ID, "9" as ChannelKey);
+    const live = makeSourceItem({ source: "recording", key, inProgress: true });
+    const settled = makeSourceItem({
+      source: "recording",
+      key,
+      url: "https://app.example/settled",
+    });
+    const dtLive = makeSourceItem({ source: "devtools", key, inProgress: true });
+    const dtLater = makeSourceItem({
+      source: "devtools",
+      key,
+      inProgress: true,
+      url: "https://app.example/later",
+    });
+    const keyless = makeSourceItem({ source: "devtools", key: null });
+    const result = pairItems([live, settled, live], [dtLive, dtLater, keyless, keyless]);
+    expect(result.pairs).toEqual([
+      { kind: "both", recording: settled, devtools: dtLive },
+      { kind: "devtools-only", devtools: keyless },
+      { kind: "devtools-only", devtools: keyless },
+    ]);
+    expect(result.duplicates).toEqual({ recording: 2, devtools: 1 });
+    expect(result.unpaired).toBe(2);
+  });
+
+  it("marks a pair in progress when either side is still live", () => {
+    const rec = makeSourceItem({ source: "recording", inProgress: true });
+    const dt = makeSourceItem({ source: "devtools" });
+    const entry = makeHarEntry();
+    const merged = (r: SourceItem, d: SourceItem) =>
+      mergeEntry(
+        { kind: "both", recording: r, devtools: d },
+        makeMaterial(entry),
+        makeMaterial(entry),
+      ).inProgress;
+    expect(merged(rec, dt)).toBe(true);
+    expect(merged(dt, rec)).toBe(true);
+    expect(merged({ ...rec, inProgress: false }, dt)).toBe(false);
+  });
+
   it("planted: a time-window fallback wrongly pairs distinct exchanges and fails the test", async () => {
     const mutated = await importMutated<{ pairItems: typeof pairItems }>("merge.ts", {
       id: "time-window-fallback",
-      from: '  for (let i = 0; i < devtools.length; i += 1) {\n    if (!matchedDt.has(i)) {\n      pairs.push({ kind: "devtools-only", devtools: devtools[i]! });\n    }\n  }',
-      to: `  for (let i = 0; i < devtools.length; i += 1) {
-    if (matchedDt.has(i)) continue;
-    const dt = devtools[i]!;
+      from: '  for (const item of devtools.kept) {\n    if (item.key === null || dtByKey.has(item.key))\n      pairs.push({ kind: "devtools-only", devtools: item });\n  }',
+      to: `  for (const dt of devtools.kept) {
+    if (dt.key !== null && !dtByKey.has(dt.key)) continue;
     const idx = pairs.findIndex((p) => p.kind === "recording-only" && Math.abs(p.recording.startedAt - dt.startedAt) <= 50 && p.recording.url === dt.url);
     if (idx >= 0) {
       const rec = (pairs[idx] as { readonly recording: typeof dt }).recording;

@@ -1,41 +1,57 @@
 // The export itself, host-neutral: both hosts call runExport with their own ports, and Node tests call it with fakes.
 
-import type { HarEntry, HarPostData } from "@one-click-har/har/model";
+import type { PageId } from "@one-click-har/har/model";
 import type { BodyCheck } from "@one-click-har/recording/exchange";
 import type { ByteCount } from "@one-click-har/recording/ids";
 import {
-  encodeChunk,
-  encodeTextChunk,
-  entryExtension,
-  entryHead,
-  entryTail,
-  finishEncoder,
-  startEncoder,
-  textModeFor,
-  type BodyEnd,
-  type EncoderState,
+  base64Stream,
+  bytesFromBase64Slices,
+  bytesFromTextSlices,
+  charsetOf,
+  chooseEncoding,
+} from "./body.ts";
+import {
+  NO_BODY,
+  buildEntry,
+  missingBody,
+  splitAtSentinel,
+  streamSentinel,
+  type BodyWrite,
 } from "./entry-writer.ts";
-import { encodeUtf8 } from "./internal.ts";
 import type { ExportRequest, WriteFailure } from "./jobs.ts";
-import { devtoolsBodyWanted, mergeEntry, pairItems, type MergedEntry } from "./merge.ts";
-import { MISSING_REASONS, type MissingReason } from "./missing.ts";
+import {
+  devtoolsBodyWanted,
+  mergeEntry,
+  pairItems,
+  stubMaterial,
+  type MergedEntry,
+  type Pair,
+} from "./merge.ts";
+import type { MissingReason } from "./missing.ts";
 import { finishPages, pageFor, startPages } from "./pages.ts";
+import { documentRedaction, type DocumentRedaction, type LogFields } from "./redaction.ts";
 import { emptyReport, reportComment, tally, type ExportReport } from "./report.ts";
 import type { ResolvedSelection } from "./selection.ts";
 import {
   classifyUrl,
   type AbortSignalLike,
   type BodyCandidates,
+  type BodyChunks,
   type BodyReader,
   type BodySource,
   type ExchangeSource,
+  type Material,
   type SourceItem,
+  type SourceListing,
+  type SourceName,
 } from "./source.ts";
-import type { WrittenBody, WrittenPlace, WrittenUrl } from "./written.ts";
 
-export const BODY_CHUNK_BYTES = 3 * 1_048_576;
-/** JSON and form bodies up to this size are read whole, parsed and redacted when secrets are removed. */
-export const REDACT_BODY_MAX = 1_048_576;
+const BODY_CHUNK_BYTES = 3 * 1_048_576;
+/**
+ * A body up to this size is read whole before any of it is written, so its encoding is decided on all its bytes and
+ * it is redacted inside its entry. A longer response body streams as base64; a longer request body is cut here.
+ */
+export const BODY_WINDOW_BYTES = BODY_CHUNK_BYTES;
 
 /** Where the document goes. The host's sink batches writes and owns the .part file and its rename. */
 export interface HarSink {
@@ -43,7 +59,10 @@ export interface HarSink {
   readonly bytesWritten: () => ByteCount;
 }
 
-/** Thrown by a sink when the file system refuses. The only error runExport lets out, besides an abort. */
+/**
+ * Thrown by a sink when the file system refuses. A failing sink is the only port failure that fails the export;
+ * every other port that throws becomes a loss written into the file and counted in the report.
+ */
 export class WriteRefused extends Error {
   readonly failure: WriteFailure;
 
@@ -54,31 +73,12 @@ export class WriteRefused extends Error {
   }
 }
 
-/**
- * The only producer of Written values. With secrets "remove" it applies @one-click-har/har/redact; with "keep" it
- * passes values through. Page titles, bodies and entries reach the sink only through it.
- */
-export interface RedactPort {
-  entry(entry: HarEntry): {
-    readonly entry: HarEntry;
-    readonly url: WrittenUrl;
-    readonly touched: boolean;
-  };
-  /** JSON or form bodies up to REDACT_BODY_MAX. null for a body it does not parse; the report lists it as not scanned. */
-  body(
-    mimeType: string,
-    bytes: Uint8Array,
-  ): { readonly body: WrittenBody; readonly touched: boolean } | null;
-  readonly covered: readonly WrittenPlace[];
-}
-
 export interface ExportPorts {
   readonly recording: ExchangeSource;
   readonly devtools: ExchangeSource;
   readonly bodies: BodyReader;
   readonly sink: HarSink;
   readonly creator: { readonly name: string; readonly version: string };
-  readonly redact: RedactPort;
   /** Wire-encoded bytes to decoded bytes, chunk by chunk (gzip, deflate, br, zstd). */
   readonly decode: (
     encoding: string,
@@ -101,40 +101,40 @@ function throwIfAborted(signal: AbortSignalLike): void {
   throw err;
 }
 
-function isRedactableBodyMime(mimeType: string): boolean {
-  const base = (mimeType.split(";")[0] ?? "").trim().toLowerCase();
-  return base.includes("json") || base.includes("x-www-form-urlencoded");
-}
-
-function addNotNetworkCounts(
-  target: Record<string, number>,
-  source: { readonly [scheme: string]: number },
-): void {
-  for (const [scheme, count] of Object.entries(source)) {
-    if (count > 0) target[scheme] = (target[scheme] ?? 0) + count;
+/** A port call that may throw. An abort and a sink refusal pass through; anything else is reported as a loss. */
+async function attempt<T>(
+  signal: AbortSignalLike,
+  call: () => Promise<T> | T,
+): Promise<{ readonly ok: true; readonly value: T } | { readonly ok: false }> {
+  try {
+    return { ok: true, value: await call() };
+  } catch (err) {
+    throwIfAborted(signal);
+    if (err instanceof WriteRefused) throw err;
+    return { ok: false };
   }
 }
 
-function filterNetworkItems(
-  items: readonly SourceItem[],
-  notNetwork: Record<string, number>,
-): SourceItem[] {
+function networkItems(listing: SourceListing, notNetwork: Record<string, number>): SourceItem[] {
+  for (const [scheme, count] of Object.entries(listing.notNetwork)) {
+    if (count > 0) notNetwork[scheme] = (notNetwork[scheme] ?? 0) + count;
+  }
   const kept: SourceItem[] = [];
-  for (const item of items) {
+  for (const item of listing.items) {
     const kind = classifyUrl(item.url);
     if (kind.kind === "network") {
       kept.push(item);
-    } else if (kind.kind === "not-network") {
-      notNetwork[kind.scheme] = (notNetwork[kind.scheme] ?? 0) + 1;
     } else {
-      notNetwork["malformed"] = (notNetwork["malformed"] ?? 0) + 1;
+      const key = kind.kind === "not-network" ? kind.scheme : "malformed";
+      notNetwork[key] = (notNetwork[key] ?? 0) + 1;
     }
   }
   return kept;
 }
 
-function concatBytes(parts: readonly Uint8Array[], totalLength: number): Uint8Array {
-  const out = new Uint8Array(totalLength);
+function concatBytes(parts: readonly Uint8Array[], total: number): Uint8Array {
+  if (parts.length === 1) return parts[0]!;
+  const out = new Uint8Array(total);
   let offset = 0;
   for (const part of parts) {
     out.set(part, offset);
@@ -143,490 +143,356 @@ function concatBytes(parts: readonly Uint8Array[], totalLength: number): Uint8Ar
   return out;
 }
 
-function decodeUtf8Whole(bytes: Uint8Array): string {
-  let state = startEncoder("utf8-text");
-  const first = encodeChunk(state, bytes);
-  state = first.state;
-  const last = finishEncoder(state);
-  return JSON.parse(`"${first.json}${last.json}"`) as string;
+/** One opened body as decoded bytes, whatever shape its reader gave. */
+interface OpenBody {
+  readonly chunks: AsyncIterator<Uint8Array>;
+  readonly charset: string | null;
+  readonly from: "stored" | "devtools";
+  readonly check: BodyCheck | null;
+  readonly wireBytes: () => number | null;
+  readonly lossy: () => number;
 }
 
-async function openFirstCandidate(
+function asBytes(
+  body: BodyChunks,
+  candidate: BodySource,
+  mimeType: string,
+  ports: ExportPorts,
+): OpenBody {
+  const from = candidate.kind === "stored" ? "stored" : "devtools";
+  const check = candidate.kind === "stored" ? candidate.check : null;
+  if (body.kind === "bytes") {
+    let wire = 0;
+    const raw = body.chunks;
+    const counted: AsyncIterable<Uint8Array> = {
+      async *[Symbol.asyncIterator]() {
+        for await (const chunk of raw) {
+          wire += chunk.byteLength;
+          yield chunk;
+        }
+      },
+    };
+    const decoded = body.wireEncoding === null ? counted : ports.decode(body.wireEncoding, counted);
+    return {
+      chunks: decoded[Symbol.asyncIterator](),
+      charset: charsetOf(mimeType),
+      from,
+      check,
+      wireBytes: () => (from === "stored" ? wire : null),
+      lossy: () => 0,
+    };
+  }
+  if (body.encoding === "base64") {
+    return {
+      chunks: bytesFromBase64Slices(body.chunks)[Symbol.asyncIterator](),
+      charset: charsetOf(mimeType),
+      from,
+      check,
+      wireBytes: () => null,
+      lossy: () => 0,
+    };
+  }
+  const text = bytesFromTextSlices(body.chunks);
+  return {
+    chunks: text.bytes[Symbol.asyncIterator](),
+    charset: "utf-8",
+    from,
+    check,
+    wireBytes: () => null,
+    lossy: text.lossy,
+  };
+}
+
+async function openBody(
   candidates: readonly BodySource[],
-  bodies: BodyReader,
-  signal: AbortSignalLike,
+  mimeType: string,
+  ports: ExportPorts,
 ): Promise<
-  | {
-      readonly ok: true;
-      readonly candidate: BodySource;
-      readonly body: Extract<
-        Awaited<ReturnType<BodyReader["open"]>>,
-        { readonly ok: true }
-      >["body"];
-    }
+  | { readonly ok: true; readonly body: OpenBody }
   | { readonly ok: false; readonly reason: MissingReason }
 > {
-  let lastReason: MissingReason = "source-error";
+  let reason: MissingReason = "source-error";
   for (const candidate of candidates) {
-    throwIfAborted(signal);
-    try {
-      const res = await bodies.open(candidate, BODY_CHUNK_BYTES, signal);
-      if (res.ok) return { ok: true, candidate, body: res.body };
-      lastReason = res.reason;
-    } catch (err) {
-      throwIfAborted(signal);
-      if (err instanceof WriteRefused) throw err;
-      lastReason = "source-error";
+    throwIfAborted(ports.signal);
+    const opened = await attempt(ports.signal, () =>
+      ports.bodies.open(candidate, BODY_CHUNK_BYTES, ports.signal),
+    );
+    if (!opened.ok) {
+      reason = "source-error";
+    } else if (!opened.value.ok) {
+      reason = opened.value.reason;
+    } else {
+      return { ok: true, body: asBytes(opened.value.body, candidate, mimeType, ports) };
     }
   }
-  return { ok: false, reason: lastReason };
+  return { ok: false, reason };
 }
 
-function countWireBytes(
-  chunks: AsyncIterable<Uint8Array>,
-  onBytes: (n: number) => void,
-): AsyncIterable<Uint8Array> {
+type Step =
+  | { readonly kind: "chunk"; readonly bytes: Uint8Array }
+  | { readonly kind: "end" | "failed" };
+
+async function nextChunk(body: OpenBody, signal: AbortSignalLike): Promise<Step> {
+  throwIfAborted(signal);
+  const step = await attempt(signal, () => body.chunks.next());
+  if (!step.ok) return { kind: "failed" };
+  if (step.value.done === true) return { kind: "end" };
+  return { kind: "chunk", bytes: step.value.value };
+}
+
+/** Reads until the body ends, fails, or passes `limit` bytes. */
+async function readWindow(
+  body: OpenBody,
+  limit: number,
+  signal: AbortSignalLike,
+): Promise<{ readonly bytes: Uint8Array; readonly ended: "end" | "failed" | "more" }> {
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  while (total <= limit) {
+    const step = await nextChunk(body, signal);
+    if (step.kind !== "chunk") return { bytes: concatBytes(parts, total), ended: step.kind };
+    if (step.bytes.byteLength === 0) continue;
+    parts.push(step.bytes);
+    total += step.bytes.byteLength;
+  }
+  return { bytes: concatBytes(parts, total), ended: "more" };
+}
+
+function wholeWrite(body: OpenBody, bytes: Uint8Array, ended: "end" | "failed"): BodyWrite {
+  if (ended === "failed" && bytes.length === 0) {
+    return missingBody({ kind: "missing", reason: "source-error" });
+  }
+  if (ended === "end" && bytes.length === 0 && body.check !== "first-part") return NO_BODY;
+  const written = chooseEncoding(bytes, body.charset);
+  const outcome =
+    ended === "failed"
+      ? ({ kind: "cut-short", reason: "source-error", lossy: body.lossy() } as const)
+      : body.check === "first-part"
+        ? ({ kind: "cut-short", reason: "over-body-cap", lossy: body.lossy() } as const)
+        : ({
+            kind: "included",
+            from: body.from,
+            unchecked: body.check === "sink-only",
+            lossy: body.lossy(),
+          } as const);
   return {
-    async *[Symbol.asyncIterator]() {
-      for await (const chunk of chunks) {
-        onBytes(chunk.byteLength);
-        yield chunk;
-      }
-    },
+    outcome,
+    text: written.text,
+    encoding: written.encoding,
+    size: bytes.length,
+    wireBytes: body.wireBytes(),
+    check: body.check,
   };
 }
 
-async function resolveUpload(
+function withRequestChoice(candidates: BodyCandidates, request: ExportRequest): BodyCandidates {
+  return request.bodies === "omit" && candidates.kind === "candidates"
+    ? { kind: "none", reason: "omitted-by-choice" }
+    : candidates;
+}
+
+/** The request body is read whole, up to one window, because HAR 1.2 gives it no streamable place of its own. */
+async function readUpload(
   merged: MergedEntry,
   request: ExportRequest,
   ports: ExportPorts,
-  notScanned: Set<string>,
-): Promise<{
-  readonly entry: HarEntry;
-  readonly secretsTouched: boolean;
-  readonly neverStored: boolean;
-}> {
-  const req = merged.entry.request;
-  let upload = merged.upload;
-  if (request.bodies === "omit" && upload.kind === "candidates") {
-    upload = { kind: "none", reason: "omitted-by-choice" };
-  }
-
-  if (upload.kind === "empty") {
-    const cleanReq = { ...req };
-    delete (cleanReq as { postData?: HarPostData }).postData;
-    return {
-      entry: { ...merged.entry, request: { ...cleanReq, bodySize: -1 } },
-      secretsTouched: false,
-      neverStored: false,
-    };
-  }
-
-  if (upload.kind === "none") {
-    const cleanReq = { ...req };
-    delete (cleanReq as { postData?: HarPostData }).postData;
-    return {
-      entry: {
-        ...merged.entry,
-        request: {
-          ...cleanReq,
-          bodySize: -1,
-          comment: MISSING_REASONS[upload.reason].comment,
-        },
-      },
-      secretsTouched: false,
-      neverStored: upload.reason === "upload-never-stored",
-    };
-  }
-
-  const opened = await openFirstCandidate(upload.list, ports.bodies, ports.signal);
-  if (!opened.ok) {
-    const cleanReq = { ...req };
-    delete (cleanReq as { postData?: HarPostData }).postData;
-    return {
-      entry: {
-        ...merged.entry,
-        request: {
-          ...cleanReq,
-          bodySize: -1,
-          comment: MISSING_REASONS[opened.reason].comment,
-        },
-      },
-      secretsTouched: false,
-      neverStored: false,
-    };
-  }
-
-  const mimeType = req.postData?.mimeType ?? "";
-  let secretsTouched = false;
-  let rawBytes: Uint8Array;
-  try {
-    if (opened.body.kind === "bytes") {
-      const stream =
-        opened.body.wireEncoding !== null
-          ? ports.decode(opened.body.wireEncoding, opened.body.chunks)
-          : opened.body.chunks;
-      const parts: Uint8Array[] = [];
-      let total = 0;
-      for await (const chunk of stream) {
-        throwIfAborted(ports.signal);
-        parts.push(chunk);
-        total += chunk.byteLength;
-      }
-      rawBytes = concatBytes(parts, total);
-    } else {
-      let text = "";
-      for await (const chunk of opened.body.chunks) {
-        throwIfAborted(ports.signal);
-        text += chunk;
-      }
-      rawBytes = encodeUtf8(text);
-    }
-  } catch (err) {
-    throwIfAborted(ports.signal);
-    if (err instanceof WriteRefused) throw err;
-    const cleanReq = { ...req };
-    delete (cleanReq as { postData?: HarPostData }).postData;
-    return {
-      entry: {
-        ...merged.entry,
-        request: {
-          ...cleanReq,
-          bodySize: -1,
-          comment: MISSING_REASONS["source-error"].comment,
-        },
-      },
-      secretsTouched: false,
-      neverStored: false,
-    };
-  }
-
-  let writtenBytes = rawBytes;
-  if (request.secrets === "remove") {
-    if (rawBytes.byteLength <= REDACT_BODY_MAX && isRedactableBodyMime(mimeType)) {
-      const redacted = ports.redact.body(mimeType, rawBytes);
-      if (redacted !== null) {
-        writtenBytes = redacted.body;
-        secretsTouched = redacted.touched;
-      } else {
-        notScanned.add("request-body");
-      }
-    } else if (rawBytes.byteLength > 0) {
-      notScanned.add("request-body");
-    }
-  }
-
-  const text = decodeUtf8Whole(writtenBytes);
+): Promise<BodyWrite> {
+  const upload = withRequestChoice(merged.upload, request);
+  if (upload.kind === "empty") return NO_BODY;
+  if (upload.kind === "none") return missingBody({ kind: "missing", reason: upload.reason });
+  const mimeType = merged.entry.request.postData?.mimeType ?? "";
+  const opened = await openBody(upload.list, mimeType, ports);
+  if (!opened.ok) return missingBody({ kind: "missing", reason: opened.reason });
+  const read = await readWindow(opened.body, BODY_WINDOW_BYTES, ports.signal);
+  if (read.ended !== "more") return wholeWrite(opened.body, read.bytes, read.ended);
+  await attempt(ports.signal, () => opened.body.chunks.return?.());
+  const kept = read.bytes.subarray(0, BODY_WINDOW_BYTES);
+  const written = chooseEncoding(kept, opened.body.charset);
   return {
-    entry: {
-      ...merged.entry,
-      request: {
-        ...req,
-        bodySize: writtenBytes.byteLength,
-        postData: {
-          mimeType,
-          params: req.postData?.params ?? [],
-          text,
-        },
-      },
-    },
-    secretsTouched,
-    neverStored: false,
+    outcome: { kind: "cut-short", reason: "over-export-window", lossy: opened.body.lossy() },
+    text: written.text,
+    encoding: written.encoding,
+    size: kept.length,
+    wireBytes: null,
+    check: opened.body.check,
   };
 }
 
-function bodyCandidatesForRequest(body: BodyCandidates, request: ExportRequest): BodyCandidates {
-  if (request.bodies === "omit" && body.kind === "candidates") {
-    return { kind: "none", reason: "omitted-by-choice" };
-  }
-  return body;
+interface EntryContext {
+  readonly merged: MergedEntry;
+  readonly pageref: PageId;
+  readonly upload: BodyWrite;
+  readonly loadFailed: readonly SourceName[];
+  readonly index: number;
+  readonly prefix: string;
 }
 
-interface StreamedBodyResult {
-  readonly end: BodyEnd;
-  readonly bodyFrom: "stored" | "devtools" | null;
-  readonly unchecked: boolean;
-  readonly secretsTouched: boolean;
-}
-
-async function writeBodyPartPrefix(
-  sink: HarSink,
-  prefix: string,
-  entry: HarEntry,
-  mode: "utf8-text" | "base64",
-): Promise<void> {
-  const bodyKey = mode === "base64" ? ',"encoding":"base64","text":"' : ',"text":"';
-  await sink.write(`${prefix}${entryHead(entry)}${bodyKey}`);
-}
-
-async function finishAndCloseEntry(
-  sink: HarSink,
-  encoder: EncoderState,
-  end: BodyEnd,
-  merged: MergedEntry,
-): Promise<void> {
-  const finished = finishEncoder(encoder);
-  const ext = entryExtension(
-    end.kind === "complete"
-      ? { ...end, encoder: finished.state }
-      : end.kind === "cut-short"
-        ? { ...end, encoder: finished.state }
-        : end,
-    merged.sources,
-    merged.inProgress,
-  );
-  await sink.write(
-    `${finished.json}"${entryTail(
-      end.kind === "complete"
-        ? { ...end, encoder: finished.state }
-        : end.kind === "cut-short"
-          ? { ...end, encoder: finished.state }
-          : end,
-      ext,
-    )}`,
-  );
-}
-
-async function writeNoBodyEntry(
-  sink: HarSink,
-  prefix: string,
-  entry: HarEntry,
-  end: Extract<BodyEnd, { readonly kind: "empty" | "missing" }>,
-  merged: MergedEntry,
-): Promise<void> {
-  const ext = entryExtension(end, merged.sources, merged.inProgress);
-  await sink.write(`${prefix}${entryHead(entry)}${entryTail(end, ext)}`);
-}
-
-async function streamByteBody(
-  entry: HarEntry,
-  prefix: string,
-  check: BodyCheck,
-  from: "stored" | "devtools",
-  rawBody: { readonly chunks: AsyncIterable<Uint8Array>; readonly wireEncoding: string | null },
-  merged: MergedEntry,
-  request: ExportRequest,
-  ports: ExportPorts,
-  notScanned: Set<string>,
-): Promise<StreamedBodyResult> {
-  const mimeType = entry.response.content.mimeType;
-  const mode = textModeFor(mimeType, null);
-  let wireBytes = 0;
-  const countedWire = countWireBytes(rawBody.chunks, (n) => {
-    wireBytes += n;
-  });
-  const decodedStream =
-    rawBody.wireEncoding !== null ? ports.decode(rawBody.wireEncoding, countedWire) : countedWire;
-
-  const shouldTryRedact = request.secrets === "remove" && isRedactableBodyMime(mimeType);
-  let encoder = startEncoder(mode);
-  let headWritten = false;
-  let buffered: Uint8Array[] = [];
-  let bufferedLen = 0;
-  let secretsTouched = false;
-
-  const flushHeadAndBuffer = async (): Promise<void> => {
-    await writeBodyPartPrefix(ports.sink, prefix, entry, mode);
-    headWritten = true;
-    for (const part of buffered) {
-      const step = encodeChunk(encoder, part);
-      encoder = step.state;
-      if (step.json.length > 0) await ports.sink.write(step.json);
-    }
-    buffered = [];
-  };
-
-  try {
-    for await (const chunk of decodedStream) {
-      throwIfAborted(ports.signal);
-      if (chunk.byteLength === 0) continue;
-      if (!headWritten && shouldTryRedact) {
-        if (bufferedLen + chunk.byteLength <= REDACT_BODY_MAX) {
-          buffered.push(chunk);
-          bufferedLen += chunk.byteLength;
-          continue;
-        }
-        notScanned.add("response-body (>1 MB)");
-        await flushHeadAndBuffer();
-      } else if (!headWritten) {
-        if (request.secrets === "remove") notScanned.add("response-body");
-        await writeBodyPartPrefix(ports.sink, prefix, entry, mode);
-        headWritten = true;
-      }
-      const step = encodeChunk(encoder, chunk);
-      encoder = step.state;
-      if (step.json.length > 0) await ports.sink.write(step.json);
-    }
-  } catch (err) {
-    throwIfAborted(ports.signal);
-    if (err instanceof WriteRefused) throw err;
-    if (!headWritten && bufferedLen === 0) {
-      await writeNoBodyEntry(
-        ports.sink,
-        prefix,
-        entry,
-        { kind: "missing", reason: "source-error" },
-        merged,
-      );
-      return {
-        end: { kind: "missing", reason: "source-error" },
-        bodyFrom: null,
-        unchecked: false,
-        secretsTouched: false,
-      };
-    }
-    if (!headWritten) await flushHeadAndBuffer();
-    const end: BodyEnd = { kind: "cut-short", encoder, reason: "source-error" };
-    await finishAndCloseEntry(ports.sink, encoder, end, merged);
-    return { end, bodyFrom: from, unchecked: false, secretsTouched: false };
-  }
-
-  if (!headWritten && bufferedLen === 0) {
-    await writeNoBodyEntry(ports.sink, prefix, entry, { kind: "empty" }, merged);
-    return { end: { kind: "empty" }, bodyFrom: null, unchecked: false, secretsTouched: false };
-  }
-
-  if (!headWritten) {
-    const whole = concatBytes(buffered, bufferedLen);
-    buffered = [];
-    const redacted = ports.redact.body(mimeType, whole);
-    let toWrite: Uint8Array = whole;
-    if (redacted !== null) {
-      toWrite = redacted.body;
-      secretsTouched = redacted.touched;
-    } else {
-      notScanned.add("response-body");
-    }
-    await writeBodyPartPrefix(ports.sink, prefix, entry, mode);
-    const step = encodeChunk(encoder, toWrite);
-    encoder = step.state;
-    if (step.json.length > 0) await ports.sink.write(step.json);
-  }
-
-  const end: BodyEnd =
-    check === "first-part"
-      ? { kind: "cut-short", encoder, reason: "over-body-cap" }
-      : { kind: "complete", encoder, wireBytes, check, from };
-  await finishAndCloseEntry(ports.sink, encoder, end, merged);
-  return {
-    end,
-    bodyFrom: from,
-    unchecked: check === "sink-only",
-    secretsTouched,
-  };
-}
-
-async function streamTextBody(
-  entry: HarEntry,
-  prefix: string,
-  rawBody: { readonly chunks: AsyncIterable<string>; readonly encoding: "base64" | null },
-  merged: MergedEntry,
-  request: ExportRequest,
-  ports: ExportPorts,
-  notScanned: Set<string>,
-): Promise<StreamedBodyResult> {
-  const mimeType = entry.response.content.mimeType;
-  const mode = rawBody.encoding === "base64" ? "base64" : textModeFor(mimeType, null);
-  const shouldTryRedact =
-    request.secrets === "remove" && rawBody.encoding === null && isRedactableBodyMime(mimeType);
-
-  let encoder = startEncoder(mode);
-  let headWritten = false;
-  let buffered = "";
-  let secretsTouched = false;
-
-  const flushHeadAndBuffer = async (): Promise<void> => {
-    await writeBodyPartPrefix(ports.sink, prefix, entry, mode);
-    headWritten = true;
-    if (buffered.length > 0) {
-      const step = encodeTextChunk(encoder, buffered);
-      encoder = step.state;
-      if (step.json.length > 0) await ports.sink.write(step.json);
-      buffered = "";
-    }
-  };
-
-  try {
-    for await (const slice of rawBody.chunks) {
-      throwIfAborted(ports.signal);
-      if (slice.length === 0) continue;
-      if (!headWritten && shouldTryRedact) {
-        if (buffered.length + slice.length <= REDACT_BODY_MAX) {
-          buffered += slice;
-          continue;
-        }
-        notScanned.add("response-body (>1 MB)");
-        await flushHeadAndBuffer();
-      } else if (!headWritten) {
-        if (request.secrets === "remove") notScanned.add("response-body");
-        await writeBodyPartPrefix(ports.sink, prefix, entry, mode);
-        headWritten = true;
-      }
-      const step = encodeTextChunk(encoder, slice);
-      encoder = step.state;
-      if (step.json.length > 0) await ports.sink.write(step.json);
-    }
-  } catch (err) {
-    throwIfAborted(ports.signal);
-    if (err instanceof WriteRefused) throw err;
-    if (!headWritten && buffered.length === 0) {
-      await writeNoBodyEntry(
-        ports.sink,
-        prefix,
-        entry,
-        { kind: "missing", reason: "source-error" },
-        merged,
-      );
-      return {
-        end: { kind: "missing", reason: "source-error" },
-        bodyFrom: null,
-        unchecked: false,
-        secretsTouched: false,
-      };
-    }
-    if (!headWritten) await flushHeadAndBuffer();
-    const end: BodyEnd = { kind: "cut-short", encoder, reason: "source-error" };
-    await finishAndCloseEntry(ports.sink, encoder, end, merged);
-    return { end, bodyFrom: "devtools", unchecked: false, secretsTouched: false };
-  }
-
-  if (!headWritten && buffered.length === 0) {
-    await writeNoBodyEntry(ports.sink, prefix, entry, { kind: "empty" }, merged);
-    return { end: { kind: "empty" }, bodyFrom: null, unchecked: false, secretsTouched: false };
-  }
-
-  if (!headWritten) {
-    const rawBytes = encodeUtf8(buffered);
-    buffered = "";
-    const redacted = ports.redact.body(mimeType, rawBytes);
-    await writeBodyPartPrefix(ports.sink, prefix, entry, mode);
-    if (redacted !== null) {
-      secretsTouched = redacted.touched;
-      const step = encodeChunk(encoder, redacted.body);
-      encoder = step.state;
-      if (step.json.length > 0) await ports.sink.write(step.json);
-    } else {
-      notScanned.add("response-body");
-      const step = encodeChunk(encoder, rawBytes);
-      encoder = step.state;
-      if (step.json.length > 0) await ports.sink.write(step.json);
-    }
-  }
-
-  const end: BodyEnd = {
-    kind: "complete",
-    encoder,
-    wireBytes: -1,
-    check: "sink-only",
-    from: "devtools",
-  };
-  await finishAndCloseEntry(ports.sink, encoder, end, merged);
-  return { end, bodyFrom: "devtools", unchecked: false, secretsTouched };
+function entryJson(ctx: EntryContext, response: BodyWrite, redaction: DocumentRedaction): string {
+  const entry = buildEntry(ctx.merged, ctx.pageref, response, ctx.upload, ctx.loadFailed);
+  return JSON.stringify(redaction.entry(entry, ctx.index));
 }
 
 /**
- * Writes one complete HAR 1.2 document into ports.sink and returns what it wrote. Never rejects for a missing or
- * unreadable body: that is a comment in the entry and a count in the report.
+ * A response body longer than one window. Its text is base64, decided before its first byte is written. A probe of
+ * the entry, redacted but not counted, says whether the level keeps the text and gives the JSON before it; the entry
+ * redacted once its body has ended gives the JSON after it, and must agree on the part already written.
+ */
+async function streamLongBody(
+  ctx: EntryContext,
+  body: OpenBody,
+  first: Uint8Array,
+  redaction: DocumentRedaction,
+  ports: ExportPorts,
+): Promise<BodyOutcomeWritten> {
+  const placeholder = (sentinel: string): BodyWrite => ({
+    outcome: { kind: "included", from: body.from, unchecked: false, lossy: 0 },
+    text: sentinel,
+    encoding: "base64",
+    size: 0,
+    wireBytes: null,
+    check: body.check,
+  });
+  const preview = (text: string | null): string =>
+    JSON.stringify(
+      redaction.preview(
+        buildEntry(
+          ctx.merged,
+          ctx.pageref,
+          { ...placeholder(""), text },
+          ctx.upload,
+          ctx.loadFailed,
+        ),
+        ctx.index,
+      ),
+    );
+  const bare = preview(null);
+  let k = 0;
+  while (bare.includes(JSON.stringify(streamSentinel(k)))) k += 1;
+  const sentinel = streamSentinel(k);
+  const hole = splitAtSentinel(preview(sentinel), sentinel);
+  const encoder = base64Stream();
+  if (hole !== null) await ports.sink.write(`${ctx.prefix}${hole.head}${encoder.push(first)}`);
+
+  let size = first.length;
+  let ended: "end" | "failed" = "end";
+  for (;;) {
+    const step = await nextChunk(body, ports.signal);
+    if (step.kind !== "chunk") {
+      ended = step.kind;
+      break;
+    }
+    size += step.bytes.length;
+    if (hole !== null) {
+      const text = encoder.push(step.bytes);
+      if (text.length > 0) await ports.sink.write(text);
+    }
+  }
+  const outcome =
+    ended === "failed"
+      ? ({ kind: "cut-short", reason: "source-error", lossy: body.lossy() } as const)
+      : body.check === "first-part"
+        ? ({ kind: "cut-short", reason: "over-body-cap", lossy: body.lossy() } as const)
+        : ({
+            kind: "included",
+            from: body.from,
+            unchecked: body.check === "sink-only",
+            lossy: body.lossy(),
+          } as const);
+  const write: BodyWrite = {
+    outcome,
+    text: sentinel,
+    encoding: "base64",
+    size,
+    wireBytes: body.wireBytes(),
+    check: body.check,
+  };
+  const json = entryJson(ctx, write, redaction);
+  const done = splitAtSentinel(json, sentinel);
+  if (hole === null) {
+    if (done !== null) throw new Error("Redaction kept a body its probe removed.");
+    await ports.sink.write(`${ctx.prefix}${json}`);
+  } else {
+    if (done?.head !== hole.head)
+      throw new Error("Redaction changed the entry around a streamed body.");
+    await ports.sink.write(`${encoder.end()}${done.tail}`);
+  }
+  return { outcome };
+}
+
+interface BodyOutcomeWritten {
+  readonly outcome: BodyWrite["outcome"];
+}
+
+/** Writes the entry and returns what its response body ended as. */
+async function writeEntry(
+  ctx: EntryContext,
+  request: ExportRequest,
+  redaction: DocumentRedaction,
+  ports: ExportPorts,
+): Promise<BodyOutcomeWritten> {
+  const body = withRequestChoice(ctx.merged.body, request);
+  const writeWhole = async (response: BodyWrite): Promise<BodyOutcomeWritten> => {
+    await ports.sink.write(`${ctx.prefix}${entryJson(ctx, response, redaction)}`);
+    return { outcome: response.outcome };
+  };
+  if (body.kind === "empty") return writeWhole(NO_BODY);
+  if (body.kind === "none")
+    return writeWhole(missingBody({ kind: "missing", reason: body.reason }));
+  const opened = await openBody(body.list, ctx.merged.entry.response.content.mimeType, ports);
+  if (!opened.ok) return writeWhole(missingBody({ kind: "missing", reason: opened.reason }));
+  const read = await readWindow(opened.body, BODY_WINDOW_BYTES, ports.signal);
+  if (read.ended !== "more") return writeWhole(wholeWrite(opened.body, read.bytes, read.ended));
+  return streamLongBody(ctx, opened.body, read.bytes, redaction, ports);
+}
+
+/** Both sides' material for a pair. A side whose load throws is left out and named; with no side left, a stub. */
+async function loadPair(
+  pair: Pair,
+  request: ExportRequest,
+  ports: ExportPorts,
+): Promise<{
+  readonly recording: Material | null;
+  readonly devtools: Material | null;
+  readonly loadFailed: readonly SourceName[];
+}> {
+  const includeBodies = request.bodies === "include";
+  const loadFailed: SourceName[] = [];
+  let recording: Material | null = null;
+  if (pair.kind !== "devtools-only") {
+    const loaded = await attempt(ports.signal, () =>
+      ports.recording.load(pair.recording, { body: includeBodies }),
+    );
+    if (loaded.ok) recording = loaded.value;
+    else loadFailed.push("recording");
+  }
+  let devtools: Material | null = null;
+  if (pair.kind !== "recording-only") {
+    const loaded = await attempt(ports.signal, () =>
+      ports.devtools.load(pair.devtools, {
+        body: includeBodies && devtoolsBodyWanted(pair, recording),
+      }),
+    );
+    if (loaded.ok) devtools = loaded.value;
+    else loadFailed.push("devtools");
+  }
+  if (recording === null && devtools === null) {
+    recording = stubMaterial(pair.kind === "devtools-only" ? pair.devtools : pair.recording);
+  }
+  return { recording, devtools, loadFailed };
+}
+
+async function listSource(
+  source: ExchangeSource,
+  selection: ResolvedSelection,
+  signal: AbortSignalLike,
+): Promise<SourceListing | null> {
+  const listed = await attempt(signal, () => source.list(selection));
+  return listed.ok ? listed.value : null;
+}
+
+/**
+ * Writes one complete HAR 1.2 document into ports.sink and returns what it wrote. Rejects only on an abort or when
+ * the sink throws. Every other failure is a loss written into the file and counted in the report.
  */
 export async function runExport(
   request: ExportRequest,
@@ -635,154 +501,83 @@ export async function runExport(
 ): Promise<ExportReport> {
   throwIfAborted(ports.signal);
   const [recListing, dtListing] = await Promise.all([
-    ports.recording.list(selection),
-    ports.devtools.list(selection),
+    listSource(ports.recording, selection, ports.signal),
+    listSource(ports.devtools, selection, ports.signal),
   ]);
   throwIfAborted(ports.signal);
 
   const notNetwork: Record<string, number> = {};
-  addNotNetworkCounts(notNetwork, recListing.notNetwork);
-  addNotNetworkCounts(notNetwork, dtListing.notNetwork);
+  const empty: SourceListing = { items: [], notNetwork: {} };
+  const recItems = networkItems(recListing ?? empty, notNetwork);
+  const dtItems = networkItems(dtListing ?? empty, notNetwork);
+  const listFailed: SourceName[] = [
+    ...(recListing === null ? (["recording"] as const) : []),
+    ...(dtListing === null ? (["devtools"] as const) : []),
+  ];
 
-  const recItems = filterNetworkItems(recListing.items, notNetwork);
-  const dtItems = filterNetworkItems(dtListing.items, notNetwork);
-
-  const { pairs, unpaired } = pairItems(recItems, dtItems);
-  let report = emptyReport(request.secrets, unpaired, notNetwork);
-  const notScanned = new Set<string>();
+  const { pairs, unpaired, duplicates } = pairItems(recItems, dtItems);
+  let report = emptyReport(request.redaction, unpaired, duplicates, notNetwork, listFailed);
+  const redaction = documentRedaction(request.redaction);
   let pageState = startPages();
+  const progress = async (done: number): Promise<void> => {
+    await attempt(ports.signal, () =>
+      ports.onProgress({ done, total: pairs.length, bytes: ports.sink.bytesWritten() }),
+    );
+  };
 
-  const total = pairs.length;
-  ports.onProgress({ done: 0, total, bytes: ports.sink.bytesWritten() });
+  await progress(0);
+  await ports.sink.write(`{"log":{"entries":[`);
 
-  await ports.sink.write(
-    `{"log":{"version":"1.2","creator":${JSON.stringify(ports.creator)},"entries":[`,
-  );
-
-  for (let i = 0; i < pairs.length; i += 1) {
+  for (let index = 0; index < pairs.length; index += 1) {
     throwIfAborted(ports.signal);
-    const pair = pairs[i]!;
-    const includeBodies = request.bodies === "include";
-    const recMat =
-      pair.kind === "devtools-only"
-        ? null
-        : await ports.recording.load(pair.recording, { body: includeBodies });
-    const dtMat =
-      pair.kind === "recording-only"
-        ? null
-        : await ports.devtools.load(pair.devtools, {
-            body: includeBodies && devtoolsBodyWanted(pair, recMat),
-          });
+    const pair = pairs[index]!;
+    const loaded = await loadPair(pair, request, ports);
     throwIfAborted(ports.signal);
-
-    const merged = mergeEntry(pair, recMat, dtMat);
-    const withUpload = await resolveUpload(merged, request, ports, notScanned);
-    const redactedEntry = ports.redact.entry(withUpload.entry);
-    const tab = pair.kind === "devtools-only" ? pair.devtools.tab : pair.recording.tab;
-    const startedAt =
-      pair.kind === "devtools-only" ? pair.devtools.startedAt : pair.recording.startedAt;
-    const pageStep = pageFor(pageState, {
-      tab,
-      startedAt,
+    const merged = mergeEntry(pair, loaded.recording, loaded.devtools);
+    const page = pageFor(pageState, {
+      tab: pair.kind === "devtools-only" ? pair.devtools.tab : pair.recording.tab,
+      startedAt: pair.kind === "devtools-only" ? pair.devtools.startedAt : pair.recording.startedAt,
       navigation: merged.navigation,
-      url: redactedEntry.url,
+      url: merged.entry.request.url,
     });
-    pageState = pageStep.state;
-    const entryToWrite: HarEntry = { ...redactedEntry.entry, pageref: pageStep.pageref };
-
-    const prefix = i > 0 ? "," : "";
-    const effectiveBody = bodyCandidatesForRequest(merged.body, request);
-
-    let streamed: StreamedBodyResult;
-    if (effectiveBody.kind === "empty") {
-      await writeNoBodyEntry(ports.sink, prefix, entryToWrite, { kind: "empty" }, merged);
-      streamed = {
-        end: { kind: "empty" },
-        bodyFrom: null,
-        unchecked: false,
-        secretsTouched: false,
-      };
-    } else if (effectiveBody.kind === "none") {
-      const end: BodyEnd = { kind: "missing", reason: effectiveBody.reason };
-      await writeNoBodyEntry(ports.sink, prefix, entryToWrite, end, merged);
-      streamed = { end, bodyFrom: null, unchecked: false, secretsTouched: false };
-    } else {
-      const opened = await openFirstCandidate(effectiveBody.list, ports.bodies, ports.signal);
-      if (!opened.ok) {
-        const end: BodyEnd = { kind: "missing", reason: opened.reason };
-        await writeNoBodyEntry(ports.sink, prefix, entryToWrite, end, merged);
-        streamed = { end, bodyFrom: null, unchecked: false, secretsTouched: false };
-      } else if (opened.body.kind === "bytes") {
-        const check: BodyCheck =
-          opened.candidate.kind === "stored" ? opened.candidate.check : "sink-only";
-        const from = opened.candidate.kind === "stored" ? "stored" : "devtools";
-        streamed = await streamByteBody(
-          entryToWrite,
-          prefix,
-          check,
-          from,
-          opened.body,
-          merged,
-          request,
-          ports,
-          notScanned,
-        );
-      } else {
-        streamed = await streamTextBody(
-          entryToWrite,
-          prefix,
-          opened.body,
-          merged,
-          request,
-          ports,
-          notScanned,
-        );
-      }
-    }
-
-    const writtenBody =
-      streamed.end.kind === "complete"
-        ? ("included" as const)
-        : streamed.end.kind === "empty"
-          ? ("empty" as const)
-          : streamed.end.kind === "cut-short"
-            ? ({ cutShort: streamed.end.reason } as const)
-            : ({ missing: streamed.end.reason } as const);
-
+    pageState = page.state;
+    const upload = await readUpload(merged, request, ports);
+    const ctx: EntryContext = {
+      merged,
+      pageref: page.pageref,
+      upload,
+      loadFailed: loaded.loadFailed,
+      index,
+      prefix: index > 0 ? "," : "",
+    };
+    const written = await writeEntry(ctx, request, redaction, ports);
     report = tally(report, merged, {
-      body: writtenBody,
-      bodyFrom: streamed.bodyFrom,
-      unchecked: streamed.unchecked,
-      secretsTouched: redactedEntry.touched || withUpload.secretsTouched || streamed.secretsTouched,
-      neverStored: withUpload.neverStored,
+      response: written.outcome,
+      request: upload.outcome,
+      loadFailed: loaded.loadFailed,
     });
-
-    ports.onProgress({ done: i + 1, total, bytes: ports.sink.bytesWritten() });
-    await ports.yieldNow();
+    await progress(index + 1);
+    await attempt(ports.signal, () => ports.yieldNow());
   }
 
   throwIfAborted(ports.signal);
-  const pages = finishPages(pageState);
-  const reportWithSecrets: ExportReport =
-    report.secrets.mode === "remove"
-      ? {
-          ...report,
-          secrets: {
-            ...report.secrets,
-            covered: [...ports.redact.covered],
-            notScanned: [...notScanned],
-          },
-        }
-      : report;
-
-  const comment = reportComment(reportWithSecrets);
-  const reportForFooter: ExportReport = {
-    ...reportWithSecrets,
+  const fileReport = {
+    ...report,
+    redaction: { choice: request.redaction },
     fileBytes: ports.sink.bytesWritten(),
   };
-  await ports.sink.write(
-    `],"pages":${JSON.stringify(pages)},"comment":${JSON.stringify(comment)},"_harExport":{"report":${JSON.stringify(reportForFooter)}}}}`,
-  );
-
-  return { ...reportWithSecrets, fileBytes: ports.sink.bytesWritten() };
+  const log: LogFields = {
+    version: "1.2",
+    creator: { name: ports.creator.name, version: ports.creator.version },
+    pages: finishPages(pageState),
+    comment: reportComment(report),
+    _harExport: { report: fileReport },
+  };
+  const finished = redaction.finish(log);
+  await ports.sink.write(`],${JSON.stringify(finished.log).slice(1)}}`);
+  return {
+    ...report,
+    redaction: { choice: request.redaction, report: finished.report },
+    fileBytes: ports.sink.bytesWritten(),
+  };
 }

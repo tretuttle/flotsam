@@ -1,8 +1,6 @@
-import { redactUrl } from "@one-click-har/har/redact";
 import type { EpochMs, RunId, TabKey } from "@one-click-har/recording/ids";
 import { describe, expect, it } from "vite-plus/test";
 import { finishPages, pageFor, startPages } from "../src/pages.ts";
-import type { WrittenUrl } from "../src/written.ts";
 import { T0 } from "./fixtures.ts";
 import { importMutated } from "./mutate.ts";
 
@@ -19,7 +17,7 @@ describe("pages", () => {
       tab: TAB_A,
       startedAt: T0,
       navigation: false,
-      url: "https://app.example/style.css" as WrittenUrl,
+      url: "https://app.example/style.css",
     });
     state = step.state;
     refs.push(step.pageref);
@@ -29,7 +27,7 @@ describe("pages", () => {
       tab: TAB_A,
       startedAt: (T0 + 10) as EpochMs,
       navigation: false,
-      url: "https://app.example/app.js" as WrittenUrl,
+      url: "https://app.example/app.js",
     });
     state = step.state;
     refs.push(step.pageref);
@@ -40,7 +38,7 @@ describe("pages", () => {
       tab: TAB_B,
       startedAt: (T0 + 20) as EpochMs,
       navigation: true,
-      url: "https://other.example/" as WrittenUrl,
+      url: "https://other.example/",
     });
     state = step.state;
     refs.push(step.pageref);
@@ -51,7 +49,7 @@ describe("pages", () => {
       tab: TAB_A,
       startedAt: (T0 + 30) as EpochMs,
       navigation: true,
-      url: "https://app.example/next" as WrittenUrl,
+      url: "https://app.example/next",
     });
     state = step.state;
     refs.push(step.pageref);
@@ -62,7 +60,7 @@ describe("pages", () => {
       tab: TAB_A,
       startedAt: (T0 + 40) as EpochMs,
       navigation: false,
-      url: "https://app.example/next.js" as WrittenUrl,
+      url: "https://app.example/next.js",
     });
     state = step.state;
     refs.push(step.pageref);
@@ -80,21 +78,6 @@ describe("pages", () => {
     }
   });
 
-  it("redacted page titles never retain query secrets (deepseek F3)", () => {
-    const secret = "oauth-code-9f3a";
-    const rawUrl = `https://app.example/callback?code=${secret}&state=ok`;
-    const { url } = redactUrl(rawUrl);
-    const step = pageFor(startPages(), {
-      tab: TAB_A,
-      startedAt: T0,
-      navigation: true,
-      url: url as WrittenUrl,
-    });
-    const pages = finishPages(step.state);
-    expect(JSON.stringify(pages)).not.toContain(secret);
-    expect(pages[0]!.title).toContain("REDACTED");
-  });
-
   it("planted: ignoring navigation flag merges distinct navigations onto one page", async () => {
     const mutated = await importMutated<{
       startPages: typeof startPages;
@@ -110,14 +93,14 @@ describe("pages", () => {
       tab: TAB_A,
       startedAt: T0,
       navigation: true,
-      url: "https://a.example/1" as WrittenUrl,
+      url: "https://a.example/1",
     });
     state = s1.state;
     const s2 = mutated.pageFor(state, {
       tab: TAB_A,
       startedAt: (T0 + 10) as EpochMs,
       navigation: true,
-      url: "https://a.example/2" as WrittenUrl,
+      url: "https://a.example/2",
     });
     expect(s2.pageref).toBe(s1.pageref);
   });

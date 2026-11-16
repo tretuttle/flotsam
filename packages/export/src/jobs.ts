@@ -2,6 +2,7 @@
 
 import type { ByteCount, EpochMs, Minute, Site, TabId } from "@one-click-har/recording/ids";
 import { isPlainRecord } from "./internal.ts";
+import { REDACTION_CHOICES, type RedactionChoice } from "./redaction.ts";
 import type { ExportReport } from "./report.ts";
 import { parseSelection, type PresetId, type Selection } from "./selection.ts";
 
@@ -11,8 +12,8 @@ export type Packaging = "har" | "har.zip" | "har.gz";
 export interface ExportRequest {
   readonly selection: Selection;
   readonly bodies: "include" | "omit";
-  /** remove: @one-click-har/har/redact over structured fields, page titles, and JSON and form bodies up to REDACT_BODY_MAX. */
-  readonly secrets: "remove" | "keep";
+  /** A @one-click-har/har redaction level by name, applied to every entry and the log as the last step, or none. */
+  readonly redaction: RedactionChoice;
   readonly packaging: Packaging;
   /** null: built by @one-click-har/har/filename from site, date and range. A given name is sanitized the same way. */
   readonly fileName: string | null;
@@ -64,7 +65,7 @@ export interface PopupState {
   readonly problems: readonly RecordingProblem[];
   readonly running: ExportJob | null;
   readonly last: ExportJob | null;
-  readonly defaults: { readonly bodies: "include" | "omit"; readonly secrets: "remove" | "keep" };
+  readonly defaults: { readonly bodies: "include" | "omit"; readonly redaction: RedactionChoice };
 }
 
 export type ExportId = string & { readonly __exportId: unique symbol };
@@ -130,8 +131,8 @@ export function parseExportRequest(raw: unknown): ExportRequest | null {
   if (selection === null) return null;
   const bodies = raw["bodies"];
   if (bodies !== "include" && bodies !== "omit") return null;
-  const secrets = raw["secrets"];
-  if (secrets !== "remove" && secrets !== "keep") return null;
+  const redaction = REDACTION_CHOICES.find((choice) => choice === raw["redaction"]);
+  if (redaction === undefined) return null;
   const packaging = raw["packaging"];
   if (
     typeof packaging !== "string" ||
@@ -145,7 +146,7 @@ export function parseExportRequest(raw: unknown): ExportRequest | null {
   return {
     selection,
     bodies,
-    secrets,
+    redaction,
     packaging: packaging as Packaging,
     fileName: fileName.value,
   };

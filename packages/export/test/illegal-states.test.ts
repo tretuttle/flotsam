@@ -13,6 +13,7 @@ describe("runtime parsers reject what the types reject", () => {
 
   it("parseExportRequest rejects unsupported packaging", () => {
     expect(parseExportRequest(states.badPackaging)).toBeNull();
+    expect(parseExportRequest(states.ownLevel)).toBeNull();
   });
 
   it("keeps legal twins and tables intact", () => {

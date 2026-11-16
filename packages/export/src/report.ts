@@ -1,9 +1,39 @@
 // What the export did, counted as it streams. Shown in the popup result, written into log.comment and log._harExport.report.
 
+import type { HarLogRedactionExtension } from "@one-click-har/har/model";
 import type { ByteCount } from "@one-click-har/recording/ids";
-import { FIELD_GROUPS, type MergedEntry } from "./merge.ts";
-import { MISSING_REASONS, type MissingReason } from "./missing.ts";
-import type { WrittenPlace } from "./written.ts";
+import type { MergedEntry } from "./merge.ts";
+import {
+  CUT_SHORT_REASONS,
+  MISSING_REASONS,
+  SOURCE_FAILURES,
+  type BodyPlace,
+  type CutShortReason,
+  type MissingReason,
+} from "./missing.ts";
+import type { RedactionChoice } from "./redaction.ts";
+import type { SourceName } from "./source.ts";
+
+/** What one body place of one entry ended as. Exactly one per place per entry. */
+export type BodyOutcome =
+  | {
+      readonly kind: "included";
+      readonly from: "stored" | "devtools";
+      readonly unchecked: boolean;
+      readonly lossy: number;
+    }
+  | { readonly kind: "empty" }
+  | { readonly kind: "cut-short"; readonly reason: CutShortReason; readonly lossy: number }
+  | { readonly kind: "missing"; readonly reason: MissingReason };
+
+export interface PlaceTally {
+  readonly included: number;
+  readonly empty: number;
+  readonly cutShort: { readonly [R in CutShortReason]?: number };
+  readonly missing: { readonly [R in MissingReason]?: number };
+  /** Bodies holding U+FFFD where DevTools' text had a lone surrogate. */
+  readonly lossyText: number;
+}
 
 export interface ExportReport {
   readonly requests: number;
@@ -14,174 +44,201 @@ export interface ExportReport {
   };
   /** Items that had no key and so could not be paired. Each appears once per source. */
   readonly unpaired: number;
+  /** Rows a source listed more than once under one key. Each key is written once. */
+  readonly duplicates: { readonly [S in SourceName]: number };
   /** Requests the recorder still held, written with their head and marked in progress. */
   readonly inProgress: number;
   /** data:, blob:, about: and other rows that are not network requests, by scheme. Not written as entries. */
   readonly notNetwork: { readonly [scheme: string]: number };
-  readonly bodies: {
-    readonly included: number;
-    /** Bodies that came from a different source than the headers, such as one DevTools had discarded. */
-    readonly filledIn: number;
-    /** Bodies stored with only the tee's own count behind them (BodyCheck sink-only). */
-    readonly unchecked: number;
-    readonly cutShort: number;
-    readonly missing: { readonly [R in MissingReason]?: number };
+  readonly sourceErrors: {
+    /** Sources whose listing threw. The export went on with the other source. */
+    readonly list: readonly SourceName[];
+    /** Entries for which this source's details threw while loading. */
+    readonly load: { readonly [S in SourceName]: number };
   };
-  readonly secrets:
-    | {
-        readonly mode: "remove";
-        readonly entriesWithValuesRemoved: number;
-        readonly covered: readonly WrittenPlace[];
-        readonly notScanned: readonly string[];
-      }
-    | {
-        readonly mode: "keep";
-        readonly entriesWithValuesKept: number;
-        readonly entriesNeverStored: number;
-      };
+  readonly bodies: {
+    readonly response: PlaceTally & {
+      /** Bodies that came from a different source than the headers, such as one DevTools had discarded. */
+      readonly filledIn: number;
+      /** Bodies stored with only the tee's own count behind them (BodyCheck sink-only). */
+      readonly unchecked: number;
+    };
+    readonly request: PlaceTally;
+  };
+  readonly redaction: {
+    readonly choice: RedactionChoice;
+    /** @one-click-har/har's own report for the file, unchanged. null when nothing was redacted. */
+    readonly report: HarLogRedactionExtension | null;
+  };
   readonly fileBytes: ByteCount;
 }
 
+const emptyPlace = (): PlaceTally => ({
+  included: 0,
+  empty: 0,
+  cutShort: {},
+  missing: {},
+  lossyText: 0,
+});
+
 export function emptyReport(
-  secrets: "remove" | "keep",
+  choice: RedactionChoice,
   unpaired: number,
+  duplicates: { readonly [S in SourceName]: number },
   notNetwork: { readonly [scheme: string]: number },
+  listFailed: readonly SourceName[],
 ): ExportReport {
   return {
     requests: 0,
     sources: { both: 0, recordingOnly: 0, devtoolsOnly: 0 },
     unpaired,
+    duplicates: { ...duplicates },
     inProgress: 0,
     notNetwork: { ...notNetwork },
+    sourceErrors: { list: [...listFailed], load: { recording: 0, devtools: 0 } },
     bodies: {
-      included: 0,
-      filledIn: 0,
-      unchecked: 0,
-      cutShort: 0,
-      missing: {},
+      response: { ...emptyPlace(), filledIn: 0, unchecked: 0 },
+      request: emptyPlace(),
     },
-    secrets:
-      secrets === "remove"
-        ? { mode: "remove", entriesWithValuesRemoved: 0, covered: [], notScanned: [] }
-        : { mode: "keep", entriesWithValuesKept: 0, entriesNeverStored: 0 },
+    redaction: { choice, report: null },
     fileBytes: 0 as ByteCount,
   };
 }
 
-function isFilledIn(
-  sources: MergedEntry["sources"],
-  bodyFrom: "stored" | "devtools" | null,
-): boolean {
-  if (sources !== "both" || bodyFrom === null) return false;
-  const headSource = FIELD_GROUPS["response-head"].order[0];
-  const bodySource = bodyFrom === "stored" ? "recording" : "devtools";
-  return headSource !== bodySource;
+/** A one-sided entry's head and body come from the one source, so only a pair can be filled in. */
+function isFilledIn(merged: MergedEntry, from: "stored" | "devtools"): boolean {
+  return merged.responseHeadFrom !== (from === "stored" ? "recording" : "devtools");
 }
 
-/** Called once per written entry with what was actually written, after the body was resolved at write time. */
+function bump<K extends string>(
+  counts: { readonly [R in K]?: number },
+  key: K,
+): { readonly [R in K]?: number } {
+  return { ...counts, [key]: (counts[key] ?? 0) + 1 };
+}
+
+function tallyPlace<T extends PlaceTally>(place: T, outcome: BodyOutcome): T {
+  switch (outcome.kind) {
+    case "included":
+      return {
+        ...place,
+        included: place.included + 1,
+        lossyText: place.lossyText + (outcome.lossy > 0 ? 1 : 0),
+      };
+    case "empty":
+      return { ...place, empty: place.empty + 1 };
+    case "cut-short":
+      return {
+        ...place,
+        cutShort: bump(place.cutShort, outcome.reason),
+        lossyText: place.lossyText + (outcome.lossy > 0 ? 1 : 0),
+      };
+    case "missing":
+      return { ...place, missing: bump(place.missing, outcome.reason) };
+  }
+}
+
+/** Called once per written entry with what was actually written. */
 export function tally(
   report: ExportReport,
   merged: MergedEntry,
   written: {
-    readonly body:
-      | "included"
-      | "empty"
-      | { readonly cutShort: MissingReason }
-      | { readonly missing: MissingReason };
-    readonly bodyFrom: "stored" | "devtools" | null;
-    readonly unchecked: boolean;
-    readonly secretsTouched: boolean;
-    readonly neverStored: boolean;
+    readonly response: BodyOutcome;
+    readonly request: BodyOutcome;
+    readonly loadFailed: readonly SourceName[];
   },
 ): ExportReport {
-  const sources = {
-    both: report.sources.both + (merged.sources === "both" ? 1 : 0),
-    recordingOnly: report.sources.recordingOnly + (merged.sources === "recording-only" ? 1 : 0),
-    devtoolsOnly: report.sources.devtoolsOnly + (merged.sources === "devtools-only" ? 1 : 0),
-  };
-
-  let included = report.bodies.included;
-  let filledIn = report.bodies.filledIn;
-  let unchecked = report.bodies.unchecked;
-  let cutShort = report.bodies.cutShort;
-  const missing: { [R in MissingReason]?: number } = { ...report.bodies.missing };
-
-  if (written.body === "included") {
-    included += 1;
-    if (isFilledIn(merged.sources, written.bodyFrom)) filledIn += 1;
-    if (written.unchecked) unchecked += 1;
-  } else if (typeof written.body === "object") {
-    if ("cutShort" in written.body) {
-      cutShort += 1;
-    } else {
-      const reason = written.body.missing;
-      missing[reason] = (missing[reason] ?? 0) + 1;
-    }
-  }
-
-  const secrets =
-    report.secrets.mode === "remove"
-      ? {
-          ...report.secrets,
-          entriesWithValuesRemoved:
-            report.secrets.entriesWithValuesRemoved + (written.secretsTouched ? 1 : 0),
-        }
-      : {
-          ...report.secrets,
-          entriesWithValuesKept:
-            report.secrets.entriesWithValuesKept + (written.neverStored ? 0 : 1),
-          entriesNeverStored: report.secrets.entriesNeverStored + (written.neverStored ? 1 : 0),
-        };
-
+  const response = tallyPlace(report.bodies.response, written.response);
+  const included = written.response.kind === "included" ? written.response : null;
   return {
     ...report,
     requests: report.requests + 1,
-    sources,
+    sources: {
+      both: report.sources.both + (merged.sources === "both" ? 1 : 0),
+      recordingOnly: report.sources.recordingOnly + (merged.sources === "recording-only" ? 1 : 0),
+      devtoolsOnly: report.sources.devtoolsOnly + (merged.sources === "devtools-only" ? 1 : 0),
+    },
     inProgress: report.inProgress + (merged.inProgress ? 1 : 0),
-    bodies: { included, filledIn, unchecked, cutShort, missing },
-    secrets,
+    sourceErrors: {
+      list: report.sourceErrors.list,
+      load: {
+        recording:
+          report.sourceErrors.load.recording + (written.loadFailed.includes("recording") ? 1 : 0),
+        devtools:
+          report.sourceErrors.load.devtools + (written.loadFailed.includes("devtools") ? 1 : 0),
+      },
+    },
+    bodies: {
+      response: {
+        ...response,
+        filledIn: response.filledIn + (included && isFilledIn(merged, included.from) ? 1 : 0),
+        unchecked: response.unchecked + (included?.unchecked ? 1 : 0),
+      },
+      request: tallyPlace(report.bodies.request, written.request),
+    },
   };
 }
 
-/** Plain sentences built from MISSING_REASONS labels, such as "22 bodies not available: 14 removed by storage limits." */
-export function reportComment(report: ExportReport): string {
-  const sentences: string[] = [
-    `Exported ${String(report.requests)} ${report.requests === 1 ? "request" : "requests"}.`,
-  ];
+const PLACE_NOUN: { readonly [P in BodyPlace]: readonly [string, string] } = {
+  response: ["body", "bodies"],
+  request: ["request body", "request bodies"],
+};
 
-  const missingEntries = (
-    Object.entries(report.bodies.missing) as [MissingReason, number][]
-  ).filter(([, count]) => count > 0);
-  if (missingEntries.length > 0) {
-    const totalMissing = missingEntries.reduce((sum, [, count]) => sum + count, 0);
-    const details = missingEntries.map(
+function plural(count: number, forms: readonly [string, string]): string {
+  return `${String(count)} ${count === 1 ? forms[0] : forms[1]}`;
+}
+
+function lossSentences(place: BodyPlace, tallyOf: PlaceTally): string[] {
+  const sentences: string[] = [];
+  const missing = (Object.entries(tallyOf.missing) as [MissingReason, number][]).filter(
+    ([, count]) => count > 0,
+  );
+  if (missing.length > 0) {
+    const total = missing.reduce((sum, [, count]) => sum + count, 0);
+    const details = missing.map(
       ([reason, count]) => `${String(count)} ${MISSING_REASONS[reason].reportLabel}`,
     );
-    sentences.push(
-      `${String(totalMissing)} ${totalMissing === 1 ? "body" : "bodies"} not available: ${details.join(", ")}.`,
-    );
+    sentences.push(`${plural(total, PLACE_NOUN[place])} not available: ${details.join(", ")}.`);
   }
-
-  if (report.bodies.cutShort > 0) {
-    sentences.push(
-      `${String(report.bodies.cutShort)} ${report.bodies.cutShort === 1 ? "body" : "bodies"} cut short.`,
+  const cutShort = (Object.entries(tallyOf.cutShort) as [CutShortReason, number][]).filter(
+    ([, count]) => count > 0,
+  );
+  if (cutShort.length > 0) {
+    const total = cutShort.reduce((sum, [, count]) => sum + count, 0);
+    const details = cutShort.map(
+      ([reason, count]) => `${String(count)} ${CUT_SHORT_REASONS[reason].reportLabel}`,
     );
+    sentences.push(`${plural(total, PLACE_NOUN[place])} cut short: ${details.join(", ")}.`);
   }
+  return sentences;
+}
 
+/** Plain sentences built from the loss tables, such as "22 bodies not available: 14 removed by storage limits." */
+export function reportComment(report: ExportReport): string {
+  const sentences: string[] = [
+    `Exported ${plural(report.requests, ["request", "requests"])}.`,
+    ...report.sourceErrors.list.map((source) => SOURCE_FAILURES[source].list),
+    ...lossSentences("response", report.bodies.response),
+    ...lossSentences("request", report.bodies.request),
+  ];
+  for (const source of ["recording", "devtools"] as const) {
+    const count = report.sourceErrors.load[source];
+    if (count > 0) {
+      sentences.push(
+        `Details from ${SOURCE_FAILURES[source].name} could not be read for ${plural(count, ["request", "requests"])}.`,
+      );
+    }
+  }
   if (report.inProgress > 0) {
+    sentences.push(`${plural(report.inProgress, ["request", "requests"])} still in progress.`);
+  }
+  const notNetwork = Object.entries(report.notNetwork).filter(([, count]) => count > 0);
+  if (notNetwork.length > 0) {
+    const total = notNetwork.reduce((sum, [, count]) => sum + count, 0);
+    const schemes = notNetwork.map(([scheme, count]) => `${String(count)} ${scheme}`);
     sentences.push(
-      `${String(report.inProgress)} ${report.inProgress === 1 ? "request" : "requests"} still in progress.`,
+      `Left out ${plural(total, ["non-network row", "non-network rows"])} (${schemes.join(", ")}).`,
     );
   }
-
-  const nonNetworkEntries = Object.entries(report.notNetwork).filter(([, count]) => count > 0);
-  if (nonNetworkEntries.length > 0) {
-    const totalLeftOut = nonNetworkEntries.reduce((sum, [, count]) => sum + count, 0);
-    const schemes = nonNetworkEntries.map(([scheme, count]) => `${String(count)} ${scheme}`);
-    sentences.push(
-      `Left out ${String(totalLeftOut)} non-network ${totalLeftOut === 1 ? "row" : "rows"} (${schemes.join(", ")}).`,
-    );
-  }
-
   return sentences.join(" ");
 }

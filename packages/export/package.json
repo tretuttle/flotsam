@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./body": "./src/body.ts",
     "./entry-writer": "./src/entry-writer.ts",
     "./from-recording": "./src/from-recording.ts",
     "./har-fields": "./src/har-fields.ts",
@@ -11,11 +12,11 @@
     "./merge": "./src/merge.ts",
     "./missing": "./src/missing.ts",
     "./pages": "./src/pages.ts",
+    "./redaction": "./src/redaction.ts",
     "./report": "./src/report.ts",
     "./run": "./src/run.ts",
     "./selection": "./src/selection.ts",
-    "./source": "./src/source.ts",
-    "./written": "./src/written.ts"
+    "./source": "./src/source.ts"
   },
   "scripts": {
     "test": "vp test run --config ../../vite.config.ts --dir .",

@@ -3,7 +3,15 @@
 //   mergeEntry:  every field of the entry from FIELD_RULES, a table total over the HAR model's fields
 //   bodyPlan:    stored candidates first, DevTools after, else the most specific reason
 
-import type { HarEntry, HarRequest, HarResponse, HarTimings } from "@one-click-har/har/model";
+import { buildHarEntry } from "@one-click-har/har/build";
+import {
+  isoDateTimeFromEpochMs,
+  toHarUrl,
+  type HarEntry,
+  type HarRequest,
+  type HarResponse,
+  type HarTimings,
+} from "@one-click-har/har/model";
 import type { NonEmpty } from "@one-click-har/recording/ids";
 import type { HarEntryField } from "./har-fields.ts";
 import type { BodyCandidates, BodySource, Material, SourceItem, SourceName } from "./source.ts";
@@ -19,50 +27,85 @@ function pairStartedAt(pair: Pair): number {
 }
 
 /**
+ * The rule for rows that share a key. A source may list one request twice: the recording's listing includes its live
+ * snapshot, so a request that settles between reading the lines and taking the snapshot appears as a line and as a
+ * live row. Within one source the row of the better standing is kept, ties go to the first listed, and each row left
+ * out is counted in the report's `duplicates`. Across sources the kept rows pair one to one.
+ */
+const DUPLICATE_RULE = {
+  standing: ["settled", "live"],
+  tie: "first listed",
+  counted: "report.duplicates, per source",
+} as const;
+
+function standing(item: SourceItem): number {
+  return DUPLICATE_RULE.standing.indexOf(item.inProgress ? "live" : "settled");
+}
+
+/** One row per key, chosen by DUPLICATE_RULE, in the order the keys were first listed. Keyless rows all stay. */
+function oneRowPerKey(items: readonly SourceItem[]): {
+  readonly kept: readonly SourceItem[];
+  readonly dropped: number;
+} {
+  const slotByKey = new Map<string, number>();
+  const kept: SourceItem[] = [];
+  let dropped = 0;
+  for (const item of items) {
+    const slot = item.key === null ? undefined : slotByKey.get(item.key);
+    if (slot === undefined) {
+      if (item.key !== null) slotByKey.set(item.key, kept.length);
+      kept.push(item);
+      continue;
+    }
+    dropped += 1;
+    if (standing(item) < standing(kept[slot]!)) kept[slot] = item;
+  }
+  return { kept, dropped };
+}
+
+/**
  * Items join on `key` only. A key is an ExchangeId, so a DevTools item (current run) can never pair with a recording
  * line of another run that reused the channel id (opus 6). Items without a key stay unpaired and are counted.
  */
 export function pairItems(
-  recording: readonly SourceItem[],
-  devtools: readonly SourceItem[],
-): { readonly pairs: readonly Pair[]; readonly unpaired: number } {
+  recordingItems: readonly SourceItem[],
+  devtoolsItems: readonly SourceItem[],
+): {
+  readonly pairs: readonly Pair[];
+  readonly unpaired: number;
+  readonly duplicates: { readonly [S in SourceName]: number };
+} {
+  const recording = oneRowPerKey(recordingItems);
+  const devtools = oneRowPerKey(devtoolsItems);
   let unpaired = 0;
-  const dtByKey = new Map<string, number>();
-  for (let i = 0; i < devtools.length; i += 1) {
-    const item = devtools[i]!;
-    if (item.key === null) {
-      unpaired += 1;
-    } else if (!dtByKey.has(item.key)) {
-      dtByKey.set(item.key, i);
-    }
+  const dtByKey = new Map<string, SourceItem>();
+  for (const item of devtools.kept) {
+    if (item.key === null) unpaired += 1;
+    else dtByKey.set(item.key, item);
   }
 
-  const matchedDt = new Set<number>();
   const pairs: Pair[] = [];
-
-  for (const item of recording) {
-    if (item.key === null) {
-      unpaired += 1;
+  for (const item of recording.kept) {
+    if (item.key === null) unpaired += 1;
+    const dt = item.key === null ? undefined : dtByKey.get(item.key);
+    if (dt === undefined) {
       pairs.push({ kind: "recording-only", recording: item });
-      continue;
-    }
-    const dtIndex = dtByKey.get(item.key);
-    if (dtIndex !== undefined && !matchedDt.has(dtIndex)) {
-      matchedDt.add(dtIndex);
-      pairs.push({ kind: "both", recording: item, devtools: devtools[dtIndex]! });
     } else {
-      pairs.push({ kind: "recording-only", recording: item });
+      dtByKey.delete(item.key!);
+      pairs.push({ kind: "both", recording: item, devtools: dt });
     }
   }
-
-  for (let i = 0; i < devtools.length; i += 1) {
-    if (!matchedDt.has(i)) {
-      pairs.push({ kind: "devtools-only", devtools: devtools[i]! });
-    }
+  for (const item of devtools.kept) {
+    if (item.key === null || dtByKey.has(item.key))
+      pairs.push({ kind: "devtools-only", devtools: item });
   }
 
   pairs.sort((a, b) => pairStartedAt(a) - pairStartedAt(b));
-  return { pairs, unpaired };
+  return {
+    pairs,
+    unpaired,
+    duplicates: { recording: recording.dropped, devtools: devtools.dropped },
+  };
 }
 
 /** Fields that only make sense together come from one source as a unit, so an entry never mixes two sources' timings. */
@@ -116,7 +159,10 @@ export const FIELD_RULES: { readonly [F in HarEntryField]: FieldRule } = {
     order: ["devtools", "recording"],
     why: "DevTools writes its connection id; the recording has the remote port.",
   },
-  comment: { kind: "export-writes", why: "Reserved for the export's own notes." },
+  comment: {
+    kind: "export-writes",
+    why: "The export's note when a source's details for this request could not be read (SOURCE_FAILURES).",
+  },
   _securityState: {
     kind: "first-of",
     order: ["devtools"],
@@ -146,7 +192,7 @@ export const FIELD_RULES: { readonly [F in HarEntryField]: FieldRule } = {
   },
   _harExport: {
     kind: "export-writes",
-    why: "Source, body state and checks, written in the entry's tail after the body.",
+    why: "Source, body states and checks, known once the bodies were read.",
   },
   "request.method": { kind: "group", group: "request-head" },
   "request.url": { kind: "group", group: "request-head" },
@@ -157,7 +203,7 @@ export const FIELD_RULES: { readonly [F in HarEntryField]: FieldRule } = {
   "request.headersSize": { kind: "group", group: "request-head" },
   "request.postData": {
     kind: "export-writes",
-    why: "Built from the upload candidate, its MIME type and, for forms, its parsed params, after redaction.",
+    why: "Built from the upload candidate and its MIME type. Text when the bytes are UTF-8, else base64 with encoding.",
   },
   "request.bodySize": {
     kind: "export-writes",
@@ -165,7 +211,7 @@ export const FIELD_RULES: { readonly [F in HarEntryField]: FieldRule } = {
   },
   "request.comment": {
     kind: "export-writes",
-    why: "The upload's missing reason, when it has one.",
+    why: "Why the request body is missing or cut short, from MISSING_REASONS or CUT_SHORT_REASONS.",
   },
   "response.status": { kind: "group", group: "response-head" },
   "response.statusText": { kind: "group", group: "response-head" },
@@ -201,15 +247,15 @@ export const FIELD_RULES: { readonly [F in HarEntryField]: FieldRule } = {
   "response.content.mimeType": { kind: "group", group: "response-head" },
   "response.content.text": {
     kind: "export-writes",
-    why: "Streamed from the body candidate that opened.",
+    why: "From the body candidate that opened: whole when it fits one window, else streamed as base64.",
   },
   "response.content.encoding": {
     kind: "export-writes",
-    why: "base64 when the text mode is base64.",
+    why: "base64 unless the bytes are whole, valid UTF-8 in a UTF-8 or ASCII charset (chooseEncoding).",
   },
   "response.content.comment": {
     kind: "export-writes",
-    why: "The missing or incomplete reason from MISSING_REASONS.",
+    why: "Why the body is missing or cut short, from MISSING_REASONS or CUT_SHORT_REASONS.",
   },
   "cache.beforeRequest": {
     kind: "first-of",
@@ -263,6 +309,19 @@ export function devtoolsBodyWanted(pair: Pair, recording: Material | null): bool
   return recording === null || recording.body.kind !== "candidates";
 }
 
+/** What a listing row alone says about a request, used when its source throws while loading the rest. */
+export function stubMaterial(item: SourceItem): Material {
+  return {
+    entry: buildHarEntry({
+      startedDateTime: isoDateTimeFromEpochMs(item.startedAt),
+      request: { method: item.method, url: toHarUrl(item.url) ?? (item.url as HarRequest["url"]) },
+      response: { status: 0, content: { size: -1, mimeType: "" } },
+    }),
+    body: { kind: "none", reason: "source-error" },
+    upload: { kind: "none", reason: "source-error" },
+  };
+}
+
 export interface MergedEntry {
   /** Built from FIELD_RULES only. response.content has no text, size or comment yet: the writer fills them. */
   readonly entry: HarEntry;
@@ -271,6 +330,8 @@ export interface MergedEntry {
   readonly sources: Pair["kind"];
   readonly navigation: boolean;
   readonly inProgress: boolean;
+  /** The source the response head came from, which is not FIELD_GROUPS' first when that source failed to load. */
+  readonly responseHeadFrom: SourceName;
 }
 
 const SPEC_TIME_PHASES = ["blocked", "dns", "connect", "send", "wait", "receive"] as const;
@@ -304,14 +365,13 @@ function pickFromRule<T>(
   return undefined;
 }
 
-function pickGroupMaterial(
+function pickGroupSource(
   group: FieldGroup,
   recording: Material | null,
   devtools: Material | null,
-): Material {
+): SourceName {
   for (const name of FIELD_GROUPS[group].order) {
-    const mat = sourceByName(name, recording, devtools);
-    if (mat !== null) return mat;
+    if (sourceByName(name, recording, devtools) !== null) return name;
   }
   throw new Error(`Merged entry requires at least one source for ${group}`);
 }
@@ -410,9 +470,11 @@ export function mergeEntry(
   recording: Material | null,
   devtools: Material | null,
 ): MergedEntry {
-  const reqMat = pickGroupMaterial("request-head", recording, devtools);
-  const resMat = pickGroupMaterial("response-head", recording, devtools);
-  const timingsMat = pickGroupMaterial("timings", recording, devtools);
+  const pick = (group: FieldGroup): Material =>
+    sourceByName(pickGroupSource(group, recording, devtools), recording, devtools)!;
+  const reqMat = pick("request-head");
+  const resMat = pick("response-head");
+  const timingsMat = pick("timings");
 
   const startedDateTime = pickFromRule(
     "startedDateTime",
@@ -502,5 +564,6 @@ export function mergeEntry(
     sources: pair.kind,
     navigation,
     inProgress,
+    responseHeadFrom: pickGroupSource("response-head", recording, devtools),
   };
 }

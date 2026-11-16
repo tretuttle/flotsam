@@ -12,7 +12,7 @@ const validSelection = {
 const validRequest = {
   selection: validSelection,
   bodies: "include",
-  secrets: "remove",
+  redaction: "standard",
   packaging: "har",
   fileName: null,
 };
@@ -29,7 +29,7 @@ describe("parseExportRequest rejection table", () => {
       },
     ],
     ["bad bodies", { ...validRequest, bodies: "partial" }],
-    ["bad secrets", { ...validRequest, secrets: "strip" }],
+    ["bad redaction", { ...validRequest, redaction: "remove" }],
     ["har.zip rejected until measured", { ...validRequest, packaging: "har.zip" }],
     ["har.gz rejected until measured", { ...validRequest, packaging: "har.gz" }],
     ["unknown packaging", { ...validRequest, packaging: "json" }],

@@ -7,7 +7,6 @@ import {
   type PageId,
 } from "@one-click-har/har/model";
 import type { EpochMs, TabKey } from "@one-click-har/recording/ids";
-import type { WrittenUrl } from "./written.ts";
 
 export interface PageState {
   readonly __pages: unique symbol;
@@ -30,8 +29,8 @@ export function startPages(): PageState {
 }
 
 /**
- * `url` is the entry's request URL as written, after redaction, and becomes the page title. The type accepts only a
- * WrittenUrl, so a title can never carry a query secret the entry had removed (deepseek F3).
+ * `url` is the entry's request URL and becomes the page title. Titles are redacted with the rest of the log by
+ * @one-click-har/har at the end of the export, under the same level as the entries (deepseek F3).
  */
 export function pageFor(
   state: PageState,
@@ -39,7 +38,7 @@ export function pageFor(
     readonly tab: TabKey | null;
     readonly startedAt: EpochMs;
     readonly navigation: boolean;
-    readonly url: WrittenUrl;
+    readonly url: string;
   },
 ): { readonly pageref: PageId; readonly state: PageState } {
   const s = asInternal(state);

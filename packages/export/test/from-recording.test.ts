@@ -97,6 +97,13 @@ describe("materialFromRecording validates against HAR 1.2 schema", () => {
     expect(mat.entry.response.headers).toEqual([]);
     expect(mat.entry.response._error).toBe("NS_ERROR_CONNECTION_REFUSED");
     expect(mat.body).toEqual({ kind: "none", reason: "no-response" });
+    const whateverStored = materialFromRecording({
+      kind: "settled",
+      settled,
+      body: { kind: "empty" },
+      upload: { kind: "empty" },
+    });
+    expect(whateverStored.body).toEqual({ kind: "none", reason: "no-response" });
     const doc = asHarDoc(mat.entry);
     await expect(HarValidator.har(doc)).resolves.toBe(doc);
   });
@@ -168,6 +175,29 @@ describe("materialFromRecording validates against HAR 1.2 schema", () => {
     const matCopying = materialFromRecording({ kind: "live", live: liveCopying });
     expect(matCopying.entry.response.status).toBe(200);
     expect(matCopying.body).toEqual({ kind: "none", reason: "in-progress" });
+    const fromCache = (source: (typeof responseFacts)["source"]) =>
+      materialFromRecording({
+        kind: "live",
+        live: { ...liveCopying, response: { ...responseFacts, source } },
+      }).entry._fromCache;
+    expect([
+      fromCache("revalidated"),
+      fromCache("cache"),
+      fromCache("network"),
+      fromCache("service-worker"),
+    ]).toEqual(["disk", "disk", undefined, undefined]);
+    const upload = (headers: LiveExchange["request"]["headers"]) =>
+      materialFromRecording({
+        kind: "live",
+        live: { ...liveOpen, request: { ...requestFacts, method: "POST", headers } },
+      }).upload;
+    expect(upload([["content-length", "12"]])).toEqual({ kind: "none", reason: "in-progress" });
+    expect(upload([["transfer-encoding", "chunked"]])).toEqual({
+      kind: "none",
+      reason: "in-progress",
+    });
+    expect(upload([["content-length", "0"]])).toEqual({ kind: "empty" });
+    expect(upload([])).toEqual({ kind: "empty" });
     const doc2 = asHarDoc(matCopying.entry);
     await expect(HarValidator.har(doc2)).resolves.toBe(doc2);
   });
