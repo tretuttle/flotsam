@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     "./model": "./src/model.ts",
-    "./parse": "./src/parse.ts"
+    "./parse": "./src/parse.ts",
+    "./build": "./src/build.ts"
   },
   "scripts": {
     "test": "vp test run --config ../../vite.config.ts --dir .",
