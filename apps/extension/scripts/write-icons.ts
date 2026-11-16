@@ -1,6 +1,6 @@
 // Writes each raster icon the manifest lists under `icons` into `public`, rendered from the SVG master
-// `src/icons/icon.svg`. Rasters are generated and gitignored, so a PNG cannot drift from its master. The toolbar
-// SVG under `action` is not generated: extension.js copies it from `src/icons`.
+// `src/icons/icon.svg`. Rasters are generated and gitignored, so a PNG cannot drift from its master.
+// `scripts/toolbar-icon.ts` writes `src/icons/toolbar.svg`. extension.js copies that file as-is.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { Resvg } from "@resvg/resvg-js";
