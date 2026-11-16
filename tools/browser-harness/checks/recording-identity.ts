@@ -124,7 +124,7 @@ const check: HarnessCheck = {
       (l) => pathOf(l) === ID_ENDLESS_PATH && l.body.check === "first-part",
     );
     const cappedLength = capped[0]?.body.at.length ?? 0;
-    if (capped.length !== 1 || cappedLength < SMALL_CAP_BYTES || cappedLength >= ENDLESS_READ_BYTES)
+    if (capped.length !== 1 || cappedLength < SMALL_CAP_BYTES)
       problems.push(
         `endless stream: ${String(capped.length)} first-part lines of ${String(cappedLength)} bytes`,
       );

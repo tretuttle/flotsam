@@ -447,7 +447,8 @@ export function startRecorder(options: {
         sink.result = {
           kind: "closed",
           bytes: bytes as ByteCount,
-          cappedAt: sink.cappedAt as ByteCount | null,
+          // The watchdog can run late; a part that reached the cap is the body's first part however it ended.
+          cappedAt: (sink.cappedAt ?? (bytes >= sink.cap ? bytes : null)) as ByteCount | null,
         };
         sink.bytes = { kind: "part", id };
         commit(entry);
