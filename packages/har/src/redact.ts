@@ -1,4 +1,4 @@
-import { OWNED_FIELDS, pickCustomFields, safeDecodeQueryComponent } from "./internal.ts";
+import { OWNED_FIELDS, safeDecodeQueryComponent } from "./internal.ts";
 import {
   HAR_REDACTION_PLACES,
   toHarUrl,
@@ -14,7 +14,9 @@ import {
   type HarCreator,
   type HarDocument,
   type HarEntry,
+  type HarEntryExtension,
   type HarLogRedactionExtension,
+  type HarModelNumberField,
   type HarModelStringField,
   type HarNameValue,
   type HarPage,
@@ -45,7 +47,13 @@ export interface HarPlaceRule {
   readonly place: HarRedactionPlace;
   readonly standard: "removed" | "kept-not-examined";
   readonly shareable: "removed" | "kept-by-allowlist";
-  readonly description: string;
+  readonly label: string;
+  // Under `standard` a selected place is removed only while a rule of this target is in force, and its
+  // label names what those rules select.
+  readonly selectedBy?:
+    | { readonly target: HarRedactionTarget; readonly byName: boolean }
+    | undefined;
+  readonly listedNames?: ReadonlySet<string> | undefined;
 }
 
 export interface HarModelFieldRow<F extends HarModelStringField = HarModelStringField> {
@@ -81,28 +89,73 @@ export interface RedactUrlResult {
   readonly records: readonly HarRedactionRecord[];
 }
 
-export interface RedactionLevelSpec {
-  readonly id: RedactionLevel;
-  readonly guarantee: string;
-  readonly remainingRisk: string;
-}
+export const ALLOWLISTED_HEADER_NAMES: ReadonlySet<string> = new Set([
+  "content-type",
+  "content-length",
+  "content-encoding",
+  "accept",
+  "accept-encoding",
+  "accept-language",
+  "cache-control",
+  "vary",
+  "upgrade",
+]);
 
-export const REDACTION_LEVEL_TABLE: Readonly<Record<RedactionLevel, RedactionLevelSpec>> = {
-  standard: {
-    id: "standard",
-    guarantee:
-      "Removes Cookie, Set-Cookie, Authorization, Proxy-Authorization, and listed secret header and parameter names, cookie values, and URL userinfo, and leaves every other field byte-for-byte intact.",
-    remainingRisk:
-      "Every place marked kept-not-examined was not examined and may contain secrets, including request and response bodies, unlisted headers and parameters, URL paths and fragments, redirects, comments, cache metadata, initiators, WebSocket messages, and custom fields.",
+export const URL_HEADER_NAMES: ReadonlySet<string> = new Set([
+  "location",
+  "referer",
+  "referrer",
+  ":path",
+  "link",
+  "refresh",
+  "origin",
+  "content-location",
+]);
+
+const SECRET_PARAMETER_NAMES = [
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "token",
+  "api_key",
+  "apikey",
+  "key",
+  "client_secret",
+  "secret",
+  "password",
+  "auth",
+  "code",
+  "sig",
+  "signature",
+  "x-amz-signature",
+  "x-amz-security-token",
+] as const;
+
+// A header is listed when its value is a credential or a proof bound to one request. `Digest`,
+// `Content-Digest` and `Repr-Digest` hold a hash of the body, which proves nothing about the sender,
+// so they are not listed.
+export const DEFAULT_REDACTION_RULES: readonly HarRedactionRule[] = [
+  { id: "header:cookie", target: "header", names: ["cookie"] },
+  { id: "header:set-cookie", target: "header", names: ["set-cookie"] },
+  { id: "header:authorization", target: "header", names: ["authorization"] },
+  { id: "header:proxy-authorization", target: "header", names: ["proxy-authorization"] },
+  {
+    id: "header:x-api-key",
+    target: "header",
+    names: ["x-api-key", "api-key", "x-api-token", "x-auth-token", "x-amz-security-token"],
   },
-  shareable: {
-    id: "shareable",
-    guarantee:
-      "Keeps only allowlisted structural fields (methods, status codes, timings, sizes, MIME types, host names, URL paths, header names, and allowlisted non-secret header values) and removes all bodies, query values, fragments, cookies, unlisted header values, redirects, page titles, comments, cache metadata, initiators, WebSocket messages, and custom fields.",
-    remainingRisk:
-      "Host names and URL paths are kept by the allowlist and can themselves be sensitive.",
+  {
+    id: "header:x-csrf-token",
+    target: "header",
+    names: ["x-csrf-token", "x-xsrf-token", "csrf-token"],
   },
-};
+  // RFC 9449 DPoP proofs and RFC 9421 HTTP message signatures, each signed for one request.
+  { id: "header:request-proof", target: "header", names: ["dpop", "signature"] },
+  { id: "cookie:all", target: "cookie", names: [], matchAll: true },
+  { id: "query:secrets", target: "query", names: SECRET_PARAMETER_NAMES },
+  { id: "body:secrets", target: "body", names: SECRET_PARAMETER_NAMES },
+  { id: "url:userinfo", target: "url-userinfo", names: [], matchAll: true },
+];
 
 export const HAR_PLACE_TABLE: {
   readonly [P in HarRedactionPlace]: HarPlaceRule & { readonly place: P };
@@ -111,204 +164,225 @@ export const HAR_PLACE_TABLE: {
     place: "request-url-userinfo",
     standard: "removed",
     shareable: "removed",
-    description: "Credentials in the userinfo section of a request URL or page title URL.",
+    label: "the userinfo part of request URLs and URL page titles",
+    selectedBy: { target: "url-userinfo", byName: false },
   },
   "request-url-host": {
     place: "request-url-host",
     standard: "kept-not-examined",
     shareable: "kept-by-allowlist",
-    description: "Scheme, host name, and port of a request URL.",
+    label: "the scheme, host and port of request URLs",
   },
   "request-url-path": {
     place: "request-url-path",
     standard: "kept-not-examined",
     shareable: "kept-by-allowlist",
-    description: "Path segments of a request URL.",
+    label: "the path of request URLs",
   },
   "request-url-query-secret": {
     place: "request-url-query-secret",
     standard: "removed",
     shareable: "removed",
-    description: "Values of listed secret query parameters in a request URL or page title URL.",
+    label: "values of query parameters in request URLs and URL page titles",
+    selectedBy: { target: "query", byName: true },
   },
   "request-url-query": {
     place: "request-url-query",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Query parameter names and unlisted query values in a request URL.",
+    label: "query parameter names and every other query value in request URLs",
   },
   "request-url-fragment": {
     place: "request-url-fragment",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Fragment identifier of a request URL.",
+    label: "the fragment of request URLs",
   },
   "header-name": {
     place: "header-name",
     standard: "kept-not-examined",
     shareable: "kept-by-allowlist",
-    description: "HTTP request and response header names.",
+    label: "header names",
   },
   "header-value-secret": {
     place: "header-value-secret",
     standard: "removed",
     shareable: "removed",
-    description:
-      "Values of Cookie, Set-Cookie, Authorization, Proxy-Authorization, and listed secret headers.",
+    label: "values of request and response headers",
+    selectedBy: { target: "header", byName: true },
   },
   "header-value-allowlisted": {
     place: "header-value-allowlisted",
     standard: "kept-not-examined",
     shareable: "kept-by-allowlist",
-    description:
-      "Values of allowlisted non-secret headers such as Content-Type and Content-Length.",
+    label: "values of headers",
+    listedNames: ALLOWLISTED_HEADER_NAMES,
   },
   "named-header": {
     place: "named-header",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Values of headers not on the secret list or non-secret allowlist.",
+    label: "values of every header not named in another place",
   },
   "url-header": {
     place: "url-header",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Values of URL-carrying headers such as Location, Referer, Link, and :path.",
+    label: "values of headers",
+    listedNames: URL_HEADER_NAMES,
   },
   cookie: {
     place: "cookie",
     standard: "removed",
     shareable: "removed",
-    description: "Cookie values in request.cookies and response.cookies.",
+    label: "cookie values",
+    selectedBy: { target: "cookie", byName: false },
   },
   "cookie-metadata": {
     place: "cookie-metadata",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Cookie name, path, domain, and expires attributes.",
+    label: "cookie names, paths, domains and expiry dates",
   },
   "query-string-secret": {
     place: "query-string-secret",
     standard: "removed",
     shareable: "removed",
-    description: "Values of listed secret parameters in request.queryString.",
+    label: "values of queryString items",
+    selectedBy: { target: "query", byName: true },
   },
   "query-string": {
     place: "query-string",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Parameter names and unlisted parameter values in request.queryString.",
+    label: "queryString item names and every other queryString value",
   },
   "body-param-secret": {
     place: "body-param-secret",
     standard: "removed",
     shareable: "removed",
-    description: "Values of listed secret parameters in request.postData.params.",
+    label: "values of postData params",
+    selectedBy: { target: "body", byName: true },
   },
   "body-param": {
     place: "body-param",
     standard: "kept-not-examined",
     shareable: "removed",
-    description:
-      "Parameter names, unlisted values, fileName, and contentType in request.postData.params.",
+    label: "postData param names, file names, content types and every other param value",
   },
   "body-json": {
     place: "body-json",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "JSON request body text in request.postData.text.",
+    label: "JSON request bodies",
   },
   "body-form": {
     place: "body-form",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Form-urlencoded request body text in request.postData.text.",
+    label: "form-encoded request bodies",
   },
   "body-multipart": {
     place: "body-multipart",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Multipart request body text in request.postData.text.",
+    label: "multipart request bodies",
   },
   "request-body-other": {
     place: "request-body-other",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Non-JSON, non-form, non-multipart request body text in request.postData.text.",
+    label: "every other request body",
   },
   "redirect-url": {
     place: "redirect-url",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Redirect target URL in response.redirectURL.",
+    label: "redirect URLs",
   },
   "response-body-json": {
     place: "response-body-json",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "JSON response body text in response.content.text.",
+    label: "JSON response bodies",
   },
   "response-body-base64": {
     place: "response-body-base64",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Base64-encoded response body text in response.content.text.",
+    label: "base64 response bodies",
   },
   "response-body-other": {
     place: "response-body-other",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "HTML, JavaScript, CSS, or plain text in response.content.text.",
+    label: "every other response body",
   },
   "page-title": {
     place: "page-title",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Page title in log.pages[].title.",
+    label: "page titles",
   },
   initiator: {
     place: "initiator",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Request initiator metadata and call stack in entry._initiator.",
+    label: "request initiators and their call stacks",
   },
   websocket: {
     place: "websocket",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "WebSocket frame payloads in entry._webSocketMessages.",
+    label: "WebSocket messages",
   },
   cache: {
     place: "cache",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Cache state fields in entry.cache.beforeRequest and afterRequest.",
+    label: "cache entry text fields",
   },
   comment: {
     place: "comment",
     standard: "kept-not-examined",
     shareable: "removed",
-    description: "Free-form comment fields at any HAR object level.",
+    label: "comments",
   },
   "other-custom-field": {
     place: "other-custom-field",
     standard: "kept-not-examined",
     shareable: "removed",
-    description:
-      "Custom and unknown fields at any HAR object level, plus serverIPAddress and connection.",
+    label: "custom and unknown fields from any tool, server IP addresses and connection ids",
   },
   "protocol-metadata": {
     place: "protocol-metadata",
     standard: "kept-not-examined",
     shareable: "kept-by-allowlist",
-    description:
-      "Structural protocol metadata (version, creator, page ids, timestamps, HTTP methods, statusText, httpVersion, MIME types, and content encoding).",
+    label:
+      "the HAR version, creator and browser names and versions, page ids, start times, page references, methods, HTTP versions, status text, MIME types and content encodings",
+  },
+  "export-annotation": {
+    place: "export-annotation",
+    standard: "kept-not-examined",
+    shareable: "removed",
+    label: "body state, body source and missing-body notes written by the export",
+  },
+  "redaction-record": {
+    place: "redaction-record",
+    standard: "removed",
+    shareable: "removed",
+    label: "redaction records from an earlier run, replaced by this run's records",
+  },
+  "malformed-number": {
+    place: "malformed-number",
+    standard: "removed",
+    shareable: "removed",
+    label:
+      "values that are not numbers or booleans in fields HAR 1.2 defines as numbers or booleans",
   },
 };
 
-export const HAR_MODEL_FIELD_TABLE: {
-  readonly [F in HarModelStringField]: HarModelFieldRow<F>;
-} = {
+export const HAR_MODEL_FIELD_TABLE = {
   "log.version": { field: "log.version", places: ["protocol-metadata"] },
   "log.comment": { field: "log.comment", places: ["comment"] },
   "log.<custom>": { field: "log.<custom>", places: ["other-custom-field"] },
@@ -540,117 +614,118 @@ export const HAR_MODEL_FIELD_TABLE: {
   },
   "timings.comment": { field: "timings.comment", places: ["comment"] },
   "timings.<custom>": { field: "timings.<custom>", places: ["other-custom-field"] },
+  "log._harExport.redaction": { field: "log._harExport.redaction", places: ["redaction-record"] },
+  "log._harExport.<custom>": { field: "log._harExport.<custom>", places: ["other-custom-field"] },
+  "entry._harExport.source": { field: "entry._harExport.source", places: ["export-annotation"] },
+  "entry._harExport.bodyState": {
+    field: "entry._harExport.bodyState",
+    places: ["export-annotation"],
+  },
+  "entry._harExport.bodyMissing": {
+    field: "entry._harExport.bodyMissing",
+    places: ["export-annotation"],
+  },
+  "entry._harExport.bodyCheck": {
+    field: "entry._harExport.bodyCheck",
+    places: ["export-annotation"],
+  },
+  "entry._harExport.redactedFields": {
+    field: "entry._harExport.redactedFields",
+    places: ["redaction-record"],
+  },
+  "entry._harExport.<custom>": {
+    field: "entry._harExport.<custom>",
+    places: ["other-custom-field"],
+  },
+  "entry._initiator.<custom>": { field: "entry._initiator.<custom>", places: ["initiator"] },
+  "entry._initiator.stack.<custom>": {
+    field: "entry._initiator.stack.<custom>",
+    places: ["initiator"],
+  },
+  "entry._initiator.stack.callFrames[].<custom>": {
+    field: "entry._initiator.stack.callFrames[].<custom>",
+    places: ["initiator"],
+  },
+  "entry._webSocketMessages[].<custom>": {
+    field: "entry._webSocketMessages[].<custom>",
+    places: ["websocket"],
+  },
+} as const satisfies { readonly [F in HarModelStringField]: HarModelFieldRow<F> };
+
+export interface HarModelNumberRow {
+  readonly type: "number" | "boolean";
+  // What a required field holds once its malformed value is removed; an optional field is deleted.
+  readonly whenRemoved?: number | undefined;
+}
+
+export const HAR_MODEL_NUMBER_FIELD_TABLE: {
+  readonly [F in HarModelNumberField]: HarModelNumberRow;
+} = {
+  "log.pages[].pageTimings.onContentLoad": { type: "number" },
+  "log.pages[].pageTimings.onLoad": { type: "number" },
+  "entry.time": { type: "number", whenRemoved: 0 },
+  "request.headersSize": { type: "number", whenRemoved: -1 },
+  "request.bodySize": { type: "number", whenRemoved: -1 },
+  "request.cookies[].httpOnly": { type: "boolean" },
+  "request.cookies[].secure": { type: "boolean" },
+  "response.status": { type: "number", whenRemoved: 0 },
+  "response.headersSize": { type: "number", whenRemoved: -1 },
+  "response.bodySize": { type: "number", whenRemoved: -1 },
+  "response.cookies[].httpOnly": { type: "boolean" },
+  "response.cookies[].secure": { type: "boolean" },
+  "response.content.size": { type: "number", whenRemoved: -1 },
+  "response.content.compression": { type: "number" },
+  "cache.beforeRequest.hitCount": { type: "number" },
+  "cache.afterRequest.hitCount": { type: "number" },
+  "timings.blocked": { type: "number" },
+  "timings.dns": { type: "number" },
+  "timings.connect": { type: "number" },
+  "timings.send": { type: "number", whenRemoved: 0 },
+  "timings.wait": { type: "number", whenRemoved: 0 },
+  "timings.receive": { type: "number", whenRemoved: 0 },
+  "timings.ssl": { type: "number" },
 };
 
-type MappedPlaces = (typeof HAR_MODEL_FIELD_TABLE)[HarModelStringField]["places"][number];
+type MappedPlaces =
+  | (typeof HAR_MODEL_FIELD_TABLE)[HarModelStringField]["places"][number]
+  | "malformed-number";
 type UnmappedPlaces = Exclude<HarRedactionPlace, MappedPlaces>;
 const _assertEveryPlaceMappedToModelField: UnmappedPlaces extends never ? true : never = true;
 void _assertEveryPlaceMappedToModelField;
 
-export const ALLOWLISTED_HEADER_NAMES: ReadonlySet<string> = new Set([
-  "content-type",
-  "content-length",
-  "content-encoding",
-  "accept",
-  "accept-encoding",
-  "accept-language",
-  "cache-control",
-  "vary",
-  "upgrade",
-]);
+type PlaceOf<F extends HarModelStringField> = (typeof HAR_MODEL_FIELD_TABLE)[F]["places"][number];
+type FieldIn<P extends HarRedactionPlace> = {
+  [F in HarModelStringField]: P extends PlaceOf<F> ? F : never;
+}[HarModelStringField];
 
-export const URL_HEADER_NAMES: ReadonlySet<string> = new Set([
-  "location",
-  "referer",
-  "referrer",
-  ":path",
-  "link",
-  "refresh",
-  "origin",
-  "content-location",
-]);
-
-export const DEFAULT_REDACTION_RULES: readonly HarRedactionRule[] = [
-  { id: "header:cookie", target: "header", names: ["cookie"] },
-  { id: "header:set-cookie", target: "header", names: ["set-cookie"] },
-  { id: "header:authorization", target: "header", names: ["authorization"] },
-  { id: "header:proxy-authorization", target: "header", names: ["proxy-authorization"] },
-  { id: "cookie:all", target: "cookie", names: [], matchAll: true },
-  {
-    id: "query:secrets",
-    target: "query",
-    names: [
-      "access_token",
-      "refresh_token",
-      "id_token",
-      "token",
-      "api_key",
-      "apikey",
-      "key",
-      "client_secret",
-      "secret",
-      "password",
-      "auth",
-      "code",
-      "sig",
-      "signature",
-      "x-amz-signature",
-      "x-amz-security-token",
-    ],
-  },
-  {
-    id: "body:secrets",
-    target: "body",
-    names: [
-      "access_token",
-      "refresh_token",
-      "id_token",
-      "token",
-      "api_key",
-      "apikey",
-      "key",
-      "client_secret",
-      "secret",
-      "password",
-      "auth",
-      "code",
-      "sig",
-      "signature",
-      "x-amz-signature",
-      "x-amz-security-token",
-    ],
-  },
-  {
-    id: "header:x-api-key",
-    target: "header",
-    names: ["x-api-key", "api-key", "x-api-token", "x-auth-token", "x-amz-security-token"],
-  },
-  {
-    id: "header:x-csrf-token",
-    target: "header",
-    names: ["x-csrf-token", "x-xsrf-token", "csrf-token"],
-  },
-  { id: "url:userinfo", target: "url-userinfo", names: ["userinfo"], matchAll: true },
-];
+const FIELDS_BY_PLACE: ReadonlyMap<
+  HarRedactionPlace,
+  readonly (HarModelStringField | HarModelNumberField)[]
+> = (() => {
+  const map = new Map<HarRedactionPlace, (HarModelStringField | HarModelNumberField)[]>();
+  for (const row of Object.values(HAR_MODEL_FIELD_TABLE) as HarModelFieldRow[]) {
+    for (const place of row.places) {
+      map.set(place, [...(map.get(place) ?? []), row.field]);
+    }
+  }
+  map.set("malformed-number", Object.keys(HAR_MODEL_NUMBER_FIELD_TABLE) as HarModelNumberField[]);
+  return map;
+})();
 
 const DEFAULT_REPLACEMENT = "[REDACTED]";
 
 function resolveLevel(input: RedactionLevelInput | undefined): RedactionLevel {
+  if (input === undefined || input === "standard" || input === "default") {
+    return "standard";
+  }
   if (input === "shareable" || input === "strict") {
     return "shareable";
   }
-  return "standard";
+  throw new RangeError(`Unknown redaction level: ${String(input)}`);
 }
 
 function foldKey(name: string): string {
   return name.replace(/[_-]/gu, "").toLowerCase();
-}
-
-function appendComment(existing: string | undefined, note: string): string {
-  if (!existing || existing.length === 0) {
-    return note;
-  }
-  return existing.includes(note) ? existing : `${existing}; ${note}`;
 }
 
 function findMatchingRule(
@@ -697,29 +772,19 @@ function findBodyRule(
   return undefined;
 }
 
-function rulesCover(place: HarRedactionPlace, rules: readonly HarRedactionRule[]): boolean {
-  if (place === "request-url-userinfo") {
-    return findMatchingRule(rules, "url-userinfo", "userinfo") !== undefined;
+function rulesSelecting(
+  rule: HarPlaceRule,
+  rules: readonly HarRedactionRule[],
+): readonly HarRedactionRule[] {
+  const selector = rule.selectedBy;
+  if (!selector) {
+    return [];
   }
-  if (place === "cookie") {
-    return rules.some((rule) => rule.target === "cookie" && rule.matchAll === true);
-  }
-  if (place === "header-value-secret") {
-    return rules.some(
-      (rule) => rule.target === "header" && (rule.matchAll === true || rule.names.length > 0),
-    );
-  }
-  if (place === "request-url-query-secret" || place === "query-string-secret") {
-    return rules.some(
-      (rule) => rule.target === "query" && (rule.matchAll === true || rule.names.length > 0),
-    );
-  }
-  if (place === "body-param-secret") {
-    return rules.some(
-      (rule) => rule.target === "body" && (rule.matchAll === true || rule.names.length > 0),
-    );
-  }
-  return true;
+  return rules.filter(
+    (candidate) =>
+      candidate.target === selector.target &&
+      (!selector.byName || candidate.matchAll === true || candidate.names.length > 0),
+  );
 }
 
 function effectivePlaceStatus(
@@ -728,88 +793,179 @@ function effectivePlaceStatus(
   rules: readonly HarRedactionRule[],
   table: Readonly<Record<HarRedactionPlace, HarPlaceRule>>,
 ): PlaceExamStatus {
-  const configured = table[place][level];
-  if (configured === "removed" && level === "standard" && !rulesCover(place, rules)) {
+  const row = table[place];
+  const configured = row[level];
+  if (
+    configured === "removed" &&
+    level === "standard" &&
+    row.selectedBy !== undefined &&
+    rulesSelecting(row, rules).length === 0
+  ) {
     return "kept-not-examined";
   }
   return configured;
 }
 
-function detailForStatus(status: PlaceExamStatus): PlaceReportDetail {
-  if (status === "removed") {
-    return "removed";
+function placeLabel(
+  place: HarRedactionPlace,
+  rules: readonly HarRedactionRule[],
+  table: Readonly<Record<HarRedactionPlace, HarPlaceRule>>,
+): string {
+  const row = table[place];
+  let names: readonly string[] | "any" | undefined = row.listedNames
+    ? [...row.listedNames]
+    : undefined;
+  if (row.selectedBy?.byName === true) {
+    const selecting = rulesSelecting(row, rules);
+    names = selecting.some((rule) => rule.matchAll === true)
+      ? "any"
+      : [...new Set(selecting.flatMap((rule) => rule.names.map((name) => name.toLowerCase())))];
   }
-  if (status === "kept-by-allowlist") {
-    return "kept by allowlist";
+  if (names === undefined) {
+    return row.label;
   }
-  return "not examined: may contain secrets";
+  if (names === "any") {
+    return `${row.label} with any name`;
+  }
+  return names.length > 0
+    ? `${row.label} named ${names.join(", ")}`
+    : `${row.label} named by a rule (no rule is in force)`;
 }
 
-function canStillHoldForStatus(status: PlaceExamStatus): string {
-  if (status === "removed") {
-    return "Removed.";
-  }
-  if (status === "kept-by-allowlist") {
-    return "Kept by allowlist. Any secret in a host name or URL path can remain.";
-  }
-  return "Not examined: may contain secrets. Any secret can remain.";
+interface StatusWording {
+  readonly detail: PlaceReportDetail;
+  readonly clause: string;
+  readonly canStillHold: (label: string) => string;
 }
 
-interface RemovalKey {
-  readonly target: HarRedactionTarget;
-  readonly field: string;
-  readonly ruleId: string;
-  readonly place: HarRedactionPlace;
+const STATUS_WORDING: Readonly<Record<PlaceExamStatus, StatusWording>> = {
+  removed: {
+    detail: "removed",
+    clause: "Removes",
+    canStillHold: (label) => `Nothing. Every value in ${label} is removed.`,
+  },
+  "kept-by-allowlist": {
+    detail: "kept by allowlist",
+    clause: "Keeps by allowlist",
+    canStillHold: (label) =>
+      `Any secret written into ${label} remains: the allowlist keeps it without examining it.`,
+  },
+  "kept-not-examined": {
+    detail: "not examined: may contain secrets",
+    clause: "Keeps without examining",
+    canStillHold: (label) => `Any secret in ${label} remains: it was not examined.`,
+  },
+};
+
+const STATUS_ORDER: readonly PlaceExamStatus[] = [
+  "removed",
+  "kept-by-allowlist",
+  "kept-not-examined",
+];
+
+export const PLACE_SEPARATOR = "; ";
+
+function describeLevel(places: readonly HarPlaceCoverage[]): {
+  readonly guarantee: string;
+  readonly remainingRisk: string;
+} {
+  const phrase = (place: HarPlaceCoverage): string => `${place.label} (${place.fields.join(", ")})`;
+  const clauses = STATUS_ORDER.flatMap((status) => {
+    const matching = places.filter((place) => place.status === status);
+    return matching.length > 0
+      ? [`${STATUS_WORDING[status].clause}: ${matching.map(phrase).join(PLACE_SEPARATOR)}.`]
+      : [];
+  });
+  const kept = places.filter((place) => place.status !== "removed");
+  return {
+    guarantee: [
+      ...clauses,
+      "Every kept value and the order of keys stay as they were.",
+      "Each removal is listed by field path in log._harExport.redaction.records and in _harExport.redactedFields on its entry.",
+    ].join(" "),
+    remainingRisk:
+      kept.length > 0
+        ? `Any secret in a kept place remains: ${kept.map((place) => place.label).join(PLACE_SEPARATOR)}.`
+        : "No place is kept.",
+  };
+}
+
+function buildPlacesReport(
+  level: RedactionLevel,
+  rules: readonly HarRedactionRule[],
+  counts: ReadonlyMap<HarRedactionPlace, number>,
+  table: Readonly<Record<HarRedactionPlace, HarPlaceRule>>,
+): readonly HarPlaceCoverage[] {
+  return HAR_REDACTION_PLACES.map((place) => {
+    const status = effectivePlaceStatus(place, level, rules, table);
+    const label = placeLabel(place, rules, table);
+    return {
+      place,
+      label,
+      fields: FIELDS_BY_PLACE.get(place) ?? [],
+      status,
+      count: counts.get(place) ?? 0,
+      detail: STATUS_WORDING[status].detail,
+      canStillHold: STATUS_WORDING[status].canStillHold(label),
+    };
+  });
 }
 
 class RedactionTracker {
   readonly #entryIndex: number;
-  readonly #removals = new Map<string, RemovalKey & { count: number }>();
-  readonly #fields = new Set<string>();
+  readonly #removals = new Map<
+    string,
+    {
+      place: HarRedactionPlace;
+      field: HarModelStringField | HarModelNumberField;
+      ruleId: string;
+      count: number;
+    }
+  >();
+  readonly #fields = new Set<HarModelStringField | HarModelNumberField>();
   readonly placeCounts = new Map<HarRedactionPlace, number>();
 
   constructor(entryIndex: number) {
     this.#entryIndex = entryIndex;
   }
 
-  noteCount(place: HarRedactionPlace, amount = 1): void {
+  kept<F extends HarModelStringField>(_field: F, place: PlaceOf<F>, amount = 1): void {
+    if (amount > 0) {
+      this.placeCounts.set(place, (this.placeCounts.get(place) ?? 0) + amount);
+    }
+  }
+
+  removed<F extends HarModelStringField | HarModelNumberField>(
+    field: F,
+    place: F extends HarModelStringField ? PlaceOf<F> : "malformed-number",
+    ruleId: string,
+    amount = 1,
+  ): void {
     if (amount <= 0) {
       return;
     }
     this.placeCounts.set(place, (this.placeCounts.get(place) ?? 0) + amount);
-  }
-
-  markRemoved(
-    place: HarRedactionPlace,
-    target: HarRedactionTarget,
-    field: string,
-    ruleId: string,
-    amount = 1,
-  ): void {
-    this.noteCount(place, amount);
-    this.#fields.add(`${target}:${field}`);
-    const key = `${place}\0${target}\0${field.toLowerCase()}\0${ruleId}`;
+    this.#fields.add(field);
+    const key = `${place}\0${field}\0${ruleId}`;
     const prior = this.#removals.get(key);
     if (prior) {
       prior.count += amount;
     } else {
-      this.#removals.set(key, { place, target, field, ruleId, count: amount });
+      this.#removals.set(key, { place, field, ruleId, count: amount });
     }
   }
 
-  records(url: HarUrl): readonly HarRedactionRecord[] {
+  records(): readonly HarRedactionRecord[] {
     return [...this.#removals.values()].map((item) => ({
       entryIndex: this.#entryIndex,
-      url,
       place: item.place,
-      target: item.target,
       field: item.field,
       ruleId: item.ruleId,
       count: item.count,
     }));
   }
 
-  get fields(): readonly string[] {
+  get fields(): readonly (HarModelStringField | HarModelNumberField)[] {
     return [...this.#fields];
   }
 }
@@ -818,10 +974,10 @@ interface RedactContext {
   readonly level: RedactionLevel;
   readonly rules: readonly HarRedactionRule[];
   readonly replacement: string;
-  readonly table: Readonly<Record<HarRedactionPlace, HarPlaceRule>>;
   readonly tracker: RedactionTracker;
-  status(place: HarRedactionPlace): PlaceExamStatus;
   isRemoved(place: HarRedactionPlace): boolean;
+  levelRule(place: HarRedactionPlace): string;
+  emptied(): string;
 }
 
 function createContext(
@@ -831,82 +987,40 @@ function createContext(
   replacement: string,
   table: Readonly<Record<HarRedactionPlace, HarPlaceRule>>,
 ): RedactContext {
-  const tracker = new RedactionTracker(entryIndex);
   return {
     level,
     rules,
     replacement,
-    table,
-    tracker,
-    status(place) {
-      return effectivePlaceStatus(place, level, rules, table);
-    },
+    tracker: new RedactionTracker(entryIndex),
     isRemoved(place) {
       return effectivePlaceStatus(place, level, rules, table) === "removed";
+    },
+    levelRule(place) {
+      return `${level}:${place}`;
+    },
+    emptied() {
+      return level === "shareable" ? "" : replacement;
     },
   };
 }
 
-function redactProtocolString(value: string, fieldName: string, ctx: RedactContext): string {
-  if (ctx.isRemoved("protocol-metadata")) {
-    if (value.length > 0) {
-      ctx.tracker.markRemoved(
-        "protocol-metadata",
-        "body",
-        fieldName,
-        `${ctx.level}:protocol-metadata`,
-      );
+// Rebuilds `source` in its own key order. A key in `changes` takes the new value, or is deleted when
+// the new value is undefined. Keys only in `changes` go last.
+function rebuild<T extends object>(source: T, changes: Readonly<Record<string, unknown>>): T {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!Object.hasOwn(changes, key)) {
+      out[key] = value;
+    } else if (changes[key] !== undefined) {
+      out[key] = changes[key];
     }
-    return "";
   }
-  if (value.length > 0) {
-    ctx.tracker.noteCount("protocol-metadata");
+  for (const [key, value] of Object.entries(changes)) {
+    if (!Object.hasOwn(source, key) && value !== undefined) {
+      out[key] = value;
+    }
   }
-  return value;
-}
-
-function redactProtocolIso(value: IsoDateTime, fieldName: string, ctx: RedactContext): IsoDateTime {
-  if (ctx.isRemoved("protocol-metadata")) {
-    ctx.tracker.markRemoved(
-      "protocol-metadata",
-      "body",
-      fieldName,
-      `${ctx.level}:protocol-metadata`,
-    );
-    return toIsoDateTime("1970-01-01T00:00:00.000Z")!;
-  }
-  ctx.tracker.noteCount("protocol-metadata");
-  return value;
-}
-
-function redactProtocolPageId(value: PageId, fieldName: string, ctx: RedactContext): PageId {
-  if (ctx.isRemoved("protocol-metadata")) {
-    ctx.tracker.markRemoved(
-      "protocol-metadata",
-      "page",
-      fieldName,
-      `${ctx.level}:protocol-metadata`,
-    );
-    return toPageId("page_redacted")!;
-  }
-  ctx.tracker.noteCount("protocol-metadata");
-  return value;
-}
-
-function redactComment(
-  comment: string | undefined,
-  fieldName: string,
-  ctx: RedactContext,
-): string | undefined {
-  if (comment === undefined) {
-    return undefined;
-  }
-  if (ctx.isRemoved("comment")) {
-    ctx.tracker.markRemoved("comment", "body", fieldName, `${ctx.level}:comment`);
-    return undefined;
-  }
-  ctx.tracker.noteCount("comment");
-  return comment;
+  return out as T;
 }
 
 function countStringsInUnknown(value: unknown): number {
@@ -914,65 +1028,131 @@ function countStringsInUnknown(value: unknown): number {
     return 1;
   }
   if (Array.isArray(value)) {
-    let total = 0;
-    for (const item of value) {
-      total += countStringsInUnknown(item);
-    }
-    return total;
+    return value.reduce((sum: number, item) => sum + countStringsInUnknown(item), 0);
   }
   if (typeof value === "object" && value !== null) {
-    let total = 0;
-    for (const field of Object.values(value)) {
-      total += countStringsInUnknown(field);
-    }
-    return total;
+    return Object.values(value).reduce((sum: number, item) => sum + countStringsInUnknown(item), 0);
   }
   return 0;
+}
+
+// A value whose JSON type is not the one HAR 1.2 gives the field is not a value of that field, and
+// no other place covers it, so both levels remove it.
+function removeMalformedNumbers(
+  source: object,
+  fields: readonly HarModelNumberField[],
+  ctx: RedactContext,
+): Record<string, unknown> {
+  const changes: Record<string, unknown> = {};
+  for (const field of fields) {
+    const key = field.slice(field.lastIndexOf(".") + 1);
+    const value = (source as Record<string, unknown>)[key];
+    const row = HAR_MODEL_NUMBER_FIELD_TABLE[field];
+    if (value !== undefined && typeof value !== row.type) {
+      ctx.tracker.removed(field, "malformed-number", ctx.levelRule("malformed-number"));
+      changes[key] = row.whenRemoved;
+    }
+  }
+  return changes;
+}
+
+function redactProtocolString(
+  value: string,
+  field: FieldIn<"protocol-metadata">,
+  ctx: RedactContext,
+): string {
+  if (ctx.isRemoved("protocol-metadata")) {
+    ctx.tracker.removed(field, "protocol-metadata", ctx.levelRule("protocol-metadata"));
+    return "";
+  }
+  ctx.tracker.kept(field, "protocol-metadata");
+  return value;
+}
+
+function redactProtocolIso(
+  value: IsoDateTime,
+  field: FieldIn<"protocol-metadata">,
+  ctx: RedactContext,
+): IsoDateTime {
+  if (ctx.isRemoved("protocol-metadata")) {
+    ctx.tracker.removed(field, "protocol-metadata", ctx.levelRule("protocol-metadata"));
+    return toIsoDateTime("1970-01-01T00:00:00.000Z")!;
+  }
+  ctx.tracker.kept(field, "protocol-metadata");
+  return value;
+}
+
+function redactProtocolPageId(
+  value: PageId,
+  field: FieldIn<"protocol-metadata">,
+  ctx: RedactContext,
+): PageId {
+  if (ctx.isRemoved("protocol-metadata")) {
+    ctx.tracker.removed(field, "protocol-metadata", ctx.levelRule("protocol-metadata"));
+    return toPageId("page_redacted")!;
+  }
+  ctx.tracker.kept(field, "protocol-metadata");
+  return value;
+}
+
+function redactComment(
+  comment: string | undefined,
+  field: FieldIn<"comment">,
+  ctx: RedactContext,
+): string | undefined {
+  if (comment === undefined) {
+    return undefined;
+  }
+  if (ctx.isRemoved("comment")) {
+    ctx.tracker.removed(field, "comment", ctx.levelRule("comment"));
+    return undefined;
+  }
+  ctx.tracker.kept(field, "comment");
+  return comment;
 }
 
 function redactCustomFields(
   source: object,
   owned: ReadonlySet<string>,
+  field: FieldIn<"other-custom-field">,
   ctx: RedactContext,
   extraOwned?: ReadonlySet<string>,
-): Record<string, unknown> {
-  const custom = pickCustomFields(source, owned);
-  const keys = Object.keys(custom).filter(
-    (key) => key !== "_harExport" && !(extraOwned?.has(key) ?? false),
+): Record<string, undefined> {
+  const keys = Object.keys(source).filter(
+    (key) => !owned.has(key) && !(extraOwned?.has(key) ?? false),
   );
-  if (keys.length === 0) {
+  const amount = keys.reduce(
+    (sum, key) => sum + countStringsInUnknown((source as Record<string, unknown>)[key]),
+    0,
+  );
+  if (!ctx.isRemoved("other-custom-field")) {
+    ctx.tracker.kept(field, "other-custom-field", amount);
     return {};
   }
-  let stringCount = 0;
-  for (const key of keys) {
-    stringCount += countStringsInUnknown(custom[key]);
-  }
-  const amount = Math.max(1, stringCount);
+  ctx.tracker.removed(field, "other-custom-field", ctx.levelRule("other-custom-field"), amount);
+  return Object.fromEntries(keys.map((key) => [key, undefined]));
+}
+
+function redactDeclaredCustomField(
+  value: unknown,
+  field: FieldIn<"other-custom-field">,
+  ctx: RedactContext,
+): unknown {
+  const amount = countStringsInUnknown(value);
   if (ctx.isRemoved("other-custom-field")) {
-    ctx.tracker.markRemoved(
-      "other-custom-field",
-      "body",
-      keys[0] ?? "custom",
-      `${ctx.level}:custom`,
-      amount,
-    );
-    return {};
+    ctx.tracker.removed(field, "other-custom-field", ctx.levelRule("other-custom-field"), amount);
+    return undefined;
   }
-  ctx.tracker.noteCount("other-custom-field", amount);
-  const kept: Record<string, unknown> = {};
-  for (const key of keys) {
-    kept[key] = custom[key];
-  }
-  return kept;
+  ctx.tracker.kept(field, "other-custom-field", amount);
+  return value;
 }
 
 function redactStructuredUrl(
   raw: string,
   ctx: RedactContext,
-  mode: "request-url" | "page-title",
+  field: "request.url" | "log.pages[].title",
 ): string {
-  const isPage = mode === "page-title";
-  const queryTarget: HarRedactionTarget = isPage ? "page" : "query";
+  const isPage = field === "log.pages[].title";
   const encodedReplacement = encodeURIComponent(ctx.replacement);
 
   const hashIndex = raw.indexOf("#");
@@ -995,37 +1175,36 @@ function redactStructuredUrl(
 
     let nextUserinfoPrefix = "";
     if (userinfo !== null) {
-      const userinfoRule = findMatchingRule(ctx.rules, "url-userinfo", "userinfo");
-      if (ctx.isRemoved("request-url-userinfo") && (ctx.level === "shareable" || userinfoRule)) {
-        ctx.tracker.markRemoved(
+      if (ctx.isRemoved("request-url-userinfo")) {
+        const rule = findMatchingRule(ctx.rules, "url-userinfo", "userinfo");
+        ctx.tracker.removed(
+          field,
           "request-url-userinfo",
-          isPage ? "page" : "url-userinfo",
-          "userinfo",
-          userinfoRule?.id ?? `${ctx.level}:userinfo`,
+          rule?.id ?? ctx.levelRule("request-url-userinfo"),
         );
         nextUserinfoPrefix = ctx.level === "shareable" ? "" : `${encodedReplacement}@`;
       } else {
-        ctx.tracker.noteCount("request-url-userinfo");
+        ctx.tracker.kept(field, "request-url-userinfo");
         nextUserinfoPrefix = `${userinfo}@`;
       }
     }
 
     if (!isPage) {
       if (ctx.isRemoved("request-url-host")) {
-        ctx.tracker.markRemoved("request-url-host", "query", "host", `${ctx.level}:host`);
+        ctx.tracker.removed("request.url", "request-url-host", ctx.levelRule("request-url-host"));
         hostPort = "redacted.invalid";
       } else if (hostPort.length > 0) {
-        ctx.tracker.noteCount("request-url-host");
+        ctx.tracker.kept("request.url", "request-url-host");
       }
     }
 
     let nextPath = pathPart;
     if (!isPage && pathPart.length > 0) {
       if (ctx.isRemoved("request-url-path")) {
-        ctx.tracker.markRemoved("request-url-path", "query", "path", `${ctx.level}:path`);
+        ctx.tracker.removed("request.url", "request-url-path", ctx.levelRule("request-url-path"));
         nextPath = "/";
       } else {
-        ctx.tracker.noteCount("request-url-path");
+        ctx.tracker.kept("request.url", "request-url-path");
       }
     }
 
@@ -1034,80 +1213,56 @@ function redactStructuredUrl(
 
   let nextQuery: string | null = null;
   if (query !== null) {
-    if (query.length === 0) {
-      nextQuery = ctx.isRemoved("request-url-query") ? null : "";
-    } else {
-      const keptSegments: string[] = [];
-      for (const segment of query.split("&")) {
-        if (segment.length === 0) {
-          if (!ctx.isRemoved("request-url-query")) {
-            keptSegments.push(segment);
-          }
-          continue;
-        }
-        const eqIndex = segment.indexOf("=");
-        const rawName = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
-        const decodedName = safeDecodeQueryComponent(rawName);
-        const secretRule = findMatchingRule(ctx.rules, "query", decodedName);
-        if (secretRule) {
-          if (ctx.isRemoved("request-url-query-secret")) {
-            ctx.tracker.markRemoved(
-              "request-url-query-secret",
-              queryTarget,
-              decodedName,
-              secretRule.id,
-            );
-            if (!ctx.isRemoved("request-url-query")) {
-              keptSegments.push(`${rawName}=${encodedReplacement}`);
-            }
-          } else {
-            ctx.tracker.noteCount("request-url-query-secret");
-            keptSegments.push(segment);
-          }
-        } else if (!isPage) {
-          if (ctx.isRemoved("request-url-query")) {
-            ctx.tracker.markRemoved(
-              "request-url-query",
-              queryTarget,
-              decodedName || "query",
-              `${ctx.level}:query`,
-            );
-          } else {
-            ctx.tracker.noteCount("request-url-query");
-            keptSegments.push(segment);
+    const otherQueryRemoved = !isPage && ctx.isRemoved("request-url-query");
+    const keptSegments: string[] = [];
+    for (const segment of query.split("&")) {
+      const eqIndex = segment.indexOf("=");
+      const rawName = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
+      const secretRule =
+        segment.length > 0
+          ? findMatchingRule(ctx.rules, "query", safeDecodeQueryComponent(rawName))
+          : undefined;
+      if (secretRule) {
+        if (ctx.isRemoved("request-url-query-secret")) {
+          ctx.tracker.removed(field, "request-url-query-secret", secretRule.id);
+          if (!otherQueryRemoved) {
+            keptSegments.push(`${rawName}=${encodedReplacement}`);
           }
         } else {
+          ctx.tracker.kept(field, "request-url-query-secret");
           keptSegments.push(segment);
         }
-      }
-      if (keptSegments.length > 0) {
-        nextQuery = keptSegments.join("&");
-      } else if (!ctx.isRemoved("request-url-query")) {
-        nextQuery = "";
-      }
-    }
-  }
-
-  let nextFragment: string | null = null;
-  if (fragment !== null) {
-    if (!isPage) {
-      if (ctx.isRemoved("request-url-fragment")) {
-        if (fragment.length > 0) {
-          ctx.tracker.markRemoved(
-            "request-url-fragment",
-            "query",
-            "fragment",
-            `${ctx.level}:fragment`,
+      } else if (otherQueryRemoved) {
+        if (segment.length > 0) {
+          ctx.tracker.removed(
+            "request.url",
+            "request-url-query",
+            ctx.levelRule("request-url-query"),
           );
         }
       } else {
-        if (fragment.length > 0) {
-          ctx.tracker.noteCount("request-url-fragment");
+        if (!isPage && segment.length > 0) {
+          ctx.tracker.kept("request.url", "request-url-query");
         }
-        nextFragment = fragment;
+        keptSegments.push(segment);
       }
-    } else {
-      nextFragment = fragment;
+    }
+    nextQuery = otherQueryRemoved && keptSegments.length === 0 ? null : keptSegments.join("&");
+  }
+
+  let nextFragment: string | null = fragment;
+  if (fragment !== null && !isPage) {
+    if (ctx.isRemoved("request-url-fragment")) {
+      if (fragment.length > 0) {
+        ctx.tracker.removed(
+          "request.url",
+          "request-url-fragment",
+          ctx.levelRule("request-url-fragment"),
+        );
+      }
+      nextFragment = null;
+    } else if (fragment.length > 0) {
+      ctx.tracker.kept("request.url", "request-url-fragment");
     }
   }
 
@@ -1117,24 +1272,27 @@ function redactStructuredUrl(
 }
 
 function redactPageTitle(title: string, ctx: RedactContext): string {
-  const afterUrl = redactStructuredUrl(title, ctx, "page-title");
+  const afterUrl = redactStructuredUrl(title, ctx, "log.pages[].title");
   if (ctx.isRemoved("page-title")) {
     if (title.length > 0) {
-      ctx.tracker.markRemoved("page-title", "page", "title", `${ctx.level}:page-title`);
+      ctx.tracker.removed("log.pages[].title", "page-title", ctx.levelRule("page-title"));
     }
     return "";
   }
   if (afterUrl.length > 0) {
-    ctx.tracker.noteCount("page-title");
+    ctx.tracker.kept("log.pages[].title", "page-title");
   }
   return afterUrl;
 }
 
+type HeaderValuePlace = PlaceOf<"request.headers[].value">;
+
 function classifyHeaderValuePlace(
   headerName: string,
   rules: readonly HarRedactionRule[],
-): { readonly place: HarRedactionPlace; readonly rule?: HarRedactionRule | undefined } {
-  const rule = findMatchingRule(rules, "header", headerName);
+): { readonly place: HeaderValuePlace; readonly rule?: HarRedactionRule | undefined } {
+  // Some proxies keep the colon or stray spaces in a header name; the rule still applies.
+  const rule = findMatchingRule(rules, "header", headerName.trim().replace(/\s*:$/u, ""));
   if (rule) {
     return { place: "header-value-secret", rule };
   }
@@ -1148,178 +1306,150 @@ function classifyHeaderValuePlace(
   return { place: "named-header" };
 }
 
+type Side = "request" | "response";
+
 function redactHeaders(
   headers: readonly HarNameValue[],
+  side: Side,
   ctx: RedactContext,
 ): readonly HarNameValue[] {
   return headers.map((header) => {
-    const custom = redactCustomFields(header, OWNED_FIELDS.nameValue, ctx);
-    let comment = redactComment(header.comment, "header.comment", ctx);
-
-    let name = header.name;
-    const nameRemoved = ctx.isRemoved("header-name");
-    if (nameRemoved) {
-      ctx.tracker.markRemoved("header-name", "header", "header", `${ctx.level}:header-name`);
-      name = "";
-    } else {
-      ctx.tracker.noteCount("header-name");
-    }
-
-    const { place: valuePlace, rule } = classifyHeaderValuePlace(header.name, ctx.rules);
-    let value = header.value;
-    if (ctx.isRemoved(valuePlace)) {
-      const ruleId = rule?.id ?? `${ctx.level}:${valuePlace}`;
-      ctx.tracker.markRemoved(valuePlace, "header", nameRemoved ? "header" : header.name, ruleId);
-      if (ctx.level === "shareable" && !rule) {
-        value = "";
-      } else {
-        value = ctx.replacement;
-        if (!ctx.isRemoved("comment")) {
-          comment = appendComment(comment, `redacted by ${ruleId}`);
-        }
-      }
-    } else {
-      ctx.tracker.noteCount(valuePlace);
-    }
-
-    return {
-      ...custom,
-      name,
-      value,
-      ...(comment !== undefined ? { comment } : {}),
+    const changes: Record<string, unknown> = {
+      ...redactCustomFields(header, OWNED_FIELDS.nameValue, `${side}.headers[].<custom>`, ctx),
+      comment: redactComment(header.comment, `${side}.headers[].comment`, ctx),
     };
+
+    if (ctx.isRemoved("header-name")) {
+      ctx.tracker.removed(`${side}.headers[].name`, "header-name", ctx.levelRule("header-name"));
+      changes.name = "";
+    } else {
+      ctx.tracker.kept(`${side}.headers[].name`, "header-name");
+    }
+
+    const { place, rule } = classifyHeaderValuePlace(header.name, ctx.rules);
+    if (ctx.isRemoved(place)) {
+      ctx.tracker.removed(`${side}.headers[].value`, place, rule?.id ?? ctx.levelRule(place));
+      changes.value = ctx.emptied();
+    } else {
+      ctx.tracker.kept(`${side}.headers[].value`, place);
+    }
+    return rebuild(header, changes);
   });
 }
 
-function redactCookies(cookies: readonly HarCookie[], ctx: RedactContext): readonly HarCookie[] {
-  const valueRemoved = ctx.isRemoved("cookie");
+const COOKIE_METADATA_KEYS = ["name", "path", "domain", "expires"] as const;
+
+function redactCookies(
+  cookies: readonly HarCookie[],
+  side: Side,
+  ctx: RedactContext,
+): readonly HarCookie[] {
   const metaRemoved = ctx.isRemoved("cookie-metadata");
+  const valueRemoved = ctx.isRemoved("cookie");
   const result: HarCookie[] = [];
 
   for (const cookie of cookies) {
-    const custom = redactCustomFields(cookie, OWNED_FIELDS.cookie, ctx);
-    let comment = redactComment(cookie.comment, "cookie.comment", ctx);
+    const changes: Record<string, unknown> = {
+      ...removeMalformedNumbers(
+        cookie,
+        [`${side}.cookies[].httpOnly`, `${side}.cookies[].secure`],
+        ctx,
+      ),
+      ...redactCustomFields(cookie, OWNED_FIELDS.cookie, `${side}.cookies[].<custom>`, ctx),
+      comment: redactComment(cookie.comment, `${side}.cookies[].comment`, ctx),
+    };
 
-    let name = cookie.name;
-    let path = cookie.path;
-    let domain = cookie.domain;
-    let expires = cookie.expires;
-    const metaCount =
-      1 +
-      (path !== undefined ? 1 : 0) +
-      (domain !== undefined ? 1 : 0) +
-      (typeof expires === "string" ? 1 : 0);
-
-    if (metaRemoved) {
-      ctx.tracker.markRemoved(
-        "cookie-metadata",
-        "cookie",
-        "cookie",
-        `${ctx.level}:cookie-metadata`,
-        metaCount,
-      );
-      name = "";
-      path = undefined;
-      domain = undefined;
-      expires = undefined;
-    } else {
-      ctx.tracker.noteCount("cookie-metadata", metaCount);
-    }
-
-    const rule = findMatchingRule(ctx.rules, "cookie", cookie.name);
-    let value = cookie.value;
-    let didRedactValue = false;
-    if (valueRemoved || rule) {
-      const ruleId = rule?.id ?? `${ctx.level}:cookie`;
-      ctx.tracker.markRemoved("cookie", "cookie", metaRemoved ? "cookie" : cookie.name, ruleId);
-      value = ctx.level === "shareable" ? "" : ctx.replacement;
-      didRedactValue = true;
-      if (rule && !ctx.isRemoved("comment")) {
-        comment = appendComment(comment, `redacted by ${rule.id}`);
+    for (const key of COOKIE_METADATA_KEYS) {
+      if (typeof cookie[key] !== "string") {
+        continue;
       }
-    } else {
-      ctx.tracker.noteCount("cookie");
+      if (metaRemoved) {
+        ctx.tracker.removed(
+          `${side}.cookies[].${key}`,
+          "cookie-metadata",
+          ctx.levelRule("cookie-metadata"),
+        );
+        changes[key] = key === "name" ? "" : undefined;
+      } else {
+        ctx.tracker.kept(`${side}.cookies[].${key}`, "cookie-metadata");
+      }
     }
 
-    if (
-      metaRemoved &&
-      didRedactValue &&
-      comment === undefined &&
-      Object.keys(custom).length === 0
-    ) {
+    if (valueRemoved) {
+      const rule = findMatchingRule(ctx.rules, "cookie", cookie.name);
+      ctx.tracker.removed(`${side}.cookies[].value`, "cookie", rule?.id ?? ctx.levelRule("cookie"));
+      changes.value = ctx.emptied();
+    } else {
+      ctx.tracker.kept(`${side}.cookies[].value`, "cookie");
+    }
+
+    const next = rebuild(cookie, changes);
+    if (metaRemoved && valueRemoved && keepsOnly(next, OWNED_FIELDS.cookie, ["name", "value"])) {
       continue;
     }
-
-    result.push({
-      ...custom,
-      name,
-      value,
-      ...(path !== undefined ? { path } : {}),
-      ...(domain !== undefined ? { domain } : {}),
-      ...(expires !== undefined ? { expires } : {}),
-      ...(cookie.httpOnly !== undefined ? { httpOnly: cookie.httpOnly } : {}),
-      ...(cookie.secure !== undefined ? { secure: cookie.secure } : {}),
-      ...(comment !== undefined ? { comment } : {}),
-    });
+    result.push(next);
   }
-
   return result;
+}
+
+// True when every key left on `item` is one of `emptiedKeys` or a non-string field the spec owns, so
+// the item no longer carries anything worth keeping.
+function keepsOnly(
+  item: object,
+  owned: ReadonlySet<string>,
+  emptiedKeys: readonly string[],
+): boolean {
+  return Object.entries(item).every(
+    ([key, value]) =>
+      emptiedKeys.includes(key) ||
+      (owned.has(key) && key !== "comment" && typeof value !== "string"),
+  );
 }
 
 function redactQueryString(
   queryString: readonly HarNameValue[],
   ctx: RedactContext,
 ): readonly HarNameValue[] {
-  const otherRemoved = ctx.isRemoved("query-string");
-  const secretRemoved = ctx.isRemoved("query-string-secret");
+  const nameRemoved = ctx.isRemoved("query-string");
   const result: HarNameValue[] = [];
 
   for (const item of queryString) {
-    const custom = redactCustomFields(item, OWNED_FIELDS.nameValue, ctx);
-    let comment = redactComment(item.comment, "queryString.comment", ctx);
+    const changes: Record<string, unknown> = {
+      ...redactCustomFields(item, OWNED_FIELDS.nameValue, "request.queryString[].<custom>", ctx),
+      comment: redactComment(item.comment, "request.queryString[].comment", ctx),
+    };
 
-    let name = item.name;
-    if (otherRemoved) {
-      ctx.tracker.markRemoved("query-string", "query", "query", `${ctx.level}:query-name`);
-      name = "";
+    if (nameRemoved) {
+      ctx.tracker.removed(
+        "request.queryString[].name",
+        "query-string",
+        ctx.levelRule("query-string"),
+      );
+      changes.name = "";
     } else {
-      ctx.tracker.noteCount("query-string");
+      ctx.tracker.kept("request.queryString[].name", "query-string");
     }
 
     const rule = findMatchingRule(ctx.rules, "query", item.name);
-    const valuePlace: HarRedactionPlace = rule ? "query-string-secret" : "query-string";
-    let value = item.value;
-    let didRemoveValue = false;
-    if (ctx.isRemoved(valuePlace)) {
-      const ruleId = rule?.id ?? `${ctx.level}:query`;
-      ctx.tracker.markRemoved(valuePlace, "query", otherRemoved ? "query" : item.name, ruleId);
-      value = ctx.level === "shareable" ? "" : ctx.replacement;
-      didRemoveValue = true;
-      if (rule && !ctx.isRemoved("comment")) {
-        comment = appendComment(comment, `redacted by ${rule.id}`);
-      }
+    const valuePlace = rule ? "query-string-secret" : "query-string";
+    const valueRemoved = ctx.isRemoved(valuePlace);
+    if (valueRemoved) {
+      ctx.tracker.removed(
+        "request.queryString[].value",
+        valuePlace,
+        rule?.id ?? ctx.levelRule(valuePlace),
+      );
+      changes.value = ctx.emptied();
     } else {
-      ctx.tracker.noteCount(valuePlace);
+      ctx.tracker.kept("request.queryString[].value", valuePlace);
     }
 
-    if (
-      otherRemoved &&
-      secretRemoved &&
-      didRemoveValue &&
-      comment === undefined &&
-      Object.keys(custom).length === 0
-    ) {
+    const next = rebuild(item, changes);
+    if (nameRemoved && valueRemoved && keepsOnly(next, OWNED_FIELDS.nameValue, ["name", "value"])) {
       continue;
     }
-
-    result.push({
-      ...custom,
-      name,
-      value,
-      ...(comment !== undefined ? { comment } : {}),
-    });
+    result.push(next);
   }
-
   return result;
 }
 
@@ -1328,7 +1458,10 @@ function looksLikeJson(text: string): boolean {
   return trimmed.startsWith("{") || trimmed.startsWith("[");
 }
 
-function classifyRequestBodyPlace(mimeType: string, text: string): HarRedactionPlace {
+function classifyRequestBodyPlace(
+  mimeType: string,
+  text: string,
+): PlaceOf<"request.postData.text"> {
   const mime = mimeType.toLowerCase();
   if (mime.includes("json") || looksLikeJson(text)) {
     return "body-json";
@@ -1346,7 +1479,7 @@ function classifyResponseBodyPlace(
   mimeType: string,
   encoding: string | undefined,
   text: string,
-): HarRedactionPlace {
+): PlaceOf<"response.content.text"> {
   if (encoding?.toLowerCase() === "base64") {
     return "response-body-base64";
   }
@@ -1357,6 +1490,68 @@ function classifyResponseBodyPlace(
   return "response-body-other";
 }
 
+const PARAM_METADATA_KEYS = ["name", "fileName", "contentType"] as const;
+
+function redactParams(
+  params: readonly HarPostDataParam[],
+  ctx: RedactContext,
+): readonly HarPostDataParam[] {
+  const metaRemoved = ctx.isRemoved("body-param");
+  const result: HarPostDataParam[] = [];
+
+  for (const param of params) {
+    const changes: Record<string, unknown> = {
+      ...redactCustomFields(
+        param,
+        OWNED_FIELDS.postParam,
+        "request.postData.params[].<custom>",
+        ctx,
+      ),
+      comment: redactComment(param.comment, "request.postData.params[].comment", ctx),
+    };
+
+    for (const key of PARAM_METADATA_KEYS) {
+      if (typeof param[key] !== "string") {
+        continue;
+      }
+      if (metaRemoved) {
+        ctx.tracker.removed(
+          `request.postData.params[].${key}`,
+          "body-param",
+          ctx.levelRule("body-param"),
+        );
+        changes[key] = key === "name" ? "" : undefined;
+      } else {
+        ctx.tracker.kept(`request.postData.params[].${key}`, "body-param");
+      }
+    }
+
+    const rule = findBodyRule(ctx.rules, param.name);
+    const valuePlace = rule ? "body-param-secret" : "body-param";
+    let valueRemoved = param.value === undefined;
+    if (param.value !== undefined) {
+      if (ctx.isRemoved(valuePlace)) {
+        ctx.tracker.removed(
+          "request.postData.params[].value",
+          valuePlace,
+          rule?.id ?? ctx.levelRule(valuePlace),
+        );
+        changes.value = ctx.emptied();
+        valueRemoved = true;
+      } else {
+        ctx.tracker.kept("request.postData.params[].value", valuePlace);
+      }
+    }
+
+    const next = rebuild(param, changes);
+    if (metaRemoved && valueRemoved && keepsOnly(next, OWNED_FIELDS.postParam, ["name", "value"])) {
+      continue;
+    }
+    result.push(next);
+  }
+  return result;
+}
+
 function redactPostData(
   postData: HarPostData | undefined,
   ctx: RedactContext,
@@ -1364,125 +1559,52 @@ function redactPostData(
   if (!postData) {
     return undefined;
   }
-  const custom = redactCustomFields(postData, OWNED_FIELDS.postData, ctx);
-  const comment = redactComment(postData.comment, "postData.comment", ctx);
-  const mimeType = redactProtocolString(postData.mimeType, "postData.mimeType", ctx);
+  const changes: Record<string, unknown> = {
+    ...redactCustomFields(postData, OWNED_FIELDS.postData, "request.postData.<custom>", ctx),
+    comment: redactComment(postData.comment, "request.postData.comment", ctx),
+    mimeType: redactProtocolString(postData.mimeType, "request.postData.mimeType", ctx),
+    params: redactParams(postData.params, ctx),
+  };
 
-  const paramMetaRemoved = ctx.isRemoved("body-param");
-  const paramSecretRemoved = ctx.isRemoved("body-param-secret");
-  const params: HarPostDataParam[] = [];
-  for (const param of postData.params) {
-    const paramCustom = redactCustomFields(param, OWNED_FIELDS.postParam, ctx);
-    let paramComment = redactComment(param.comment, "postData.param.comment", ctx);
-
-    let name = param.name;
-    let fileName = param.fileName;
-    let contentType = param.contentType;
-    const metaCount = 1 + (fileName !== undefined ? 1 : 0) + (contentType !== undefined ? 1 : 0);
-
-    if (paramMetaRemoved) {
-      ctx.tracker.markRemoved("body-param", "body", "param", `${ctx.level}:body-param`, metaCount);
-      name = "";
-      fileName = undefined;
-      contentType = undefined;
-    } else {
-      ctx.tracker.noteCount("body-param", metaCount);
-    }
-
-    const rule = findBodyRule(ctx.rules, param.name);
-    const valuePlace: HarRedactionPlace = rule ? "body-param-secret" : "body-param";
-    let value = param.value;
-    let valueRemoved = false;
-    if (value !== undefined) {
-      if (ctx.isRemoved(valuePlace)) {
-        const ruleId = rule?.id ?? `${ctx.level}:body-param`;
-        ctx.tracker.markRemoved(
-          valuePlace,
-          "body",
-          paramMetaRemoved ? "param" : param.name,
-          ruleId,
-        );
-        value = ctx.level === "shareable" ? "" : ctx.replacement;
-        valueRemoved = true;
-        if (rule && !ctx.isRemoved("comment")) {
-          paramComment = appendComment(paramComment, `redacted by ${rule.id}`);
-        }
-      } else {
-        ctx.tracker.noteCount(valuePlace);
-      }
-    }
-
-    if (
-      paramMetaRemoved &&
-      paramSecretRemoved &&
-      (param.value === undefined || valueRemoved) &&
-      paramComment === undefined &&
-      Object.keys(paramCustom).length === 0
-    ) {
-      continue;
-    }
-
-    params.push({
-      ...paramCustom,
-      name,
-      ...(value !== undefined ? { value } : {}),
-      ...(fileName !== undefined ? { fileName } : {}),
-      ...(contentType !== undefined ? { contentType } : {}),
-      ...(paramComment !== undefined ? { comment: paramComment } : {}),
-    });
-  }
-
-  let text = postData.text;
+  const text = postData.text;
   if (typeof text === "string" && text.length > 0) {
     const bodyPlace = classifyRequestBodyPlace(postData.mimeType, text);
     if (ctx.isRemoved(bodyPlace)) {
-      ctx.tracker.markRemoved(bodyPlace, "body", "postData.text", `${ctx.level}:${bodyPlace}`);
-      text = "";
+      ctx.tracker.removed("request.postData.text", bodyPlace, ctx.levelRule(bodyPlace));
+      changes.text = "";
     } else {
-      ctx.tracker.noteCount(bodyPlace);
+      ctx.tracker.kept("request.postData.text", bodyPlace);
     }
   }
-
-  return {
-    ...custom,
-    mimeType,
-    params,
-    text,
-    ...(comment !== undefined ? { comment } : {}),
-  };
+  return rebuild(postData, changes);
 }
 
 function redactContent(content: HarContent, ctx: RedactContext): HarContent {
-  const custom = redactCustomFields(content, OWNED_FIELDS.content, ctx);
-  const comment = redactComment(content.comment, "content.comment", ctx);
-  const mimeType = redactProtocolString(content.mimeType, "content.mimeType", ctx);
-  const encoding =
-    content.encoding !== undefined
-      ? redactProtocolString(content.encoding, "content.encoding", ctx)
-      : undefined;
+  const changes: Record<string, unknown> = {
+    ...removeMalformedNumbers(
+      content,
+      ["response.content.size", "response.content.compression"],
+      ctx,
+    ),
+    ...redactCustomFields(content, OWNED_FIELDS.content, "response.content.<custom>", ctx),
+    comment: redactComment(content.comment, "response.content.comment", ctx),
+    mimeType: redactProtocolString(content.mimeType, "response.content.mimeType", ctx),
+  };
+  if (typeof content.encoding === "string") {
+    changes.encoding = redactProtocolString(content.encoding, "response.content.encoding", ctx);
+  }
 
-  let text = content.text;
+  const text = content.text;
   if (typeof text === "string" && text.length > 0) {
     const bodyPlace = classifyResponseBodyPlace(content.mimeType, content.encoding, text);
     if (ctx.isRemoved(bodyPlace)) {
-      ctx.tracker.markRemoved(bodyPlace, "body", "content.text", `${ctx.level}:${bodyPlace}`);
-      text = undefined;
+      ctx.tracker.removed("response.content.text", bodyPlace, ctx.levelRule(bodyPlace));
+      changes.text = undefined;
     } else {
-      ctx.tracker.noteCount(bodyPlace);
+      ctx.tracker.kept("response.content.text", bodyPlace);
     }
-  } else if (typeof text === "string" && text.length === 0 && ctx.level === "shareable") {
-    text = undefined;
   }
-
-  return {
-    ...custom,
-    size: content.size,
-    ...(content.compression !== undefined ? { compression: content.compression } : {}),
-    mimeType,
-    ...(text !== undefined ? { text } : {}),
-    ...(encoding !== undefined && encoding.length > 0 ? { encoding } : {}),
-    ...(comment !== undefined ? { comment } : {}),
-  };
+  return rebuild(content, changes);
 }
 
 const CACHE_ENTRY_STRING_KEYS = [
@@ -1498,195 +1620,216 @@ const CACHE_ENTRY_STRING_KEYS = [
 
 const CACHE_ENTRY_ALL_OWNED = new Set<string>([
   ...OWNED_FIELDS.cacheEntry,
-  "_dataSize",
-  "_lastModified",
-  "_device",
+  ...CACHE_ENTRY_STRING_KEYS,
 ]);
 
 function redactCacheEntry(
   entry: HarCacheEntry | null | undefined,
-  slotName: string,
+  slot: "beforeRequest" | "afterRequest",
   ctx: RedactContext,
 ): HarCacheEntry | null | undefined {
   if (entry === undefined || entry === null) {
     return entry;
   }
-  const custom = redactCustomFields(entry, CACHE_ENTRY_ALL_OWNED, ctx);
-  const comment = redactComment(entry.comment, `${slotName}.comment`, ctx);
-
-  let stringCount = 0;
-  for (const key of CACHE_ENTRY_STRING_KEYS) {
-    const val = entry[key];
-    if (typeof val === "string" && val.length > 0) {
-      stringCount += 1;
-    }
-  }
-
-  if (ctx.isRemoved("cache")) {
-    if (stringCount > 0 || entry.hitCount !== undefined || typeof entry.fetchCount === "number") {
-      ctx.tracker.markRemoved(
-        "cache",
-        "body",
-        slotName,
-        `${ctx.level}:cache`,
-        Math.max(1, stringCount),
-      );
-    }
-    if (comment === undefined && Object.keys(custom).length === 0) {
-      return undefined;
-    }
-    return {
-      ...custom,
-      ...(comment !== undefined ? { comment } : {}),
-    };
-  }
-
-  if (stringCount > 0) {
-    ctx.tracker.noteCount("cache", stringCount);
-  }
-
-  return {
-    ...custom,
-    ...(entry.expires !== undefined ? { expires: entry.expires } : {}),
-    ...(entry.lastAccess !== undefined ? { lastAccess: entry.lastAccess } : {}),
-    ...(entry.lastFetched !== undefined ? { lastFetched: entry.lastFetched } : {}),
-    ...(entry.eTag !== undefined ? { eTag: entry.eTag } : {}),
-    ...(entry.hitCount !== undefined ? { hitCount: entry.hitCount } : {}),
-    ...(entry.fetchCount !== undefined ? { fetchCount: entry.fetchCount } : {}),
-    ...(comment !== undefined ? { comment } : {}),
-    ...(entry._dataSize !== undefined ? { _dataSize: entry._dataSize } : {}),
-    ...(entry._lastModified !== undefined ? { _lastModified: entry._lastModified } : {}),
-    ...(entry._device !== undefined ? { _device: entry._device } : {}),
+  const changes: Record<string, unknown> = {
+    ...removeMalformedNumbers(entry, [`cache.${slot}.hitCount`], ctx),
+    ...redactCustomFields(entry, CACHE_ENTRY_ALL_OWNED, `cache.${slot}.<custom>`, ctx),
+    comment: redactComment(entry.comment, `cache.${slot}.comment`, ctx),
   };
+  for (const key of CACHE_ENTRY_STRING_KEYS) {
+    if (typeof entry[key] !== "string") {
+      continue;
+    }
+    if (ctx.isRemoved("cache")) {
+      ctx.tracker.removed(`cache.${slot}.${key}`, "cache", ctx.levelRule("cache"));
+      changes[key] = undefined;
+    } else {
+      ctx.tracker.kept(`cache.${slot}.${key}`, "cache");
+    }
+  }
+  return rebuild(entry, changes);
 }
 
 function redactCache(cache: HarCache, ctx: RedactContext): HarCache {
-  const custom = redactCustomFields(cache, OWNED_FIELDS.cache, ctx);
-  const comment = redactComment(cache.comment, "cache.comment", ctx);
-  const beforeRequest = redactCacheEntry(cache.beforeRequest, "beforeRequest", ctx);
-  const afterRequest = redactCacheEntry(cache.afterRequest, "afterRequest", ctx);
-
-  return {
-    ...custom,
-    ...(beforeRequest !== undefined ? { beforeRequest } : {}),
-    ...(afterRequest !== undefined ? { afterRequest } : {}),
-    ...(comment !== undefined ? { comment } : {}),
-  };
+  return rebuild(cache, {
+    ...redactCustomFields(cache, OWNED_FIELDS.cache, "cache.<custom>", ctx),
+    comment: redactComment(cache.comment, "cache.comment", ctx),
+    beforeRequest: redactCacheEntry(cache.beforeRequest, "beforeRequest", ctx),
+    afterRequest: redactCacheEntry(cache.afterRequest, "afterRequest", ctx),
+  });
 }
+
+const TIMING_FIELDS: readonly HarModelNumberField[] = [
+  "timings.blocked",
+  "timings.dns",
+  "timings.connect",
+  "timings.send",
+  "timings.wait",
+  "timings.receive",
+  "timings.ssl",
+];
 
 function redactTimings(timings: HarTimings, ctx: RedactContext): HarTimings {
-  const custom = redactCustomFields(timings, OWNED_FIELDS.timings, ctx);
-  const comment = redactComment(timings.comment, "timings.comment", ctx);
-
-  return {
-    ...custom,
-    ...(timings.blocked !== undefined ? { blocked: timings.blocked } : {}),
-    ...(timings.dns !== undefined ? { dns: timings.dns } : {}),
-    ...(timings.connect !== undefined ? { connect: timings.connect } : {}),
-    send: timings.send,
-    wait: timings.wait,
-    receive: timings.receive,
-    ...(timings.ssl !== undefined ? { ssl: timings.ssl } : {}),
-    ...(comment !== undefined ? { comment } : {}),
-  };
+  return rebuild(timings, {
+    ...removeMalformedNumbers(timings, TIMING_FIELDS, ctx),
+    ...redactCustomFields(timings, OWNED_FIELDS.timings, "timings.<custom>", ctx),
+    comment: redactComment(timings.comment, "timings.comment", ctx),
+  });
 }
 
-function countInitiatorStackStrings(stack: ChromeInitiatorStack | undefined): number {
-  if (!stack) {
-    return 0;
+function countOwnStrings<F extends HarModelStringField>(
+  source: unknown,
+  ownFields: Readonly<Record<string, F>>,
+  customField: F,
+  skip: ReadonlySet<string>,
+  counts: Map<F, number>,
+): void {
+  const add = (field: F, amount: number): void => {
+    if (amount > 0) {
+      counts.set(field, (counts.get(field) ?? 0) + amount);
+    }
+  };
+  if (typeof source !== "object" || source === null) {
+    add(customField, countStringsInUnknown(source));
+    return;
   }
-  let count = 0;
-  for (const frame of stack.callFrames ?? []) {
-    if (typeof frame.functionName === "string") {
-      count += 1;
-    }
-    if (typeof frame.scriptId === "string") {
-      count += 1;
-    }
-    if (typeof frame.url === "string") {
-      count += 1;
+  for (const [key, value] of Object.entries(source)) {
+    const own = ownFields[key];
+    if (own !== undefined) {
+      add(own, typeof value === "string" ? 1 : 0);
+    } else if (!skip.has(key)) {
+      add(customField, countStringsInUnknown(value));
     }
   }
-  count += countInitiatorStackStrings(stack.parent);
-  return count;
+}
+
+function countInitiatorStack(stack: unknown, counts: Map<FieldIn<"initiator">, number>): void {
+  if (stack === undefined) {
+    return;
+  }
+  countOwnStrings(
+    stack,
+    {},
+    "entry._initiator.stack.<custom>",
+    OWNED_FIELDS.initiatorStack,
+    counts,
+  );
+  if (typeof stack !== "object" || stack === null) {
+    return;
+  }
+  const { callFrames, parent } = stack as Partial<ChromeInitiatorStack>;
+  for (const frame of Array.isArray(callFrames) ? callFrames : []) {
+    countOwnStrings(
+      frame,
+      {
+        functionName: "entry._initiator.stack.callFrames[].functionName",
+        scriptId: "entry._initiator.stack.callFrames[].scriptId",
+        url: "entry._initiator.stack.callFrames[].url",
+      },
+      "entry._initiator.stack.callFrames[].<custom>",
+      OWNED_FIELDS.initiatorFrame,
+      counts,
+    );
+  }
+  countInitiatorStack(parent, counts);
 }
 
 function redactInitiator(
   initiator: ChromeInitiator | undefined,
   ctx: RedactContext,
 ): ChromeInitiator | undefined {
-  if (!initiator) {
+  if (initiator === undefined) {
     return undefined;
   }
-  const stringCount =
-    (typeof initiator.type === "string" ? 1 : 0) +
-    (typeof initiator.url === "string" ? 1 : 0) +
-    (typeof initiator.requestId === "string" ? 1 : 0) +
-    countInitiatorStackStrings(initiator.stack);
-  const amount = Math.max(1, stringCount);
-  if (ctx.isRemoved("initiator")) {
-    ctx.tracker.markRemoved(
-      "initiator",
-      "initiator",
-      "_initiator",
-      `${ctx.level}:initiator`,
-      amount,
-    );
-    return undefined;
+  const counts = new Map<FieldIn<"initiator">, number>();
+  countOwnStrings(
+    initiator,
+    {
+      type: "entry._initiator.type",
+      url: "entry._initiator.url",
+      requestId: "entry._initiator.requestId",
+    },
+    "entry._initiator.<custom>",
+    OWNED_FIELDS.initiator,
+    counts,
+  );
+  countInitiatorStack((initiator as Partial<ChromeInitiator>).stack, counts);
+  const removed = ctx.isRemoved("initiator");
+  for (const [field, amount] of counts) {
+    if (removed) {
+      ctx.tracker.removed(field, "initiator", ctx.levelRule("initiator"), amount);
+    } else {
+      ctx.tracker.kept(field, "initiator", amount);
+    }
   }
-  ctx.tracker.noteCount("initiator", amount);
-  return initiator;
+  return removed ? undefined : initiator;
 }
 
 function redactWebSocketMessages(
   messages: readonly ChromeWebSocketMessage[] | undefined,
   ctx: RedactContext,
 ): readonly ChromeWebSocketMessage[] | undefined {
-  if (!messages) {
+  if (messages === undefined) {
     return undefined;
   }
-  let stringCount = 0;
-  for (const msg of messages) {
-    if (typeof msg.type === "string") {
-      stringCount += 1;
-    }
-    if (typeof msg.data === "string") {
-      stringCount += 1;
+  const counts = new Map<FieldIn<"websocket">, number>();
+  for (const message of Array.isArray(messages) ? messages : [messages]) {
+    countOwnStrings(
+      message,
+      { type: "entry._webSocketMessages[].type", data: "entry._webSocketMessages[].data" },
+      "entry._webSocketMessages[].<custom>",
+      OWNED_FIELDS.webSocketMessage,
+      counts,
+    );
+  }
+  const removed = ctx.isRemoved("websocket");
+  for (const [field, amount] of counts) {
+    if (removed) {
+      ctx.tracker.removed(field, "websocket", ctx.levelRule("websocket"), amount);
+    } else {
+      ctx.tracker.kept(field, "websocket", amount);
     }
   }
-  const amount = Math.max(1, stringCount);
-  if (ctx.isRemoved("websocket")) {
-    if (messages.length > 0) {
-      ctx.tracker.markRemoved(
-        "websocket",
-        "body",
-        "_webSocketMessages",
-        `${ctx.level}:websocket`,
-        amount,
-      );
-    }
-    return undefined;
-  }
-  if (messages.length > 0) {
-    ctx.tracker.noteCount("websocket", amount);
-  }
-  return messages;
+  return removed ? undefined : messages;
 }
 
-function redactCustomStringField<T extends string>(
-  value: T | undefined,
-  fieldName: string,
+const EXPORT_ANNOTATION_KEYS = ["source", "bodyState", "bodyMissing", "bodyCheck"] as const;
+
+function redactEntryExport(
+  extension: HarEntryExtension | undefined,
   ctx: RedactContext,
-): T | undefined {
-  if (value === undefined) {
-    return undefined;
+): Record<string, unknown> {
+  if (typeof extension !== "object" || extension === null) {
+    return {};
   }
-  if (ctx.isRemoved("other-custom-field")) {
-    ctx.tracker.markRemoved("other-custom-field", "body", fieldName, `${ctx.level}:${fieldName}`);
-    return undefined;
+  const changes: Record<string, unknown> = {
+    ...redactCustomFields(extension, OWNED_FIELDS.entryExport, "entry._harExport.<custom>", ctx),
+  };
+  for (const key of EXPORT_ANNOTATION_KEYS) {
+    if (typeof extension[key] !== "string") {
+      continue;
+    }
+    if (ctx.isRemoved("export-annotation")) {
+      ctx.tracker.removed(
+        `entry._harExport.${key}`,
+        "export-annotation",
+        ctx.levelRule("export-annotation"),
+      );
+      changes[key] = undefined;
+    } else {
+      ctx.tracker.kept(`entry._harExport.${key}`, "export-annotation");
+    }
   }
-  ctx.tracker.noteCount("other-custom-field");
-  return value;
+  if (extension.redactedFields !== undefined) {
+    ctx.tracker.removed(
+      "entry._harExport.redactedFields",
+      "redaction-record",
+      ctx.levelRule("redaction-record"),
+      Math.max(1, countStringsInUnknown(extension.redactedFields)),
+    );
+    changes.redactedFields = undefined;
+  }
+  return changes;
 }
 
 const ENTRY_DECLARED_CUSTOM = new Set<string>([
@@ -1700,218 +1843,145 @@ const ENTRY_DECLARED_CUSTOM = new Set<string>([
   "_harExport",
 ]);
 
-const RESPONSE_DECLARED_CUSTOM = new Set<string>(["_transferSize", "_error"]);
+const ENTRY_CUSTOM_STRING_FIELDS = [
+  ["serverIPAddress", "entry.serverIPAddress"],
+  ["connection", "entry.connection"],
+  ["_securityState", "entry._securityState"],
+  ["_priority", "entry._priority"],
+  ["_resourceType", "entry._resourceType"],
+  ["_fromCache", "entry._fromCache"],
+  ["_connectionId", "entry._connectionId"],
+] as const;
+
+const RESPONSE_DECLARED_CUSTOM = new Set<string>(["_error"]);
+
+function redactRequest(entry: HarEntry, ctx: RedactContext): HarEntry["request"] {
+  const request = entry.request;
+  const url = redactStructuredUrl(request.url, ctx, "request.url");
+  return rebuild(request, {
+    ...removeMalformedNumbers(request, ["request.headersSize", "request.bodySize"], ctx),
+    ...redactCustomFields(request, OWNED_FIELDS.request, "request.<custom>", ctx),
+    method: redactProtocolString(request.method, "request.method", ctx),
+    url: toHarUrl(url) ?? request.url,
+    httpVersion: redactProtocolString(request.httpVersion, "request.httpVersion", ctx),
+    cookies: redactCookies(request.cookies, "request", ctx),
+    headers: redactHeaders(request.headers, "request", ctx),
+    queryString: redactQueryString(request.queryString, ctx),
+    postData: redactPostData(request.postData, ctx),
+    comment: redactComment(request.comment, "request.comment", ctx),
+  });
+}
+
+function redactResponse(entry: HarEntry, ctx: RedactContext): HarEntry["response"] {
+  const response = entry.response;
+  const changes: Record<string, unknown> = {
+    ...removeMalformedNumbers(
+      response,
+      ["response.status", "response.headersSize", "response.bodySize"],
+      ctx,
+    ),
+    ...redactCustomFields(
+      response,
+      OWNED_FIELDS.response,
+      "response.<custom>",
+      ctx,
+      RESPONSE_DECLARED_CUSTOM,
+    ),
+    statusText: redactProtocolString(response.statusText, "response.statusText", ctx),
+    httpVersion: redactProtocolString(response.httpVersion, "response.httpVersion", ctx),
+    cookies: redactCookies(response.cookies, "response", ctx),
+    headers: redactHeaders(response.headers, "response", ctx),
+    content: redactContent(response.content, ctx),
+    comment: redactComment(response.comment, "response.comment", ctx),
+  };
+  if (response.redirectURL.length > 0) {
+    if (ctx.isRemoved("redirect-url")) {
+      ctx.tracker.removed("response.redirectURL", "redirect-url", ctx.levelRule("redirect-url"));
+      changes.redirectURL = "";
+    } else {
+      ctx.tracker.kept("response.redirectURL", "redirect-url");
+    }
+  }
+  if (response._error !== undefined) {
+    changes._error = redactDeclaredCustomField(response._error, "response._error", ctx);
+  }
+  return rebuild(response, changes);
+}
 
 function redactEntryWithContext(
   entry: HarEntry,
   ctx: RedactContext,
-): {
-  readonly entry: HarEntry;
-  readonly url: HarUrl;
-  readonly records: readonly HarRedactionRecord[];
-} {
-  const startedDateTime = redactProtocolIso(entry.startedDateTime, "entry.startedDateTime", ctx);
-  const pageref =
-    entry.pageref !== undefined
-      ? redactProtocolPageId(entry.pageref, "entry.pageref", ctx)
-      : undefined;
-
-  const requestMethod = redactProtocolString(entry.request.method, "request.method", ctx);
-  const requestHttpVersion = redactProtocolString(
-    entry.request.httpVersion,
-    "request.httpVersion",
-    ctx,
-  );
-  const requestHeaders = redactHeaders(entry.request.headers, ctx);
-  const requestCookies = redactCookies(entry.request.cookies, ctx);
-  const queryString = redactQueryString(entry.request.queryString, ctx);
-  const urlText = redactStructuredUrl(entry.request.url, ctx, "request-url");
-  const url = toHarUrl(urlText) ?? entry.request.url;
-  const postData = redactPostData(entry.request.postData, ctx);
-  const requestComment = redactComment(entry.request.comment, "request.comment", ctx);
-  const requestCustom = redactCustomFields(entry.request, OWNED_FIELDS.request, ctx);
-
-  const responseStatusText = redactProtocolString(
-    entry.response.statusText,
-    "response.statusText",
-    ctx,
-  );
-  const responseHttpVersion = redactProtocolString(
-    entry.response.httpVersion,
-    "response.httpVersion",
-    ctx,
-  );
-  const responseHeaders = redactHeaders(entry.response.headers, ctx);
-  const responseCookies = redactCookies(entry.response.cookies, ctx);
-  const content = redactContent(entry.response.content, ctx);
-
-  let redirectURL = entry.response.redirectURL;
-  if (redirectURL.length > 0) {
-    if (ctx.isRemoved("redirect-url")) {
-      ctx.tracker.markRemoved("redirect-url", "query", "redirectURL", `${ctx.level}:redirect-url`);
-      redirectURL = "";
-    } else {
-      ctx.tracker.noteCount("redirect-url");
+): { readonly entry: HarEntry; readonly records: readonly HarRedactionRecord[] } {
+  const exportChanges = redactEntryExport(entry._harExport, ctx);
+  const changes: Record<string, unknown> = {
+    ...removeMalformedNumbers(entry, ["entry.time"], ctx),
+    ...redactCustomFields(entry, OWNED_FIELDS.entry, "entry.<custom>", ctx, ENTRY_DECLARED_CUSTOM),
+    pageref:
+      entry.pageref !== undefined
+        ? redactProtocolPageId(entry.pageref, "entry.pageref", ctx)
+        : undefined,
+    startedDateTime: redactProtocolIso(entry.startedDateTime, "entry.startedDateTime", ctx),
+    request: redactRequest(entry, ctx),
+    response: redactResponse(entry, ctx),
+    cache: redactCache(entry.cache, ctx),
+    timings: redactTimings(entry.timings, ctx),
+    comment: redactComment(entry.comment, "entry.comment", ctx),
+    _initiator: redactInitiator(entry._initiator, ctx),
+    _webSocketMessages: redactWebSocketMessages(entry._webSocketMessages, ctx),
+  };
+  for (const [key, field] of ENTRY_CUSTOM_STRING_FIELDS) {
+    if (entry[key] !== undefined) {
+      changes[key] = redactDeclaredCustomField(entry[key], field, ctx);
     }
   }
 
-  const responseComment = redactComment(entry.response.comment, "response.comment", ctx);
-  const responseError =
-    entry.response._error !== undefined && entry.response._error !== null
-      ? redactCustomStringField(entry.response._error, "response._error", ctx)
-      : entry.response._error === null && !ctx.isRemoved("other-custom-field")
-        ? null
-        : undefined;
-  const responseTransferSize =
-    entry.response._transferSize !== undefined && !ctx.isRemoved("other-custom-field")
-      ? entry.response._transferSize
-      : undefined;
-  const responseCustom = redactCustomFields(
-    entry.response,
-    OWNED_FIELDS.response,
-    ctx,
-    RESPONSE_DECLARED_CUSTOM,
-  );
-
-  const cache = redactCache(entry.cache, ctx);
-  const timings = redactTimings(entry.timings, ctx);
-  const serverIPAddress = redactCustomStringField(
-    entry.serverIPAddress,
-    "entry.serverIPAddress",
-    ctx,
-  );
-  const connection = redactCustomStringField(entry.connection, "entry.connection", ctx);
-  const entryComment = redactComment(entry.comment, "entry.comment", ctx);
-  const securityState = redactCustomStringField(entry._securityState, "entry._securityState", ctx);
-  const priority = redactCustomStringField(entry._priority, "entry._priority", ctx);
-  const initiator = redactInitiator(entry._initiator, ctx);
-  const resourceType = redactCustomStringField(entry._resourceType, "entry._resourceType", ctx);
-  const fromCache = redactCustomStringField(entry._fromCache, "entry._fromCache", ctx);
-  const connectionId = redactCustomStringField(entry._connectionId, "entry._connectionId", ctx);
-  const webSocketMessages = redactWebSocketMessages(entry._webSocketMessages, ctx);
-  const entryCustom = redactCustomFields(entry, OWNED_FIELDS.entry, ctx, ENTRY_DECLARED_CUSTOM);
-
-  const records = ctx.tracker.records(url);
-  const updated: HarEntry = {
-    ...entryCustom,
-    ...(pageref !== undefined ? { pageref } : {}),
-    startedDateTime,
-    time: entry.time,
-    request: {
-      ...requestCustom,
-      method: requestMethod,
-      url,
-      httpVersion: requestHttpVersion,
-      cookies: requestCookies,
-      headers: requestHeaders,
-      queryString,
-      ...(postData !== undefined ? { postData } : {}),
-      headersSize: entry.request.headersSize,
-      bodySize: entry.request.bodySize,
-      ...(requestComment !== undefined ? { comment: requestComment } : {}),
-    },
-    response: {
-      ...responseCustom,
-      status: entry.response.status,
-      statusText: responseStatusText,
-      httpVersion: responseHttpVersion,
-      cookies: responseCookies,
-      headers: responseHeaders,
-      content,
-      redirectURL,
-      headersSize: entry.response.headersSize,
-      bodySize: entry.response.bodySize,
-      ...(responseComment !== undefined ? { comment: responseComment } : {}),
-      ...(responseTransferSize !== undefined ? { _transferSize: responseTransferSize } : {}),
-      ...(responseError !== undefined ? { _error: responseError } : {}),
-    },
-    cache,
-    timings,
-    ...(serverIPAddress !== undefined ? { serverIPAddress } : {}),
-    ...(connection !== undefined ? { connection } : {}),
-    ...(entryComment !== undefined ? { comment: entryComment } : {}),
-    ...(securityState !== undefined ? { _securityState: securityState } : {}),
-    ...(priority !== undefined ? { _priority: priority } : {}),
-    ...(initiator !== undefined ? { _initiator: initiator } : {}),
-    ...(resourceType !== undefined ? { _resourceType: resourceType } : {}),
-    ...(fromCache !== undefined ? { _fromCache: fromCache } : {}),
-    ...(connectionId !== undefined ? { _connectionId: connectionId } : {}),
-    ...(webSocketMessages !== undefined ? { _webSocketMessages: webSocketMessages } : {}),
-    ...(records.length > 0
-      ? {
-          _harExport: {
-            ...entry._harExport,
-            redactedFields: [
-              ...new Set([...(entry._harExport?.redactedFields ?? []), ...ctx.tracker.fields]),
-            ],
-          },
-        }
-      : entry._harExport
-        ? { _harExport: entry._harExport }
-        : {}),
-  };
-
-  return { entry: updated, url, records };
+  const removedFields = ctx.tracker.fields;
+  if (entry._harExport !== undefined || removedFields.length > 0) {
+    changes._harExport = rebuild(entry._harExport ?? {}, {
+      ...exportChanges,
+      ...(removedFields.length > 0 ? { redactedFields: removedFields } : {}),
+    });
+  }
+  return { entry: rebuild(entry, changes), records: ctx.tracker.records() };
 }
 
 function redactCreator(
   creator: HarCreator,
-  prefix: "creator" | "browser",
+  prefix: "log.creator" | "log.browser",
   ctx: RedactContext,
 ): HarCreator {
-  const custom = redactCustomFields(creator, OWNED_FIELDS.creator, ctx);
+  const removed = ctx.isRemoved("protocol-metadata");
   const name = redactProtocolString(creator.name, `${prefix}.name`, ctx);
   const version = redactProtocolString(creator.version, `${prefix}.version`, ctx);
-  const comment = redactComment(creator.comment, `${prefix}.comment`, ctx);
-  return {
-    ...custom,
-    name,
-    version,
-    ...(comment !== undefined ? { comment } : {}),
-  };
+  return rebuild(creator, {
+    ...redactCustomFields(creator, OWNED_FIELDS.creator, `${prefix}.<custom>`, ctx),
+    name: removed ? "redacted" : name,
+    version: removed ? "0" : version,
+    comment: redactComment(creator.comment, `${prefix}.comment`, ctx),
+  });
 }
 
 function redactPage(page: HarPage, ctx: RedactContext): HarPage {
-  const pageCustom = redactCustomFields(page, OWNED_FIELDS.page, ctx);
-  const timingCustom = redactCustomFields(page.pageTimings, OWNED_FIELDS.pageTimings, ctx);
-  const startedDateTime = redactProtocolIso(page.startedDateTime, "page.startedDateTime", ctx);
-  const id = redactProtocolPageId(page.id, "page.id", ctx);
-  const title = redactPageTitle(page.title, ctx);
-  const comment = redactComment(page.comment, "page.comment", ctx);
-  const timingComment = redactComment(page.pageTimings.comment, "pageTimings.comment", ctx);
-
-  return {
-    ...pageCustom,
-    startedDateTime,
-    id,
-    title,
-    pageTimings: {
-      ...timingCustom,
-      ...(page.pageTimings.onContentLoad !== undefined
-        ? { onContentLoad: page.pageTimings.onContentLoad }
-        : {}),
-      ...(page.pageTimings.onLoad !== undefined ? { onLoad: page.pageTimings.onLoad } : {}),
-      ...(timingComment !== undefined ? { comment: timingComment } : {}),
-    },
-    ...(comment !== undefined ? { comment } : {}),
-  };
-}
-
-function buildPlacesReport(
-  level: RedactionLevel,
-  rules: readonly HarRedactionRule[],
-  counts: ReadonlyMap<HarRedactionPlace, number>,
-  table: Readonly<Record<HarRedactionPlace, HarPlaceRule>>,
-): readonly HarPlaceCoverage[] {
-  return HAR_REDACTION_PLACES.map((place) => {
-    const status = effectivePlaceStatus(place, level, rules, table);
-    return {
-      place,
-      status,
-      count: counts.get(place) ?? 0,
-      detail: detailForStatus(status),
-      canStillHold: canStillHoldForStatus(status),
-    };
+  return rebuild(page, {
+    ...redactCustomFields(page, OWNED_FIELDS.page, "log.pages[].<custom>", ctx),
+    startedDateTime: redactProtocolIso(page.startedDateTime, "log.pages[].startedDateTime", ctx),
+    id: redactProtocolPageId(page.id, "log.pages[].id", ctx),
+    title: redactPageTitle(page.title, ctx),
+    pageTimings: rebuild(page.pageTimings, {
+      ...removeMalformedNumbers(
+        page.pageTimings,
+        ["log.pages[].pageTimings.onContentLoad", "log.pages[].pageTimings.onLoad"],
+        ctx,
+      ),
+      ...redactCustomFields(
+        page.pageTimings,
+        OWNED_FIELDS.pageTimings,
+        "log.pages[].pageTimings.<custom>",
+        ctx,
+      ),
+      comment: redactComment(page.pageTimings.comment, "log.pages[].pageTimings.comment", ctx),
+    }),
+    comment: redactComment(page.comment, "log.pages[].comment", ctx),
   });
 }
 
@@ -1944,62 +2014,50 @@ export function redactUrl(
 ): RedactUrlResult {
   const { level, rules, replacement, table } = normalizeOptions(optionsOrRules);
   const ctx = createContext(-1, level, rules, replacement, table);
-  const next = redactStructuredUrl(url, ctx, "request-url");
-  const harUrl = toHarUrl(next) ?? toHarUrl("https://redacted.invalid/")!;
-  const records = ctx.tracker.records(harUrl);
-  return {
-    url: next,
-    touched: records.length > 0 || next !== url,
-    records,
-  };
+  const next = redactStructuredUrl(url, ctx, "request.url");
+  const records = ctx.tracker.records();
+  return { url: next, touched: records.length > 0 || next !== url, records };
 }
 
 export function redactHarEntry(
   entry: HarEntry,
-  optionsOrRules?: RedactHarOptions | readonly HarRedactionRule[],
-  entryIndex = 0,
+  optionsOrRules: RedactHarOptions | readonly HarRedactionRule[] | undefined,
+  entryIndex: number,
 ): RedactHarEntryResult {
   const { level, rules, replacement, table } = normalizeOptions(optionsOrRules);
   const ctx = createContext(entryIndex, level, rules, replacement, table);
   const result = redactEntryWithContext(entry, ctx);
   const places = buildPlacesReport(level, rules, ctx.tracker.placeCounts, table);
-  const covered = places
-    .filter((place) => place.status !== "kept-not-examined")
-    .map((place) => place.place);
   return {
     entry: result.entry,
-    url: result.url,
+    url: result.entry.request.url,
     touched: result.records.length > 0,
     records: result.records,
-    covered,
+    covered: places
+      .filter((place) => place.status !== "kept-not-examined")
+      .map((place) => place.place),
     places,
   };
 }
 
 export function redactHar(document: HarDocument, options?: RedactHarOptions): RedactHarResult {
   const { level, rules, replacement, table } = normalizeOptions(options);
-  const levelSpec = REDACTION_LEVEL_TABLE[level];
   const allRecords: HarRedactionRecord[] = [];
-  const appliedRules = new Set<string>();
   const totalCounts = new Map<HarRedactionPlace, number>();
   let entriesAffected = 0;
 
-  const mergeContext = (ctx: RedactContext, records: readonly HarRedactionRecord[]): void => {
-    for (const [place, count] of ctx.tracker.placeCounts.entries()) {
+  const merge = (ctx: RedactContext): void => {
+    for (const [place, count] of ctx.tracker.placeCounts) {
       totalCounts.set(place, (totalCounts.get(place) ?? 0) + count);
     }
-    for (const record of records) {
-      allRecords.push(record);
-      appliedRules.add(record.ruleId);
-    }
+    allRecords.push(...ctx.tracker.records());
   };
 
   const pages = document.log.pages?.map((page) => {
     const ctx = createContext(-1, level, rules, replacement, table);
-    const updatedPage = redactPage(page, ctx);
-    const pageUrl = toHarUrl(updatedPage.title) ?? toHarUrl("https://redacted.invalid/")!;
-    mergeContext(ctx, ctx.tracker.records(pageUrl));
-    return updatedPage;
+    const updated = redactPage(page, ctx);
+    merge(ctx);
+    return updated;
   });
 
   const entries = document.log.entries.map((entry, index) => {
@@ -2008,63 +2066,55 @@ export function redactHar(document: HarDocument, options?: RedactHarOptions): Re
     if (result.records.length > 0) {
       entriesAffected += 1;
     }
-    mergeContext(ctx, result.records);
+    merge(ctx);
     return result.entry;
   });
 
-  const docCtx = createContext(-1, level, rules, replacement, table);
-  const logCustom = redactCustomFields(document.log, OWNED_FIELDS.log, docCtx);
-  const version = redactProtocolString(document.log.version, "log.version", docCtx);
-  const creator = redactCreator(document.log.creator, "creator", docCtx);
-  const browser = document.log.browser
-    ? redactCreator(document.log.browser, "browser", docCtx)
-    : undefined;
-  const logComment = redactComment(document.log.comment, "log.comment", docCtx);
-  mergeContext(docCtx, docCtx.tracker.records(toHarUrl("https://redacted.invalid/")!));
+  const logCtx = createContext(-1, level, rules, replacement, table);
+  const log = document.log;
+  const exportCustom =
+    log._harExport !== undefined
+      ? redactCustomFields(
+          log._harExport,
+          OWNED_FIELDS.logExport,
+          "log._harExport.<custom>",
+          logCtx,
+        )
+      : {};
+  if (log._harExport?.redaction !== undefined) {
+    logCtx.tracker.removed(
+      "log._harExport.redaction",
+      "redaction-record",
+      logCtx.levelRule("redaction-record"),
+    );
+  }
+  const version = redactProtocolString(log.version, "log.version", logCtx);
+  const logChanges: Record<string, unknown> = {
+    ...redactCustomFields(log, OWNED_FIELDS.log, "log.<custom>", logCtx, new Set(["_harExport"])),
+    version: logCtx.isRemoved("protocol-metadata") ? "1.2" : version,
+    creator: redactCreator(log.creator, "log.creator", logCtx),
+    browser: log.browser ? redactCreator(log.browser, "log.browser", logCtx) : undefined,
+    pages,
+    entries,
+    comment: redactComment(log.comment, "log.comment", logCtx),
+  };
+  merge(logCtx);
 
   const places = buildPlacesReport(level, rules, totalCounts, table);
   const notExamined = places.filter((place) => place.status === "kept-not-examined");
-  const totalRemoved = allRecords.reduce((sum, record) => sum + record.count, 0);
   const report: HarLogRedactionExtension = {
     applied: true,
-    level: levelSpec.id,
-    guarantee: levelSpec.guarantee,
-    remainingRisk: levelSpec.remainingRisk,
-    totalRemoved,
+    level,
+    ...describeLevel(places),
+    totalRemoved: allRecords.reduce((sum, record) => sum + record.count, 0),
     entriesAffected,
-    rules: [...appliedRules],
+    rules: [...new Set(allRecords.map((record) => record.ruleId))],
     records: allRecords,
     places,
     notExamined,
     notInspected: notExamined.map((place) => place.place),
   };
+  logChanges._harExport = rebuild(log._harExport ?? {}, { ...exportCustom, redaction: report });
 
-  const redactedDocument: HarDocument = {
-    log: {
-      ...logCustom,
-      version: version.length > 0 ? version : "1.2",
-      creator: {
-        ...creator,
-        name: creator.name.length > 0 ? creator.name : "redacted",
-        version: creator.version.length > 0 ? creator.version : "0",
-      },
-      ...(browser
-        ? {
-            browser: {
-              ...browser,
-              name: browser.name.length > 0 ? browser.name : "redacted",
-              version: browser.version.length > 0 ? browser.version : "0",
-            },
-          }
-        : {}),
-      ...(pages !== undefined ? { pages } : {}),
-      entries,
-      ...(logComment !== undefined ? { comment: logComment } : {}),
-      _harExport: {
-        ...document.log._harExport,
-        redaction: report,
-      },
-    },
-  };
-  return { document: redactedDocument, report };
+  return { document: { log: rebuild(log, logChanges) }, report };
 }

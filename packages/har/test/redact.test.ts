@@ -3,13 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { buildHar } from "../src/build.ts";
 import { toHarUrl, toIsoDateTime, toMimeType } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
-import {
-  DEFAULT_REDACTION_RULES,
-  REDACTION_LEVEL_TABLE,
-  redactHar,
-  redactHarEntry,
-  redactUrl,
-} from "../src/redact.ts";
+import { DEFAULT_REDACTION_RULES, redactHar, redactHarEntry, redactUrl } from "../src/redact.ts";
 
 describe("redactHar", () => {
   it("removes structurally defined credential carriers under standard and leaves bodies byte-identical", () => {
@@ -95,11 +89,7 @@ describe("redactHar", () => {
       "https://%5BREDACTED%5D@api.example/oauth/token?access_token=%5BREDACTED%5D&page=2",
     );
     expect(first.request.queryString).toEqual([
-      {
-        name: "access_token",
-        value: "[REDACTED]",
-        comment: "redacted by query:secrets",
-      },
+      { name: "access_token", value: "[REDACTED]" },
       { name: "page", value: "2" },
     ]);
     expect(first.request.headers.find((h) => h.name === "Accept")?.value).toBe("application/json");
@@ -108,26 +98,17 @@ describe("redactHar", () => {
 
     const second = redacted.log.entries[1]!;
     expect(second.request.postData?.params).toEqual([
-      {
-        name: "client_secret",
-        value: "[REDACTED]",
-        comment: "redacted by body:secrets",
-      },
-      {
-        name: "clientSecret",
-        value: "[REDACTED]",
-        comment: "redacted by body:secrets",
-      },
+      { name: "client_secret", value: "[REDACTED]" },
+      { name: "clientSecret", value: "[REDACTED]" },
       { name: "grant_type", value: "client_credentials" },
     ]);
     expect(second.request.postData?.text).toBe(formBodyText);
 
     expect(report.applied).toBe(true);
     expect(report.level).toBe("standard");
-    expect(report.guarantee).toBe(REDACTION_LEVEL_TABLE.standard.guarantee);
     expect(report.entriesAffected).toBe(2);
     expect(report.totalRemoved).toBe(13);
-    expect(report.records.some((record) => record.target === "page")).toBe(true);
+    expect(report.records.some((record) => record.field === "log.pages[].title")).toBe(true);
     expect(report.notInspected).toContain("body-json");
     expect(report.notInspected).toContain("body-form");
     expect(report.notInspected).toContain("response-body-json");
@@ -137,9 +118,15 @@ describe("redactHar", () => {
       ),
     ).toBe(true);
     expect(redacted.log._harExport?.redaction).toEqual(report);
-    expect(first._harExport?.redactedFields).toContain("header:Authorization");
-    expect(first._harExport?.redactedFields).toContain("query:access_token");
-    expect(second._harExport?.redactedFields).toContain("body:client_secret");
+    expect(first._harExport?.redactedFields).toEqual([
+      "request.url",
+      "request.cookies[].value",
+      "request.headers[].value",
+      "request.queryString[].value",
+      "response.cookies[].value",
+      "response.headers[].value",
+    ]);
+    expect(second._harExport?.redactedFields).toEqual(["request.postData.params[].value"]);
     expect(parseHar(redacted).ok).toBe(true);
   });
 
@@ -211,12 +198,12 @@ describe("redactHar", () => {
       rules: [{ id: "cookie:sid", target: "cookie", names: ["sid"] }],
     });
     const partialEntry = partialCookieRules.document.log.entries[0]!;
-    expect(partialEntry.request.cookies.find((c) => c.name === "sid")?.value).toBe("[REDACTED]");
-    expect(partialEntry.request.cookies.find((c) => c.name === "other")?.value).toBe("other-val");
+    // A cookie rule selects every cookie value, whatever names it lists.
+    expect(partialEntry.request.cookies.map((c) => c.value)).toEqual(["[REDACTED]", "[REDACTED]"]);
     expect(partialEntry.request.url).toContain("alice:pw@");
     expect(partialEntry.request.url).toContain("access_token=tok1");
     expect(partialCookieRules.report.places.find((p) => p.place === "cookie")?.status).toBe(
-      "kept-not-examined",
+      "removed",
     );
     expect(
       partialCookieRules.report.places.find((p) => p.place === "request-url-userinfo")?.status,
@@ -227,7 +214,6 @@ describe("redactHar", () => {
     expect(
       partialCookieRules.report.places.find((p) => p.place === "header-value-secret")?.status,
     ).toBe("kept-not-examined");
-    expect(partialCookieRules.report.notInspected).toContain("cookie");
     expect(partialCookieRules.report.notInspected).toContain("request-url-userinfo");
     expect(partialCookieRules.report.notInspected).toContain("request-url-query-secret");
     expect(partialCookieRules.report.notInspected).toContain("header-value-secret");
@@ -257,7 +243,7 @@ describe("redactHar", () => {
       ],
     });
 
-    const singleStandard = redactHarEntry(built.log.entries[0]!, DEFAULT_REDACTION_RULES);
+    const singleStandard = redactHarEntry(built.log.entries[0]!, DEFAULT_REDACTION_RULES, 0);
     expect(singleStandard.touched).toBe(true);
     expect(singleStandard.url).toBe(
       "https://%5BREDACTED%5D@api.example/items?token=%5BREDACTED%5D&page=1",
@@ -269,10 +255,12 @@ describe("redactHar", () => {
       "cookie",
       "query-string-secret",
       "body-param-secret",
+      "redaction-record",
+      "malformed-number",
     ]);
     expect(singleStandard.entry.response.content.text).toBe('{"ok":true}');
 
-    const singleShareable = redactHarEntry(built.log.entries[0]!, { level: "shareable" });
+    const singleShareable = redactHarEntry(built.log.entries[0]!, { level: "shareable" }, 0);
     expect(singleShareable.touched).toBe(true);
     expect(singleShareable.url).toBe("https://api.example/items");
     expect(singleShareable.entry.request.cookies).toEqual([]);
@@ -486,7 +474,7 @@ describe("redactHar", () => {
     }
 
     expect(stdReport.entriesAffected).toBe(1);
-    expect(stdReport.records.some((record) => record.target === "page")).toBe(true);
+    expect(stdReport.records.some((record) => record.field === "log.pages[].title")).toBe(true);
     expect("_oneClickHar" in stdDoc.log).toBe(false);
     expect(stdDoc.log._harExport?.redaction).toEqual(stdReport);
     expect(parseHar(stdDoc).ok).toBe(true);
@@ -500,7 +488,7 @@ describe("redactHar", () => {
       expect(shareText).not.toContain(secret(key));
     }
     expect(shareReport.level).toBe("shareable");
-    expect(shareReport.remainingRisk).toContain("Host names and URL paths");
+    expect(shareReport.remainingRisk).toContain("the path of request URLs");
     expect(parseHar(shareDoc).ok).toBe(true);
   });
 });

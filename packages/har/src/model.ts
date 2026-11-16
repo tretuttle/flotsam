@@ -119,7 +119,7 @@ export type HarMissingBodyReason =
 
 export type HarBodyState = "present" | "empty" | HarMissingBodyReason;
 
-export interface HarEntryExtension {
+export interface HarEntryExtension extends CustomHarFields {
   readonly source?: "both" | "recording-only" | "devtools-only" | (string & {}) | undefined;
   readonly bodyState?: HarBodyState | undefined;
   readonly bodyMissing?: string | undefined;
@@ -130,15 +130,7 @@ export interface HarEntryExtension {
   readonly redactedFields?: readonly string[] | undefined;
 }
 
-export type HarRedactionTarget =
-  | "header"
-  | "header-url"
-  | "cookie"
-  | "query"
-  | "body"
-  | "url-userinfo"
-  | "initiator"
-  | "page";
+export type HarRedactionTarget = "header" | "cookie" | "query" | "body" | "url-userinfo";
 
 export const HAR_REDACTION_PLACES = [
   "request-url-userinfo",
@@ -173,6 +165,9 @@ export const HAR_REDACTION_PLACES = [
   "comment",
   "other-custom-field",
   "protocol-metadata",
+  "export-annotation",
+  "redaction-record",
+  "malformed-number",
 ] as const;
 
 export type HarRedactionPlace = (typeof HAR_REDACTION_PLACES)[number];
@@ -192,6 +187,8 @@ export type PlaceReportDetail =
 
 export interface HarPlaceCoverage {
   readonly place: HarRedactionPlace;
+  readonly label: string;
+  readonly fields: readonly (HarModelStringField | HarModelNumberField)[];
   readonly status: PlaceExamStatus;
   readonly count: number;
   readonly detail: PlaceReportDetail;
@@ -200,10 +197,8 @@ export interface HarPlaceCoverage {
 
 export interface HarRedactionRecord {
   readonly entryIndex: number;
-  readonly url: HarUrl;
   readonly place: HarRedactionPlace;
-  readonly target: HarRedactionTarget;
-  readonly field: string;
+  readonly field: HarModelStringField | HarModelNumberField;
   readonly ruleId: string;
   readonly count: number;
 }
@@ -222,11 +217,11 @@ export interface HarLogRedactionExtension {
   readonly notInspected: readonly HarRedactionPlace[];
 }
 
-export interface HarLogExtension {
+export interface HarLogExtension extends CustomHarFields {
   readonly redaction?: HarLogRedactionExtension | undefined;
 }
 
-export interface ChromeInitiatorCallFrame {
+export interface ChromeInitiatorCallFrame extends CustomHarFields {
   readonly functionName: string;
   readonly scriptId: string;
   readonly url: string;
@@ -234,12 +229,12 @@ export interface ChromeInitiatorCallFrame {
   readonly columnNumber: number;
 }
 
-export interface ChromeInitiatorStack {
+export interface ChromeInitiatorStack extends CustomHarFields {
   readonly callFrames: readonly ChromeInitiatorCallFrame[];
   readonly parent?: ChromeInitiatorStack | undefined;
 }
 
-export interface ChromeInitiator {
+export interface ChromeInitiator extends CustomHarFields {
   readonly type: string;
   readonly url?: string | undefined;
   readonly lineNumber?: number | undefined;
@@ -248,7 +243,7 @@ export interface ChromeInitiator {
   readonly stack?: ChromeInitiatorStack | undefined;
 }
 
-export interface ChromeWebSocketMessage {
+export interface ChromeWebSocketMessage extends CustomHarFields {
   readonly type: "send" | "receive";
   readonly time: number;
   readonly opcode: number;
@@ -446,6 +441,8 @@ export type HarModelStringField =
       StringOrUnhandledKey<HarLog, "creator" | "browser" | "pages" | "entries" | "_harExport">
     >
   | CustomFieldKey<HarLog, "log">
+  | PrefixField<"log._harExport", StringOrUnhandledKey<HarLogExtension>>
+  | CustomFieldKey<HarLogExtension, "log._harExport">
   | PrefixField<"log.creator", StringOrUnhandledKey<HarCreator>>
   | CustomFieldKey<HarCreator, "log.creator">
   | PrefixField<"log.browser", StringOrUnhandledKey<HarCreator>>
@@ -468,16 +465,22 @@ export type HarModelStringField =
       >
     >
   | CustomFieldKey<HarEntry, "entry">
+  | PrefixField<"entry._harExport", StringOrUnhandledKey<HarEntryExtension>>
+  | CustomFieldKey<HarEntryExtension, "entry._harExport">
   | PrefixField<"entry._initiator", StringOrUnhandledKey<ChromeInitiator, "stack">>
+  | CustomFieldKey<ChromeInitiator, "entry._initiator">
   | PrefixField<
       "entry._initiator.stack",
       StringOrUnhandledKey<ChromeInitiatorStack, "callFrames" | "parent">
     >
+  | CustomFieldKey<ChromeInitiatorStack, "entry._initiator.stack">
   | PrefixField<
       "entry._initiator.stack.callFrames[]",
       StringOrUnhandledKey<ChromeInitiatorCallFrame>
     >
+  | CustomFieldKey<ChromeInitiatorCallFrame, "entry._initiator.stack.callFrames[]">
   | PrefixField<"entry._webSocketMessages[]", StringOrUnhandledKey<ChromeWebSocketMessage>>
+  | CustomFieldKey<ChromeWebSocketMessage, "entry._webSocketMessages[]">
   | PrefixField<
       "request",
       StringOrUnhandledKey<HarRequest, "cookies" | "headers" | "queryString" | "postData">
@@ -509,3 +512,23 @@ export type HarModelStringField =
   | CustomFieldKey<HarCacheEntry, "cache.afterRequest">
   | PrefixField<"timings", StringOrUnhandledKey<HarTimings>>
   | CustomFieldKey<HarTimings, "timings">;
+
+type NumberOrBooleanKey<T> = {
+  [K in DeclaredKeys<T>]: K extends `_${string}`
+    ? never
+    : IsPureNumberOrBoolean<T[K]> extends true
+      ? K
+      : never;
+}[DeclaredKeys<T>];
+
+export type HarModelNumberField =
+  | PrefixField<"log.pages[].pageTimings", NumberOrBooleanKey<HarPageTimings>>
+  | PrefixField<"entry", NumberOrBooleanKey<HarEntry>>
+  | PrefixField<"request", NumberOrBooleanKey<HarRequest>>
+  | PrefixField<"request.cookies[]", NumberOrBooleanKey<HarCookie>>
+  | PrefixField<"response", NumberOrBooleanKey<HarResponse>>
+  | PrefixField<"response.cookies[]", NumberOrBooleanKey<HarCookie>>
+  | PrefixField<"response.content", NumberOrBooleanKey<HarContent>>
+  | PrefixField<"cache.beforeRequest", NumberOrBooleanKey<HarCacheEntry>>
+  | PrefixField<"cache.afterRequest", NumberOrBooleanKey<HarCacheEntry>>
+  | PrefixField<"timings", NumberOrBooleanKey<HarTimings>>;

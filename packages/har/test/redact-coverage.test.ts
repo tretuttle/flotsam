@@ -4,19 +4,13 @@ import { decodeAsciiBase64, encodeAsciiBase64 } from "./ascii-base64.ts";
 import { buildHar } from "../src/build.ts";
 import {
   HAR_REDACTION_PLACES,
-  REDACTION_LEVELS,
   toHarUrl,
   toIsoDateTime,
   toMimeType,
   type HarRedactionPlace,
 } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
-import {
-  ALLOWLISTED_HEADER_NAMES,
-  REDACTION_LEVEL_TABLE,
-  URL_HEADER_NAMES,
-  redactHar,
-} from "../src/redact.ts";
+import { ALLOWLISTED_HEADER_NAMES, URL_HEADER_NAMES, redactHar } from "../src/redact.ts";
 
 const PNG =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -53,8 +47,7 @@ function entry(start: string, url: string, extra: Record<string, unknown> = {}) 
 }
 
 describe("redaction coverage", () => {
-  it("defines standard and shareable guarantees and leaves bodies byte-identical under standard", () => {
-    expect(Object.keys(REDACTION_LEVEL_TABLE)).toEqual([...REDACTION_LEVELS]);
+  it("leaves realistic bodies byte-identical under standard and removes them under shareable", () => {
     expect(ALLOWLISTED_HEADER_NAMES.has("content-type")).toBe(true);
     expect(ALLOWLISTED_HEADER_NAMES.has("content-length")).toBe(true);
     expect(URL_HEADER_NAMES.has("location")).toBe(true);
@@ -136,7 +129,6 @@ describe("redaction coverage", () => {
     });
 
     const standard = redactHar(doc, { level: "standard" });
-    expect(standard.report.guarantee).toBe(REDACTION_LEVEL_TABLE.standard.guarantee);
     expect(standard.document.log.entries[0]!.response.content.text).toBe(jsBundle);
     expect(standard.document.log.entries[0]!.request.url).toContain(
       "snowflake=1849203849102938471",
@@ -149,7 +141,6 @@ describe("redaction coverage", () => {
     });
 
     const shareable = redactHar(doc, { level: "shareable" });
-    expect(shareable.report.guarantee).toBe(REDACTION_LEVEL_TABLE.shareable.guarantee);
     expect(shareable.document.log.entries[0]!.request.url).toBe(
       "https://cdn.example/assets/index-C4tyqWfb.js",
     );
