@@ -104,7 +104,7 @@ describe("process inspection table", () => {
 
 describe.runIf(currentPlatformName() !== "win32")("windows process trees", () => {
   it("asks taskkill to end the tree", async () => {
-    const bin = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-taskkill-"));
+    const bin = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-taskkill-"));
     directories.push(bin);
     const argsFile = NodePath.join(bin, "args");
     await NodeFSP.writeFile(
@@ -153,7 +153,9 @@ describe("owned process trees", () => {
   );
 
   it("removes a profile directory once the process holding a file in it is gone", async () => {
-    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-profile-"));
+    const directory = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "one-click-har-profile-"),
+    );
     directories.push(directory);
     const holder = spawnOwned(
       process.execPath,

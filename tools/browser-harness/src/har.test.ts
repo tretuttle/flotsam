@@ -125,7 +125,7 @@ describe("har-check", () => {
   });
 
   it("reads a HAR file and groups its problems by kind", async () => {
-    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-har-"));
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-har-"));
     const file = NodePath.join(directory, "capture.har");
     const list = entries("page").filter((entry) => !entry.request.url.endsWith("/r/json/0"));
     await NodeFSP.writeFile(file, JSON.stringify(document([...list, at(list, 1)])), "utf8");

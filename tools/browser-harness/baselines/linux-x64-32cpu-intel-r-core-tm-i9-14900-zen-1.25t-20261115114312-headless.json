@@ -4,7 +4,7 @@
   "page": {
     "resourceCount": 200,
     "cache": "no-store",
-    "seed": "har-anytime-zen-harness-v1",
+    "seed": "one-click-har-zen-harness-v1",
     "smallPerKind": 50,
     "kinds": ["css", "js", "image", "json"]
   },

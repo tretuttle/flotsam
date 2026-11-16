@@ -41,7 +41,7 @@ describe("zip entries", () => {
 });
 
 async function writeTemp(bytes: Buffer): Promise<string> {
-  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-zip-"));
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-zip-"));
   directories.push(directory);
   const file = NodePath.join(directory, "addon.xpi");
   await NodeFSP.writeFile(file, bytes);

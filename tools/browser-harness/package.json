@@ -1,5 +1,5 @@
 {
-  "name": "@har-anytime/browser-harness",
+  "name": "@one-click-har/browser-harness",
   "private": true,
   "bin": {
     "browser-harness": "./src/cli.ts"

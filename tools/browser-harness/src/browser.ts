@@ -193,7 +193,7 @@ export async function prepareProfile(
     row.path,
     foldsCase(platform),
   );
-  const profile = await NodeFSP.mkdtemp(NodePath.join(directory, "har-anytime-browser-"));
+  const profile = await NodeFSP.mkdtemp(NodePath.join(directory, "one-click-har-browser-"));
   try {
     await NodeFSP.writeFile(
       NodePath.join(profile, "user.js"),

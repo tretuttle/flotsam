@@ -220,7 +220,7 @@ describe("baselines", () => {
   });
 
   it("does not write a baseline file when any run failed", async () => {
-    const outDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-baseline-"));
+    const outDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-baseline-"));
     const failed = { ...baselineStub(), errors: 2, failures: [{ run: 1, reason: "page failed" }] };
     await expect(writeBaseline(failed, outDir)).rejects.toThrow(
       "refusing to write a baseline with 2 failed runs",

@@ -46,7 +46,7 @@ const LIVE_PROFILES = {
       "/home/u/snap/firefox/common/.mozilla/firefox/p",
     ],
     accepted: [
-      "/tmp/har-anytime-browser-abc",
+      "/tmp/one-click-har-browser-abc",
       "/home/u/.zenith/p",
       "/home/u/.Mozilla/firefox/p",
       "/home/u/projects/.mozilla-notes",
@@ -64,7 +64,7 @@ const LIVE_PROFILES = {
       "/Users/u/Library/Caches/zen/Profiles/p",
     ],
     accepted: [
-      "/var/folders/xy/T/har-anytime-browser-abc",
+      "/var/folders/xy/T/one-click-har-browser-abc",
       "/Users/u/Library/Application Support/Code",
     ],
   },
@@ -84,7 +84,7 @@ const LIVE_PROFILES = {
       "C:\\Users\\u\\AppData\\Roaming\\Waterfox\\Profiles\\p",
       "C:\\Users\\u\\AppData\\Local\\zen\\Profiles\\p",
     ],
-    accepted: ["C:\\Users\\u\\AppData\\Local\\Temp\\har-anytime-browser-abc"],
+    accepted: ["C:\\Users\\u\\AppData\\Local\\Temp\\one-click-har-browser-abc"],
   },
 } as const;
 
@@ -136,7 +136,7 @@ describe("browser profile", () => {
   });
 
   it("refuses a symlinked temporary directory that resolves inside a live profile before creating one", async () => {
-    const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-guard-"));
+    const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-guard-"));
     directories.push(scratch);
     const home = NodePath.join(scratch, "home");
     const live = NodePath.join(home, ".mozilla");
@@ -164,20 +164,20 @@ describe("browser profile", () => {
   });
 
   it("sideloads an unpacked extension and an xpi by gecko id", async () => {
-    const unpacked = await makeUnpacked("unpacked@har-anytime");
+    const unpacked = await makeUnpacked("unpacked@one-click-har");
     const unpackedProfile = await prepareProfile(unpacked);
     directories.push(unpackedProfile);
     const proxy = await NodeFSP.readFile(
-      NodePath.join(unpackedProfile, "extensions", "unpacked@har-anytime"),
+      NodePath.join(unpackedProfile, "extensions", "unpacked@one-click-har"),
       "utf8",
     );
     expect(proxy).toBe(unpacked);
 
-    const xpi = await makeXpi("packed@har-anytime");
+    const xpi = await makeXpi("packed@one-click-har");
     const packedProfile = await prepareProfile(xpi);
     directories.push(packedProfile);
     const copied = await NodeFSP.stat(
-      NodePath.join(packedProfile, "extensions", "packed@har-anytime.xpi"),
+      NodePath.join(packedProfile, "extensions", "packed@one-click-har.xpi"),
     );
     expect(copied.isFile()).toBe(true);
   });
@@ -189,7 +189,7 @@ describe.runIf(currentPlatformName() !== "win32")("browser launch", () => {
   it.each(["bidi", "marionette"] as const)(
     "asks for a headless %s browser and leaves no profile or process when it exits at startup",
     async (protocol) => {
-      const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-fake-"));
+      const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-fake-"));
       directories.push(scratch);
       const argsFile = NodePath.join(scratch, "args");
       const binary = NodePath.join(scratch, "browser");
@@ -232,7 +232,7 @@ function restoreEnv(previous: Record<string, string | undefined>): void {
 }
 
 async function makeUnpacked(id: string): Promise<string> {
-  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-ext-"));
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-ext-"));
   directories.push(directory);
   await NodeFSP.writeFile(NodePath.join(directory, "manifest.json"), manifest(id), "utf8");
   return directory;

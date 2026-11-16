@@ -1,6 +1,6 @@
 import * as NodeCrypto from "node:crypto";
 
-export const FIXTURE_SEED = "har-anytime-zen-harness-v1";
+export const FIXTURE_SEED = "one-click-har-zen-harness-v1";
 export const WEBSOCKET_PATH = "/fixtures/websocket";
 export const SMALL_PER_KIND = 50;
 export const SMALL_KINDS = ["css", "js", "image", "json"] as const;
