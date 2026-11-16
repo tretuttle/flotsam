@@ -7,7 +7,9 @@
     "./model": "./src/model.ts",
     "./parse": "./src/parse.ts",
     "./build": "./src/build.ts",
-    "./redact": "./src/redact.ts"
+    "./redact": "./src/redact.ts",
+    "./summarize": "./src/summarize.ts",
+    "./filename": "./src/filename.ts"
   },
   "scripts": {
     "test": "vp test run --config ../../vite.config.ts --dir .",
