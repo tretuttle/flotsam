@@ -4,14 +4,21 @@ The rule: everything in the packed XPI is production build output. No source, no
 
 ## The rules are one table
 
-`scripts/xpi-rules.ts` lists every rule with what it inspects, how it decides, and the planted archive that proves it. `check-xpi.test.ts` runs every planted archive and requires the exact set of rules that file fails. A rule cannot be added without a plant, and a plant whose rule is removed fails. To add a rule, add a row.
+`scripts/xpi-rules.ts` lists every rule with what it inspects, how it decides, and the planted archive that proves it. `check-xpi.test.ts` runs the evasions from both verification reports and requires the exact set of rules that file fails. A rule cannot be added without a plant, and a plant whose rule is removed fails. To add a rule, add a row.
 
 ## Decisions
 
-- **A file's extension says what it claims to be; the rules read its bytes.** A `.json` file must parse as strict JSON, must not be a source map, and must not hold readable source in a string. A `.png` must start with the PNG signature. A `.LICENSE.txt` must be prose. Scripts and styles inside an HTML page or SVG are judged like files. Judging by extension let a source map named `parent.map.json` and a development React build named `.json` through.
-- **Minified means few line breaks in any window, not a good file average.** A window of 512 characters may hold at most 3 line breaks. A file average lets one 218 KB line carry 2.7 KB of readable source. Minified output measured 0 or 1 break in the whole file; React's development build holds 30 breaks in one window.
-- **Comments are found by tokenizing.** `/*` inside a string, a template literal or a regular expression is data. `xpi-source.ts` matched every comment in 8818 `.js`, `.cjs` and `.mjs` files under `node_modules` (166455 comments) exactly as acorn does.
-- **A minified script keeps no comment except a short legal one.** A legal comment starts `/*!` or carries `@license` or `@preserve`, is at most 400 characters, and holds no code punctuation or keyword. Anything else that claims to be legal fails as `legal-comment`.
+- **Minified means the build's minifier cannot improve it, and no line break sits between tokens.** For each script and stylesheet the check runs the same minifier the build runs, with comments kept, and fails when the output is smaller by more than `max(32 bytes, 3% of the file)`. On the real build the savings were 0, 3, 5, 7 and 302 bytes (302 of 218517), so the margin is about twice the largest observed. A minifier also leaves no line break between tokens, so one outside a string, template, regular expression or comment fails; the line holding a kept legal comment is the only exception. This replaces the old 512-character window, which let pretty source through once each line was 170 characters and ignored CR, U+2028 and U+2029.
+- **A string that decodes to readable source is still readable source.** A script string or template quasi with at least two line breaks, at least 120 characters, code keywords, and a value the minifier shrinks by over 40% fails `string-holds-source`. A minifier cannot rewrite string data, so size alone does not catch a function hidden in a template literal.
+- **A file's extension says what it claims to be; the rules read its bytes.** A `.json` file must parse as strict JSON and must not be a source map. A `.png` must start with the PNG signature. A `.svg` must hold an `<svg` element and a `.html` a doctype or `<html`. A first-byte signature for ZIP, gzip, WebAssembly, ELF, Mach-O, PDF, RAR or 7-Zip fails `foreign-content`, so an archive or wasm module cannot ship under an allowed suffix regardless of its name. The build's icon SVG is one line plus a trailing newline; any other line break fails.
+- **Comments are found by the build's own parser.** `oxc-parser` reads scripts, so `/*` inside a string or a regular expression is data, and a comment after `a++/2` is still a comment. `sourceMappingURL` is looked for in those comments only, which keeps the same text inside a string legal. A legal comment is at most 400 characters and holds no code punctuation or keyword; `==` counts, because a comment of calls and comparisons is a program.
+- **A source map is an object, not a file name.** The check looks for a version 3 map object at any offset in every file's bytes, and inside decoded JSON strings and script strings. A map behind a NUL byte, inside an SVG, after a PNG, or as a JSON string value fails.
+- **Every script and style the markup would run is judged.** `inlineBodies` reads closed and unclosed `<script>` bodies, `data:` URLs in `src`, `on*` handlers and `style` attributes.
+- **A development build is a marker, not a file name.** `NODE_ENV`, `jsxDEV`, `__DEV__` and the React DevTools banner fail in any spelling, including the bracket form, because a production build folds them away.
+
+## The parent's result shape is checked at run time
+
+`experiment/parent-api.ts` builds the API object from injected reads, so `contract.test.ts` runs the real handler in Node. It compares `Object.keys` of the result, the browser object and both toolbox shapes with `environmentKeys` in `contract.ts`. TypeScript checks excess properties only on a fresh literal; a returned variable with an extra key passes typecheck and fails this comparison.
 
 ## Trap: extension.js bundles scripts from `scripts/`
 
