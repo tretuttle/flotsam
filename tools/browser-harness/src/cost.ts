@@ -1,6 +1,7 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import { locateArchive, readLines } from "./archive.ts";
 import {
   launchBrowser,
   readExtensionId,
@@ -18,6 +19,7 @@ import {
   type MachineLoad,
   type Summary,
 } from "./measure.ts";
+import { callHook, HARNESS_PREFS } from "./recording-session.ts";
 import { getCostScenario, type CostScenarioName, type MeasuredScenario } from "./scenarios.ts";
 import { startFixtureServer, type ServedRequest } from "./server.ts";
 
@@ -368,11 +370,13 @@ async function executeRound(options: {
         display: options.display,
         protocol: "marionette",
         allowSystemAccess: true,
+        extraPrefs: arm === "extension" ? HARNESS_PREFS : [],
         signal: options.signal,
       });
       browserIdentity ??= session.identity;
       const sample = await runCostArm({
         session,
+        ...(arm === "extension" ? { readRecorded: () => recordedRequests(session) } : {}),
         server: options.server,
         scenario: options.scenario,
         round: options.round,
@@ -393,6 +397,17 @@ async function executeRound(options: {
   return { samples, failures, browserIdentity };
 }
 
+/** Flushes the recorder, then reads `METHOD path` for every line in the launch's archive. */
+async function recordedRequests(session: BrowserSession): Promise<readonly string[]> {
+  await callHook(session, { kind: "flush" });
+  const archive = locateArchive(session.dataHome, session.profileDir);
+  return archive === null
+    ? []
+    : readLines(archive.root).map(
+        ({ exchange }) => `${exchange.request.method} ${new URL(exchange.request.url).pathname}`,
+      );
+}
+
 export type CostArmSession = Pick<
   BrowserSession,
   "openTab" | "navigateTab" | "evaluate" | "evaluateChrome" | "closeTab"
@@ -411,6 +426,8 @@ export async function runCostArm(options: {
   readonly popupPath: string;
   readonly signal: AbortSignal;
   readonly readProcInfo?: (session: CostArmSession) => Promise<ProcInfoSample>;
+  /** The extension arm's proof that the recorder did the work it was timed on: every request it recorded. */
+  readonly readRecorded?: () => Promise<readonly string[]>;
   readonly settle?: (
     session: CostArmSession,
     readInfo: () => Promise<ProcInfoSample>,
@@ -464,6 +481,17 @@ export async function runCostArm(options: {
 
     const problem = verifyCostRequests(report, served, scenario);
     if (problem !== null) throw new Error(problem);
+    if (options.readRecorded !== undefined) {
+      const recorded = await options.readRecorded();
+      const missed = subtractMultiset(
+        served.map((request) => `${request.method} ${request.path}`),
+        recorded,
+      );
+      if (missed.length > 0)
+        throw new Error(
+          `the recorder missed ${String(missed.length)} of ${String(served.length)} served requests`,
+        );
+    }
     return {
       round,
       arm,

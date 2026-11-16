@@ -19,6 +19,11 @@ export const ID_INDEX_PATH = "/id/index.html";
 export const SW_INDEX_PATH = "/sw/index.html";
 export const SW_JS_PATH = "/sw/sw.js";
 export const SW_PASS_PATH = "/sw/pass";
+/** A 204 and a finite `text/event-stream` body: the recorder's no-body and streaming rows. */
+export const ROUTE_NO_CONTENT_PATH = "/route/no-content";
+export const ROUTE_EVENTS_PATH = "/route/events";
+/** The endless stream repeats this chunk, so any prefix of it is known in advance. */
+export const ID_ENDLESS_CHUNK = Buffer.from('{"n":1}\n'.repeat(512), "utf8");
 const SW_SYNTH_BODY = `synth-from-sw-${"x".repeat(5000)}`;
 
 export const COST_IMAGES_COUNT = 200;
@@ -41,7 +46,7 @@ const MIXED_SIZES = [70, 900, 3000, 12000, 40000] as const;
 export type StaticRoute = {
   readonly method: FixtureMethod;
   readonly path: string;
-  readonly status: 200 | 302 | 307;
+  readonly status: 200 | 204 | 302 | 307;
   readonly contentType: string;
   readonly cacheControl: string | null;
   readonly extraHeaders?: Readonly<Record<string, string>>;
@@ -78,7 +83,7 @@ export function getExtendedStaticRoutes(): ReadonlyMap<string, StaticRoute> {
     contentType: string,
     cacheControl: string | null,
     options: {
-      readonly status?: 200 | 302 | 307;
+      readonly status?: 200 | 204 | 302 | 307;
       readonly gzip?: boolean;
       readonly extraHeaders?: Readonly<Record<string, string>>;
     } = {},
@@ -255,6 +260,17 @@ export function getExtendedStaticRoutes(): ReadonlyMap<string, StaticRoute> {
       "utf8",
     ),
     "text/html; charset=utf-8",
+    NO_STORE,
+  );
+
+  add("GET", ROUTE_NO_CONTENT_PATH, Buffer.alloc(0), "text/plain; charset=utf-8", NO_STORE, {
+    status: 204,
+  });
+  add(
+    "GET",
+    ROUTE_EVENTS_PATH,
+    Buffer.from("event: tick\ndata: 1\n\nevent: tick\ndata: 2\n\n", "utf8"),
+    "text/event-stream",
     NO_STORE,
   );
 

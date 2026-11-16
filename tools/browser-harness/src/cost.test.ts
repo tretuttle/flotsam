@@ -262,7 +262,7 @@ describe("three-arm cost measurement", () => {
     ).rejects.toThrow(/off precondition failed/);
   });
 
-  it("rejects failed page resources and unexpected server requests", async () => {
+  it("rejects failed page resources, unexpected server requests and a recorder that missed one", async () => {
     const scenario = getCostScenario("cost-images");
     const baseSession: CostArmSession = {
       openTab: async () => "tab-1",
@@ -313,6 +313,35 @@ describe("three-arm cost measurement", () => {
         settle: async () => 10,
       }),
     ).rejects.toThrow(/server also served 1 unexpected/);
+
+    const cleanSession: CostArmSession = {
+      ...baseSession,
+      evaluate: async () =>
+        JSON.stringify({
+          lastResourceFinishedMs: 20,
+          finished: scenario.responses.map((r) => r.path),
+          failed: [],
+        }),
+    };
+    const served = scenario.responses.map((r) => `${r.method} ${r.path}`);
+    const withRecorded = (recorded: readonly string[]) =>
+      runCostArm({
+        session: cleanSession,
+        server: makeMockServer(scenario.responses),
+        scenario,
+        round: 1,
+        arm: "off",
+        addonId: "ext@test",
+        popupPath: "action/index.html",
+        signal: new AbortController().signal,
+        readProcInfo: async () => procInfo(10),
+        settle: async () => 10,
+        readRecorded: async () => recorded,
+      });
+    await expect(withRecorded(served)).resolves.toMatchObject({ arm: "off" });
+    await expect(withRecorded(served.slice(1))).rejects.toThrow(
+      new RegExp(`recorder missed 1 of ${String(served.length)} served requests`),
+    );
   });
 
   it("reads parent main-thread CPU time by tid === pid from ChromeUtils.requestProcInfo", async () => {

@@ -9,6 +9,7 @@ import {
   getRevalBody,
   ID_BIG_FIRST_CHUNK_BYTES,
   ID_BIG_PATH,
+  ID_ENDLESS_CHUNK,
   ID_ENDLESS_PATH,
   ID_INDEX_PATH,
   ID_REVAL_PATH,
@@ -22,7 +23,6 @@ const CHUNK_BYTES = 64 * 1024;
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HARNESS_PREFIX = "/__harness/";
 const BIG_DELAY_MS = 1500;
-const ENDLESS_CHUNK = Buffer.from('{"n":1}\n'.repeat(512), "utf8");
 
 export type ServedRequest = {
   readonly seq: number;
@@ -216,7 +216,13 @@ async function handle(
   }
 
   if (method === "GET" && path === ID_ENDLESS_PATH) {
-    writeEndlessStream(state, request, response, meta);
+    writeEndlessStream(
+      state,
+      request,
+      response,
+      meta,
+      parsedUrl.searchParams.get("rate") === "fast",
+    );
     return;
   }
 
@@ -353,7 +359,7 @@ function sendBuffered(
     ...headers,
     "x-seq": String(meta.seq),
   };
-  if (status !== 304) finalHeaders["content-length"] = String(wire.length);
+  if (status !== 304 && status !== 204) finalHeaders["content-length"] = String(wire.length);
   const truth: SequenceTruth = {
     seq: meta.seq,
     method: meta.method,
@@ -370,7 +376,7 @@ function sendBuffered(
   state.setTruth(truth);
   state.recordRequest({ ...meta, status });
   response.writeHead(status, finalHeaders);
-  response.end(status === 304 ? undefined : wire);
+  response.end(status === 304 || status === 204 ? undefined : wire);
 }
 
 async function writeChunked(
@@ -475,6 +481,7 @@ function writeEndlessStream(
   request: NodeHttp.IncomingMessage,
   response: NodeHttp.ServerResponse,
   meta: RequestMeta,
+  fast: boolean,
 ): void {
   const hash = NodeCrypto.createHash("sha256");
   let sent = 0;
@@ -503,12 +510,23 @@ function writeEndlessStream(
   });
   const pushChunk = (): void => {
     if (closed) return;
-    hash.update(ENDLESS_CHUNK);
-    sent += ENDLESS_CHUNK.length;
-    response.write(ENDLESS_CHUNK);
+    hash.update(ID_ENDLESS_CHUNK);
+    sent += ID_ENDLESS_CHUNK.length;
+    response.write(ID_ENDLESS_CHUNK);
   };
   pushChunk();
-  const interval = setInterval(pushChunk, 5);
+  // `rate=fast` writes as fast as the client reads, so a check reaches the recorder's body cap in seconds.
+  const pump = (): void => {
+    let flowing = true;
+    while (flowing) {
+      hash.update(ID_ENDLESS_CHUNK);
+      sent += ID_ENDLESS_CHUNK.length;
+      flowing = response.write(ID_ENDLESS_CHUNK);
+    }
+    if (!closed) response.once("drain", pump);
+  };
+  if (fast) pump();
+  const interval = fast ? undefined : setInterval(pushChunk, 5);
   const stop = (): void => {
     if (closed) return;
     closed = true;

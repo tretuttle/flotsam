@@ -402,6 +402,9 @@ importers:
 
   tools/browser-harness:
     devDependencies:
+      '@one-click-har/recording':
+        specifier: workspace:*
+        version: link:../../packages/recording
       '@types/node':
         specifier: 'catalog:'
         version: 24.12.4
