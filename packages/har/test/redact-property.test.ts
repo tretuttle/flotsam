@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildMarkerDocument, haystackFor, type PlantedMarker } from "./marker-document.ts";
+import { buildMarkerDocument, markerPresent, type PlantedMarker } from "./marker-document.ts";
 import {
   HAR_REDACTION_PLACES,
   type HarDocument,
-  type HarModelStringField,
+  type HarModelField,
   type HarRedactionPlace,
   type RedactionLevel,
 } from "../src/model.ts";
@@ -23,7 +23,7 @@ const STANDARD_REMOVED_PLACES: ReadonlySet<HarRedactionPlace> = new Set([
   "query-string-secret",
   "body-param-secret",
   "redaction-record",
-  "malformed-number",
+  "wrong-type",
 ]);
 
 const SHAREABLE_KEPT_PLACES: ReadonlySet<HarRedactionPlace> = new Set([
@@ -32,6 +32,7 @@ const SHAREABLE_KEPT_PLACES: ReadonlySet<HarRedactionPlace> = new Set([
   "header-name",
   "header-value-allowlisted",
   "protocol-metadata",
+  "measurement",
 ]);
 
 function verifyLevel(
@@ -41,11 +42,10 @@ function verifyLevel(
   placeTable: Readonly<Record<HarRedactionPlace, HarPlaceRule>> = HAR_PLACE_TABLE,
 ): readonly string[] {
   const { document: redacted, report } = redactHar(document, { level, placeTable });
-  const hay = haystackFor(redacted);
   const failures: string[] = [];
 
   for (const item of markers) {
-    const present = hay.includes(item.marker);
+    const present = markerPresent(redacted, item);
     const coverage = report.places.find((place) => place.place === item.place);
     if (!coverage) {
       failures.push(`${item.field} (${item.place}) missing from report.places`);
@@ -95,25 +95,35 @@ function verifyLevel(
 }
 
 describe("total model place table and marker verification", () => {
-  it("fills every string-holding place of the HAR model with a unique marker and accounts for 100% of markers at both levels", () => {
+  it("fills every field of the HAR model that holds a value with a marker and accounts for 100% of markers at both levels", () => {
     const { document, markers, plantedFields } = buildMarkerDocument();
 
-    const modelFields = Object.keys(HAR_MODEL_FIELD_TABLE) as HarModelStringField[];
-    expect([...plantedFields].sort()).toEqual([...modelFields].sort());
+    // A field whose own fields are listed is walked through them; every other field holds a value.
+    const allFields = Object.keys(HAR_MODEL_FIELD_TABLE) as HarModelField[];
+    const valueFields = allFields.filter(
+      (field) =>
+        HAR_MODEL_FIELD_TABLE[field].places.some((place) => place !== "wrong-type") &&
+        !allFields.some((other) =>
+          other.startsWith(
+            `${HAR_MODEL_FIELD_TABLE[field].children ?? field}${HAR_MODEL_FIELD_TABLE[field].kinds.includes("array") ? "[]" : ""}.`,
+          ),
+        ),
+    );
+    expect([...plantedFields].sort()).toEqual([...valueFields].sort());
 
-    for (const field of modelFields) {
-      const expectedPlaces = HAR_MODEL_FIELD_TABLE[field].places;
-      const plantedPlacesForField = markers
-        .filter((item) => item.field === field)
-        .map((item) => item.place);
-      expect([...plantedPlacesForField].sort()).toEqual([...expectedPlaces].sort());
-    }
-
-    const beforeHay = haystackFor(document);
-    for (const item of markers) {
-      expect(beforeHay, `missing initial marker for ${item.field} (${item.place})`).toContain(
-        item.marker,
+    for (const field of valueFields) {
+      const expectedPlaces = HAR_MODEL_FIELD_TABLE[field].places.filter(
+        (place) => place !== "wrong-type",
       );
+      const plantedPlacesForField = markers
+        .filter((item) => item.field === field && item.place !== "wrong-type")
+        .map((item) => item.place);
+      expect([...plantedPlacesForField].sort(), field).toEqual([...expectedPlaces].sort());
+    }
+    expect(markers.some((item) => item.place === "wrong-type")).toBe(true);
+
+    for (const item of markers) {
+      expect(markerPresent(document, item), `missing initial marker for ${item.field}`).toBe(true);
     }
 
     const standardFailures = verifyLevel(document, markers, "standard");

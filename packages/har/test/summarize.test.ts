@@ -369,4 +369,27 @@ describe("summarizeHar", () => {
       entriesAffected: 0,
     });
   });
+
+  it("reads bodyMissing before the text, and the text before a bodyState note alone", () => {
+    const withText = (extension: Record<string, unknown>) => ({
+      startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+      request: { method: "GET", url: toHarUrl("https://a.example/")! },
+      response: {
+        status: 200,
+        content: { mimeType: toMimeType("text/plain")!, size: 4, text: "full" },
+      },
+      _harExport: extension,
+    });
+    const doc = buildHar({
+      creator: { name: "Caller", version: "1" },
+      entries: [
+        withText({ bodyMissing: "devtools-discarded" }),
+        withText({ bodyState: "size-limit" }),
+      ],
+    });
+    expect(doc.log.entries.map((entry) => classifyEntryBodyState(entry))).toEqual([
+      { state: "missing", reason: "discarded" },
+      { state: "present" },
+    ]);
+  });
 });

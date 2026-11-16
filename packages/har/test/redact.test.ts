@@ -256,7 +256,7 @@ describe("redactHar", () => {
       "query-string-secret",
       "body-param-secret",
       "redaction-record",
-      "malformed-number",
+      "wrong-type",
     ]);
     expect(singleStandard.entry.response.content.text).toBe('{"ok":true}');
 

@@ -167,7 +167,8 @@ export const HAR_REDACTION_PLACES = [
   "protocol-metadata",
   "export-annotation",
   "redaction-record",
-  "malformed-number",
+  "measurement",
+  "wrong-type",
 ] as const;
 
 export type HarRedactionPlace = (typeof HAR_REDACTION_PLACES)[number];
@@ -188,7 +189,7 @@ export type PlaceReportDetail =
 export interface HarPlaceCoverage {
   readonly place: HarRedactionPlace;
   readonly label: string;
-  readonly fields: readonly (HarModelStringField | HarModelNumberField)[];
+  readonly fields: readonly HarModelField[];
   readonly status: PlaceExamStatus;
   readonly count: number;
   readonly detail: PlaceReportDetail;
@@ -198,7 +199,7 @@ export interface HarPlaceCoverage {
 export interface HarRedactionRecord {
   readonly entryIndex: number;
   readonly place: HarRedactionPlace;
-  readonly field: HarModelStringField | HarModelNumberField;
+  readonly field: HarModelField;
   readonly ruleId: string;
   readonly count: number;
 }
@@ -418,117 +419,94 @@ type DeclaredKeys<T> = keyof {
 } &
   string;
 
-type HoldsString<T> = [Extract<NonNullable<T>, string>] extends [never] ? false : true;
+type Leaf = string | number | boolean | null | undefined;
 
-type IsPureNumberOrBoolean<T> = [NonNullable<T>] extends [number | boolean] ? true : false;
+export type IsExactly<A, B> =
+  (<G>() => G extends A ? 1 : 2) extends <G>() => G extends B ? 1 : 2 ? true : false;
 
-type StringOrUnhandledKey<T, Containers extends string = never> = {
-  [K in Exclude<DeclaredKeys<T>, Containers>]: HoldsString<T[K]> extends true
-    ? K
-    : IsPureNumberOrBoolean<T[K]> extends true
+type Includes<T, Seen extends readonly unknown[]> = Seen extends readonly [
+  infer Head,
+  ...infer Rest,
+]
+  ? IsExactly<T, Head> extends true
+    ? true
+    : Includes<T, Rest>
+  : false;
+
+// Redaction writes this report and replaces any earlier one whole, so its fields are not walked.
+type Opaque = HarLogRedactionExtension;
+
+type ValueEntries<V, P extends string, Seen extends readonly unknown[]> = [NonNullable<V>] extends [
+  Leaf,
+]
+  ? never
+  : NonNullable<V> extends readonly (infer Item)[]
+    ? [Item] extends [Leaf]
       ? never
-      : K;
-}[Exclude<DeclaredKeys<T>, Containers>];
+      : ObjectEntries<Item, `${P}[]`, Seen>
+    : IsExactly<NonNullable<V>, Opaque> extends true
+      ? never
+      : ObjectEntries<NonNullable<V>, P, Seen>;
 
-type PrefixField<Prefix extends string, K extends string> = `${Prefix}.${K}`;
-type CustomFieldKey<T, Prefix extends string> = string extends keyof T
-  ? `${Prefix}.<custom>`
-  : never;
-
-export type HarModelStringField =
-  | PrefixField<
-      "log",
-      StringOrUnhandledKey<HarLog, "creator" | "browser" | "pages" | "entries" | "_harExport">
-    >
-  | CustomFieldKey<HarLog, "log">
-  | PrefixField<"log._harExport", StringOrUnhandledKey<HarLogExtension>>
-  | CustomFieldKey<HarLogExtension, "log._harExport">
-  | PrefixField<"log.creator", StringOrUnhandledKey<HarCreator>>
-  | CustomFieldKey<HarCreator, "log.creator">
-  | PrefixField<"log.browser", StringOrUnhandledKey<HarCreator>>
-  | CustomFieldKey<HarCreator, "log.browser">
-  | PrefixField<"log.pages[]", StringOrUnhandledKey<HarPage, "pageTimings">>
-  | CustomFieldKey<HarPage, "log.pages[]">
-  | PrefixField<"log.pages[].pageTimings", StringOrUnhandledKey<HarPageTimings>>
-  | CustomFieldKey<HarPageTimings, "log.pages[].pageTimings">
-  | PrefixField<
-      "entry",
-      StringOrUnhandledKey<
-        HarEntry,
-        | "request"
-        | "response"
-        | "cache"
-        | "timings"
-        | "_initiator"
-        | "_webSocketMessages"
-        | "_harExport"
-      >
-    >
-  | CustomFieldKey<HarEntry, "entry">
-  | PrefixField<"entry._harExport", StringOrUnhandledKey<HarEntryExtension>>
-  | CustomFieldKey<HarEntryExtension, "entry._harExport">
-  | PrefixField<"entry._initiator", StringOrUnhandledKey<ChromeInitiator, "stack">>
-  | CustomFieldKey<ChromeInitiator, "entry._initiator">
-  | PrefixField<
-      "entry._initiator.stack",
-      StringOrUnhandledKey<ChromeInitiatorStack, "callFrames" | "parent">
-    >
-  | CustomFieldKey<ChromeInitiatorStack, "entry._initiator.stack">
-  | PrefixField<
-      "entry._initiator.stack.callFrames[]",
-      StringOrUnhandledKey<ChromeInitiatorCallFrame>
-    >
-  | CustomFieldKey<ChromeInitiatorCallFrame, "entry._initiator.stack.callFrames[]">
-  | PrefixField<"entry._webSocketMessages[]", StringOrUnhandledKey<ChromeWebSocketMessage>>
-  | CustomFieldKey<ChromeWebSocketMessage, "entry._webSocketMessages[]">
-  | PrefixField<
-      "request",
-      StringOrUnhandledKey<HarRequest, "cookies" | "headers" | "queryString" | "postData">
-    >
-  | CustomFieldKey<HarRequest, "request">
-  | PrefixField<"request.cookies[]", StringOrUnhandledKey<HarCookie>>
-  | CustomFieldKey<HarCookie, "request.cookies[]">
-  | PrefixField<"request.headers[]", StringOrUnhandledKey<HarNameValue>>
-  | CustomFieldKey<HarNameValue, "request.headers[]">
-  | PrefixField<"request.queryString[]", StringOrUnhandledKey<HarNameValue>>
-  | CustomFieldKey<HarNameValue, "request.queryString[]">
-  | PrefixField<"request.postData", StringOrUnhandledKey<HarPostData, "params">>
-  | CustomFieldKey<HarPostData, "request.postData">
-  | PrefixField<"request.postData.params[]", StringOrUnhandledKey<HarPostDataParam>>
-  | CustomFieldKey<HarPostDataParam, "request.postData.params[]">
-  | PrefixField<"response", StringOrUnhandledKey<HarResponse, "cookies" | "headers" | "content">>
-  | CustomFieldKey<HarResponse, "response">
-  | PrefixField<"response.cookies[]", StringOrUnhandledKey<HarCookie>>
-  | CustomFieldKey<HarCookie, "response.cookies[]">
-  | PrefixField<"response.headers[]", StringOrUnhandledKey<HarNameValue>>
-  | CustomFieldKey<HarNameValue, "response.headers[]">
-  | PrefixField<"response.content", StringOrUnhandledKey<HarContent>>
-  | CustomFieldKey<HarContent, "response.content">
-  | PrefixField<"cache", StringOrUnhandledKey<HarCache, "beforeRequest" | "afterRequest">>
-  | CustomFieldKey<HarCache, "cache">
-  | PrefixField<"cache.beforeRequest", StringOrUnhandledKey<HarCacheEntry>>
-  | CustomFieldKey<HarCacheEntry, "cache.beforeRequest">
-  | PrefixField<"cache.afterRequest", StringOrUnhandledKey<HarCacheEntry>>
-  | CustomFieldKey<HarCacheEntry, "cache.afterRequest">
-  | PrefixField<"timings", StringOrUnhandledKey<HarTimings>>
-  | CustomFieldKey<HarTimings, "timings">;
-
-type NumberOrBooleanKey<T> = {
-  [K in DeclaredKeys<T>]: K extends `_${string}`
+// One entry per declared key at any depth, plus `<custom>` for an index signature. A type already
+// on the path (the initiator stack's `parent`) is not walked again.
+type ObjectEntries<
+  T,
+  P extends string,
+  Seen extends readonly unknown[],
+  Rerooted extends string = never,
+> =
+  Includes<T, Seen> extends true
     ? never
-    : IsPureNumberOrBoolean<T[K]> extends true
-      ? K
-      : never;
-}[DeclaredKeys<T>];
+    :
+        | {
+            [K in DeclaredKeys<T>]:
+              | readonly [`${P}.${K}`, T[K]]
+              | (K extends Rerooted ? never : ValueEntries<T[K], `${P}.${K}`, [...Seen, T]>);
+          }[DeclaredKeys<T>]
+        | (string extends keyof T ? readonly [`${P}.<custom>`, unknown] : never);
 
-export type HarModelNumberField =
-  | PrefixField<"log.pages[].pageTimings", NumberOrBooleanKey<HarPageTimings>>
-  | PrefixField<"entry", NumberOrBooleanKey<HarEntry>>
-  | PrefixField<"request", NumberOrBooleanKey<HarRequest>>
-  | PrefixField<"request.cookies[]", NumberOrBooleanKey<HarCookie>>
-  | PrefixField<"response", NumberOrBooleanKey<HarResponse>>
-  | PrefixField<"response.cookies[]", NumberOrBooleanKey<HarCookie>>
-  | PrefixField<"response.content", NumberOrBooleanKey<HarContent>>
-  | PrefixField<"cache.beforeRequest", NumberOrBooleanKey<HarCacheEntry>>
-  | PrefixField<"cache.afterRequest", NumberOrBooleanKey<HarCacheEntry>>
-  | PrefixField<"timings", NumberOrBooleanKey<HarTimings>>;
+type ModelEntries =
+  | ObjectEntries<HarLog, "log", [], "entries">
+  | ObjectEntries<HarEntry, "entry", [], "request" | "response" | "cache" | "timings">
+  | ObjectEntries<HarRequest, "request", [HarEntry]>
+  | ObjectEntries<HarResponse, "response", [HarEntry]>
+  | ObjectEntries<HarCache, "cache", [HarEntry]>
+  | ObjectEntries<HarTimings, "timings", [HarEntry]>;
+
+export type HarModelFieldValues = { [E in ModelEntries as E[0]]: E[1] };
+
+export type HarModelField = keyof HarModelFieldValues;
+
+export type HarValueKind =
+  | "string"
+  | "number"
+  | "boolean"
+  | "null"
+  | "array"
+  | "object"
+  | "unknown";
+
+type KindOfMember<V> = V extends string
+  ? "string"
+  : V extends number
+    ? "number"
+    : V extends boolean
+      ? "boolean"
+      : V extends null
+        ? "null"
+        : V extends undefined
+          ? never
+          : V extends readonly unknown[]
+            ? "array"
+            : "object";
+
+export type KindOf<V> = unknown extends V ? "unknown" : KindOfMember<V>;
+
+export type HarModelKind<F extends HarModelField> = KindOf<HarModelFieldValues[F]>;
+
+export type HarModelItemKind<F extends HarModelField> =
+  NonNullable<HarModelFieldValues[F]> extends readonly (infer Item)[] ? KindOf<Item> : never;
+
+export type HarModelFieldIsOptional<F extends HarModelField> =
+  undefined extends HarModelFieldValues[F] ? true : false;

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import firefoxHar from "./fixtures/firefox.json" with { type: "json" };
 import specHar from "./fixtures/spec.json" with { type: "json" };
-import { buildMarkerDocument, haystackFor } from "./marker-document.ts";
+import { buildMarkerDocument, markerPresent } from "./marker-document.ts";
 import {
   REDACTION_LEVELS,
   type HarDocument,
@@ -13,7 +13,6 @@ import {
 import { parseHar } from "../src/parse.ts";
 import {
   HAR_MODEL_FIELD_TABLE,
-  HAR_MODEL_NUMBER_FIELD_TABLE,
   PLACE_SEPARATOR,
   redactHar,
   redactHarEntry,
@@ -174,14 +173,13 @@ describe("redaction report wording", () => {
     const { document, markers } = buildMarkerDocument();
     for (const level of REDACTION_LEVELS) {
       const { document: redacted, report } = redactHar(document, { level });
-      const hay = haystackFor(redacted);
       const claimed = new Map(
         claimsIn(report.guarantee).map((claim) => [placeFor(report, claim)?.place, claim.status]),
       );
       for (const marker of markers) {
         const status = claimed.get(marker.place);
         expect(status, `${level}: ${marker.place} is in no clause`).toBeDefined();
-        expect(hay.includes(marker.marker), `${level}: ${marker.field} (${marker.place})`).toBe(
+        expect(markerPresent(redacted, marker), `${level}: ${marker.field} (${marker.place})`).toBe(
           status !== "removed",
         );
       }
@@ -213,10 +211,7 @@ describe("redaction report wording", () => {
 
   it("carries no planted value or name and lists removals only by model field path", () => {
     const { document, markers } = buildMarkerDocument();
-    const modelFields = new Set<string>([
-      ...Object.keys(HAR_MODEL_FIELD_TABLE),
-      ...Object.keys(HAR_MODEL_NUMBER_FIELD_TABLE),
-    ]);
+    const modelFields = new Set<string>(Object.keys(HAR_MODEL_FIELD_TABLE));
     for (const level of REDACTION_LEVELS) {
       const { document: redacted, report } = redactHar(document, { level });
       const reportText = JSON.stringify(report);
@@ -231,10 +226,7 @@ describe("redaction report wording", () => {
         expect(modelFields.has(field), `${level}: ${field}`).toBe(true);
       }
       for (const record of report.records) {
-        const places: readonly string[] =
-          record.field in HAR_MODEL_FIELD_TABLE
-            ? HAR_MODEL_FIELD_TABLE[record.field as keyof typeof HAR_MODEL_FIELD_TABLE].places
-            : ["malformed-number"];
+        const places: readonly string[] = HAR_MODEL_FIELD_TABLE[record.field].places;
         expect(places, `${record.field} recorded under ${record.place}`).toContain(record.place);
       }
     }
@@ -306,6 +298,22 @@ describe("number and boolean fields", () => {
     "timings.wait",
     "timings.receive",
     "timings.ssl",
+    "timings._blocked_queueing",
+    "timings._blocked_proxy",
+    "timings._workerStart",
+    "timings._workerReady",
+    "timings._workerFetchStart",
+    "timings._workerRespondWithSettled",
+    "response._transferSize",
+    "entry._harExport.bodyIncomplete",
+    "entry._harExport.lossyText",
+    "entry._harExport.inProgress",
+    "entry._initiator.lineNumber",
+    "entry._initiator.columnNumber",
+    "entry._initiator.stack.callFrames[].lineNumber",
+    "entry._initiator.stack.callFrames[].columnNumber",
+    "entry._webSocketMessages[].time",
+    "entry._webSocketMessages[].opcode",
   ];
   const text = (field: string) => `TEXT_IN_${field.replace(/[^a-z]/giu, "_")}`;
   const cookie = (side: string) => ({
@@ -341,16 +349,57 @@ describe("number and boolean fields", () => {
       redirectURL: "",
       headersSize: text("response.headersSize"),
       bodySize: text("response.bodySize"),
+      _transferSize: text("response._transferSize"),
     },
+    _harExport: {
+      bodyIncomplete: text("entry._harExport.bodyIncomplete"),
+      lossyText: text("entry._harExport.lossyText"),
+      inProgress: text("entry._harExport.inProgress"),
+    },
+    _initiator: {
+      type: "script",
+      lineNumber: text("entry._initiator.lineNumber"),
+      columnNumber: text("entry._initiator.columnNumber"),
+      stack: {
+        callFrames: [
+          {
+            functionName: "f",
+            scriptId: "1",
+            url: "https://a.example/a.js",
+            lineNumber: text("entry._initiator.stack.callFrames[].lineNumber"),
+            columnNumber: text("entry._initiator.stack.callFrames[].columnNumber"),
+          },
+        ],
+      },
+    },
+    _webSocketMessages: [
+      {
+        type: "send",
+        time: text("entry._webSocketMessages[].time"),
+        opcode: text("entry._webSocketMessages[].opcode"),
+        data: "d",
+      },
+    ],
     cache: {
       beforeRequest: { hitCount: text("cache.beforeRequest.hitCount") },
       afterRequest: { hitCount: text("cache.afterRequest.hitCount") },
     },
     timings: Object.fromEntries(
-      ["blocked", "dns", "connect", "send", "wait", "receive", "ssl"].map((key) => [
-        key,
-        text(`timings.${key}`),
-      ]),
+      [
+        "blocked",
+        "dns",
+        "connect",
+        "send",
+        "wait",
+        "receive",
+        "ssl",
+        "_blocked_queueing",
+        "_blocked_proxy",
+        "_workerStart",
+        "_workerReady",
+        "_workerFetchStart",
+        "_workerRespondWithSettled",
+      ].map((key) => [key, text(`timings.${key}`)]),
     ),
   };
   const page = {
@@ -363,11 +412,15 @@ describe("number and boolean fields", () => {
     },
   };
 
-  it("names every number and boolean field of the model in the number table", () => {
-    expect(Object.keys(HAR_MODEL_NUMBER_FIELD_TABLE).sort()).toEqual([...NUMBER_FIELDS].sort());
+  it("gives every number and boolean field of the model a row of that kind", () => {
+    const numberRows = Object.values(HAR_MODEL_FIELD_TABLE)
+      .filter((row) => row.kinds.includes("number") || row.kinds.includes("boolean"))
+      .filter((row) => !row.kinds.includes("string"))
+      .map((row) => row.field);
+    expect([...numberRows].sort()).toEqual([...NUMBER_FIELDS].sort());
   });
 
-  it("removes a value of the wrong type from every number and boolean field at both levels", () => {
+  it("removes a value of the wrong type from every number and boolean field at both levels and records each", () => {
     for (const level of REDACTION_LEVELS) {
       const input = documentOf([clone(planted)], { pages: [clone(page)] });
       const { document, report } = redactHar(input, { level });
@@ -375,11 +428,20 @@ describe("number and boolean fields", () => {
       for (const field of NUMBER_FIELDS) {
         expect(output, `${level}: ${field}`).not.toContain(text(field));
       }
-      const malformed = report.records.filter((record) => record.place === "malformed-number");
-      expect(malformed.map((record) => record.field).sort(), level).toEqual(
+      const wrongType = report.records.filter((record) => record.place === "wrong-type");
+      expect(wrongType.map((record) => record.field).sort(), level).toEqual(
         [...NUMBER_FIELDS].sort(),
       );
-      expect(report.places.find((place) => place.place === "malformed-number")?.count).toBe(23);
+      expect(report.places.find((place) => place.place === "wrong-type")?.count).toBe(
+        NUMBER_FIELDS.length,
+      );
+      const timings = document.log.entries[0]!.timings;
+      expect([timings.send, timings.wait, timings.receive, timings.ssl]).toEqual([
+        0,
+        0,
+        0,
+        undefined,
+      ]);
       expect(parseHar(document).problems.filter((problem) => problem.severity !== "note")).toEqual(
         [],
       );
@@ -389,6 +451,114 @@ describe("number and boolean fields", () => {
         expect(JSON.stringify(single.entry), `${level} entry: ${field}`).not.toContain(text(field));
       }
     }
+  });
+});
+
+describe("counting and recording by place", () => {
+  it("counts and records a custom field whose value holds no string", () => {
+    const input = documentOf([entry({ _serverPort: 443, _flags: { on: true }, _none: null })]);
+    const standard = redactHar(input, { level: "standard" });
+    expect(standard.document.log.entries[0]).toMatchObject({ _serverPort: 443, _none: null });
+    expect(
+      standard.report.places.find((place) => place.place === "other-custom-field")?.count,
+    ).toBe(3);
+
+    const shareable = redactHar(input, { level: "shareable" });
+    const redacted = shareable.document.log.entries[0]!;
+    expect(
+      Object.keys(redacted).filter((key) => key.startsWith("_") && key !== "_harExport"),
+    ).toEqual([]);
+    expect(shareable.report.records).toContainEqual({
+      entryIndex: 0,
+      place: "other-custom-field",
+      field: "entry.<custom>",
+      ruleId: "shareable:other-custom-field",
+      count: 3,
+    });
+    expect(redacted._harExport?.redactedFields).toContain("entry.<custom>");
+  });
+
+  it("lists every removal of an entry both in the records and in that entry's redactedFields, and says so", () => {
+    const { document } = buildMarkerDocument();
+    for (const level of REDACTION_LEVELS) {
+      const { document: redacted, report } = redactHar(document, { level });
+      expect(report.guarantee).toContain(
+        "Each removal is listed by field path in log._harExport.redaction.records and in _harExport.redactedFields on its entry.",
+      );
+      redacted.log.entries.forEach((item, index) => {
+        const recorded = new Set(
+          report.records
+            .filter((record) => record.entryIndex === index)
+            .map((record) => record.field),
+        );
+        expect(
+          [...(item._harExport?.redactedFields ?? [])].sort(),
+          `${level} entry ${String(index)}`,
+        ).toEqual([...recorded].sort());
+      });
+    }
+  });
+});
+
+describe("values of the wrong type", () => {
+  it("drops array items of the wrong type and records each", () => {
+    const headers = [{ name: "Accept", value: "a" }, 5, "Authorization: Bearer hidden"];
+    for (const level of REDACTION_LEVELS) {
+      const { document, report } = redactHar(
+        documentOf([entry({}, { headers: headers as unknown as never[] })]),
+        { level },
+      );
+      expect(document.log.entries[0]!.request.headers).toHaveLength(1);
+      expect(JSON.stringify(document)).not.toContain("hidden");
+      expect(report.records).toContainEqual({
+        entryIndex: 0,
+        place: "wrong-type",
+        field: "request.headers",
+        ruleId: `${level}:wrong-type`,
+        count: 2,
+      });
+    }
+  });
+});
+
+describe("rules that select by name", () => {
+  it("says a header rule with matchAll selects every name, and removes every header value", () => {
+    const headers = [
+      { name: "X-One", value: "one" },
+      { name: "Accept", value: "two" },
+    ];
+    const { document, report } = redactHar(documentOf([entry({}, { headers })]), {
+      rules: [{ id: "header:all", target: "header", names: [], matchAll: true }],
+    });
+    expect(document.log.entries[0]!.request.headers.map((header) => header.value)).toEqual([
+      "[REDACTED]",
+      "[REDACTED]",
+    ]);
+    expect(report.places.find((place) => place.place === "header-value-secret")?.label).toBe(
+      "values of request and response headers with any name",
+    );
+  });
+
+  it("describes a cookie rule as selecting every cookie value, and names the rule where it matched", () => {
+    const cookies = [
+      { name: "sid", value: "s" },
+      { name: "other", value: "o" },
+    ];
+    const { document, report } = redactHar(documentOf([entry({}, { cookies })]), {
+      rules: [{ id: "cookie:only-sid", target: "cookie", names: ["sid"] }],
+    });
+    expect(document.log.entries[0]!.request.cookies.map((cookie) => cookie.value)).toEqual([
+      "[REDACTED]",
+      "[REDACTED]",
+    ]);
+    const cookiePlace = report.places.find((place) => place.place === "cookie");
+    expect(cookiePlace?.label).toBe("cookie values");
+    expect(cookiePlace?.status).toBe("removed");
+    // The value the rule names is recorded under the rule; the rest under the level's cookie place.
+    expect(report.records.map((record) => `${record.ruleId} ${String(record.count)}`)).toEqual([
+      "cookie:only-sid 1",
+      "standard:cookie 1",
+    ]);
   });
 });
 

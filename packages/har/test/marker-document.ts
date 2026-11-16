@@ -1,16 +1,166 @@
 import { decodeAsciiBase64, encodeAsciiBase64 } from "./ascii-base64.ts";
-import type {
-  HarDocument,
-  HarModelNumberField,
-  HarModelStringField,
-  HarRedactionPlace,
-} from "../src/model.ts";
+import type { HarDocument, HarModelField, HarRedactionPlace } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
 
+// A text marker is found by searching the output. A number or boolean cannot be told apart that way,
+// so it is planted at a path and found by reading that path back.
 export interface PlantedMarker {
-  readonly field: HarModelStringField | HarModelNumberField;
+  readonly field: HarModelField;
   readonly place: HarRedactionPlace;
   readonly marker: string;
+  readonly path?: readonly (string | number)[] | undefined;
+  readonly value?: number | boolean | undefined;
+}
+
+function valueAt(root: unknown, path: readonly (string | number)[]): unknown {
+  let node = root;
+  for (const step of path) {
+    node =
+      typeof node === "object" && node !== null
+        ? (node as Record<string, unknown>)[step]
+        : undefined;
+  }
+  return node;
+}
+
+export function markerPresent(document: HarDocument, item: PlantedMarker): boolean {
+  return item.path === undefined
+    ? haystackFor(document).includes(item.marker)
+    : valueAt(document, item.path) === item.value;
+}
+
+const ENTRY: readonly (string | number)[] = ["log", "entries", 0];
+
+const NUMBER_PLANTS: ReadonlyArray<
+  readonly [HarModelField, HarRedactionPlace, readonly (string | number)[], number | boolean]
+> = [
+  [
+    "log.pages[].pageTimings.onContentLoad",
+    "measurement",
+    ["log", "pages", 0, "pageTimings", "onContentLoad"],
+    101,
+  ],
+  [
+    "log.pages[].pageTimings.onLoad",
+    "measurement",
+    ["log", "pages", 0, "pageTimings", "onLoad"],
+    102,
+  ],
+  ["entry.time", "measurement", [...ENTRY, "time"], 103],
+  ["request.headersSize", "measurement", [...ENTRY, "request", "headersSize"], 104],
+  ["request.bodySize", "measurement", [...ENTRY, "request", "bodySize"], 105],
+  [
+    "request.cookies[].httpOnly",
+    "cookie-metadata",
+    [...ENTRY, "request", "cookies", 0, "httpOnly"],
+    true,
+  ],
+  [
+    "request.cookies[].secure",
+    "cookie-metadata",
+    [...ENTRY, "request", "cookies", 0, "secure"],
+    true,
+  ],
+  ["response.status", "measurement", [...ENTRY, "response", "status"], 206],
+  ["response.headersSize", "measurement", [...ENTRY, "response", "headersSize"], 107],
+  ["response.bodySize", "measurement", [...ENTRY, "response", "bodySize"], 108],
+  [
+    "response.cookies[].httpOnly",
+    "cookie-metadata",
+    [...ENTRY, "response", "cookies", 0, "httpOnly"],
+    true,
+  ],
+  [
+    "response.cookies[].secure",
+    "cookie-metadata",
+    [...ENTRY, "response", "cookies", 0, "secure"],
+    true,
+  ],
+  ["response.content.size", "measurement", [...ENTRY, "response", "content", "size"], 109],
+  [
+    "response.content.compression",
+    "measurement",
+    [...ENTRY, "response", "content", "compression"],
+    110,
+  ],
+  ["response._transferSize", "other-custom-field", [...ENTRY, "response", "_transferSize"], 111],
+  ["cache.beforeRequest.hitCount", "cache", [...ENTRY, "cache", "beforeRequest", "hitCount"], 112],
+  ["cache.afterRequest.hitCount", "cache", [...ENTRY, "cache", "afterRequest", "hitCount"], 113],
+  ["timings.blocked", "measurement", [...ENTRY, "timings", "blocked"], 114],
+  ["timings.dns", "measurement", [...ENTRY, "timings", "dns"], 115],
+  ["timings.connect", "measurement", [...ENTRY, "timings", "connect"], 116],
+  ["timings.send", "measurement", [...ENTRY, "timings", "send"], 117],
+  ["timings.wait", "measurement", [...ENTRY, "timings", "wait"], 118],
+  ["timings.receive", "measurement", [...ENTRY, "timings", "receive"], 119],
+  ["timings.ssl", "measurement", [...ENTRY, "timings", "ssl"], 120],
+  [
+    "timings._blocked_queueing",
+    "other-custom-field",
+    [...ENTRY, "timings", "_blocked_queueing"],
+    121,
+  ],
+  ["timings._blocked_proxy", "other-custom-field", [...ENTRY, "timings", "_blocked_proxy"], 122],
+  ["timings._workerStart", "other-custom-field", [...ENTRY, "timings", "_workerStart"], 123],
+  ["timings._workerReady", "other-custom-field", [...ENTRY, "timings", "_workerReady"], 124],
+  [
+    "timings._workerFetchStart",
+    "other-custom-field",
+    [...ENTRY, "timings", "_workerFetchStart"],
+    125,
+  ],
+  [
+    "timings._workerRespondWithSettled",
+    "other-custom-field",
+    [...ENTRY, "timings", "_workerRespondWithSettled"],
+    126,
+  ],
+  [
+    "entry._harExport.bodyIncomplete",
+    "export-annotation",
+    [...ENTRY, "_harExport", "bodyIncomplete"],
+    true,
+  ],
+  ["entry._harExport.lossyText", "export-annotation", [...ENTRY, "_harExport", "lossyText"], 127],
+  [
+    "entry._harExport.inProgress",
+    "export-annotation",
+    [...ENTRY, "_harExport", "inProgress"],
+    true,
+  ],
+  ["entry._initiator.lineNumber", "initiator", [...ENTRY, "_initiator", "lineNumber"], 128],
+  ["entry._initiator.columnNumber", "initiator", [...ENTRY, "_initiator", "columnNumber"], 129],
+  [
+    "entry._initiator.stack.callFrames[].lineNumber",
+    "initiator",
+    [...ENTRY, "_initiator", "stack", "callFrames", 0, "lineNumber"],
+    130,
+  ],
+  [
+    "entry._initiator.stack.callFrames[].columnNumber",
+    "initiator",
+    [...ENTRY, "_initiator", "stack", "callFrames", 0, "columnNumber"],
+    131,
+  ],
+  [
+    "entry._webSocketMessages[].time",
+    "websocket",
+    [...ENTRY, "_webSocketMessages", 0, "time"],
+    132,
+  ],
+  [
+    "entry._webSocketMessages[].opcode",
+    "websocket",
+    [...ENTRY, "_webSocketMessages", 0, "opcode"],
+    133,
+  ],
+];
+
+function setAt(root: unknown, path: readonly (string | number)[], value: unknown): void {
+  const parent = valueAt(root, path.slice(0, -1));
+  if (typeof parent !== "object" || parent === null) {
+    throw new Error(`No object at ${path.slice(0, -1).join(".")}`);
+  }
+  (parent as Record<string | number, unknown>)[path.at(-1)!] = value;
 }
 
 function baseEntry(index: number, url = "https://plain.example/item"): Record<string, unknown> {
@@ -47,13 +197,13 @@ function baseEntry(index: number, url = "https://plain.example/item"): Record<st
 export function buildMarkerDocument(): {
   readonly document: HarDocument;
   readonly markers: readonly PlantedMarker[];
-  readonly plantedFields: ReadonlySet<HarModelStringField>;
+  readonly plantedFields: ReadonlySet<HarModelField>;
 } {
   const markers: PlantedMarker[] = [];
-  const plantedFields = new Set<HarModelStringField>();
+  const plantedFields = new Set<HarModelField>();
   let seq = 0;
 
-  const nextMarker = (field: HarModelStringField, place: HarRedactionPlace): string => {
+  const nextMarker = (field: HarModelField, place: HarRedactionPlace): string => {
     seq += 1;
     plantedFields.add(field);
     if (field === "log.version") {
@@ -527,17 +677,22 @@ export function buildMarkerDocument(): {
     );
   }
 
+  for (const [field, place, path, value] of NUMBER_PLANTS) {
+    plantedFields.add(field);
+    setAt(parsed.document, path, value);
+    markers.push({ field, place, marker: `${path.join(".")}=${String(value)}`, path, value });
+  }
+
   // Parse replaces text in a number field, so this marker goes in after parse, as a caller that
   // skips parse would pass it.
   const malformed = "MARKER_text_in_timings_ssl";
-  markers.push({ field: "timings.ssl", place: "malformed-number", marker: malformed });
-  const timings = parsed.document.log.entries[0]!.timings as unknown as Record<string, unknown>;
-  timings.ssl = malformed;
+  markers.push({ field: "timings.ssl", place: "wrong-type", marker: malformed });
+  setAt(parsed.document, ["log", "entries", 1, "timings", "ssl"], malformed);
 
   return { document: parsed.document, markers, plantedFields };
 }
 
-export function haystackFor(document: HarDocument): string {
+function haystackFor(document: HarDocument): string {
   const b64Texts = document.log.entries
     .filter((entry) => entry.response.content.encoding === "base64" && entry.response.content.text)
     .map((entry) => decodeAsciiBase64(entry.response.content.text ?? ""));
