@@ -5,5 +5,5 @@
     "lib": ["ESNext"],
     "types": []
   },
-  "include": ["parent.ts", "gecko.d.ts", "contract.ts", "gecko-schema.ts"]
+  "include": ["parent.ts", "parent-api.ts", "gecko.d.ts", "contract.ts", "gecko-schema.ts"]
 }

@@ -24,3 +24,19 @@ export const oneClickHarApi = {
 };
 
 export type OneClickHarApi = ApiFunctions<typeof oneClickHarApi>;
+
+/**
+ * The result's key sets at run time. Types are erased, so the contract test compares the handler's actual keys
+ * with this table; a value held in a variable is not checked for excess properties by the type checker.
+ */
+export const environmentKeys = {
+  result: ["browser", "toolbox"],
+  browser: ["name", "version", "buildId"],
+  toolboxOpen: ["host", "open"],
+  toolboxClosed: ["open", "reason"],
+} as const satisfies {
+  result: ReadonlyArray<keyof Environment>;
+  browser: ReadonlyArray<keyof Environment["browser"]>;
+  toolboxOpen: ReadonlyArray<keyof Extract<ToolboxState, { open: true }>>;
+  toolboxClosed: ReadonlyArray<keyof Extract<ToolboxState, { open: false }>>;
+};

@@ -6,6 +6,32 @@
     "apps/extension": {
       // extension.js builds the pages src/manifest.json names, and scripts/build-experiment.ts bundles the parent script.
       "entry": ["src/*/main.tsx", "experiment/parent.ts", "scripts/*.ts", "extension.config.js"],
+      // scripts/minify.test.ts bundles these from entry text, so each resolves to its browser build.
+      "ignoreDependencies": [
+        "acorn",
+        "bootstrap",
+        "ajv",
+        "dayjs",
+        "djv",
+        "effect",
+        "ejs",
+        "greenlet",
+        "handlebars",
+        "js-yaml",
+        "jsonschema",
+        "kysely",
+        "libphonenumber-js",
+        "lit-html",
+        "lru-cache",
+        "marked",
+        "pako",
+        "prismjs",
+        "sql.js",
+        "vue",
+        "yaml",
+        "zod",
+        "zustand",
+      ],
     },
     "packages/*": {
       // Only package.json `exports` and the tests are entries. Knip's default entries include src/index.ts, which
