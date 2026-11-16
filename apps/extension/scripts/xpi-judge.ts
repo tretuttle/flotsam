@@ -61,9 +61,9 @@ const judgeFile = (file: Unit): Extract<JudgeEvent, { event: "done" }> => {
         );
       }
     }
-    const minifier = PRODUCERS[unit.kind ?? "source"].minifier;
-    if (unit === file && minifier !== undefined && "facts" in read && "saved" in read.facts)
-      measurement = { bytes: unit.bytes.length, saved: read.facts.saved, margin: minifier.margin };
+    const { step } = PRODUCERS[unit.kind ?? "source"];
+    if (unit === file && step !== undefined && "facts" in read && "saved" in read.facts)
+      measurement = { bytes: unit.bytes.length, saved: read.facts.saved, margin: step.margin };
   }
   return { event: "done", index: -1, path: file.path, violations, measurement };
 };

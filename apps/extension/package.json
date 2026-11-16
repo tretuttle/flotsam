@@ -25,6 +25,7 @@
     "@types/react-dom": "19.3.0",
     "acorn": "8.19.0",
     "ajv": "8.17.1",
+    "bootstrap": "5.3.8",
     "dayjs": "1.11.13",
     "djv": "2.1.4",
     "effect": "catalog:",

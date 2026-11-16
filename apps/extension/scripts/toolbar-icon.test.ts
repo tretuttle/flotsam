@@ -25,8 +25,8 @@ const shownClass = (svg: string, width: number): string => {
     const query = rule[1] ?? "";
     const id = rule[2] ?? "";
     const hit = query.split(",").some((part) => {
-      const min = part.match(/min-width:([\d.]+)px/);
-      const max = part.match(/max-width:([\d.]+)px/);
+      const min = part.match(/width>=([\d.]+)px/);
+      const max = part.match(/width<=([\d.]+)px/);
       if (!min?.[1] || !max?.[1]) return false;
       return width + 1e-9 >= Number(min[1]) && width - 1e-9 <= Number(max[1]);
     });

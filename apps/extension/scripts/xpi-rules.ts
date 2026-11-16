@@ -3,15 +3,17 @@
 // the rules judge the facts. Every rule carries the planted archive that proves it, and check-xpi.test.ts runs them.
 import * as NodeZlib from "node:zlib";
 import { CANNOT_JUDGE } from "./check-xpi.ts";
-import { minifyScript, minifyStyle, minifyStyleAttribute, reminifyScript } from "./minify.ts";
+import { readManifest } from "./manifest.ts";
+import { MINIFIED, minifyScript, minifyStyleAttribute, type Step } from "./minify.ts";
 import { readMarkup, type BodyKind, type Markup } from "./xpi-markup.ts";
 import { lineOf, parseScript, type ScriptFacts } from "./xpi-source.ts";
 
-export type Kind = BodyKind | "notice" | "source-map" | "source";
+/** A body's kind, or for a file in the archive, the build step it comes from. A carried `script` is inline code. */
+export type Kind = BodyKind | "page-script" | "parent-script" | "notice" | "source-map" | "source";
 
 // The only file types an XPI may ship. Matched by suffix, first hit wins. A path that matches none is a violation.
 const KIND_BY_SUFFIX: ReadonlyArray<readonly [string, Kind]> = [
-  [".js", "script"],
+  [".js", "page-script"],
   [".css", "style"],
   [".svg", "vector"],
   [".html", "markup"],
@@ -24,36 +26,34 @@ const KIND_BY_SUFFIX: ReadonlyArray<readonly [string, Kind]> = [
   ),
 ];
 
+// build-experiment.ts writes the parent script where the manifest names it; rspack writes every other script.
+const PARENT_SCRIPT = Object.values(readManifest().experiment_apis).map(({ parent }) =>
+  parent.script.replace(/^\//, ""),
+);
+
 export const kindOf = (path: string): Kind | undefined =>
-  KIND_BY_SUFFIX.find(([suffix]) => path.endsWith(suffix))?.[1];
+  PARENT_SCRIPT.includes(path)
+    ? "parent-script"
+    : KIND_BY_SUFFIX.find(([suffix]) => path.endsWith(suffix))?.[1];
 
 interface Producer {
   readonly builtBy: string;
-  /** The producer's minifier, run again by the check. A minified file comes back at most `margin` bytes smaller. */
-  readonly minifier?: { readonly run: (text: string) => string; readonly margin: number };
+  /** The step that minified it, which the check runs again. */
+  readonly step?: Step;
 }
 
-// What a second run of the build's own minifier still saves on honest output, measured: 0 bytes on every packed
-// script but 1 on shared/framework.js, and on the libraries minify.test.ts builds at most 7 through the page build
-// and 8 through the parent build, both vue. 16 is twice that. One 210 byte readable function saves 89.
-const SCRIPT_MARGIN_BYTES = 16;
-// lightningcss reaches a fixed point in one run: 0 bytes on both packed stylesheets and on real 13 and 90 KB sheets.
-const STYLE_MARGIN_BYTES = 0;
-
-/** Which build step writes each kind of file, and so which minifier a packed file of that kind must survive. */
+/** Which build step writes each kind of file: the minified kinds are minify.ts's table, the rest only copied. */
 export const PRODUCERS: Readonly<Record<Kind, Producer>> = {
+  "page-script": { builtBy: MINIFIED["page-script"].builtBy, step: MINIFIED["page-script"] },
+  "parent-script": { builtBy: MINIFIED["parent-script"].builtBy, step: MINIFIED["parent-script"] },
   script: {
-    builtBy:
-      "rspack's SwcJsMinimizerRspackPlugin for the pages and build-experiment.ts for the parent, both with minify.ts",
-    minifier: { run: reminifyScript, margin: SCRIPT_MARGIN_BYTES },
+    builtBy: "nothing; the build writes no inline script, so one is judged like the parent script",
+    step: MINIFIED["parent-script"],
   },
-  style: {
-    builtBy: "the minify.ts style minimizer in the rspack page build",
-    minifier: { run: minifyStyle, margin: STYLE_MARGIN_BYTES },
-  },
+  style: { builtBy: MINIFIED.style.builtBy, step: MINIFIED.style },
   "style-attribute": {
     builtBy: "nothing; the build writes no style attribute, so one is judged like a stylesheet",
-    minifier: { run: minifyStyleAttribute, margin: STYLE_MARGIN_BYTES },
+    step: { ...MINIFIED.style, run: minifyStyleAttribute },
   },
   vector: { builtBy: "extension.js, which copies src/icons as written, on one line" },
   markup: { builtBy: "extension.js, which writes each page shell and loads every script by src" },
@@ -139,13 +139,13 @@ const messageOf = (error: unknown): string => {
     .replaceAll(/\s+/g, " ");
 };
 
-/** Runs the producer's minifier. A file it cannot read, or one it reduces to nothing, is not minified output. */
+/** Runs the producer's step. A file it cannot read, or one it reduces to nothing, is not minified output. */
 const measure = (unit: Unit, text: string): number => {
-  const minifier = PRODUCERS[unit.kind ?? "source"].minifier;
-  if (minifier === undefined) throw new Error(`no minifier for ${String(unit.kind)}`);
+  const { step } = PRODUCERS[unit.kind ?? "source"];
+  if (step === undefined) throw new Error(`no minifier for ${String(unit.kind)}`);
   let minified: string;
   try {
-    minified = minifier.run(text);
+    minified = step.run(text, unit.path);
   } catch (error) {
     throw new Unreadable(`the build's minifier fails on it: ${messageOf(error)}`);
   }
@@ -164,14 +164,17 @@ const read = (unit: Unit): Facts => {
     throw new Unreadable("is not valid UTF-8");
   }
   if (
+    unit.kind === "page-script" ||
+    unit.kind === "parent-script" ||
     unit.kind === "script" ||
     unit.kind === "style" ||
     unit.kind === "style-attribute" ||
-    unit.kind === "data" ||
-    unit.kind === "notice"
+    unit.kind === "data"
   )
     ensureShallow(text, "it");
   switch (unit.kind) {
+    case "page-script":
+    case "parent-script":
     case "script": {
       const script = parseScript(text);
       const [error] = script.errors;
@@ -1213,7 +1216,7 @@ export const RULES: readonly Rule[] = [
           : undefined;
       }
       if (facts.form !== "script" && facts.form !== "style") return undefined;
-      const margin = PRODUCERS[unit.kind ?? "source"].minifier?.margin ?? 0;
+      const margin = PRODUCERS[unit.kind ?? "source"].step?.margin ?? 0;
       return facts.saved > margin
         ? `the build's minifier removes ${facts.saved} more bytes (${((facts.saved / facts.text.length) * 100).toFixed(1)}%); minified output gives up at most ${margin}`
         : undefined;
@@ -1237,6 +1240,65 @@ export const RULES: readonly Rule[] = [
         name: "V01 an unminified parent script",
         changes: (fixtures) => ({ "experiment/parent.js": fixtures.unminifiedParent }),
         path: "experiment/parent.js",
+      },
+      {
+        name: "N01 a readable function inside a one-line /*! comment on the parent, whose step drops every comment",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `/*! function readHeaders(entries) { return entries.map((entry) => entry.name); } */\n${fixtures.minifiedParent}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a /*! comment of prose over 400 characters on the parent",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `/*! ${"This notice is far longer than a pointer to a license file needs to be. ".repeat(8)}*/\n${fixtures.minifiedParent}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a @license comment that assigns a value on the parent",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `/** @license token = readHeaders(entries) */\n${fixtures.minifiedParent}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "E20 a legal comment of calls and comparisons on the parent",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `/*! ${"readHeaders(entries)===entries.length&&check(entries)===true&&".repeat(5)}*/\n${fixtures.minifiedParent}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "the page build's license pointer on the parent, which the parent step never writes",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `/*! LICENSE: parent.js.LICENSE.txt */\n${fixtures.minifiedParent}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a readable function in a legal comment beside the page pointer, which the page step moves to the notice",
+        changes: (fixtures) => ({
+          "shared/framework.js": fixtures.framework.replace(
+            "*/\n",
+            `*/\n/*! @license MIT ${ONE_LINE_FUNCTION} */`,
+          ),
+        }),
+        path: "shared/framework.js",
+      },
+      {
+        name: "a page script that kept its legal comment, as rspack writes with extractComments off and comments all",
+        changes: () => ({
+          "shared/main.js": `console.log(/*! @license MIT\n${PRETTY_FUNCTION}${"Permission is hereby granted, free of charge, to any person obtaining a copy. ".repeat(10)}*/"x");`,
+        }),
+        path: "shared/main.js",
+      },
+      {
+        name: "a React @license comment kept in a page script, which the page step moves to the notice",
+        changes: (fixtures) => ({
+          "shared/payload.js": `/**\n * @license React v19.3.1\n * react.production.js\n *\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n *\n * This source code is licensed under the MIT license found in the\n * LICENSE file in the root directory of this source tree.\n */\n${fixtures.minifiedParent}`,
+        }),
+        path: "shared/payload.js",
       },
       {
         name: "V09 a pretty stylesheet",
@@ -1340,6 +1402,13 @@ export const RULES: readonly Rule[] = [
       {
         name: "E23 a closed inline script with a readable function",
         changes: () => ({ "action/index.html": inPage(`<script>${PRETTY_FUNCTION}</script>`) }),
+        path: "action/index.html",
+      },
+      {
+        name: "a legal comment in an inline script, which no build step writes or moves to a notice",
+        changes: () => ({
+          "action/index.html": inPage("<script>/*! @license MIT, see LICENSE */a();</script>"),
+        }),
         path: "action/index.html",
       },
       {

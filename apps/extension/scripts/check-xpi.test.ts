@@ -262,12 +262,6 @@ describe.concurrent("check-xpi", () => {
       }),
     },
     {
-      name: "a React style multi-line @license comment above one long line",
-      changes: (fixtures) => ({
-        "shared/payload.js": `/**\n * @license React v19.3.1\n * react.production.js\n *\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n *\n * This source code is licensed under the MIT license found in the\n * LICENSE file in the root directory of this source tree.\n */\n${fixtures.minifiedParent}`,
-      }),
-    },
-    {
       name: "E06 a regular expression literal that contains the characters of a function",
       changes: (fixtures) => ({
         "experiment/parent.js": `${fixtures.minifiedParent};var r=/function collectHeaders\\(entries\\)\\{return entries\\.map\\(\\(e\\)=>e\\.name\\)\\}/;`,
@@ -353,9 +347,8 @@ describe.concurrent("check-xpi", () => {
     expect(result.status).toBe(0);
   });
 
-  // What the check does not judge, as docs/internals/shipped-output.md states: the contents of a string and the
-  // comments the minifier keeps. The minifier cannot shrink either, so the question "is this the minifier's output"
-  // does not reach them. No build step writes source into them.
+  // What the check does not judge, as docs/internals/shipped-output.md states: the contents of a string and the text of
+  // a license notice. The minifier cannot shrink a string, and a notice is not code the browser runs.
   const limits: ReadonlyArray<{
     readonly name: string;
     readonly changes: (fixtures: Fixtures) => Changes;
@@ -364,12 +357,6 @@ describe.concurrent("check-xpi", () => {
       name: "a readable function in a string",
       changes: (fixtures) => ({
         "experiment/parent.js": `${fixtures.minifiedParent};eval(${JSON.stringify(PRETTY_SOURCE)});`,
-      }),
-    },
-    {
-      name: "a readable function in a legal comment",
-      changes: (fixtures) => ({
-        "experiment/parent.js": `/*! ${PRETTY_SOURCE} */\n${fixtures.minifiedParent}`,
       }),
     },
     {

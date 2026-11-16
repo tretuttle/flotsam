@@ -1,14 +1,14 @@
 // Writes the experiment's schema.json and parent script to the paths the manifest names, under the folder given
 // as the first argument. extension.js only copies scripts, so `build` runs this on its output afterwards and
-// `dev` runs it on `public`. The bundler only bundles: the parent script is minified by the same minifier and options
-// as the page scripts, from minify.ts, so check-xpi can judge every script against one minifier.
+// `dev` runs it on `public`. The bundler only bundles: the parent script is minified by the parent-script step in
+// minify.ts, which check-xpi runs again on the packed file.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { build } from "vite-plus/pack";
 import { oneClickHarApi, namespace } from "../experiment/contract.ts";
 import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { extensionRoot, readManifest } from "./manifest.ts";
-import { minifyScript } from "./minify.ts";
+import { MINIFIED } from "./minify.ts";
 
 /**
  * Bundles `entryFile` into one self-contained IIFE at `scriptFile`, the way the parent script ships. `minify: false`
@@ -34,7 +34,10 @@ export const bundleScript = async (
     outputOptions: { entryFileNames: "[name].js" },
   });
   if (minify)
-    NodeFS.writeFileSync(scriptFile, minifyScript(NodeFS.readFileSync(scriptFile, "utf8")));
+    NodeFS.writeFileSync(
+      scriptFile,
+      MINIFIED["parent-script"].run(NodeFS.readFileSync(scriptFile, "utf8"), scriptFile),
+    );
 };
 
 export const bundleParent = (scriptFile: string, minify: boolean): Promise<void> =>

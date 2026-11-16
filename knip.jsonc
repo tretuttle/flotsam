@@ -9,6 +9,7 @@
       // scripts/minify.test.ts bundles these from entry text, so each resolves to its browser build.
       "ignoreDependencies": [
         "acorn",
+        "bootstrap",
         "ajv",
         "dayjs",
         "djv",
