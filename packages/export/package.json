@@ -1,0 +1,34 @@
+{
+  "name": "@one-click-har/export",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./entry-writer": "./src/entry-writer.ts",
+    "./from-recording": "./src/from-recording.ts",
+    "./har-fields": "./src/har-fields.ts",
+    "./jobs": "./src/jobs.ts",
+    "./merge": "./src/merge.ts",
+    "./missing": "./src/missing.ts",
+    "./pages": "./src/pages.ts",
+    "./report": "./src/report.ts",
+    "./run": "./src/run.ts",
+    "./selection": "./src/selection.ts",
+    "./source": "./src/source.ts",
+    "./written": "./src/written.ts"
+  },
+  "scripts": {
+    "test": "vp test run --config ../../vite.config.ts --dir .",
+    "typecheck": "effect-tsgo tsrs --noEmit -p tsconfig.json && effect-tsgo tsrs --noEmit -p test/tsconfig.json"
+  },
+  "dependencies": {
+    "@one-click-har/har": "workspace:*",
+    "@one-click-har/recording": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "har-to-k6": "0.13.0",
+    "har-validator": "5.1.5",
+    "vite-plus": "catalog:"
+  }
+}

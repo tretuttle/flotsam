@@ -50,3 +50,8 @@ minimumReleaseAgeExclude:
   - "@effect/tsgo-win32-arm64@0.67.1"
   - "@effect/tsgo-win32-x64@0.67.1"
   - "@effect/tsgo@0.67.1"
+
+# Transitive dependencies of har-to-k6 whose postinstall scripts are unneeded (husky/Node 0.10 polyfill).
+allowBuilds:
+  caporal: false
+  spawn-sync: false
