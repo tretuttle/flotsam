@@ -1141,7 +1141,7 @@ export const RULES: readonly Rule[] = [
       {
         name: "E17 a sourceMappingURL hidden after a division-looking comment opener",
         changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent}a++/2;//# sourceMappingURL=parent.js.map`,
+          "experiment/parent.js": `${fixtures.minifiedParent}planted++/2;//# sourceMappingURL=parent.js.map`,
         }),
         path: "experiment/parent.js",
         alsoFails: ["comment", "not-minified"],
@@ -1149,7 +1149,7 @@ export const RULES: readonly Rule[] = [
       {
         name: "E18 an inline data: source map hidden after a division-looking comment opener",
         changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent}a++/2;/*# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ== */0`,
+          "experiment/parent.js": `${fixtures.minifiedParent}planted++/2;/*# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ== */0`,
         }),
         path: "experiment/parent.js",
         alsoFails: ["comment", "not-minified"],
@@ -1323,7 +1323,7 @@ export const RULES: readonly Rule[] = [
       {
         name: "E16 a readable function in a comment after an increment and a division",
         changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent}a++/2;/* function readHeaders(entries) { return entries.map((entry) => entry.name); } */0`,
+          "experiment/parent.js": `${fixtures.minifiedParent}planted++/2;/* function readHeaders(entries) { return entries.map((entry) => entry.name); } */0`,
         }),
         path: "experiment/parent.js",
         alsoFails: ["comment"],
