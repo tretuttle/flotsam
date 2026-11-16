@@ -1,30 +1,14 @@
-// The rules an XPI must pass, as one table. A file's extension only says what it claims to be; the rules read its
-// bytes to check the claim. Every row carries the planted archive that proves it, and check-xpi.test.ts runs them all.
+// What may ship in an XPI, as tables: the kind of each file, the build step that writes it with the minifier that
+// step runs, and the rules. A file's suffix only says what it claims to be; a reader parses its bytes into facts and
+// the rules judge the facts. Every rule carries the planted archive that proves it, and check-xpi.test.ts runs them.
+import * as NodeZlib from "node:zlib";
 import { experiments } from "@rspack/core";
-import { transform as transformCss, transformStyleAttribute } from "lightningcss";
-import {
-  classifyComments,
-  findComments,
-  hasLineTerminator,
-  lineBreaksOutsideData,
-  lineOf,
-  parseScript,
-  readStyle,
-  skipString,
-  type Syntax,
-} from "./xpi-source.ts";
+import { CANNOT_JUDGE } from "./check-xpi.ts";
+import { minifyScript, minifyStyle, minifyStyleAttribute, reminifyScript } from "./minify.ts";
+import { readMarkup, type BodyKind, type Markup } from "./xpi-markup.ts";
+import { classifyComments, lineOf, parseScript, type ScriptFacts } from "./xpi-source.ts";
 
-export type Kind =
-  | "script"
-  | "style"
-  | "style-attribute"
-  | "vector"
-  | "markup"
-  | "data"
-  | "raster"
-  | "notice"
-  | "source-map"
-  | "source";
+export type Kind = BodyKind | "notice" | "source-map" | "source";
 
 // The only file types an XPI may ship. Matched by suffix, first hit wins. A path that matches none is a violation.
 const KIND_BY_SUFFIX: ReadonlyArray<readonly [string, Kind]> = [
@@ -44,34 +28,205 @@ const KIND_BY_SUFFIX: ReadonlyArray<readonly [string, Kind]> = [
 export const kindOf = (path: string): Kind | undefined =>
   KIND_BY_SUFFIX.find(([suffix]) => path.endsWith(suffix))?.[1];
 
-/** Which comment syntax the text of a kind is read with. A kind not listed has no comments to judge. */
-const SYNTAX_BY_KIND: Readonly<Partial<Record<Kind, Syntax>>> = {
-  script: "script",
-  style: "style",
-  "style-attribute": "style",
-  vector: "vector",
+interface Producer {
+  readonly builtBy: string;
+  /** The producer's minifier, run again by the check. A minified file comes back at most `margin` bytes smaller. */
+  readonly minifier?: { readonly run: (text: string) => string; readonly margin: number };
+}
+
+// What a second run of the build's own minifier still saves on honest output, measured: 0 bytes on every packed
+// script but 1 on shared/framework.js, and at most 7 (vue) on the eight libraries minify.test.ts builds through both
+// script build paths. 16 is about twice that. One 210 byte readable function saves 89.
+const SCRIPT_MARGIN_BYTES = 16;
+// lightningcss reaches a fixed point in one run: 0 bytes on both packed stylesheets and on real 13 and 90 KB sheets.
+const STYLE_MARGIN_BYTES = 0;
+
+/** Which build step writes each kind of file, and so which minifier a packed file of that kind must survive. */
+export const PRODUCERS: Readonly<Record<Kind, Producer>> = {
+  script: {
+    builtBy:
+      "rspack's SwcJsMinimizerRspackPlugin for the pages and build-experiment.ts for the parent, both with minify.ts",
+    minifier: { run: reminifyScript, margin: SCRIPT_MARGIN_BYTES },
+  },
+  style: {
+    builtBy: "the minify.ts style minimizer in the rspack page build",
+    minifier: { run: minifyStyle, margin: STYLE_MARGIN_BYTES },
+  },
+  "style-attribute": {
+    builtBy: "nothing; the build writes no style attribute, so one is judged like a stylesheet",
+    minifier: { run: minifyStyleAttribute, margin: STYLE_MARGIN_BYTES },
+  },
+  vector: { builtBy: "extension.js, which copies src/icons as written, on one line" },
+  markup: { builtBy: "extension.js, which writes each page shell and loads every script by src" },
+  data: {
+    builtBy: "JSON.stringify: the manifest by extension.js, the schema by build-experiment.ts",
+  },
+  raster: { builtBy: "write-icons.ts, which renders the SVG master with resvg" },
+  notice: {
+    builtBy: "SwcJsMinimizerRspackPlugin, which extracts legal comments into <chunk>.LICENSE.txt",
+  },
+  "source-map": { builtBy: "nothing; the build writes no source map" },
+  source: { builtBy: "nothing; the build ships no source file" },
 };
 
-/** A file in the archive, or text carried inside one (the body of an inline `<script>`). */
+/** A file in the archive, or a body carried inside one (an inline `<script>`, a `srcdoc` page). */
 export interface Unit {
   readonly path: string;
-  /** Set for text carried inside the file at `path`. */
+  /** Set for a body carried inside the file at `path`. */
   readonly where: string | undefined;
   readonly kind: Kind | undefined;
   readonly bytes: Uint8Array;
-  readonly text: string;
+  /** How many archive entries have this path. */
+  readonly entries: number;
 }
 
-export const syntaxOf = (unit: Unit): Syntax | undefined =>
-  unit.kind === undefined ? undefined : SYNTAX_BY_KIND[unit.kind];
+/** What reading a unit found, by how it was read. */
+export type Facts =
+  | {
+      readonly form: "script";
+      readonly text: string;
+      readonly script: ScriptFacts;
+      readonly saved: number;
+    }
+  | { readonly form: "style"; readonly text: string; readonly saved: number }
+  | { readonly form: "markup"; readonly text: string; readonly markup: Markup }
+  | { readonly form: "data"; readonly text: string; readonly value: unknown }
+  | { readonly form: "text"; readonly text: string }
+  | { readonly form: "raster" };
+
+export type Read =
+  | { readonly unit: Unit; readonly facts: Facts }
+  | { readonly unit: Unit; readonly failure: string; readonly text: string | undefined };
+
+const textOf = (read: Read): string | undefined =>
+  "facts" in read ? ("text" in read.facts ? read.facts.text : undefined) : read.text;
+
+class Unreadable extends Error {}
+
+const utf8 = new TextDecoder("utf-8", { fatal: true });
+
+const messageOf = (error: unknown): string => {
+  const text = error instanceof Error ? error.message : String(error);
+  // swc throws a debug dump that repeats the whole source; its `message` field is the part worth reading.
+  return (/message: "((?:[^"\\]|\\.)*)"/.exec(text)?.[1] ?? text)
+    .slice(0, 200)
+    .replaceAll(/\s+/g, " ");
+};
+
+/** Runs the producer's minifier. A file it cannot read, or one it reduces to nothing, is not minified output. */
+const measure = (unit: Unit, text: string): number => {
+  const minifier = PRODUCERS[unit.kind ?? "source"].minifier;
+  if (minifier === undefined) throw new Error(`no minifier for ${String(unit.kind)}`);
+  let minified: string;
+  try {
+    minified = minifier.run(text);
+  } catch (error) {
+    throw new Unreadable(`the build's minifier fails on it: ${messageOf(error)}`);
+  }
+  if (unit.where === undefined && minified.trim() === "")
+    throw new Unreadable("the build's minifier reduces it to nothing, so it does no work");
+  return text.length - minified.length;
+};
+
+/** Reads a unit into facts, or throws `Unreadable` with the reason it cannot be judged. */
+const read = (unit: Unit): Facts => {
+  if (unit.kind === "raster") return { form: "raster" };
+  let text: string;
+  try {
+    text = utf8.decode(unit.bytes);
+  } catch {
+    throw new Unreadable("is not valid UTF-8");
+  }
+  const isScriptOrStyle =
+    unit.kind === "script" || unit.kind === "style" || unit.kind === "style-attribute";
+  if (unit.where === undefined && isScriptOrStyle && text.trim() === "")
+    throw new Unreadable("is empty; the build writes no empty script or stylesheet");
+  switch (unit.kind) {
+    case "script": {
+      const script = parseScript(text);
+      const [error] = script.errors;
+      if (error !== undefined) throw new Unreadable(`does not parse: ${error}`);
+      return { form: "script", text, script, saved: measure(unit, text) };
+    }
+    case "style":
+    case "style-attribute":
+      return { form: "style", text, saved: measure(unit, text) };
+    case "markup":
+    case "vector":
+      return {
+        form: "markup",
+        text,
+        markup: readMarkup(text, unit.kind === "markup" ? "page" : "vector"),
+      };
+    case "data":
+      try {
+        return { form: "data", text, value: JSON.parse(text) };
+      } catch (error) {
+        throw new Unreadable(`is not valid JSON: ${messageOf(error)}`);
+      }
+    default:
+      return { form: "text", text };
+  }
+};
+
+export const readUnit = (unit: Unit): Read => {
+  try {
+    return { unit, facts: read(unit) };
+  } catch (error) {
+    let text: string | undefined;
+    try {
+      text = utf8.decode(unit.bytes);
+    } catch {
+      text = undefined;
+    }
+    return {
+      unit,
+      failure: error instanceof Unreadable ? error.message : `reading threw: ${messageOf(error)}`,
+      text,
+    };
+  }
+};
+
+/** The bodies a page or vector carries, as units of their own. */
+export const carriedUnits = (read: Read): readonly Unit[] =>
+  "facts" in read && read.facts.form === "markup"
+    ? read.facts.markup.bodies.map((body) => ({
+        path: read.unit.path,
+        where: read.unit.where === undefined ? body.where : `${read.unit.where} > ${body.where}`,
+        kind: body.kind,
+        bytes: body.bytes,
+        entries: 1,
+      }))
+    : [];
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+// The chunks resvg writes. A text chunk could carry anything, and bytes after IEND are not image data.
+const PNG_CHUNKS = new Set(["IHDR", "PLTE", "IDAT", "IEND", "tRNS"]);
 
 const startsWith = (bytes: Uint8Array, signature: readonly number[]): boolean =>
   signature.every((byte, i) => bytes[i] === byte);
 
-// Byte signatures of containers the build never emits. A source map or a development build hidden in one of
-// these is not the only problem: the container itself does not belong in a packed extension.
+/** Why the bytes are not a PNG built from image chunks alone, or undefined when they are. */
+const pngProblem = (bytes: Uint8Array): string | undefined => {
+  if (!startsWith(bytes, PNG_SIGNATURE)) return "does not start with the PNG signature";
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let at = PNG_SIGNATURE.length;
+  while (at + 12 <= bytes.length) {
+    const length = view.getUint32(at);
+    const type = String.fromCharCode(...bytes.subarray(at + 4, at + 8));
+    const end = at + 12 + length;
+    if (end > bytes.length) return `the ${type} chunk runs past the end of the file`;
+    if (NodeZlib.crc32(bytes.subarray(at + 4, end - 4)) !== view.getUint32(end - 4))
+      return `the ${type} chunk fails its checksum`;
+    if (!PNG_CHUNKS.has(type)) return `has a ${type} chunk, which the icon renderer never writes`;
+    if (type === "IEND")
+      return end === bytes.length ? undefined : `${bytes.length - end} bytes follow the IEND chunk`;
+    at = end;
+  }
+  return "ends without an IEND chunk";
+};
+
+// Byte signatures of containers the build never emits. The container itself does not belong in a packed extension.
 const FOREIGN_BYTES: ReadonlyArray<readonly [string, readonly number[]]> = [
   ["ZIP archive", [0x50, 0x4b, 0x03, 0x04]],
   ["ZIP archive", [0x50, 0x4b, 0x05, 0x06]],
@@ -84,352 +239,70 @@ const FOREIGN_BYTES: ReadonlyArray<readonly [string, readonly number[]]> = [
   ["PDF document", [0x25, 0x50, 0x44, 0x46]],
   ["RAR archive", [0x52, 0x61, 0x72, 0x21]],
   ["7-Zip archive", [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]],
+  ["PNG image", PNG_SIGNATURE],
 ];
 
-/** What the bytes are, judged by their first bytes rather than by the path. */
-const contentOf = (bytes: Uint8Array): string => {
-  if (startsWith(bytes, PNG_SIGNATURE)) return "PNG image";
-  const foreign = FOREIGN_BYTES.find(([, signature]) => startsWith(bytes, signature));
-  return foreign?.[0] ?? "text";
-};
-
-const isText = (unit: Unit): boolean => contentOf(unit.bytes) === "text";
-
-/** The bytes as text for a content scan. A PNG keeps the bytes it carries after its image data. */
-const rawText = (unit: Unit): string =>
-  unit.kind === "raster" ? new TextDecoder("latin1").decode(unit.bytes) : unit.text;
-
-const TAG_NAME = /^[a-zA-Z][\w:-]*/;
-const ATTRIBUTE = /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
-const DATA_URL = /^data:([^,]*),(.*)$/s;
-
-interface Attribute {
-  readonly name: string;
-  readonly value: string;
-}
-
-const NAMED_ENTITIES: Readonly<Record<string, string>> = {
-  quot: '"',
-  apos: "'",
-  lt: "<",
-  gt: ">",
-  amp: "&",
-  Tab: "\t",
-  NewLine: "\n",
-};
-
-/** Character references as a browser decodes them in an attribute value, in one pass so `&amp;lt;` stays `&lt;`. */
-const decodeEntities = (value: string): string =>
-  value.replaceAll(
-    /&(?:#(\d{1,7})|#[xX]([\da-fA-F]{1,6})|([A-Za-z]+));/g,
-    (whole: string, decimal?: string, hex?: string, name?: string) => {
-      const code =
-        decimal === undefined
-          ? hex === undefined
-            ? undefined
-            : Number.parseInt(hex, 16)
-          : Number(decimal);
-      if (code !== undefined) return code <= 0x10ffff ? String.fromCodePoint(code) : whole;
-      return NAMED_ENTITIES[name ?? ""] ?? whole;
-    },
-  );
-
-// A browser drops tabs and line breaks from a URL before reading its scheme, and ignores leading control characters.
-const JAVASCRIPT_URL = new RegExp(
-  `^[\\u0000-\\u0020]*${[..."javascript"].join("[\\t\\n\\r]*")}[\\t\\n\\r]*:`,
-  "i",
-);
-
-/** The script a `javascript:` URL runs, percent-decoded the way the browser decodes it. */
-const scriptOfUrl = (value: string): string | undefined => {
-  const match = JAVASCRIPT_URL.exec(value);
-  if (match === null) return undefined;
-  const body = value.slice(match[0].length);
-  try {
-    return decodeURIComponent(body);
-  } catch {
-    return body;
-  }
-};
-
-const readAttributes = (text: string): readonly Attribute[] =>
-  [...text.matchAll(ATTRIBUTE)].flatMap((match) => {
-    const name = match[1];
-    const value = match[2] ?? match[3] ?? match[4];
-    return name === undefined || value === undefined
-      ? []
-      : [{ name: name.toLowerCase(), value: decodeEntities(value) }];
-  });
-
-const endOfTag = (text: string, from: number): number => {
-  for (let i = from; i < text.length; i++) {
-    const char = text.charAt(i);
-    if (char === ">") return i + 1;
-    if (char === '"' || char === "'") i = skipString(text, i) - 1;
-  }
-  return text.length;
-};
-
-const decodeDataUrl = (
-  url: string,
-): { readonly mime: string; readonly text: string } | undefined => {
-  const match = DATA_URL.exec(url);
-  if (match === null) return undefined;
-  const meta = match[1] ?? "";
-  const payload = match[2] ?? "";
-  const mime = meta.split(";")[0] ?? "";
-  if (/;base64/i.test(meta)) {
-    try {
-      return { mime, text: Buffer.from(payload, "base64").toString("utf8") };
-    } catch {
-      return undefined;
-    }
-  }
-  try {
-    return { mime, text: decodeURIComponent(payload) };
-  } catch {
-    return undefined;
-  }
-};
-
-const kindFromMime = (mime: string): Kind => (mime.includes("css") ? "style" : "script");
-
-const carried = (file: Unit, where: string, kind: Kind, text: string): Unit => ({
-  path: file.path,
-  where,
-  kind,
-  bytes: new TextEncoder().encode(text),
-  text,
-});
-
-interface Body {
-  readonly where: string;
-  readonly kind: Kind;
-  readonly text: string;
-}
-
-/** What one attribute makes the browser run. A reader returns the body it finds, or nothing. */
-const ATTRIBUTE_READERS: ReadonlyArray<(attribute: Attribute) => Body | undefined> = [
-  ({ name, value }) =>
-    name.startsWith("on")
-      ? { where: `inline handler ${name}`, kind: "script", text: value }
-      : undefined,
-  ({ name, value }) =>
-    name === "style"
-      ? { where: "inline style attribute", kind: "style-attribute", text: value }
-      : undefined,
-  ({ name, value }) => {
-    const text = scriptOfUrl(value);
-    return text === undefined
-      ? undefined
-      : { where: `javascript: URL in ${name}`, kind: "script", text };
-  },
-];
-
-/**
- * Every script and style the markup would run: a closed or unclosed `<script>` body, a `data:` URL in `src`,
- * an `on*` handler, a `javascript:` URL, a `style` attribute and, recursively, the page in an iframe `srcdoc`.
- * The build emits none of them, so each one is judged like a file.
- */
-export const inlineBodies = (file: Unit): readonly Unit[] => {
-  if (file.kind !== "markup" && file.kind !== "vector") return [];
-  const units: Unit[] = [];
-  const text = file.text;
-  let i = 0;
-  while (i < text.length) {
-    const open = text.indexOf("<", i);
-    if (open < 0) break;
-    if (text.startsWith("<!--", open)) {
-      const end = text.indexOf("-->", open + 4);
-      i = end < 0 ? text.length : end + 3;
-      continue;
-    }
-    const name = TAG_NAME.exec(text.slice(open + 1, open + 41))?.[0];
-    if (name === undefined) {
-      i = open + 1;
-      continue;
-    }
-    const tag = name.toLowerCase();
-    const tagEnd = endOfTag(text, open + 1 + name.length);
-    const attributes = readAttributes(text.slice(open + 1 + name.length, tagEnd - 1));
-    for (const attribute of attributes) {
-      for (const read of ATTRIBUTE_READERS) {
-        const body = read(attribute);
-        if (body !== undefined && body.text.trim() !== "")
-          units.push(carried(file, body.where, body.kind, body.text));
-      }
-      if (attribute.name === "srcdoc") {
-        const page = carried(file, "iframe srcdoc", "markup", attribute.value);
-        for (const inner of inlineBodies(page))
-          units.push({ ...inner, where: `iframe srcdoc > ${inner.where ?? ""}` });
-      }
-    }
-    if (tag === "script") {
-      const source = attributes.find(({ name: attribute }) => attribute === "src");
-      const data = source === undefined ? undefined : decodeDataUrl(source.value);
-      if (data !== undefined && data.text.trim() !== "") {
-        units.push(carried(file, "inline <script src>", kindFromMime(data.mime), data.text));
-      }
-    }
-    if (tag === "script" || tag === "style") {
-      const close = text.toLowerCase().indexOf(`</${tag}`, tagEnd);
-      const body = text.slice(tagEnd, close < 0 ? text.length : close);
-      if (body.trim() !== "") units.push(carried(file, `inline <${tag}>`, tag, body));
-      i = close < 0 ? text.length : close + tag.length + 2;
-    } else i = tagEnd;
-  }
-  return units;
-};
-
-type Parsed =
-  | { readonly ok: true; readonly value: unknown }
-  | { readonly ok: false; readonly error: string };
-
-const parseJson = (text: string): Parsed => {
-  try {
-    return { ok: true, value: JSON.parse(text) };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-};
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const isSourceMap = (value: unknown): boolean =>
-  isRecord(value) &&
+const isList = (value: unknown): boolean => Array.isArray(value) || value === "array";
+
+/** A version 3 source map, recognised by its keys in any order. Takes a parsed JSON object or an object literal. */
+const isSourceMap = (value: Readonly<Record<string, unknown>>): boolean =>
   value.version === 3 &&
-  ((typeof value.mappings === "string" && Array.isArray(value.sources)) ||
-    Array.isArray(value.sections));
+  ((typeof value.mappings === "string" && isList(value.sources)) || isList(value.sections));
 
-const SOURCE_MAP_VERSION = /"version"\s*:\s*3/g;
-
-const matchingBrace = (text: string, open: number): number => {
-  let depth = 0;
-  for (let i = open; i < text.length; i++) {
-    const char = text.charAt(i);
-    if (char === '"') i = skipString(text, i) - 1;
-    else if (char === "{") depth++;
-    else if (char === "}") {
-      depth--;
-      if (depth === 0) return i;
+/** The JSON value a text holds: all of it, or the span from its first `{` to its last `}`. */
+const jsonIn = (text: string): unknown => {
+  const trimmed = text.trim();
+  const candidates = [trimmed, trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1)];
+  for (const candidate of candidates) {
+    if (candidate.length < 2) continue;
+    try {
+      return JSON.parse(candidate) as unknown;
+    } catch {
+      // Not JSON; try the next span.
     }
-  }
-  return -1;
-};
-
-/** A version 3 map object at any offset, not only as the whole file. */
-const findSourceMap = (text: string): number | undefined => {
-  for (const match of text.matchAll(SOURCE_MAP_VERSION)) {
-    const open = text.lastIndexOf("{", match.index);
-    if (open < 0) continue;
-    const close = matchingBrace(text, open);
-    if (close < 0 || close - open > 2_000_000) continue;
-    const parsed = parseJson(text.slice(open, close + 1));
-    if (parsed.ok && isSourceMap(parsed.value)) return open;
   }
   return undefined;
 };
 
-/** Every string and every object in a parsed JSON value, with the path that reaches it. */
-const jsonNodes = (value: unknown, at = "$"): ReadonlyArray<readonly [string, unknown]> => {
-  if (Array.isArray(value)) return value.flatMap((item, i) => jsonNodes(item, `${at}[${i}]`));
-  if (isRecord(value)) {
-    return [
-      [at, value],
-      ...Object.entries(value).flatMap(([key, item]) => jsonNodes(item, `${at}.${key}`)),
-    ];
+/** Where in a JSON value a source map sits, following strings that hold JSON of their own. */
+const sourceMapIn = (root: unknown): string | undefined => {
+  const pending: Array<readonly [string, unknown]> = [["$", root]];
+  while (pending.length > 0) {
+    const next = pending.pop();
+    if (next === undefined) break;
+    const [at, value] = next;
+    if (typeof value === "string") {
+      if (value.includes("{")) pending.push([`${at} (as JSON)`, jsonIn(value)]);
+    } else if (Array.isArray(value)) {
+      value.forEach((item, i) => pending.push([`${at}[${i}]`, item]));
+    } else if (isRecord(value)) {
+      if (isSourceMap(value)) return at;
+      for (const [key, item] of Object.entries(value)) pending.push([`${at}.${key}`, item]);
+    }
   }
-  return typeof value === "string" ? [[at, value]] : [];
+  return undefined;
 };
 
-const excerpt = (text: string): string => {
-  const line = text.split("\n")[0] ?? "";
-  return line.length > 48 ? `${line.slice(0, 48)}...` : line;
-};
-
-const plural = (count: number, noun: string): string => `${count} ${noun}${count === 1 ? "" : "s"}`;
-
-// What re-minifying a minified file can still save, measured on the real build: the 218521 byte bundle saves 302
-// bytes (0.14 percent, from whole-bundle renaming and merged duplicates) and every other file saves 0, 3, 5 or 7.
-// Floor: 4.6 times the largest small-file saving. Fraction: slack for a small file another minifier wrote.
-// Ceiling: 1.7 times the bundle's 302, so a percentage cannot grow into 15750 bytes of readable code on a large file.
-const MINIFY_FLOOR_BYTES = 32;
-const MINIFY_FRACTION = 0.03;
-const MINIFY_CEILING_BYTES = 512;
-
-export const minifyMargin = (length: number): number =>
-  Math.min(MINIFY_CEILING_BYTES, Math.max(MINIFY_FLOOR_BYTES, Math.ceil(length * MINIFY_FRACTION)));
-
-export type Minified =
-  | { readonly ok: true; readonly saved: number }
-  | { readonly ok: false; readonly error: string };
-
-/** swc throws a debug dump that repeats the whole source; its `message` field is the part worth reading. */
-const minifierError = (error: unknown): string => {
-  const text = error instanceof Error ? error.message : String(error);
-  return /message: "((?:[^"\\]|\\.)*)"/.exec(text)?.[1] ?? text.slice(0, 160);
-};
-
-// The same minifier the extension build runs, with comments kept so the comment rules own them.
-const reMinifyScript = (text: string): Minified => {
-  try {
-    const { code } = experiments.swc.minifySync(text, {
-      mangle: true,
-      compress: true,
-      format: { comments: "all" },
-    });
-    return { ok: true, saved: text.length - code.length };
-  } catch (error) {
-    return { ok: false, error: minifierError(error) };
+/** Every text in a unit where JSON could sit, by how the unit was read. */
+const jsonPlaces = (facts: Facts): ReadonlyArray<readonly [string, unknown]> => {
+  switch (facts.form) {
+    case "data":
+      return [["$", facts.value]];
+    case "script":
+      return facts.script.strings.map(({ span, value }) => [
+        `the string at line ${lineOf(facts.text, span.start)}`,
+        value,
+      ]);
+    case "markup":
+      return facts.markup.texts.map((text) => ["a text or attribute value", text]);
+    case "text":
+      return [["the text", facts.text]];
+    default:
+      return [];
   }
-};
-
-/** A stylesheet, or the declarations of a `style` attribute, which are not a stylesheet and parse differently. */
-type Form = "script" | "stylesheet" | "declarations";
-
-const formOf = (unit: Unit): Form | undefined => {
-  if (unit.kind === "script") return "script";
-  if (unit.kind === "style") return "stylesheet";
-  return unit.kind === "style-attribute" ? "declarations" : undefined;
-};
-
-// The same minifier the build runs for stylesheets.
-const reMinifyStyle = (text: string, form: "stylesheet" | "declarations"): Minified => {
-  try {
-    const options = { filename: "packed.css", code: Buffer.from(text), minify: true };
-    const { code } =
-      form === "declarations" ? transformStyleAttribute(options) : transformCss(options);
-    return { ok: true, saved: text.length - code.length };
-  } catch (error) {
-    return { ok: false, error: minifierError(error) };
-  }
-};
-
-/** What the build's minifier does to the file. Undefined for a file that has no minifier. A failure is not a pass. */
-export const minifySaving = (unit: Unit): Minified | undefined => {
-  const form = formOf(unit);
-  if (form === undefined) return undefined;
-  return form === "script" ? reMinifyScript(unit.text) : reMinifyStyle(unit.text, form);
-};
-
-/** Why a script or style is not what the build's minifier writes, or undefined when it is. */
-const unminifiedReason = (text: string, form: Form): string | undefined => {
-  const syntax = form === "script" ? "script" : "style";
-  const { legal } = classifyComments(text, syntax);
-  const facts = syntax === "script" ? parseScript(text) : readStyle(text);
-  const [firstBreak] = lineBreaksOutsideData(text, [...facts.data, ...facts.comments], legal);
-  if (firstBreak !== undefined) {
-    return `line ${lineOf(text, firstBreak)} has a line break between tokens; a minifier leaves none`;
-  }
-  const minified = form === "script" ? reMinifyScript(text) : reMinifyStyle(text, form);
-  if (!minified.ok) {
-    return `the build's minifier fails on it (${minified.error}), so it cannot be judged minified`;
-  }
-  const margin = minifyMargin(text.length);
-  return minified.saved > margin
-    ? `re-minifying removes ${minified.saved} bytes (${((minified.saved / text.length) * 100).toFixed(1)}%), more than the ${margin} bytes a minified file may give up`
-    : undefined;
 };
 
 // Strings that only a development build keeps. A production build folds these away.
@@ -446,29 +319,65 @@ const DEV_ONLY_PATH =
 const CODE_LINE = /[{}]\s*$|=>|^\s*(?:function|const|let|var|import|export|return)\s+\S/;
 const MAX_CODE_LINES = 2;
 
-/** The 1-based numbers of the lines that look like code rather than prose. */
-const codeLines = (text: string): readonly number[] =>
-  text.split(/\r\n|[\n\r\u2028\u2029]/).flatMap((line, i) => (CODE_LINE.test(line) ? [i + 1] : []));
+interface CodeLine {
+  readonly number: number;
+  readonly text: string;
+}
+
+/** The lines that look like code rather than prose. */
+const codeLines = (text: string): readonly CodeLine[] =>
+  text
+    .split(/\r\n|[\n\r\u2028\u2029]/)
+    .flatMap((line, i) => (CODE_LINE.test(line) ? [{ number: i + 1, text: line }] : []));
+
+// Text in a string that parses as no script is judged by its lines. zod's code generator ships template fragments
+// of real code: at most 4 such lines and 85 bytes in one string, the most across the eight libraries in
+// minify.test.ts. 512 bytes is six times that, and about two and a half readable functions.
+const STRING_CODE_LINE_BYTES = 512;
 
 const SOURCE_MAP_REFERENCE = /[#@]\s*sourceMappingURL=/;
 
-const READABLE_SOURCE = /\b(?:function|return|const|let|var|class|if|for|while)\b/;
-const STRING_SOURCE_MIN_CHARACTERS = 120;
-const STRING_SOURCE_MIN_LINE_BREAKS = 2;
+// How a string's text is read as code: names shortened and spaces dropped, nothing removed as dead. A string is
+// data the minifier never touched, so dead-code removal would count a table of numbers as savings.
+const readable = (code: string): number =>
+  code.length -
+  experiments.swc.minifySync(code, {
+    compress: false,
+    mangle: true,
+    ecma: 2022,
+    module: false,
+    format: { comments: "all" },
+  }).code.length;
 
 /**
- * Why the text of a string reads as source. A string that parses is judged as a script of its own, so a data table
- * beside the function cannot dilute it. One that does not parse is judged by its lines, because a minifier error
- * is not evidence that the text is harmless.
+ * Why the text of a string is source code, or undefined when it is data. Prose never declares a binding, so only a
+ * string that parses and declares a function, class, variable or parameter is measured. Text that parses only as
+ * TypeScript is source. Text that parses as neither is judged by how many of its lines look like code.
  */
 const sourceInString = (value: string): string | undefined => {
-  const [error] = parseScript(value).errors;
-  if (error === undefined) return unminifiedReason(value, "script");
+  const script = parseScript(value);
+  if (script.errors.length === 0) {
+    if (!script.declaresBinding) return undefined;
+    const saved = readable(value);
+    return saved > SCRIPT_MARGIN_BYTES
+      ? `it is a script that declares names, and minifying it saves ${saved} bytes`
+      : undefined;
+  }
+  const typed = parseScript(value, "ts");
+  if (typed.errors.length === 0 && typed.declaresBinding) return "it is TypeScript source";
   const lines = codeLines(value);
-  return lines.length > MAX_CODE_LINES
-    ? `${plural(lines.length, "line")} look like code, the first is line ${lines[0]}, and the text does not parse as a script: ${error}`
+  const bytes = lines.reduce((total, line) => total + line.text.length, 0);
+  return bytes > STRING_CODE_LINE_BYTES
+    ? `it does not parse (${script.errors[0]}), and ${plural(lines.length, "line")} holding ${bytes} bytes look like code, from line ${lines[0]?.number}`
     : undefined;
 };
+
+const excerpt = (text: string): string => {
+  const line = text.split("\n")[0] ?? "";
+  return line.length > 48 ? `${line.slice(0, 48)}...` : line;
+};
+
+const plural = (count: number, noun: string): string => `${count} ${noun}${count === 1 ? "" : "s"}`;
 
 /** What a plant needs from the real build, supplied by the test. */
 export interface Fixtures {
@@ -484,6 +393,8 @@ export interface Fixtures {
   readonly framework: string;
   /** The real framework.js.LICENSE.txt. */
   readonly reactLicense: Uint8Array;
+  /** A real 16 pixel icon, rendered by write-icons.ts. */
+  readonly png: Uint8Array;
 }
 
 export type Changes = Readonly<Record<string, string | Uint8Array>>;
@@ -501,10 +412,11 @@ export interface Plant {
 
 export interface Rule {
   readonly id: string;
+  /** A path rule judges only the archive entry, not the bodies it carries. */
   readonly inspects: "path" | "contents";
   readonly decides: string;
   /** The reason the unit fails the rule, or undefined when it passes. */
-  readonly check: (unit: Unit) => string | undefined;
+  readonly check: (read: Read) => string | undefined;
   /** At least one, so a rule that nothing proves cannot be added. */
   readonly plants: readonly [Plant, ...Plant[]];
 }
@@ -531,6 +443,19 @@ const ONE_LINE_FUNCTION =
 /** A table of numbers that a minifier cannot shrink, to put readable source beside. */
 const NUMBER_TABLE = `var table=[${Array.from({ length: 2000 }, (_, i) => i).join(",")}];\n`;
 
+/** The same function in TypeScript, with comments after its braces and lines that start with a keyword. */
+const TYPESCRIPT_FUNCTION = `async function collectHeaders(entries: Array<HeaderEntry>): Promise<Array<HeaderEntry>>
+{ // collect all valid headers
+  for (const entry of entries)
+  { // check each entry
+    if (entry.name !== undefined)
+    { // keep valid entry
+      entries.push({ name: entry.name, value: String(entry.value) });
+    } // end if
+  } // end for
+} // end collectHeaders
+`;
+
 const evalOf = (fixtures: Fixtures, source: string): string =>
   `${fixtures.minifiedParent};eval(${JSON.stringify(source)});`;
 
@@ -550,15 +475,231 @@ const SOURCE_MAP = JSON.stringify({
   mappings: "AAAA;AACA",
 });
 
+/** The same map with its version key last, so the first `{` before `"version"` is inside `sourcesContent`. */
+const SOURCE_MAP_VERSION_LAST = JSON.stringify({
+  file: "parent.js",
+  sources: ["../parent.ts"],
+  sourcesContent: [`{${PRETTY_FUNCTION}`],
+  mappings: "AAAA;AACA",
+  version: 3,
+});
+
+const SOURCE_MAP_ESCAPED_VERSION = `{"\\u0076ersion":3,"file":"parent.js","sources":["../parent.ts"],"sourcesContent":[${JSON.stringify(PRETTY_FUNCTION)}],"mappings":"AAAA"}`;
+
 const prettySvg = (fixtures: Fixtures): string => fixtures.toolbarSvg.replace(/></g, ">\n  <");
 
+const nested = (open: string, close: string, depth: number): string =>
+  `var a=${open.repeat(depth)}1${close.repeat(depth)};`;
+
+/** 50 MB of one-line readable functions: the parser cannot hand an AST that large back to JavaScript. */
+const fiftyMegabytes = (): string => {
+  const block = `${ONE_LINE_FUNCTION} `;
+  return block.repeat(Math.ceil((50 * 1024 * 1024) / block.length));
+};
+
+const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
+
 export const RULES: readonly Rule[] = [
+  {
+    id: CANNOT_JUDGE,
+    inspects: "contents",
+    decides:
+      "the check cannot decode, parse or minify the file, a rule throws on it, the judge process crashes or times out on it, or it is an empty script or stylesheet",
+    check: (read) => ("failure" in read ? read.failure : undefined),
+    plants: [
+      {
+        name: "A07 a script the parser rejects",
+        changes: () => ({ "experiment/broken.js": "function ({" }),
+        path: "experiment/broken.js",
+      },
+      {
+        name: "FC01 a script the parser accepts and the minifier rejects",
+        changes: () => ({ "experiment/parent.js": `using x=a();${ONE_LINE_FUNCTION.repeat(10)}` }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC03 a TypeScript annotation in a script",
+        changes: () => ({ "experiment/parent.js": "const x: number = 1;console.log(x);" }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC04 JSX in a script",
+        changes: () => ({
+          "experiment/parent.js": 'const el=<div className="app">hi</div>;console.log(el);',
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC05 an unterminated block comment",
+        changes: () => ({ "experiment/parent.js": "a();/* never closed" }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC06 a stylesheet the minifier rejects",
+        changes: () => ({ "action/index.css": "a{color:red}}}" }),
+        path: "action/index.css",
+      },
+      {
+        name: "FC07 an at-rule in a style attribute",
+        changes: () => ({
+          "action/index.html": inPage('<div style="@media screen{color:red}">x</div>'),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "FC09 a module export with a sloppy-mode with statement",
+        changes: () => ({ "experiment/parent.js": "export const x=1;with(a)b();" }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC10 a module import with a legacy octal escape",
+        changes: () => ({ "experiment/parent.js": 'import"./a.js";var x="\\101";console.log(x);' }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC11 a module export with an HTML comment",
+        changes: () => ({ "experiment/parent.js": "export const x=1;<!-- comment" }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC12 a JSON object saved as a script",
+        changes: () => ({
+          "experiment/parent.js": '{"name":"one-click-har","version":"0.1.0","items":[1,2,3]}',
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC13a a JSON array saved as a script, which minifies to nothing",
+        changes: () => ({
+          "experiment/parent.js": JSON.stringify(Array.from({ length: 50 }, (_, i) => ({ id: i }))),
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC13b an empty object saved as a script",
+        changes: () => ({ "experiment/parent.js": "{}" }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC13c a small array saved as a script",
+        changes: () => ({ "experiment/parent.js": "[1,2,3,4,5]" }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC14a a script of bytes that are not UTF-8",
+        changes: () => ({
+          "experiment/parent.js": new Uint8Array([0xff, 0xfe, 0xfd, 0xfc, 0x80, 0x81]),
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC14b bytes that are not UTF-8 inside a script string",
+        changes: () => ({
+          "experiment/parent.js": new Uint8Array([
+            ...encode('var a="'),
+            0xff,
+            0xfe,
+            ...encode('";console.log(a);'),
+          ]),
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC14c bytes that are not UTF-8 inside a JSON string",
+        changes: () => ({
+          "experiment/schema.json": new Uint8Array([
+            ...encode('{"a":"'),
+            0xff,
+            0xfe,
+            ...encode('"}'),
+          ]),
+        }),
+        path: "experiment/schema.json",
+      },
+      {
+        name: "FC15a an empty script",
+        changes: () => ({ "experiment/parent.js": new Uint8Array(0) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC15b a script of 20 spaces",
+        changes: () => ({ "experiment/parent.js": " ".repeat(20) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC15c an empty stylesheet",
+        changes: () => ({ "action/index.css": new Uint8Array(0) }),
+        path: "action/index.css",
+      },
+      {
+        name: "FC16 a 50 MB one-line script",
+        changes: () => ({ "experiment/huge.js": fiftyMegabytes() }),
+        path: "experiment/huge.js",
+      },
+      {
+        name: "FC17b an array nested 5000 deep, which crashes the minifier",
+        changes: () => ({ "experiment/parent.js": nested("[", "]", 5000) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC17c parentheses nested 5000 deep",
+        changes: () => ({ "experiment/parent.js": nested("(", ")", 5000) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC17d an array nested 20000 deep, which crashes the parser",
+        changes: () => ({ "experiment/parent.js": nested("[", "]", 20_000) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "E07 a source map after a NUL byte on the parent script",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent}\u0000${SOURCE_MAP}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a source map named like a script",
+        changes: () => ({ "experiment/parent.js": SOURCE_MAP }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "N08 pretty JSON with a // comment and a readable function in a string",
+        changes: () => ({
+          "experiment/config.json": `{\n  // build notes\n  "snippet": ${JSON.stringify(PRETTY_FUNCTION)}\n}\n`,
+        }),
+        path: "experiment/config.json",
+      },
+      {
+        name: "a JSON file with a trailing comma",
+        changes: () => ({ "manifest.json": '{"manifest_version":3,}' }),
+        path: "manifest.json",
+      },
+      {
+        name: "A04e a script the parser accepts and the minifier rejects, then 250 readable functions on one line",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent};using x=a;${ONE_LINE_FUNCTION.repeat(250)}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a pretty function in the middle of the large bundle",
+        changes: ({ framework }) => {
+          const middle = Math.floor(framework.length / 2);
+          return {
+            "shared/framework.js": `${framework.slice(0, middle)};\n${PRETTY_FUNCTION}${framework.slice(middle)}`,
+          };
+        },
+        path: "shared/framework.js",
+      },
+    ],
+  },
   {
     id: "source-map-file",
     inspects: "path",
     decides: "the path ends in .map, a file that ships the original source",
-    check: (file) =>
-      file.kind === "source-map" ? "a source map ships the original source" : undefined,
+    check: ({ unit }) =>
+      unit.kind === "source-map" ? "a source map ships the original source" : undefined,
     plants: [
       {
         name: "V02 a stray source map next to the parent script",
@@ -578,7 +719,7 @@ export const RULES: readonly Rule[] = [
     id: "source-file",
     inspects: "path",
     decides: "the path ends in a source suffix such as .ts, .tsx or .jsx",
-    check: (file) => (file.kind === "source" ? "source files must not ship" : undefined),
+    check: ({ unit }) => (unit.kind === "source" ? "source files must not ship" : undefined),
     plants: [
       {
         name: "V03 a TypeScript file",
@@ -606,8 +747,8 @@ export const RULES: readonly Rule[] = [
     id: "unknown-file-type",
     inspects: "path",
     decides: "the path ends in no suffix of KIND_BY_SUFFIX, so the file's kind cannot be checked",
-    check: (file) =>
-      file.kind === undefined
+    check: ({ unit }) =>
+      unit.kind === undefined
         ? "not a file type an XPI ships; add it to KIND_BY_SUFFIX if it should"
         : undefined,
     plants: [
@@ -648,7 +789,7 @@ export const RULES: readonly Rule[] = [
         name: "E25 a nested XPI saved with an .xpi suffix",
         changes: () => ({ "vendor/inner.xpi": ZIP_ARCHIVE }),
         path: "vendor/inner.xpi",
-        alsoFails: ["foreign-content"],
+        alsoFails: ["foreign-content", CANNOT_JUDGE],
       },
     ],
   },
@@ -657,8 +798,8 @@ export const RULES: readonly Rule[] = [
     inspects: "path",
     decides:
       "the path is under a test, fixture or tooling folder, or is a package or tsconfig file",
-    check: (file) =>
-      DEV_ONLY_PATH.test(file.path) ? "a test, fixture or tooling file must not ship" : undefined,
+    check: ({ unit }) =>
+      DEV_ONLY_PATH.test(unit.path) ? "a test, fixture or tooling file must not ship" : undefined,
     plants: [
       {
         name: "V11 a minified script under tests/",
@@ -683,50 +824,88 @@ export const RULES: readonly Rule[] = [
     ],
   },
   {
+    id: "duplicate-entry",
+    inspects: "path",
+    decides:
+      "the archive holds more than one entry with this path, so what Gecko loads is not what was judged",
+    check: ({ unit }) =>
+      unit.entries > 1 ? `the archive has ${unit.entries} entries with this path` : undefined,
+    plants: [
+      {
+        name: "A11 a second, unminified copy of the parent script under the same path",
+        changes: (fixtures) => ({
+          [DUPLICATE_OF("experiment/parent.js")]: fixtures.unminifiedParent,
+        }),
+        path: "experiment/parent.js",
+        alsoFails: ["comment", "not-minified"],
+      },
+    ],
+  },
+  {
     id: "foreign-content",
     inspects: "contents",
     decides:
-      "the first bytes are a container the build never emits: an archive, wasm or an executable",
-    check: (file) => {
-      if (isText(file)) return undefined;
-      const content = contentOf(file.bytes);
-      if (content === "PNG image") {
-        return file.kind === "raster"
-          ? undefined
-          : "the bytes are a PNG image, not the text the path claims";
-      }
-      return `the bytes are a ${content}, which the build never emits`;
+      "the first bytes are a container the build never emits: an archive, wasm, an executable, or a PNG outside a .png",
+    check: ({ unit }) => {
+      const foreign = FOREIGN_BYTES.find(([, signature]) => startsWith(unit.bytes, signature))?.[0];
+      if (foreign === undefined || (foreign === "PNG image" && unit.kind === "raster"))
+        return undefined;
+      return `the bytes are a ${foreign}, which the build never emits here`;
     },
     plants: [
       {
         name: "E10 a stored ZIP of source files named as a page",
         changes: () => ({ "vendor/payload.html": ZIP_ARCHIVE }),
         path: "vendor/payload.html",
+        alsoFails: [CANNOT_JUDGE],
       },
       {
         name: "E11 a WebAssembly module named as a script",
         changes: () => ({ "vendor/engine.js": WASM_MODULE }),
         path: "vendor/engine.js",
+        alsoFails: [CANNOT_JUDGE],
       },
       {
         name: "a PNG image named as a script",
-        changes: () => ({ "experiment/parent.js": PNG_IMAGE }),
+        changes: (fixtures) => ({ "experiment/parent.js": fixtures.png }),
         path: "experiment/parent.js",
+        alsoFails: [CANNOT_JUDGE],
       },
     ],
   },
   {
     id: "not-a-png",
     inspects: "contents",
-    decides: "a .png file does not start with the eight PNG signature bytes",
-    check: (file) =>
-      file.kind === "raster" && !startsWith(file.bytes, PNG_SIGNATURE)
-        ? "not a PNG image: the file does not start with the PNG signature"
-        : undefined,
+    decides:
+      "a .png is not the PNG signature followed by image chunks with valid checksums, ending at IEND",
+    check: ({ unit }) => {
+      if (unit.kind !== "raster") return undefined;
+      const problem = pngProblem(unit.bytes);
+      return problem === undefined ? undefined : `not a PNG of image data alone: ${problem}`;
+    },
     plants: [
       {
         name: "a script named like an icon",
         changes: (fixtures) => ({ "icons/16.png": fixtures.unminifiedParent }),
+        path: "icons/16.png",
+      },
+      {
+        name: "E12 a source map appended after PNG image data",
+        changes: (fixtures) => ({
+          "icons/16.png": new Uint8Array([...fixtures.png, ...encode(SOURCE_MAP)]),
+        }),
+        path: "icons/16.png",
+      },
+      {
+        name: "M19 a source map with its version key last, appended after PNG image data",
+        changes: (fixtures) => ({
+          "icons/16.png": new Uint8Array([...fixtures.png, ...encode(SOURCE_MAP_VERSION_LAST)]),
+        }),
+        path: "icons/16.png",
+      },
+      {
+        name: "a source map in a PNG text chunk",
+        changes: (fixtures) => ({ "icons/16.png": withTextChunk(fixtures.png, SOURCE_MAP) }),
         path: "icons/16.png",
       },
     ],
@@ -734,10 +913,14 @@ export const RULES: readonly Rule[] = [
   {
     id: "not-vector",
     inspects: "contents",
-    decides: "a .svg file's text holds no <svg element",
-    check: (file) =>
-      file.kind === "vector" && isText(file) && !/<svg[\s>]/i.test(file.text)
-        ? "not an SVG image: the text holds no <svg element"
+    decides: "a .svg file parses to no <svg> element",
+    check: (read) =>
+      read.unit.kind === "vector" &&
+      read.unit.where === undefined &&
+      "facts" in read &&
+      read.facts.form === "markup" &&
+      !read.facts.markup.hasRoot
+        ? "not an SVG image: it parses to no svg element"
         : undefined,
     plants: [
       {
@@ -750,10 +933,14 @@ export const RULES: readonly Rule[] = [
   {
     id: "not-markup",
     inspects: "contents",
-    decides: "a .html file's text holds no <html> or <!doctype html>",
-    check: (file) =>
-      file.kind === "markup" && isText(file) && !/<(?:!doctype\s+html|html)\b/i.test(file.text)
-        ? "not an HTML page: the text holds no html element or doctype"
+    decides: "a .html file has no doctype and no <html> tag",
+    check: (read) =>
+      read.unit.kind === "markup" &&
+      read.unit.where === undefined &&
+      "facts" in read &&
+      read.facts.form === "markup" &&
+      !read.facts.markup.hasRoot
+        ? "not an HTML page: it has no doctype and no html tag"
         : undefined,
     plants: [
       {
@@ -764,54 +951,20 @@ export const RULES: readonly Rule[] = [
     ],
   },
   {
-    id: "invalid-json",
-    inspects: "contents",
-    decides:
-      "a .json file does not parse as JSON, which has no comments and no trailing commas, so no text hides in it",
-    check: (file) => {
-      if (file.kind !== "data" || !isText(file)) return undefined;
-      const parsed = parseJson(file.text);
-      return parsed.ok ? undefined : `not valid JSON (${parsed.error})`;
-    },
-    plants: [
-      {
-        name: "N08 pretty JSON with a // comment and a readable function in a string",
-        changes: () => ({
-          "experiment/config.json": `{\n  // build notes\n  "snippet": ${JSON.stringify(PRETTY_FUNCTION)}\n}\n`,
-        }),
-        path: "experiment/config.json",
-      },
-      {
-        name: "a JSON file with a trailing comma",
-        changes: () => ({ "manifest.json": '{"manifest_version":3,}' }),
-        path: "manifest.json",
-      },
-    ],
-  },
-  {
     id: "source-map-signature",
     inspects: "contents",
     decides:
-      "a version 3 map object sits anywhere in the file's bytes or in a string it holds, not only as the whole file",
-    check: (file) => {
-      const raw = findSourceMap(rawText(file));
-      if (raw !== undefined) return `bytes at offset ${raw} are a version 3 source map`;
-      if (syntaxOf(file) === "script" && isText(file)) {
-        for (const { span, value } of parseScript(file.text).strings) {
-          const at = findSourceMap(value);
-          if (at !== undefined)
-            return `the string at line ${lineOf(file.text, span.start)} holds a version 3 source map`;
-        }
+      "a version 3 source map, found by JSON.parse and recognised by its keys in any order, is the file, a value in it, a JSON string in it, a script string or object literal, or a page or vector text or attribute",
+    check: (read) => {
+      if (!("facts" in read)) return undefined;
+      if (read.facts.form === "script") {
+        if (read.facts.script.objects.some(isSourceMap))
+          return "an object literal is a version 3 source map";
       }
-      if (file.kind === "data" && isText(file)) {
-        const parsed = parseJson(file.text);
-        if (parsed.ok) {
-          for (const [path, node] of jsonNodes(parsed.value)) {
-            if (isSourceMap(node)) return `${path} is a version 3 source map`;
-            if (typeof node === "string" && findSourceMap(node) !== undefined)
-              return `${path} holds a version 3 source map`;
-          }
-        }
+      for (const [place, text] of jsonPlaces(read.facts)) {
+        const value = typeof text === "string" ? jsonIn(text) : text;
+        const at = sourceMapIn(value);
+        if (at !== undefined) return `${place} holds a version 3 source map at ${at}`;
       }
       return undefined;
     },
@@ -822,24 +975,8 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.map.json",
       },
       {
-        name: "a source map named like a script",
-        changes: () => ({ "experiment/parent.js": SOURCE_MAP }),
-        path: "experiment/parent.js",
-        alsoFails: ["invalid-script", "not-minified"],
-      },
-      {
-        name: "E07 a source map after a NUL byte on the parent script",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent}\u0000${SOURCE_MAP}`,
-        }),
-        path: "experiment/parent.js",
-        alsoFails: ["invalid-script", "not-minified"],
-      },
-      {
         name: "A05b a source map whose version key is written with a unicode escape",
-        changes: () => ({
-          "experiment/notes.json": `{"\\u0076ersion":3,"file":"parent.js","sources":["../parent.ts"],"sourcesContent":[${JSON.stringify(PRETTY_FUNCTION)}],"mappings":"AAAA"}`,
-        }),
+        changes: () => ({ "experiment/notes.json": SOURCE_MAP_ESCAPED_VERSION }),
         path: "experiment/notes.json",
       },
       {
@@ -853,34 +990,78 @@ export const RULES: readonly Rule[] = [
         path: "icons/icon.svg",
       },
       {
-        name: "E12 a source map appended after PNG image data",
-        changes: () => ({
-          "icons/16.png": new Uint8Array([...PNG_IMAGE, ...new TextEncoder().encode(SOURCE_MAP)]),
-        }),
-        path: "icons/16.png",
+        name: "E21 a source map held in a JSON string",
+        changes: () => ({ "experiment/notes.json": JSON.stringify({ blob: SOURCE_MAP }) }),
+        path: "experiment/notes.json",
       },
       {
-        name: "E21 a source map held in a JSON string",
+        name: "M19 a source map with its version key last in a vector <desc>",
+        changes: (fixtures) => ({
+          "icons/icon.svg": fixtures.toolbarSvg.replace(
+            "</svg>",
+            `<desc>${SOURCE_MAP_VERSION_LAST}</desc></svg>`,
+          ),
+        }),
+        path: "icons/icon.svg",
+      },
+      {
+        name: "M19 a source map with its version key last in a JSON string",
         changes: () => ({
-          "experiment/notes.json": JSON.stringify({ blob: SOURCE_MAP }),
+          "experiment/notes.json": JSON.stringify({ blob: SOURCE_MAP_VERSION_LAST }),
         }),
         path: "experiment/notes.json",
+      },
+      {
+        name: "M19 a source map with its version key last in a script string",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent};${minifyScript(`console.log(${JSON.stringify(SOURCE_MAP_VERSION_LAST)})`)}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "M20 a source map with an escaped version key in a vector <desc>",
+        changes: (fixtures) => ({
+          "icons/icon.svg": fixtures.toolbarSvg.replace(
+            "</svg>",
+            `<desc>${SOURCE_MAP_ESCAPED_VERSION}</desc></svg>`,
+          ),
+        }),
+        path: "icons/icon.svg",
+      },
+      {
+        name: "M20 a source map with an escaped version key in a script string",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent};${minifyScript(`console.log(${JSON.stringify(SOURCE_MAP_ESCAPED_VERSION)})`)}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a source map as an object literal in a script",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent};var m={sourcesContent:[],mappings:"AAAA",sources:["a.ts"],version:3};console.log(m);`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "a source map after prose in a license notice",
+        changes: () => ({ "shared/framework.js.LICENSE.txt": `MIT License\n\n${SOURCE_MAP}\n` }),
+        path: "shared/framework.js.LICENSE.txt",
       },
     ],
   },
   {
     id: "source-map-reference",
     inspects: "contents",
-    decides: "a comment in a script or style, found by tokenizing, names a sourceMappingURL",
-    check: (file) => {
-      const syntax = syntaxOf(file);
-      if ((syntax !== "script" && syntax !== "style") || !isText(file)) return undefined;
-      const reference = findComments(file.text, syntax).find((span) =>
-        SOURCE_MAP_REFERENCE.test(file.text.slice(span.start, span.end)),
+    decides: "a comment the script parser found names a sourceMappingURL",
+    check: (read) => {
+      if (!("facts" in read) || read.facts.form !== "script") return undefined;
+      const { text, script } = read.facts;
+      const reference = script.comments.find((span) =>
+        SOURCE_MAP_REFERENCE.test(text.slice(span.start, span.end)),
       );
       return reference === undefined
         ? undefined
-        : `line ${lineOf(file.text, reference.start)} has a sourceMappingURL comment`;
+        : `line ${lineOf(text, reference.start)} has a sourceMappingURL comment`;
     },
     plants: [
       {
@@ -905,7 +1086,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}a++/2;//# sourceMappingURL=parent.js.map`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["comment"],
+        alsoFails: ["comment", "not-minified"],
       },
       {
         name: "E18 an inline data: source map hidden after a division-looking comment opener",
@@ -915,23 +1096,15 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
         alsoFails: ["comment", "not-minified"],
       },
-      {
-        name: "a sourceMappingURL comment on a stylesheet",
-        changes: () => ({
-          "action/index.css": "body{margin:0}\n/*# sourceMappingURL=index.css.map */",
-        }),
-        path: "action/index.css",
-        alsoFails: ["comment", "not-minified"],
-      },
     ],
   },
   {
     id: "development-build",
     inspects: "contents",
-    decides: "the bytes or text hold a marker that only a development build keeps",
-    check: (file) => {
-      if (!isText(file)) return undefined;
-      const marker = DEVELOPMENT_MARKERS.find((candidate) => file.text.includes(candidate));
+    decides: "the text holds a marker that only a development build keeps",
+    check: (read) => {
+      const text = textOf(read);
+      const marker = DEVELOPMENT_MARKERS.find((candidate) => text?.includes(candidate) === true);
       return marker === undefined
         ? undefined
         : `contains \`${marker}\`, which only a development build keeps`;
@@ -955,7 +1128,7 @@ export const RULES: readonly Rule[] = [
         name: "V15 React's development build named like the bundle",
         changes: (fixtures) => ({ "vendor/react.js": fixtures.reactDevelopment }),
         path: "vendor/react.js",
-        alsoFails: ["comment", "not-minified", "string-holds-source"],
+        alsoFails: ["comment", "not-minified"],
       },
       {
         name: "N07 React's development build renamed to a .json file",
@@ -963,7 +1136,7 @@ export const RULES: readonly Rule[] = [
           "vendor/react-dom-client.production.json": fixtures.reactDevelopment,
         }),
         path: "vendor/react-dom-client.production.json",
-        alsoFails: ["invalid-json"],
+        alsoFails: [CANNOT_JUDGE],
       },
       {
         name: "a development marker in valid JSON",
@@ -987,36 +1160,25 @@ export const RULES: readonly Rule[] = [
     ],
   },
   {
-    id: "invalid-script",
-    inspects: "contents",
-    decides: "the same parser the build runs reports a syntax error in a script",
-    check: (file) => {
-      if (syntaxOf(file) !== "script" || !isText(file)) return undefined;
-      const [error] = parseScript(file.text).errors;
-      return error === undefined ? undefined : `does not parse: ${error}`;
-    },
-    plants: [
-      {
-        name: "A07 a script the parser rejects",
-        changes: () => ({ "experiment/broken.js": "function ({" }),
-        path: "experiment/broken.js",
-        alsoFails: ["not-minified"],
-      },
-    ],
-  },
-  {
     id: "comment",
     inspects: "contents",
     decides:
-      "tokenizing a script, style or vector finds a comment that is not a short legal notice",
-    check: (file) => {
-      const syntax = syntaxOf(file);
-      if (syntax === undefined || !isText(file)) return undefined;
-      const { ordinary } = classifyComments(file.text, syntax);
+      "the script parser finds a comment that is not a legal notice, or the HTML parser finds a comment in a page or vector",
+    check: (read) => {
+      if (!("facts" in read)) return undefined;
+      const { facts } = read;
+      if (facts.form === "markup") {
+        const [first] = facts.markup.comments;
+        return first === undefined
+          ? undefined
+          : `${plural(facts.markup.comments.length, "comment")}; the first is <!--${excerpt(first)}-->`;
+      }
+      if (facts.form !== "script") return undefined;
+      const { ordinary } = classifyComments(facts.text, facts.script.comments);
       const first = ordinary[0];
       return first === undefined
         ? undefined
-        : `${plural(ordinary.length, "comment")}, a minifier removes them all; first at line ${lineOf(file.text, first.start)}: ${excerpt(file.text.slice(first.start, first.end))}`;
+        : `${plural(ordinary.length, "comment")}, a minifier removes them all; first at line ${lineOf(facts.text, first.start)}: ${excerpt(facts.text.slice(first.start, first.end))}`;
     },
     plants: [
       {
@@ -1026,11 +1188,6 @@ export const RULES: readonly Rule[] = [
         }),
         path: "experiment/parent.js",
         alsoFails: ["not-minified"],
-      },
-      {
-        name: "a block comment before a stylesheet",
-        changes: () => ({ "action/index.css": "/* popup styles */body{margin:0}" }),
-        path: "action/index.css",
       },
       {
         name: "a comment in a vector image",
@@ -1047,20 +1204,25 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
         alsoFails: ["not-minified"],
       },
+      {
+        name: "A13 an HTML comment holding readable source 30 times",
+        changes: () => ({ "action/index.html": inPage(`<!--${PRETTY_FUNCTION.repeat(30)}-->`) }),
+        path: "action/index.html",
+      },
     ],
   },
   {
     id: "legal-comment",
     inspects: "contents",
     decides:
-      "a comment with a legal marker is over 400 characters or has code punctuation or keywords",
-    check: (file) => {
-      const syntax = syntaxOf(file);
-      if (syntax === undefined || !isText(file)) return undefined;
-      const [first] = classifyComments(file.text, syntax).rejected;
+      "a script comment with a legal marker is over 400 characters or has code punctuation or keywords",
+    check: (read) => {
+      if (!("facts" in read) || read.facts.form !== "script") return undefined;
+      const { text, script } = read.facts;
+      const [first] = classifyComments(text, script.comments).rejected;
       return first === undefined
         ? undefined
-        : `the legal comment at line ${lineOf(file.text, first.start)} ${first.reason}`;
+        : `the legal comment at line ${lineOf(text, first.start)} ${first.reason}`;
     },
     plants: [
       {
@@ -1069,7 +1231,6 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/*! function readHeaders(entries) { return entries.map((entry) => entry.name); } */\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
       },
       {
         name: "a /*! comment of prose over 400 characters",
@@ -1077,7 +1238,6 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/*! ${"This notice is far longer than a pointer to a license file needs to be. ".repeat(8)}*/\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
       },
       {
         name: "a @license comment that assigns a value",
@@ -1085,7 +1245,6 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/** @license token = readHeaders(entries) */\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
       },
       {
         name: "E20 a legal comment of calls and comparisons",
@@ -1093,7 +1252,6 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/*! ${"readHeaders(entries)===entries.length&&check(entries)===true&&".repeat(5)}*/\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
       },
     ],
   },
@@ -1101,15 +1259,20 @@ export const RULES: readonly Rule[] = [
     id: "not-minified",
     inspects: "contents",
     decides:
-      "the build's minifier fails on a script or style, or re-minifying saves more than the measured margin, or a script or style has a line break between tokens, or a vector has any line break",
-    check: (file) => {
-      const syntax = syntaxOf(file);
-      if (syntax === undefined || !isText(file)) return undefined;
-      if (syntax === "vector")
-        return hasLineTerminator(file.text.trim())
-          ? "the vector has a line break; the build emits its icons on one line"
+      "running the producer's minifier again on a script or style saves more than its margin, or a vector has layout whitespace between elements",
+    check: (read) => {
+      if (!("facts" in read)) return undefined;
+      const { facts, unit } = read;
+      if (facts.form === "markup") {
+        return unit.kind === "vector" && facts.markup.layoutBreaks > 0
+          ? "the vector has line breaks between elements; the build ships its icons on one line"
           : undefined;
-      return unminifiedReason(file.text, formOf(file) ?? "script");
+      }
+      if (facts.form !== "script" && facts.form !== "style") return undefined;
+      const margin = PRODUCERS[unit.kind ?? "source"].minifier?.margin ?? 0;
+      return facts.saved > margin
+        ? `the build's minifier removes ${facts.saved} more bytes (${((facts.saved / facts.text.length) * 100).toFixed(1)}%); minified output gives up at most ${margin}`
+        : undefined;
     },
     plants: [
       {
@@ -1122,6 +1285,18 @@ export const RULES: readonly Rule[] = [
         name: "V09 a pretty stylesheet",
         changes: () => ({
           "action/index.css": "body {\n  margin: 0;\n}\n\nh1 {\n  font-size: 15px;\n}\n",
+        }),
+        path: "action/index.css",
+      },
+      {
+        name: "a block comment before a stylesheet",
+        changes: () => ({ "action/index.css": "/* popup styles */body{margin:0}" }),
+        path: "action/index.css",
+      },
+      {
+        name: "a sourceMappingURL comment on a stylesheet",
+        changes: () => ({
+          "action/index.css": "body{margin:0}\n/*# sourceMappingURL=index.css.map */",
         }),
         path: "action/index.css",
       },
@@ -1145,20 +1320,9 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
       },
       {
-        name: "a pretty function in the middle of the large bundle",
-        changes: ({ framework }) => {
-          const middle = Math.floor(framework.length / 2);
-          return {
-            "shared/framework.js": `${framework.slice(0, middle)};\n${PRETTY_FUNCTION}${framework.slice(middle)}`,
-          };
-        },
-        path: "shared/framework.js",
-        alsoFails: ["invalid-script"],
-      },
-      {
         name: "a pretty script written inline in a page",
         changes: () => ({
-          "action/index.html": `<!DOCTYPE html><html><body><div id="root"></div><script>\n${PRETTY_FUNCTION}</script></body></html>`,
+          "action/index.html": inPage(`<div id="root"></div><script>\n${PRETTY_FUNCTION}</script>`),
         }),
         path: "action/index.html",
       },
@@ -1196,31 +1360,24 @@ export const RULES: readonly Rule[] = [
         path: "action/index.html",
       },
       {
-        name: "E14 an inline script carried in a data: URL",
+        name: "E14 an inline script carried in a base64 data: URL",
         changes: () => ({
-          "action/index.html": `<!DOCTYPE html><html><body><script src="data:text/javascript;base64,${Buffer.from(PRETTY_FUNCTION).toString("base64")}"></script></body></html>`,
+          "action/index.html": inPage(
+            `<script src="data:text/javascript;base64,${Buffer.from(PRETTY_FUNCTION).toString("base64")}"></script>`,
+          ),
         }),
         path: "action/index.html",
       },
       {
         name: "E15 a readable function in an onclick handler",
         changes: () => ({
-          "action/index.html": `<!DOCTYPE html><html><body><button onclick="${PRETTY_FUNCTION}">go</button></body></html>`,
+          "action/index.html": inPage(`<button onclick="${PRETTY_FUNCTION}">go</button>`),
         }),
         path: "action/index.html",
       },
       {
-        name: "E19 stylesheet rules separated by U+2028",
-        changes: () => ({
-          "action/index.css": "body{margin:0}\u2028h1{font-size:15px}",
-        }),
-        path: "action/index.css",
-      },
-      {
         name: "E23 a closed inline script with a readable function",
-        changes: () => ({
-          "action/index.html": `<!DOCTYPE html><html><body><script>${PRETTY_FUNCTION}</script></body></html>`,
-        }),
+        changes: () => ({ "action/index.html": inPage(`<script>${PRETTY_FUNCTION}</script>`) }),
         path: "action/index.html",
       },
       {
@@ -1228,18 +1385,6 @@ export const RULES: readonly Rule[] = [
         changes: () => ({
           "action/index.css": padLines("body{margin:0}\nh1{font-size:15px}", 170),
         }),
-        path: "action/index.css",
-      },
-      {
-        name: "A04e a script the parser accepts and the minifier rejects, then 250 readable functions on one line",
-        changes: (fixtures) => ({
-          "experiment/parent.js": `${fixtures.minifiedParent};using x=a;${ONE_LINE_FUNCTION.repeat(250)}`,
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "a stylesheet the minifier rejects",
-        changes: () => ({ "action/index.css": "a{color:red}}}" }),
         path: "action/index.css",
       },
       {
@@ -1257,16 +1402,16 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
       },
       {
-        name: "75 one-line readable functions (15750 bytes) appended to the large bundle",
+        name: "A02b one readable function on one line appended to the large bundle",
         changes: ({ framework }) => ({
-          "shared/framework.js": `${framework};${ONE_LINE_FUNCTION.repeat(75)}`,
+          "shared/framework.js": `${framework};${ONE_LINE_FUNCTION}`,
         }),
         path: "shared/framework.js",
       },
       {
-        name: "8 one-line readable functions (1680 bytes) appended to the large bundle",
+        name: "M02 two readable functions on one line appended to the large bundle",
         changes: ({ framework }) => ({
-          "shared/framework.js": `${framework};${ONE_LINE_FUNCTION.repeat(8)}`,
+          "shared/framework.js": `${framework};${ONE_LINE_FUNCTION.repeat(2)}`,
         }),
         path: "shared/framework.js",
       },
@@ -1297,6 +1442,60 @@ export const RULES: readonly Rule[] = [
         path: "action/index.html",
       },
       {
+        name: "CM11 a javascript: URL with a line feed and a carriage return in the scheme",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<a href="jav&#10;asc&#13;ript:${encodeURIComponent(PRETTY_FUNCTION)}">go</a>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "CM13 a javascript: URL spelled with &Tab; and &NewLine;, holding &apos; quotes",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<a href="java&Tab;scr&NewLine;ipt:${encodeURIComponent(PRETTY_FUNCTION).replaceAll("'", "&apos;")}&apos;&apos;">go</a>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "M11 a mixed-case javascript: URL with an encoded tab and line feed",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<a href="&#x09;JaVaScRiPt&#x0a;:${encodeURIComponent(PRETTY_FUNCTION)}">go</a>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "M13 a multi-line javascript: URL with > inside it",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<a href="javascript:\nif (1 > 0) {\n${PRETTY_FUNCTION.repeat(10)}\n}">go</a>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "M15 a javascript: URL spelled with a zero-padded character reference",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<a href="&#00000106;avascript:${encodeURIComponent(PRETTY_FUNCTION)}">a</a>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "M15 a javascript: URL spelled with a character reference that has no semicolon",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<a href="&#106avascript:${encodeURIComponent(PRETTY_FUNCTION)}">b</a>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
         name: "A14 a readable script in an iframe srcdoc",
         changes: () => ({
           "action/index.html": inPage(
@@ -1315,10 +1514,46 @@ export const RULES: readonly Rule[] = [
         path: "action/index.html",
       },
       {
+        name: "M12 a readable script in an iframe srcdoc inside an iframe srcdoc",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<iframe srcdoc="&lt;iframe srcdoc=&quot;&amp;lt;script&amp;gt;${PRETTY_FUNCTION.replaceAll('"', "&quot;")}&amp;lt;/script&amp;gt;&quot;&gt;&lt;/iframe&gt;"></iframe>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "M14 a srcdoc with a line break and a raw <script> inside the attribute",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<iframe srcdoc="\n<script>\n${PRETTY_FUNCTION.repeat(10)}</script>"></iframe>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "M16 an inline script with </script_len before readable source",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<script>1</script_len/g;\n${PRETTY_FUNCTION.repeat(20)}</script>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
         name: "A15 a readable script in a percent-encoded data: URL",
         changes: () => ({
           "action/index.html": inPage(
             `<script src="data:text/javascript,${encodeURIComponent(PRETTY_FUNCTION)}"></script>`,
+          ),
+        }),
+        path: "action/index.html",
+      },
+      {
+        name: "a pretty stylesheet in a data: URL on a link",
+        changes: () => ({
+          "action/index.html": inPage(
+            `<link rel="stylesheet" href="data:text/css,${encodeURIComponent("body {\n  margin: 0;\n}\n")}">`,
           ),
         }),
         path: "action/index.html",
@@ -1339,27 +1574,31 @@ export const RULES: readonly Rule[] = [
         }),
         path: "action/index.html",
       },
+      {
+        name: "a readable script inside a vector image",
+        changes: (fixtures) => ({
+          "icons/icon.svg": fixtures.toolbarSvg.replace(
+            "</svg>",
+            `<script>${ONE_LINE_FUNCTION}</script></svg>`,
+          ),
+        }),
+        path: "icons/icon.svg",
+      },
     ],
   },
   {
     id: "string-holds-source",
     inspects: "contents",
     decides:
-      "a string or template in a script has line breaks and code keywords and either parses as a script that is not minified, or does not parse and has more than 2 lines that look like code",
-    check: (file) => {
-      if (syntaxOf(file) !== "script" || !isText(file)) return undefined;
-      for (const { span, value } of parseScript(file.text).strings) {
-        const breaks = value.match(/[\n\r\u2028\u2029]/g)?.length ?? 0;
-        if (
-          breaks < STRING_SOURCE_MIN_LINE_BREAKS ||
-          value.length < STRING_SOURCE_MIN_CHARACTERS ||
-          !READABLE_SOURCE.test(value)
-        )
-          continue;
+      "a script string or template quasi parses as a script that declares names and minifying it saves more than the script margin, parses only as TypeScript, or parses as neither and has more than 512 bytes of lines that look like code",
+    check: (read) => {
+      if (!("facts" in read) || read.facts.form !== "script") return undefined;
+      const { text, script } = read.facts;
+      for (const { span, value } of script.strings) {
+        if (value.length <= SCRIPT_MARGIN_BYTES) continue;
         const reason = sourceInString(value);
-        if (reason !== undefined) {
-          return `the string at line ${lineOf(file.text, span.start)} holds readable source (${reason})`;
-        }
+        if (reason !== undefined)
+          return `the string at line ${lineOf(text, span.start)} holds readable source: ${reason}`;
       }
       return undefined;
     },
@@ -1393,6 +1632,13 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
       },
       {
+        name: "M07 eval of a number table followed by one readable function",
+        changes: (fixtures) => ({
+          "experiment/parent.js": evalOf(fixtures, NUMBER_TABLE + PRETTY_FUNCTION),
+        }),
+        path: "experiment/parent.js",
+      },
+      {
         name: "A04b new Function of a readable function alone",
         changes: (fixtures) => ({
           "experiment/parent.js": `${fixtures.minifiedParent};new Function(${JSON.stringify(PRETTY_FUNCTION)});`,
@@ -1406,17 +1652,45 @@ export const RULES: readonly Rule[] = [
         }),
         path: "experiment/parent.js",
       },
+      {
+        name: "M08 readable functions split across the quasis of one template literal",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent};var s=\`${PRETTY_FUNCTION.repeat(3)}\${1}${PRETTY_FUNCTION.repeat(3)}\`;console.log(s);`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "M09 eval of TypeScript with comments after its braces",
+        changes: (fixtures) => ({
+          "experiment/parent.js": evalOf(fixtures, TYPESCRIPT_FUNCTION.repeat(20)),
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "M10 eval of 100 readable functions on one line",
+        changes: (fixtures) => ({
+          "experiment/parent.js": evalOf(fixtures, ONE_LINE_FUNCTION.repeat(100)),
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "M17 eval of a readable function after an array nested 2000 deep",
+        changes: () => ({
+          "experiment/parent.js": `${nested("[", "]", 2000)}eval(${JSON.stringify(PRETTY_FUNCTION)});`,
+        }),
+        path: "experiment/parent.js",
+      },
     ],
   },
   {
     id: "notice-carries-code",
     inspects: "contents",
     decides: `a .LICENSE.txt file has more than ${MAX_CODE_LINES} lines that look like code`,
-    check: (file) => {
-      if (file.kind !== "notice") return undefined;
-      const lines = codeLines(file.text);
+    check: (read) => {
+      if (read.unit.kind !== "notice") return undefined;
+      const lines = codeLines(textOf(read) ?? "");
       return lines.length > MAX_CODE_LINES
-        ? `${plural(lines.length, "line")} look like code, the first is line ${lines[0]}; a notice is prose`
+        ? `${plural(lines.length, "line")} look like code, the first is line ${lines[0]?.number}; a notice is prose`
         : undefined;
     },
     plants: [
@@ -1429,17 +1703,20 @@ export const RULES: readonly Rule[] = [
   },
 ];
 
-const PNG_IMAGE = new Uint8Array([
-  ...PNG_SIGNATURE,
-  0x00,
-  0x00,
-  0x00,
-  0x0d,
-  0x49,
-  0x48,
-  0x44,
-  0x52,
-]);
+/** A change key that adds a second archive entry under `path` instead of replacing the first. */
+export const DUPLICATE_OF = (path: string): string => `${path}\u0000duplicate`;
+
+/** The PNG with a tEXt chunk before IEND, checksummed so only the chunk type is wrong. */
+const withTextChunk = (png: Uint8Array, text: string): Uint8Array => {
+  const body = new Uint8Array([...encode("tEXt"), ...encode("Comment\u0000"), ...encode(text)]);
+  const chunk = new Uint8Array(body.length + 8);
+  const view = new DataView(chunk.buffer);
+  view.setUint32(0, body.length - 4);
+  chunk.set(body, 4);
+  view.setUint32(body.length + 4, NodeZlib.crc32(body));
+  const iend = png.length - 12;
+  return new Uint8Array([...png.subarray(0, iend), ...chunk, ...png.subarray(iend)]);
+};
 
 const WASM_MODULE = new Uint8Array([
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, 0x03,

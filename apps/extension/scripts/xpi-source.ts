@@ -1,8 +1,6 @@
-// Reads a packed file the way the build's tools do: a real parser for scripts, a token walk for styles and vectors.
-// Everything here is a pure function of the text, so a whole file and an inline <script> are judged alike.
+// Reads a script with the parser the build runs. Everything here is a pure function of the text, so a whole file,
+// an inline <script> and the text of a string are read alike.
 import { parseSync } from "oxc-parser";
-
-export type Syntax = "script" | "style" | "vector";
 
 export interface Span {
   readonly start: number;
@@ -15,19 +13,19 @@ export interface TextValue {
   readonly value: string;
 }
 
+/** An object literal whose keys are all written out, reduced to what each value is. */
+export type ObjectShape = Readonly<Record<string, number | string | "array" | "other">>;
+
 export interface ScriptFacts {
   /** Comments the parser found. A `/*` inside a string or a regular expression is data, not a comment. */
   readonly comments: readonly Span[];
-  /** Spans a minifier cannot rewrite: strings, template quasis and regular expression literals. */
-  readonly data: readonly Span[];
+  /** Strings and template quasis, in source order. */
   readonly strings: readonly TextValue[];
+  readonly objects: readonly ObjectShape[];
+  /** True when the script declares a function, a class, a variable or a parameter. Prose never does. */
+  readonly declaresBinding: boolean;
   readonly errors: readonly string[];
 }
-
-const isLineTerminator = (char: string): boolean =>
-  char === "\n" || char === "\r" || char === "\u2028" || char === "\u2029";
-
-export const hasLineTerminator = (text: string): boolean => /[\n\r\u2028\u2029]/.test(text);
 
 interface AstNode {
   readonly type: string;
@@ -41,24 +39,56 @@ const isAstNode = (value: unknown): value is AstNode =>
   value !== null &&
   typeof (value as { type?: unknown }).type === "string";
 
-/** Parsed scripts keyed by their text. One archive holds a handful of scripts, and five rules read each one. */
-const scriptCache = new Map<string, ScriptFacts>();
+const BINDING_NODES = new Set([
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "ArrowFunctionExpression",
+  "ClassDeclaration",
+  "ClassExpression",
+  "VariableDeclaration",
+  "CatchClause",
+]);
 
-/** Visits every node in source order. Iterative, so a deeply nested file cannot overflow the call stack. */
+/** Visits every node. Iterative, so a deeply nested file cannot overflow the call stack. */
 const walk = (root: unknown, visit: (node: AstNode) => void): void => {
   const pending: unknown[] = [root];
   while (pending.length > 0) {
     const node = pending.pop();
-    if (Array.isArray(node)) {
-      for (let i = node.length - 1; i >= 0; i--) pending.push(node[i]);
-    } else if (isAstNode(node)) {
+    if (Array.isArray(node)) for (const item of node as unknown[]) pending.push(item);
+    else if (isAstNode(node)) {
       visit(node);
-      const children = Object.entries(node).filter(
-        ([key]) => key !== "type" && key !== "start" && key !== "end",
-      );
-      for (let i = children.length - 1; i >= 0; i--) pending.push(children[i]?.[1]);
+      for (const [key, child] of Object.entries(node))
+        if (key !== "type" && key !== "start" && key !== "end") pending.push(child);
     }
   }
+};
+
+const keyOf = (property: AstNode): string | undefined => {
+  if (property.type !== "Property" || property.computed === true) return undefined;
+  const key = property.key;
+  if (!isAstNode(key)) return undefined;
+  if (key.type === "Identifier" && typeof key.name === "string") return key.name;
+  return key.type === "Literal" && typeof key.value === "string" ? key.value : undefined;
+};
+
+const shapeOf = (value: unknown): ObjectShape[string] => {
+  if (!isAstNode(value)) return "other";
+  if (value.type === "ArrayExpression") return "array";
+  return value.type === "Literal" &&
+    (typeof value.value === "string" || typeof value.value === "number")
+    ? value.value
+    : "other";
+};
+
+const objectShape = (node: AstNode): ObjectShape | undefined => {
+  if (!Array.isArray(node.properties)) return undefined;
+  const entries: Array<readonly [string, ObjectShape[string]]> = [];
+  for (const property of node.properties as unknown[]) {
+    const key = isAstNode(property) ? keyOf(property) : undefined;
+    if (key === undefined || !isAstNode(property)) return undefined;
+    entries.push([key, shapeOf(property.value)]);
+  }
+  return Object.fromEntries(entries);
 };
 
 const cookedValue = (element: AstNode): string | undefined => {
@@ -68,97 +98,34 @@ const cookedValue = (element: AstNode): string | undefined => {
   return typeof cooked === "string" ? cooked : undefined;
 };
 
-/** Parses a script with the same parser the build runs, and keeps what it saw. */
-export const parseScript = (text: string): ScriptFacts => {
-  const cached = scriptCache.get(text);
-  if (cached !== undefined) return cached;
-  const parsed = parseSync("packed.js", text);
-  const data: Span[] = [];
+export type Language = "js" | "ts";
+
+/** Parses a script as the build's parser does and keeps what it saw. A text with errors is not a script. */
+export const parseScript = (text: string, lang: Language = "js"): ScriptFacts => {
+  const parsed = parseSync(lang === "js" ? "packed.js" : "packed.ts", text, { lang });
   const strings: TextValue[] = [];
+  const objects: ObjectShape[] = [];
+  let declaresBinding = false;
   walk(parsed.program, (node) => {
+    if (BINDING_NODES.has(node.type)) declaresBinding = true;
+    const span = { start: node.start, end: node.end };
     if (node.type === "TemplateElement") {
-      data.push({ start: node.start, end: node.end });
       const value = cookedValue(node);
-      if (value !== undefined) strings.push({ span: { start: node.start, end: node.end }, value });
-      return;
-    }
-    if (node.type !== "Literal") return;
-    if (typeof node.value === "string") {
-      data.push({ start: node.start, end: node.end });
-      strings.push({ span: { start: node.start, end: node.end }, value: node.value });
-    } else if (typeof node.regex === "object" && node.regex !== null) {
-      data.push({ start: node.start, end: node.end });
+      if (value !== undefined) strings.push({ span, value });
+    } else if (node.type === "Literal" && typeof node.value === "string") {
+      strings.push({ span, value: node.value });
+    } else if (node.type === "ObjectExpression") {
+      const shape = objectShape(node);
+      if (shape !== undefined) objects.push(shape);
     }
   });
-  const facts: ScriptFacts = {
+  return {
     comments: parsed.comments.map(({ start, end }) => ({ start, end })),
-    data,
-    strings,
+    strings: strings.toSorted((a, b) => a.span.start - b.span.start),
+    objects,
+    declaresBinding,
     errors: parsed.errors.map(({ message }) => message),
   };
-  if (scriptCache.size >= 8) scriptCache.clear();
-  scriptCache.set(text, facts);
-  return facts;
-};
-
-const endOfBlock = (text: string, start: number, close: string): number => {
-  const end = text.indexOf(close, start);
-  return end < 0 ? text.length : end + close.length;
-};
-
-export const skipString = (text: string, start: number): number => {
-  const quote = text.charAt(start);
-  for (let i = start + 1; i < text.length; i++) {
-    const char = text.charAt(i);
-    if (char === "\\") i++;
-    else if (char === quote) return i + 1;
-    else if (isLineTerminator(char)) return i;
-  }
-  return text.length;
-};
-
-export interface StyleFacts {
-  readonly comments: readonly Span[];
-  readonly data: readonly Span[];
-}
-
-/** A stylesheet has quoted strings and comments; everything else is code the minifier rewrites. */
-export const readStyle = (text: string): StyleFacts => {
-  const comments: Span[] = [];
-  const data: Span[] = [];
-  let i = 0;
-  while (i < text.length) {
-    const char = text.charAt(i);
-    const next = text.charAt(i + 1);
-    if (char === "/" && next === "*") {
-      const end = endOfBlock(text, i + 2, "*/");
-      comments.push({ start: i, end });
-      i = end;
-    } else if (char === '"' || char === "'") {
-      const end = skipString(text, i);
-      data.push({ start: i, end });
-      i = end;
-    } else i++;
-  }
-  return { comments, data };
-};
-
-const findVectorComments = (text: string): Span[] => {
-  const comments: Span[] = [];
-  let start = text.indexOf("<!--");
-  while (start >= 0) {
-    const end = endOfBlock(text, start + 4, "-->");
-    comments.push({ start, end });
-    start = text.indexOf("<!--", end);
-  }
-  return comments;
-};
-
-/** Every comment in `text`, found by the parser for scripts and by a token walk for styles and vectors. */
-export const findComments = (text: string, syntax: Syntax): readonly Span[] => {
-  if (syntax === "script") return parseScript(text).comments;
-  if (syntax === "style") return readStyle(text).comments;
-  return findVectorComments(text);
 };
 
 /** A comment that a license can require a bundle to keep. */
@@ -171,17 +138,14 @@ const LEGAL_COMMENT_MAX_CHARACTERS = 400;
 export interface Comments {
   /** Comments with no legal marker. A minifier removes all of them. */
   readonly ordinary: readonly Span[];
-  /** Legal comments short enough and free enough of code to stay. */
-  readonly legal: readonly Span[];
   /** Comments that claim to be legal and are too long or carry code. */
   readonly rejected: ReadonlyArray<Span & { readonly reason: string }>;
 }
 
-export const classifyComments = (text: string, syntax: Syntax): Comments => {
+export const classifyComments = (text: string, comments: readonly Span[]): Comments => {
   const ordinary: Span[] = [];
-  const legal: Span[] = [];
   const rejected: Array<Span & { readonly reason: string }> = [];
-  for (const span of findComments(text, syntax)) {
+  for (const span of comments) {
     const comment = text.slice(span.start, span.end);
     if (!LEGAL_MARKER.test(comment)) ordinary.push(span);
     else if (comment.length > LEGAL_COMMENT_MAX_CHARACTERS) {
@@ -191,43 +155,11 @@ export const classifyComments = (text: string, syntax: Syntax): Comments => {
       });
     } else {
       const code = CODE_IN_COMMENT.exec(comment);
-      if (code === null) legal.push(span);
-      else rejected.push({ ...span, reason: `carries code (\`${code[0].trim()}\`)` });
+      if (code !== null) rejected.push({ ...span, reason: `carries code (\`${code[0].trim()}\`)` });
     }
   }
-  return { ordinary, legal, rejected };
+  return { ordinary, rejected };
 };
 
-const inside = (spans: readonly Span[], offset: number): boolean =>
-  spans.some((span) => span.start <= offset && offset < span.end);
-
-/**
- * Line terminators a minifier would have removed. A minifier leaves every statement on one line, so a break
- * outside a string, a regular expression or a comment means the file was not minified. The line holding a kept
- * legal comment is the one exception: the build puts the license pointer on its own line.
- */
-export const lineBreaksOutsideData = (
-  text: string,
-  data: readonly Span[],
-  legal: readonly Span[],
-): readonly number[] => {
-  const breaks: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    const char = text.charAt(i);
-    if (!isLineTerminator(char)) continue;
-    if (inside(data, i)) continue;
-    const nearLegal = legal.some((span) => {
-      if (span.end <= i) return /^[ \t]*$/.test(text.slice(span.end, i));
-      if (span.start >= i) return /^[ \t]*$/.test(text.slice(i + 1, span.start));
-      return false;
-    });
-    if (!nearLegal) breaks.push(i);
-  }
-  return breaks;
-};
-
-export const lineOf = (text: string, offset: number): number => {
-  let line = 1;
-  for (let i = 0; i < offset; i++) if (isLineTerminator(text.charAt(i))) line++;
-  return line;
-};
+export const lineOf = (text: string, offset: number): number =>
+  (text.slice(0, offset).match(/\r\n|[\n\r\u2028\u2029]/g)?.length ?? 0) + 1;

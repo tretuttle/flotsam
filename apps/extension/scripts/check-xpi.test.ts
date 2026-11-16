@@ -3,22 +3,19 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { experiments } from "@rspack/core";
-import { zipSync } from "fflate";
+import { Zip, ZipDeflate } from "fflate";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { oneClickHarApi, namespace } from "../experiment/contract.ts";
 import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { bundleParent } from "./build-experiment.ts";
+import { CANNOT_JUDGE } from "./check-xpi.ts";
 import { extensionRoot } from "./manifest.ts";
-import { judge } from "./check-xpi.ts";
-import { RULES, type Changes, type Fixtures, type Unit } from "./xpi-rules.ts";
+import { minifyScript } from "./minify.ts";
+import { RULES, type Changes, type Fixtures } from "./xpi-rules.ts";
 import { renderPng } from "./write-icons.ts";
 
 const checkScript = NodePath.join(extensionRoot, "scripts", "check-xpi.ts");
 const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
-
-const ONE_LINE_FUNCTION =
-  "function collectHeaders(entries) { const result = []; for (const entry of entries) { if (entry.name === undefined) { continue; } result.push({ name: entry.name, value: String(entry.value) }); } return result; }";
 
 const inertPage = `<!DOCTYPE html><html><body><a href="#top" onclick="a()" style="margin:0">go</a><a href="javascript:void(0)">x</a><iframe srcdoc="&lt;p&gt;hi&lt;/p&gt;"></iframe></body></html>`;
 
@@ -65,21 +62,15 @@ beforeAll(async () => {
       "utf8",
     ),
     toolbarSvg,
-    framework: `/*! LICENSE: framework.js.LICENSE.txt */\n${
-      experiments.swc.minifySync(
-        NodeFS.readFileSync(
-          NodePath.join(reactDom, "cjs", "react-dom-client.production.js"),
-          "utf8",
-        ),
-        { mangle: true, compress: true, format: { comments: false } },
-      ).code
-    }`,
+    framework: `/*! LICENSE: framework.js.LICENSE.txt */\n${minifyScript(
+      NodeFS.readFileSync(NodePath.join(reactDom, "cjs", "react-dom-client.production.js"), "utf8"),
+    )}`,
     reactLicense: NodeFS.readFileSync(NodePath.join(reactDom, "LICENSE")),
+    png: renderPng(
+      NodeFS.readFileSync(NodePath.join(extensionRoot, "src", "icons", "icon.svg"), "utf8"),
+      16,
+    ),
   };
-  const master = NodeFS.readFileSync(
-    NodePath.join(extensionRoot, "src", "icons", "icon.svg"),
-    "utf8",
-  );
   // The shape of the real XPI: pretty manifest and schema, indented page, one-line scripts and styles.
   cleanFiles = {
     "manifest.json": NodeFS.readFileSync(NodePath.join(extensionRoot, "src", "manifest.json")),
@@ -93,7 +84,7 @@ beforeAll(async () => {
     "shared/framework.js": encode(fixtures.framework),
     "shared/framework.js.LICENSE.txt": fixtures.reactLicense,
     "icons/toolbar.svg": encode(toolbarSvg),
-    "icons/16.png": renderPng(master, 16),
+    "icons/16.png": fixtures.png,
   };
 });
 
@@ -106,36 +97,61 @@ interface Failure {
   readonly rule: string;
 }
 
+/** Writes the clean archive plus `changes`; a `DUPLICATE_OF` key adds a second entry under the same path. */
+const writeXpi = (file: string, changes: Changes): void => {
+  const entries = new Map<string, Uint8Array>(Object.entries(cleanFiles));
+  const duplicates: Array<readonly [string, Uint8Array]> = [];
+  for (const [key, content] of Object.entries(changes)) {
+    const bytes = typeof content === "string" ? encode(content) : content;
+    const [path, duplicate] = key.split("\u0000");
+    if (path !== undefined && duplicate === undefined) entries.set(path, bytes);
+    else if (path !== undefined) duplicates.push([path, bytes]);
+  }
+  const chunks: Uint8Array[] = [];
+  const zip = new Zip((error, chunk) => {
+    if (error !== null) throw error;
+    chunks.push(chunk);
+  });
+  for (const [path, bytes] of [...entries, ...duplicates]) {
+    const entry = new ZipDeflate(path, { level: 1 });
+    zip.add(entry);
+    entry.push(bytes, true);
+  }
+  zip.end();
+  NodeFS.writeFileSync(file, Buffer.concat(chunks));
+};
+
 /** Packs the clean archive plus `changes` into an XPI and runs the check on it the way CI does. */
-const check = (
+const check = async (
   name: string,
   changes: Changes,
-): { status: number | null; failures: Failure[]; stderr: string } => {
-  const entries = { ...cleanFiles };
-  for (const [path, content] of Object.entries(changes)) {
-    entries[path] = typeof content === "string" ? encode(content) : content;
-  }
+  args: readonly string[] = [],
+): Promise<{ status: number | null; failures: Failure[]; stderr: string }> => {
   const xpi = NodePath.join(workDir, `${name.replaceAll(/\W+/g, "-").slice(0, 80)}.xpi`);
-  NodeFS.writeFileSync(xpi, zipSync(entries));
+  writeXpi(xpi, changes);
   // Node warns on stderr when both NO_COLOR and FORCE_COLOR are set, and the test counts stderr lines.
   const { NO_COLOR: _noColor, FORCE_COLOR: _forceColor, ...env } = process.env;
-  const run = NodeChildProcess.spawnSync(process.execPath, [checkScript, xpi], {
-    encoding: "utf8",
-    env,
+  const child = NodeChildProcess.spawn(process.execPath, [checkScript, xpi, ...args], { env });
+  let stderr = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+    stderr += chunk;
   });
-  const failures = [...run.stderr.matchAll(/^FAIL (\S+): ([\w-]+): /gm)].map(([, path, rule]) => ({
+  child.stdout.resume();
+  const status = await new Promise<number | null>((resolve) => child.on("close", resolve));
+  NodeFS.rmSync(xpi, { force: true });
+  const failures = [...stderr.matchAll(/^FAIL (\S+): ([\w-]+): /gm)].map(([, path, rule]) => ({
     path: path ?? "",
     rule: rule ?? "",
   }));
-  return { status: run.status, failures, stderr: run.stderr };
+  return { status, failures, stderr };
 };
 
 const bySortKey = (a: Failure, b: Failure): number =>
   `${a.path}:${a.rule}`.localeCompare(`${b.path}:${b.rule}`);
 
-describe("check-xpi", () => {
-  it("passes an archive shaped like the real XPI", () => {
-    const result = check("clean", {});
+describe.concurrent("check-xpi", () => {
+  it("passes an archive shaped like the real XPI", async () => {
+    const result = await check("clean", {});
     expect(result.failures).toEqual([]);
     expect(result.status).toBe(0);
   });
@@ -148,8 +164,15 @@ describe("check-xpi", () => {
     {
       name: "F02 one minified line of data over 100 KB",
       changes: () => ({
-        "shared/payload.js": `var d=[${Array.from({ length: 30_000 }, (_, i) => i * 7).join(",")}];`,
+        "shared/payload.js": minifyScript(
+          `var d=[${Array.from({ length: 30_000 }, (_, i) => i * 7).join(",")}];console.log(d);`,
+        ),
       }),
+    },
+    {
+      // CSS reads U+2028 as part of a name, not as a line break, so lightningcss writes these bytes back unchanged.
+      name: "E19 a stylesheet whose second selector starts with U+2028",
+      changes: () => ({ "action/index.css": "body{margin:0}\u2028h1{font-size:15px}" }),
     },
     {
       name: "one minified line holding two 100 KB strings",
@@ -226,6 +249,24 @@ describe("check-xpi", () => {
       }),
     },
     {
+      name: "FC17a a script with an array nested 4500 deep, which the minifier still reads",
+      changes: () => ({
+        "shared/payload.js": `var a=${"[".repeat(4500)}1${"]".repeat(4500)};console.log(a);`,
+      }),
+    },
+    {
+      name: "strings that parse as scripts but declare nothing: a URL, prose, a list of globals",
+      changes: () => ({
+        "shared/payload.js": `var a=["javascript:throw new Error('A React form was unexpectedly submitted.')","Infinity,undefined,NaN,isFinite,isNaN,parseFloat,parseInt,decodeURI","\u0e1b\u0e23\u0e30\u0e40\u0e20\u0e17 \u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25: \u0e04\u0e27\u0e23"];console.log(a);`,
+      }),
+    },
+    {
+      name: "a two line string of short generated code",
+      changes: () => ({
+        "shared/payload.js": 'var f=new Function("a","return a+1;\\nreturn a");f(1);',
+      }),
+    },
+    {
       name: "three lines of prose with code keywords in one string",
       changes: () => ({
         "shared/payload.js":
@@ -247,8 +288,8 @@ describe("check-xpi", () => {
     },
   ];
 
-  it.each(legitimate)("passes $name", ({ name, changes }) => {
-    const result = check(name, changes(fixtures));
+  it.each(legitimate)("passes $name", async ({ name, changes }) => {
+    const result = await check(name, changes(fixtures));
     expect(result.failures).toEqual([]);
     expect(result.status).toBe(0);
   });
@@ -258,8 +299,8 @@ describe("check-xpi", () => {
       expect(rule.plants.length).toBeGreaterThan(0);
     });
 
-    it.each(rule.plants)("fails on $name, naming the file and the rule", (plant) => {
-      const result = check(plant.name, plant.changes(fixtures));
+    it.each(rule.plants)("fails on $name, naming the file and the rule", async (plant) => {
+      const result = await check(plant.name, plant.changes(fixtures));
       const expected = [rule.id, ...(plant.alsoFails ?? [])]
         .map((id) => ({ path: plant.path, rule: id }))
         .toSorted(bySortKey);
@@ -270,28 +311,20 @@ describe("check-xpi", () => {
     });
   });
 
-  // The margin is the detection floor of size: one function saves less than it, so it can hide in a large bundle.
-  it("A02b passes one readable function appended to the large bundle, which saves under the margin", () => {
-    const result = check("a02b", {
-      "shared/framework.js": `${fixtures.framework};${ONE_LINE_FUNCTION}`,
-    });
-    expect(result.failures).toEqual([]);
+  it("fails naming the archive when the judge runs out of time before judging a file", async () => {
+    const result = await check("timeout", {}, ["--timeout-ms", "1"]);
+    expect(result.failures).toEqual([{ path: "timeout.xpi", rule: CANNOT_JUDGE }]);
+    expect(result.status).toBe(1);
   });
 
-  it("fails a file naming the file and the rule when a rule throws on it", () => {
-    const unit: Unit = {
-      path: "experiment/parent.js",
-      where: undefined,
-      kind: "script",
-      bytes: encode("x"),
-      text: "x",
-    };
-    expect(
-      judge(() => {
-        throw new Error("boom");
-      }, unit),
-    ).toContain("boom");
-    expect(judge(() => undefined, unit)).toBeUndefined();
+  it("fails naming the archive when it is not a ZIP", async () => {
+    const xpi = NodePath.join(workDir, "not-a-zip.xpi");
+    NodeFS.writeFileSync(xpi, "not a zip");
+    const run = NodeChildProcess.spawnSync(process.execPath, [checkScript, xpi], {
+      encoding: "utf8",
+    });
+    expect(run.stderr).toMatch(new RegExp(`^FAIL not-a-zip.xpi: ${CANNOT_JUDGE}: .+`, "m"));
+    expect(run.status).toBe(1);
   });
 
   it("lists each rule once, and every extra rule a plant expects is a rule", () => {
