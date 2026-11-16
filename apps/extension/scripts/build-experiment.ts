@@ -25,7 +25,7 @@ export const bundleScript = async (
     outDir: NodePath.dirname(scriptFile),
     format: "iife",
     platform: "neutral",
-    noExternal: [/./],
+    deps: { alwaysBundle: [/./] },
     define: { "process.env.NODE_ENV": JSON.stringify("production") },
     minify: false,
     clean: false,

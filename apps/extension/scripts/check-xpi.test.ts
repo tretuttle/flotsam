@@ -311,6 +311,17 @@ describe.concurrent("check-xpi", () => {
     });
   });
 
+  it("names the rule that threw on a file", async () => {
+    const thrown = RULES.find(({ id }) => id === CANNOT_JUDGE)?.plants.find(({ name }) =>
+      name.includes("a rule throws"),
+    );
+    if (thrown === undefined) throw new Error("the plant for a throwing rule is missing");
+    const result = await check("thrown", thrown.changes(fixtures));
+    expect(result.stderr).toMatch(
+      /^FAIL experiment\/parent\.js: cannot-judge: the string-holds-source rule threw: /m,
+    );
+  });
+
   it("fails naming the archive when the judge runs out of time before judging a file", async () => {
     const result = await check("timeout", {}, ["--timeout-ms", "1"]);
     expect(result.failures).toEqual([{ path: "timeout.xpi", rule: CANNOT_JUDGE }]);

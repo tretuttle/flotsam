@@ -683,6 +683,13 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
       },
       {
+        name: "a string the parser reads as a script and the minifier rejects, so a rule throws",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent};${minifyScript(`console.log(${JSON.stringify("using x=a();function f(b){return b}")})`)}`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
         name: "a pretty function in the middle of the large bundle",
         changes: ({ framework }) => {
           const middle = Math.floor(framework.length / 2);
@@ -1289,6 +1296,11 @@ export const RULES: readonly Rule[] = [
         path: "action/index.css",
       },
       {
+        name: "a stylesheet one redundant semicolon away from minified",
+        changes: () => ({ "action/index.css": "body{margin:0;}h1{font-size:15px}" }),
+        path: "action/index.css",
+      },
+      {
         name: "a block comment before a stylesheet",
         changes: () => ({ "action/index.css": "/* popup styles */body{margin:0}" }),
         path: "action/index.css",
@@ -1649,6 +1661,16 @@ export const RULES: readonly Rule[] = [
         name: "A04d eval of text the minifier cannot parse, then 200 readable functions",
         changes: (fixtures) => ({
           "experiment/parent.js": evalOf(fixtures, `<<<<\n${PRETTY_FUNCTION.repeat(200)}`),
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "A04d written with carriage returns and U+2028 line separators",
+        changes: (fixtures) => ({
+          "experiment/parent.js": evalOf(
+            fixtures,
+            `<<<<\r${PRETTY_FUNCTION.repeat(200).replaceAll("\n", "\u2028")}`,
+          ),
         }),
         path: "experiment/parent.js",
       },
