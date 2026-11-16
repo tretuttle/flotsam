@@ -15,7 +15,11 @@ A margin is the most readable code that can hide in a file. With 16 bytes, no re
 
 ## Fail closed is one rule
 
-`cannot-judge` covers everything that stops the check from judging a file: bytes that are not UTF-8, a parser or minifier error, JSON that does not parse, a script or stylesheet the minifier reduces to nothing (an empty file included), a rule that throws, and a judge process that crashes or runs out of time. `xpi-judge.ts` reads the files in a child process and prints a line before each one, so a native crash (SWC segfaults on arrays nested about 5000 deep) names the file it was on, and `check-xpi.ts` starts a new child for the rest. An archive that cannot be opened at all fails under its own name.
+`cannot-judge` covers everything that stops the check from judging a file: bytes that are not UTF-8, nesting past the check's limit, a parser or minifier error, JSON that does not parse, a script or stylesheet the minifier reduces to nothing (an empty file included), a rule that throws, and a judge process that crashes or runs out of time. An archive that cannot be opened at all fails under its own name.
+
+**Nesting has a limit of the check's own: 256 brackets.** The parsers and minifiers recurse natively, so where they crash depends on the machine's stack. SWC crashed on an array nested 5000 deep on one machine and minified it on the CI runner, and at a 1 MB stack it crashed from 600. A verdict that depends on the runner is not fail closed, so before any parser, minifier or `JSON.parse` sees a script, stylesheet, JSON file, script string or JSON candidate, a plain loop counts its deepest bracket nesting. Past 256 the file fails with the depth it measured. Honest output is shallow: 20 levels at most across every packed file and eight libraries through both script builds, brackets inside strings and regular expressions included. The check gives the same verdicts with `ulimit -s 1024` and `node --stack-size=200`.
+
+The crash path stays as the backstop for what the limit does not cover. `xpi-judge.ts` reads the files in a child process and prints a line before each one, so a native crash names the file it was on, and `check-xpi.ts` starts a new child for the rest. The child gets the check's own Node flags.
 
 ## Real parsers, not scanners
 
@@ -26,7 +30,7 @@ A margin is the most readable code that can hide in a file. With 16 bytes, no re
 
 ## What the check does not see
 
-Each needs a deliberately hostile author, and none can come from the build. A source map split across two files, base64-encoded in a string, or inside a CSS string. Readable source split over several strings that each parse as nothing. Up to 512 bytes of code-looking lines in a string that parses as nothing. A stylesheet whose rules are joined by U+2028 passes, correctly: CSS reads U+2028 as part of a name, so lightningcss writes those bytes back unchanged.
+Each needs a deliberately hostile author, and none can come from the build. A source map split across two files, base64-encoded in a string, or inside a CSS string. Readable source split over several strings that each parse as nothing. Up to 512 bytes of code-looking lines in a string that parses as nothing. A stylesheet whose rules are joined by U+2028 with nothing else to remove passes, correctly: CSS reads U+2028 as part of a name, so lightningcss writes those bytes back unchanged, and that is what the build writes for any source holding the character. No build mistake produces it: a sheet that skipped the minifier keeps spaces, line breaks or comments, which fail, and layout written with U+2028 does not parse.
 
 ## The parent's result shape is checked at run time
 

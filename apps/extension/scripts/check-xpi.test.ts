@@ -122,16 +122,22 @@ const writeXpi = (file: string, changes: Changes): void => {
 };
 
 /** Packs the clean archive plus `changes` into an XPI and runs the check on it the way CI does. */
+// Node flags for every check run, such as a smaller --stack-size, to show that no verdict depends on the stack.
+const nodeArgs = process.env.CHECK_XPI_TEST_NODE_ARGS?.split(" ").filter(Boolean) ?? [];
+
 const check = async (
   name: string,
   changes: Changes,
   args: readonly string[] = [],
+  extraEnv: Readonly<Record<string, string>> = {},
 ): Promise<{ status: number | null; failures: Failure[]; stderr: string }> => {
   const xpi = NodePath.join(workDir, `${name.replaceAll(/\W+/g, "-").slice(0, 80)}.xpi`);
   writeXpi(xpi, changes);
   // Node warns on stderr when both NO_COLOR and FORCE_COLOR are set, and the test counts stderr lines.
   const { NO_COLOR: _noColor, FORCE_COLOR: _forceColor, ...env } = process.env;
-  const child = NodeChildProcess.spawn(process.execPath, [checkScript, xpi, ...args], { env });
+  const child = NodeChildProcess.spawn(process.execPath, [...nodeArgs, checkScript, xpi, ...args], {
+    env: { ...env, ...extraEnv },
+  });
   let stderr = "";
   child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
     stderr += chunk;
@@ -243,15 +249,9 @@ describe.concurrent("check-xpi", () => {
       changes: () => ({ "experiment/info.json": '{\n  "description": "line one\\nline two"\n}\n' }),
     },
     {
-      name: "A06 a script with an array nested 2000 deep on one line",
+      name: "a script nested 256 deep, the most the check reads",
       changes: () => ({
-        "shared/payload.js": `var a=${"[".repeat(2000)}1${"]".repeat(2000)};console.log(a);`,
-      }),
-    },
-    {
-      name: "FC17a a script with an array nested 4500 deep, which the minifier still reads",
-      changes: () => ({
-        "shared/payload.js": `var a=${"[".repeat(4500)}1${"]".repeat(4500)};console.log(a);`,
+        "shared/payload.js": `var a=${"[".repeat(256)}1${"]".repeat(256)};console.log(a);`,
       }),
     },
     {
@@ -318,8 +318,27 @@ describe.concurrent("check-xpi", () => {
     if (thrown === undefined) throw new Error("the plant for a throwing rule is missing");
     const result = await check("thrown", thrown.changes(fixtures));
     expect(result.stderr).toMatch(
-      /^FAIL experiment\/parent\.js: cannot-judge: the string-holds-source rule threw: /m,
+      /^FAIL experiment\/parent\.js: cannot-judge: the string-holds-source rule could not judge it: /m,
     );
+  });
+
+  it("names the file a judge process crashed on, and judges the files after it", async () => {
+    const result = await check(
+      "crash",
+      { "shared/commons.js": "function add ( first , second ) { return first + second ; }" },
+      [],
+      {
+        XPI_JUDGE_ABORT_ON: "experiment/parent.js",
+      },
+    );
+    expect(result.failures.toSorted(bySortKey)).toEqual([
+      { path: "experiment/parent.js", rule: CANNOT_JUDGE },
+      { path: "shared/commons.js", rule: "not-minified" },
+    ]);
+    expect(result.stderr).toMatch(
+      /^FAIL experiment\/parent\.js: cannot-judge: the judge process was killed by SIGABRT while judging this file$/m,
+    );
+    expect(result.status).toBe(1);
   });
 
   it("fails naming the archive when the judge runs out of time before judging a file", async () => {

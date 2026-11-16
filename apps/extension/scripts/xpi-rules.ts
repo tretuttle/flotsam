@@ -103,6 +103,33 @@ const textOf = (read: Read): string | undefined =>
 
 class Unreadable extends Error {}
 
+// The parsers and minifiers recurse natively, so a deep enough file crashes them, at a depth set by the machine's
+// stack: SWC on 5000 nested brackets here, not on the CI runner. The check stops first, at its own limit. Honest
+// output is shallow: 20 levels at most in every packed file and in eight libraries through both script builds,
+// counting brackets inside strings and regular expressions too. 256 is over twelve times that.
+const MAX_NESTING = 256;
+
+/** The deepest bracket nesting in `text`, counted without parsing, so no input can make the count itself recurse. */
+const nestingDepth = (text: string): number => {
+  let depth = 0;
+  let deepest = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0x28 || code === 0x5b || code === 0x7b) deepest = Math.max(deepest, ++depth);
+    else if ((code === 0x29 || code === 0x5d || code === 0x7d) && depth > 0) depth--;
+  }
+  return deepest;
+};
+
+/** Refuses text nested past `MAX_NESTING` before any parser or minifier sees it. */
+const ensureShallow = (text: string, what: string): void => {
+  const depth = nestingDepth(text);
+  if (depth > MAX_NESTING)
+    throw new Unreadable(
+      `${what} is nested ${depth} brackets deep; the check reads at most ${MAX_NESTING}, and minified output reaches about 20`,
+    );
+};
+
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 
 const messageOf = (error: unknown): string => {
@@ -137,6 +164,13 @@ const read = (unit: Unit): Facts => {
   } catch {
     throw new Unreadable("is not valid UTF-8");
   }
+  if (
+    unit.kind === "script" ||
+    unit.kind === "style" ||
+    unit.kind === "style-attribute" ||
+    unit.kind === "data"
+  )
+    ensureShallow(text, "it");
   switch (unit.kind) {
     case "script": {
       const script = parseScript(text);
@@ -253,7 +287,8 @@ const jsonIn = (text: string): unknown => {
   const trimmed = text.trim();
   const candidates = [trimmed, trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1)];
   for (const candidate of candidates) {
-    if (candidate.length < 2) continue;
+    if (!/^[[{]/.test(candidate)) continue;
+    ensureShallow(candidate, "JSON in it");
     try {
       return JSON.parse(candidate) as unknown;
     } catch {
@@ -351,6 +386,7 @@ const readable = (code: string): number =>
  * TypeScript is source. Text that parses as neither is judged by how many of its lines look like code.
  */
 const sourceInString = (value: string): string | undefined => {
+  ensureShallow(value, "a string in it");
   const script = parseScript(value);
   if (script.errors.length === 0) {
     if (!script.declaresBinding) return undefined;
@@ -633,7 +669,34 @@ export const RULES: readonly Rule[] = [
         path: "experiment/huge.js",
       },
       {
-        name: "FC17b an array nested 5000 deep, which crashes the minifier",
+        name: "an array nested 257 deep, one past the limit",
+        changes: () => ({ "experiment/parent.js": nested("[", "]", 257) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "an array nested 600 deep",
+        changes: () => ({ "experiment/parent.js": nested("[", "]", 600) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "A06 an array nested 2000 deep, which a smaller native stack cannot read",
+        changes: () => ({ "experiment/parent.js": nested("[", "]", 2000) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "M17 eval of a readable function after an array nested 2000 deep",
+        changes: () => ({
+          "experiment/parent.js": `${nested("[", "]", 2000)}eval(${JSON.stringify(PRETTY_FUNCTION)});`,
+        }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC17a an array nested 4500 deep",
+        changes: () => ({ "experiment/parent.js": nested("[", "]", 4500) }),
+        path: "experiment/parent.js",
+      },
+      {
+        name: "FC17b an array nested 5000 deep, which crashes the minifier on some machines",
         changes: () => ({ "experiment/parent.js": nested("[", "]", 5000) }),
         path: "experiment/parent.js",
       },
@@ -643,9 +706,27 @@ export const RULES: readonly Rule[] = [
         path: "experiment/parent.js",
       },
       {
-        name: "FC17d an array nested 20000 deep, which crashes the parser",
+        name: "FC17d an array nested 20000 deep, which crashes the parser on some machines",
         changes: () => ({ "experiment/parent.js": nested("[", "]", 20_000) }),
         path: "experiment/parent.js",
+      },
+      {
+        name: "parentheses nested 600 deep inside a string, written as escapes",
+        changes: (fixtures) => ({
+          "experiment/parent.js": `${fixtures.minifiedParent};console.log("${"\\x28".repeat(600)}1${"\\x29".repeat(600)}");`,
+        }),
+        path: "experiment/parent.js",
+        alsoFails: ["not-minified"],
+      },
+      {
+        name: "a JSON file nested 600 deep",
+        changes: () => ({ "experiment/notes.json": `${"[".repeat(600)}1${"]".repeat(600)}` }),
+        path: "experiment/notes.json",
+      },
+      {
+        name: "a stylesheet nested 600 deep",
+        changes: () => ({ "action/index.css": `${"a{".repeat(600)}color:red${"}".repeat(600)}` }),
+        path: "action/index.css",
       },
       {
         name: "E07 a source map after a NUL byte on the parent script",
@@ -684,6 +765,14 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent};${minifyScript(`console.log(${JSON.stringify("using x=a();function f(b){return b}")})`)}`,
         }),
         path: "experiment/parent.js",
+      },
+      {
+        name: "E19 an unminified stylesheet laid out with U+2028, which CSS does not read as a line break",
+        changes: () => ({
+          "action/index.css":
+            "body {\u2028  margin: 0;\u2028}\u2028h1 {\u2028  font-size: 15px;\u2028}\u2028",
+        }),
+        path: "action/index.css",
       },
       {
         name: "a pretty function in the middle of the large bundle",
@@ -1389,6 +1478,11 @@ export const RULES: readonly Rule[] = [
         path: "action/index.html",
       },
       {
+        name: "E19 spaced stylesheet rules joined by U+2028",
+        changes: () => ({ "action/index.css": "body { margin: 0 }\u2028h1 { font-size: 15px }" }),
+        path: "action/index.css",
+      },
+      {
         name: "E27 stylesheet rules padded to 170-character lines",
         changes: () => ({
           "action/index.css": padLines("body{margin:0}\nh1{font-size:15px}", 170),
@@ -1688,13 +1782,6 @@ export const RULES: readonly Rule[] = [
         name: "M10 eval of 100 readable functions on one line",
         changes: (fixtures) => ({
           "experiment/parent.js": evalOf(fixtures, ONE_LINE_FUNCTION.repeat(100)),
-        }),
-        path: "experiment/parent.js",
-      },
-      {
-        name: "M17 eval of a readable function after an array nested 2000 deep",
-        changes: () => ({
-          "experiment/parent.js": `${nested("[", "]", 2000)}eval(${JSON.stringify(PRETTY_FUNCTION)});`,
         }),
         path: "experiment/parent.js",
       },

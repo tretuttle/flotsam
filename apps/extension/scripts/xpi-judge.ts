@@ -53,7 +53,11 @@ const judgeFile = (file: Unit): Extract<JudgeEvent, { event: "done" }> => {
         if (detail !== undefined) violations.push(violation(unit, rule.id, detail));
       } catch (error) {
         violations.push(
-          violation(unit, CANNOT_JUDGE, `the ${rule.id} rule threw: ${messageOf(error)}`),
+          violation(
+            unit,
+            CANNOT_JUDGE,
+            `the ${rule.id} rule could not judge it: ${messageOf(error)}`,
+          ),
         );
       }
     }
@@ -99,6 +103,8 @@ if (import.meta.main) {
     const file = files[index];
     if (file === undefined) break;
     emit({ event: "start", index, path: file.path });
+    // Lets a test prove the crash backstop without depending on where a native stack runs out.
+    if (process.env.XPI_JUDGE_ABORT_ON === file.path) process.abort();
     let done: Extract<JudgeEvent, { event: "done" }>;
     try {
       done = { ...judgeFile(file), index };

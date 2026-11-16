@@ -40,12 +40,16 @@ export const checkXpi = (xpi: string, timeoutMs: number): Report => {
   const violations: Violation[] = [];
   let after = -1;
   for (;;) {
-    const run = NodeChildProcess.spawnSync(process.execPath, [judgeScript, xpi, String(after)], {
-      encoding: "utf8",
-      timeout: timeoutMs,
-      killSignal: "SIGKILL",
-      maxBuffer: 1 << 30,
-    });
+    const run = NodeChildProcess.spawnSync(
+      process.execPath,
+      [...process.execArgv, judgeScript, xpi, String(after)],
+      {
+        encoding: "utf8",
+        timeout: timeoutMs,
+        killSignal: "SIGKILL",
+        maxBuffer: 1 << 30,
+      },
+    );
     let current: { readonly index: number; readonly path: string } | undefined;
     let finished = false;
     for (const event of (run.stdout ?? "").split("\n").filter(Boolean).map(parseEvent)) {
