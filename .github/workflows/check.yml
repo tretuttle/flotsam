@@ -44,6 +44,9 @@ jobs:
       - name: Pack extension
         run: vp run @har-anytime/extension#pack
 
+      - name: Check XPI is minified production output
+        run: vp run @har-anytime/extension#check:xpi
+
       - name: Test XPI archive
         run: unzip -t apps/extension/dist/har-anytime-*.xpi
 

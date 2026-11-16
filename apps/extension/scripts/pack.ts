@@ -1,9 +1,8 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { zipSync, type Zippable } from "fflate";
-import { extensionRoot, readManifest } from "./manifest.ts";
+import { buildDir, readManifest, xpiPath } from "./manifest.ts";
 
-const buildDir = NodePath.join(extensionRoot, "dist", "firefox");
 const { version } = readManifest(NodePath.join(buildDir, "manifest.json"));
 
 // A fixed timestamp keeps the archive byte-identical for identical build output. ZIP stores local time,
@@ -21,6 +20,6 @@ const files: Zippable = Object.fromEntries(
   names.map((name) => [name, [NodeFS.readFileSync(NodePath.join(buildDir, name)), { mtime }]]),
 );
 
-const xpi = NodePath.join(extensionRoot, "dist", `har-anytime-${version}.xpi`);
+const xpi = xpiPath(version);
 NodeFS.writeFileSync(xpi, zipSync(files, { level: 9 }));
 console.log(`${NodePath.relative(process.cwd(), xpi)} ${NodeFS.statSync(xpi).size} bytes`);
