@@ -14,6 +14,7 @@ import {
   type EpochMs,
   type RunId,
 } from "../src/ids.ts";
+import { importMutated } from "./mutate.ts";
 
 describe("parsers reject malformed input", () => {
   it.each([
@@ -51,6 +52,23 @@ describe("parsers reject malformed input", () => {
     ["xn--bcher-kva.example", "xn--bcher-kva.example"],
     ["::1", "::1"],
     ["2001:db8::8a2e:370:7334", "2001:db8::8a2e:370:7334"],
+    ["::", "::"],
+    ["1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8"],
+    ["::ffff:192.0.2.1", "::ffff:192.0.2.1"],
+    ["64:ff9b::1:2:3:4.5.6.7", "64:ff9b::1:2:3:4.5.6.7"],
+    ["127.0.0.1:8080", null],
+    ["dead:80", null],
+    [":::", null],
+    ["127.0.0.1:80:80", null],
+    ["..:..:..", null],
+    ["1::2::3", null],
+    ["1:2:3::4:5::6:7:8", null],
+    ["1:2:3:4:5:6:7", null],
+    ["1:2:3:4:5:6:7:8:9", null],
+    ["1:2:3:4:5:6:7::8", null],
+    ["12345::1", null],
+    ["1.2.3.4::", null],
+    ["::1.2.3.256", null],
     ["", null],
     ["https://example.com/", null],
     ["example.com/path", null],
@@ -67,6 +85,19 @@ describe("parsers reject malformed input", () => {
     [42, null],
   ])("site %j parses to %j", (raw, want) => {
     expect(parseSite(raw)).toBe(want);
+  });
+
+  // Mutant M37 survived round 1: an IPv6 rule loose enough to take a host with a port.
+  it.each([
+    { id: "ipv6-any-width", from: "width === 8", to: "width <= 8" },
+    { id: "ipv6-many-compressions", from: "if (halves.length > 2) return false;", to: "" },
+    { id: "ipv6-any-tail", from: "if (ipv4 && !IPV4.test(tail)) return false;", to: "" },
+  ])("planted $id accepts a host that is not an address", async (m) => {
+    const mutated = await importMutated<{ parseSite: typeof parseSite }>("ids.ts", m);
+    const accepted = ["127.0.0.1:8080", "dead:80", "1:2:3::4:5::6:7:8", "::1.2.3.256"].filter(
+      (host) => mutated.parseSite(host) !== null,
+    );
+    expect(accepted).not.toEqual([]);
   });
 });
 

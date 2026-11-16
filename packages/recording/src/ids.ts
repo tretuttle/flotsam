@@ -54,7 +54,9 @@ const RUN_PATTERN = /^[0-9a-z]{1,13}$/;
 const CHANNEL_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
 const DNS_NAME =
   /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*$/;
-const IPV6 = /^[0-9a-f:.]{2,45}$/;
+const HEX_GROUP = /^[0-9a-f]{1,4}$/;
+const IPV4 =
+  /^(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$/;
 const MAX_HOST_LENGTH = 253;
 
 export function toMinute(at: EpochMs): Minute {
@@ -67,16 +69,31 @@ export function addMinutes(from: Minute, minutes: number): Minute {
 }
 
 /**
- * An ASCII host as Gecko reports it (IDNs arrive as punycode), lowercased. IPv6 hosts come without brackets and
- * need at least two colons. Anything else, such as a URL, a path or an empty string, is rejected.
+ * RFC 4291 text form: eight hex groups, or fewer around one `::`, where a dotted IPv4 address may stand for the last
+ * two. So `host:port`, `:::` and a second `::` are refused.
+ */
+function isIpv6(host: string): boolean {
+  const halves = host.split("::");
+  if (halves.length > 2) return false;
+  const groups = halves.map((half) => (half === "" ? [] : half.split(":")));
+  const tail = groups.at(-1)?.at(-1);
+  const ipv4 = tail !== undefined && tail.includes(".");
+  if (ipv4 && !IPV4.test(tail)) return false;
+  const hex = groups.flat().slice(0, ipv4 ? -1 : undefined);
+  if (!hex.every((g) => HEX_GROUP.test(g))) return false;
+  const width = hex.length + (ipv4 ? 2 : 0);
+  return halves.length === 2 ? width <= 7 : width === 8;
+}
+
+/**
+ * An ASCII host as Gecko reports it (IDNs arrive as punycode), lowercased. IPv6 hosts come without brackets. Anything
+ * else, such as a URL, a path, a port or an empty string, is rejected.
  */
 export function parseSite(raw: unknown): Site | null {
   if (typeof raw !== "string") return null;
   const host = raw.toLowerCase();
   if (host.length === 0 || host.length > MAX_HOST_LENGTH) return null;
-  if (DNS_NAME.test(host)) return host as Site;
-  if (IPV6.test(host) && host.split(":").length >= 3) return host as Site;
-  return null;
+  return DNS_NAME.test(host) || isIpv6(host) ? (host as Site) : null;
 }
 
 /** Integers 0 to 2^31-1. Rejects negatives, fractions, NaN, strings and numbers above the tab id range. */

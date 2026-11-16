@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ByteCount, Site } from "../src/ids.ts";
+import type * as routes from "../src/routes.ts";
 import {
   BODY_ROUTES,
   chooseRoute,
@@ -14,6 +15,7 @@ import {
   type GateId,
   type RouteFacts,
 } from "../src/routes.ts";
+import { importMutated } from "./mutate.ts";
 
 const MiB = 1_048_576;
 const compiled = compileRoutes({
@@ -100,6 +102,17 @@ const CATALOGUE: readonly (readonly [string, RouteFacts, BodyRouteId])[] = [
     head({ mimeType: "video/mp4", contentLength: len(16_384), status: 206 }),
     "media-details",
   ],
+  [
+    "audio while media is off",
+    head({ mimeType: "audio/ogg", contentLength: len(4096) }),
+    "media-details",
+  ],
+  ["205 Reset Content", head({ status: 205 }), "no-body"],
+  [
+    "an MJPEG camera over multipart/x-mixed-replace",
+    head({ mimeType: "multipart/x-mixed-replace" }),
+    "streaming",
+  ],
   ["1 byte under the cutoff", head({ contentLength: len(MiB - 1) }), "small"],
   ["at the cutoff", head({ contentLength: len(MiB) }), "large-or-unknown"],
 ];
@@ -131,6 +144,19 @@ describe("BODY_ROUTES", () => {
         ([label]) => label,
       ),
     ).toContain("argon 2: 302 with Location and a body");
+  });
+
+  // Mutants M06, M07 and M08 that survived round 1's tests (verify/pr-8.md).
+  it.each([
+    { id: "media-ignores-audio", from: 'f.mimeType?.startsWith("audio/") === true || ', to: "" },
+    { id: "no-body-ignores-205", from: " ||\n      f.status === 205", to: "" },
+    { id: "streaming-ignores-multipart", from: ', "multipart/x-mixed-replace"', to: "" },
+  ])("planted $id misroutes a catalogue head", async (m) => {
+    const mutated = await importMutated<typeof routes>("routes.ts", m);
+    const misrouted = CATALOGUE.filter(
+      ([, facts, want]) => mutated.chooseRoute(compiled, facts).id !== want,
+    );
+    expect(misrouted.length).toBe(1);
   });
 
   it.each(BODY_ROUTES.map((r) => r.id))("planted: without row %s some head is misrouted", (id) => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { parseSite, type ExchangeId, type RunId, type Site } from "../src/ids.ts";
+import type * as layout from "../src/layout.ts";
 import {
   archiveDirName,
   ARCHIVE_ROOTS,
@@ -22,6 +23,7 @@ import {
   siteDirName,
   type ForbiddenRoots,
 } from "../src/layout.ts";
+import { importMutated } from "./mutate.ts";
 
 const dirKeys: Record<string, string> = {
   Home: "/home/u",
@@ -79,7 +81,7 @@ describe("guardFolder", () => {
     profile: "/home/u/.zen/abc.default",
     greDir: "/opt/zen",
     appDir: "/opt/zen/browser",
-    substitutions: ["/home/u/.zen/abc.default/chrome", ""],
+    substitutions: ["/home/u/.zen/abc.default/chrome", "", "/usr/lib/zen-devtools"],
   };
   const win: ForbiddenRoots = {
     profile: "C:\\Users\\u\\AppData\\Roaming\\zen\\Profiles\\abc.default",
@@ -200,8 +202,26 @@ describe("guardFolder", () => {
         },
       },
     ],
+    [
+      "a resource:// substitution outside the profile and the install",
+      "/usr/lib/zen-devtools/exports",
+      "linux",
+      linux,
+      { ok: false, refusal: { kind: "inside", forbidden: "/usr/lib/zen-devtools" } },
+    ],
   ] as const)("%s", (_label, candidate, platform, forbidden, want) => {
     expect(guardFolder(candidate, forbidden, platform)).toEqual(want);
+  });
+
+  it("planted: without the substitutions, a folder under one is let through (mutant M34)", async () => {
+    const mutated = await importMutated<typeof layout>("layout.ts", {
+      id: "guard-ignores-substitutions",
+      from: "    ...forbidden.substitutions,\n",
+      to: "",
+    });
+    expect(mutated.guardFolder("/usr/lib/zen-devtools/exports", linux, "linux")).toMatchObject({
+      ok: true,
+    });
   });
 
   it("knows the AutoConfig substitution the user's profile maps", () => {
