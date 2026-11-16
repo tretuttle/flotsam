@@ -3,7 +3,6 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { extensionRoot } from "./manifest.ts";
-import { MINIFIED } from "./minify.ts";
 
 export const LIGHT_BAR = "#004ECB";
 export const LIGHT_TRAY = "#01662D";
@@ -345,12 +344,10 @@ export const generateToolbarSvg = (): string => {
     )
     .join("");
   const tray = `<path class="tray" d="${MASTER.tray}" fill="none" stroke="${LIGHT_TRAY}" stroke-width="${MASTER.sw}" stroke-linecap="round" stroke-linejoin="round"/>`;
-  // The stylesheet step minifies it, as the build does every stylesheet, so check-xpi finds nothing left to remove.
-  const style = `<style>${MINIFIED.style.run(
-    `.off{display:none}.bar{fill:${LIGHT_BAR}}.tray{stroke:${LIGHT_TRAY}}` +
-      `${widthRules()}` +
-      `@media (prefers-color-scheme:dark){.bar{fill:${DARK_BAR}}.tray{stroke:${DARK_TRAY}}}`,
-  )}</style>`;
+  const style =
+    `<style>.off{display:none}.bar{fill:${LIGHT_BAR}}.tray{stroke:${LIGHT_TRAY}}` +
+    `${widthRules()}` +
+    `@media (prefers-color-scheme:dark){.bar{fill:${DARK_BAR}}.tray{stroke:${DARK_TRAY}}}</style>`;
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="One-Click HAR">` +
     `${style}<g class="m">${bars}${tray}</g>${GRIDS.map(gridSvg).join("")}</svg>`

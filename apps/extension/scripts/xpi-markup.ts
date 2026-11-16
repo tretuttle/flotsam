@@ -1,18 +1,17 @@
-// Reads a page or a vector with parse5, which implements the HTML standard's tokenizer and tree builder, so the
-// check sees the same elements, attributes and decoded character references a browser does.
-import {
-  defaultTreeAdapter as tree,
-  parse,
-  parseFragment,
-  type DefaultTreeAdapterTypes,
-} from "parse5";
+// Reads a page with parse5, which implements the HTML standard's tokenizer and tree builder, and a vector with saxes,
+// a conforming XML 1.0 parser, because a browser loads an SVG file as XML. Either way the check sees the elements,
+// attributes and decoded references the browser does, and a vector that is not well-formed XML cannot be read.
+import { defaultTreeAdapter as tree, parse, type DefaultTreeAdapterTypes, type html } from "parse5";
+import { SaxesParser } from "saxes";
 
 type Node = DefaultTreeAdapterTypes.Node;
 type Element = DefaultTreeAdapterTypes.Element;
+type ParentNode = DefaultTreeAdapterTypes.ParentNode;
 
 export type BodyKind =
   | "script"
   | "style"
+  | "vector-style"
   | "style-attribute"
   | "markup"
   | "vector"
@@ -94,6 +93,29 @@ const dataUrlBody = (url: URL): { readonly mediaType: string; readonly bytes: Ui
 const textOf = (element: Element): string =>
   element.childNodes.map((child) => (tree.isTextNode(child) ? child.value : "")).join("");
 
+/** Parses XML into the tree parse5 builds, so one walk reads pages and vectors. Throws where it is not well-formed. */
+const parseXml = (text: string): DefaultTreeAdapterTypes.DocumentFragment => {
+  const root = tree.createDocumentFragment();
+  const open: ParentNode[] = [root];
+  const parent = (): ParentNode => open.at(-1) ?? root;
+  const parser = new SaxesParser({ xmlns: true, position: true });
+  parser.on("opentag", (tag) => {
+    const element = tree.createElement(
+      tag.local,
+      tag.uri as html.NS,
+      Object.values(tag.attributes).map(({ local, value }) => ({ name: local, value })),
+    );
+    tree.appendChild(parent(), element);
+    open.push(element);
+  });
+  parser.on("closetag", () => open.pop());
+  parser.on("text", (data) => tree.insertText(parent(), data));
+  parser.on("cdata", (data) => tree.insertText(parent(), data));
+  parser.on("comment", (data) => tree.appendChild(parent(), tree.createCommentNode(data)));
+  parser.write(text).close();
+  return root;
+};
+
 export const readMarkup = (text: string, form: "page" | "vector"): Markup => {
   const comments: string[] = [];
   const texts: string[] = [];
@@ -130,11 +152,11 @@ export const readMarkup = (text: string, form: "page" | "vector"): Markup => {
       }
     }
     if (tag === "script" && !hasSrc) carry("<script>", "script", textOf(element));
-    if (tag === "style") carry("<style>", "style", textOf(element));
+    if (tag === "style")
+      carry("<style>", form === "vector" ? "vector-style" : "style", textOf(element));
   };
 
-  const root =
-    form === "page" ? parse(text, { sourceCodeLocationInfo: true }) : parseFragment(text);
+  const root = form === "page" ? parse(text, { sourceCodeLocationInfo: true }) : parseXml(text);
   const pending: Node[] = [root];
   while (pending.length > 0) {
     const node = pending.pop();

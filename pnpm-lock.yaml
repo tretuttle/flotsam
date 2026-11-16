@@ -298,6 +298,9 @@ importers:
       prismjs:
         specifier: 1.29.0
         version: 1.29.0
+      saxes:
+        specifier: 6.0.0
+        version: 6.0.0
       sql.js:
         specifier: 1.12.0
         version: 1.12.0
@@ -3862,6 +3865,10 @@ packages:
     resolution: {integrity: sha512-42tBVwLWnaQvW5zc4HbZrTuWccECCZfBi92FDuwtqxasH+JbPB3/FOKb1m222K42R4WxuxzzMsTswfzgtSu64Q==}
     engines: {node: '>=11.0.0'}
 
+  saxes@6.0.0:
+    resolution: {integrity: sha512-xAg7SOnEhrm5zI3puOOKyy1OMcMlIJZYNJY7xLBwSze0UjhPLnWfj2GF2EpT0jmzaJKIWKHLsaSSajf35bcYnA==}
+    engines: {node: '>=v12.22.7'}
+
   scheduler@0.28.0:
     resolution: {integrity: sha512-juorfCmIkIw8tT+p5BXSm6PJjQF/ycEYmKyzURCIt/RaZIhL+PulbQ9Yu2z1HdOJDdqDTlxA1+xKBmHXJsczAw==}
 
@@ -4274,6 +4281,9 @@ packages:
   wsl-support@0.1.0:
     resolution: {integrity: sha512-gx7o5kHovG/4yeDVJZSPMArSz3rEARgwfgxF7JKvY3EI3p3wKBy+B0BMTwH5hHUl+ovCOVvktpYbYSJGHKtayw==}
     engines: {node: '>=18'}
+
+  xmlchars@2.2.0:
+    resolution: {integrity: sha512-JZnDKK8B0RCDw84FNdDAIpZK+JuJw+s7Lz8nksI7SIuU3UXJJslUthsi+uWBUYOwPFwW7W7PRLRfUKpxjtjFCw==}
 
   xtend@4.0.2:
     resolution: {integrity: sha512-LKYU1iAXJXUgAXn9URjiu+MWhyUXHsvfp7mcuYm9dSUKK0/CjtrUwFAxD82/mCWbtLsGjFIad0wIsod4zrTAEQ==}
@@ -7650,6 +7660,10 @@ snapshots:
   sax@1.6.1:
     optional: true
 
+  saxes@6.0.0:
+    dependencies:
+      xmlchars: 2.2.0
+
   scheduler@0.28.0: {}
 
   schema-utils@4.8.3(webpack@5.112.2(lightningcss@1.33.0)(postcss@8.5.23)(uglify-js@3.19.3)):
@@ -8102,6 +8116,8 @@ snapshots:
   ws@8.23.0: {}
 
   wsl-support@0.1.0: {}
+
+  xmlchars@2.2.0: {}
 
   xtend@4.0.2: {}
 

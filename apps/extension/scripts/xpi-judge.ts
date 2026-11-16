@@ -4,7 +4,7 @@
 import * as NodeFS from "node:fs";
 import { unzipSync } from "fflate";
 import { CANNOT_JUDGE } from "./check-xpi.ts";
-import { PRODUCERS, RULES, carriedUnits, kindOf, readUnit, type Unit } from "./xpi-rules.ts";
+import { KINDS, RULES, carriedUnits, kindOf, readUnit, type Unit } from "./xpi-rules.ts";
 
 export interface Violation {
   readonly path: string;
@@ -61,7 +61,7 @@ const judgeFile = (file: Unit): Extract<JudgeEvent, { event: "done" }> => {
         );
       }
     }
-    const { step } = PRODUCERS[unit.kind ?? "source"];
+    const { step } = KINDS[unit.kind ?? "source"];
     if (unit === file && step !== undefined && "facts" in read && "saved" in read.facts)
       measurement = { bytes: unit.bytes.length, saved: read.facts.saved, margin: step.margin };
   }

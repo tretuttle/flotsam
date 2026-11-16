@@ -11,62 +11,10 @@ import { lineOf, parseScript, type ScriptFacts } from "./xpi-source.ts";
 /** A body's kind, or for a file in the archive, the build step it comes from. A carried `script` is inline code. */
 export type Kind = BodyKind | "page-script" | "parent-script" | "notice" | "source-map" | "source";
 
-// The only file types an XPI may ship. Matched by suffix, first hit wins. A path that matches none is a violation.
-const KIND_BY_SUFFIX: ReadonlyArray<readonly [string, Kind]> = [
-  [".js", "page-script"],
-  [".css", "style"],
-  [".svg", "vector"],
-  [".html", "markup"],
-  [".json", "data"],
-  [".png", "raster"],
-  [".LICENSE.txt", "notice"],
-  [".map", "source-map"],
-  ...[".ts", ".tsx", ".mts", ".cts", ".jsx", ".vue", ".svelte", ".scss", ".sass", ".less"].map(
-    (suffix) => [suffix, "source"] as const,
-  ),
-];
-
 // build-experiment.ts writes the parent script where the manifest names it; rspack writes every other script.
 const PARENT_SCRIPT = Object.values(readManifest().experiment_apis).map(({ parent }) =>
   parent.script.replace(/^\//, ""),
 );
-
-export const kindOf = (path: string): Kind | undefined =>
-  PARENT_SCRIPT.includes(path)
-    ? "parent-script"
-    : KIND_BY_SUFFIX.find(([suffix]) => path.endsWith(suffix))?.[1];
-
-interface Producer {
-  readonly builtBy: string;
-  /** The step that minified it, which the check runs again. */
-  readonly step?: Step;
-}
-
-/** Which build step writes each kind of file: the minified kinds are minify.ts's table, the rest only copied. */
-export const PRODUCERS: Readonly<Record<Kind, Producer>> = {
-  "page-script": { builtBy: MINIFIED["page-script"].builtBy, step: MINIFIED["page-script"] },
-  "parent-script": { builtBy: MINIFIED["parent-script"].builtBy, step: MINIFIED["parent-script"] },
-  script: {
-    builtBy: "nothing; the build writes no inline script, so one is judged like the parent script",
-    step: MINIFIED["parent-script"],
-  },
-  style: { builtBy: MINIFIED.style.builtBy, step: MINIFIED.style },
-  "style-attribute": {
-    builtBy: "nothing; the build writes no style attribute, so one is judged like a stylesheet",
-    step: { ...MINIFIED.style, run: minifyStyleAttribute },
-  },
-  vector: { builtBy: "extension.js, which copies src/icons as written, on one line" },
-  markup: { builtBy: "extension.js, which writes each page shell and loads every script by src" },
-  data: {
-    builtBy: "JSON.stringify: the manifest by extension.js, the schema by build-experiment.ts",
-  },
-  raster: { builtBy: "write-icons.ts, which renders the SVG master with resvg" },
-  notice: {
-    builtBy: "SwcJsMinimizerRspackPlugin, which extracts legal comments into <chunk>.LICENSE.txt",
-  },
-  "source-map": { builtBy: "nothing; the build writes no source map" },
-  source: { builtBy: "nothing; the build ships no source file" },
-};
 
 /** A file in the archive, or a body carried inside one (an inline `<script>`, a `srcdoc` page). */
 export interface Unit {
@@ -141,7 +89,7 @@ const messageOf = (error: unknown): string => {
 
 /** Runs the producer's step. A file it cannot read, or one it reduces to nothing, is not minified output. */
 const measure = (unit: Unit, text: string): number => {
-  const { step } = PRODUCERS[unit.kind ?? "source"];
+  const { step } = KINDS[unit.kind ?? "source"];
   if (step === undefined) throw new Error(`no minifier for ${String(unit.kind)}`);
   let minified: string;
   try {
@@ -154,52 +102,180 @@ const measure = (unit: Unit, text: string): number => {
   return text.length - minified.length;
 };
 
-/** Reads a unit into facts, or throws `Unreadable` with the reason it cannot be judged. */
-const read = (unit: Unit): Facts => {
-  if (unit.kind === "raster") return { form: "raster" };
-  let text: string;
+const textIn = (unit: Unit): string => {
   try {
-    text = utf8.decode(unit.bytes);
+    return utf8.decode(unit.bytes);
   } catch {
     throw new Unreadable("is not valid UTF-8");
   }
-  if (
-    unit.kind === "page-script" ||
-    unit.kind === "parent-script" ||
-    unit.kind === "script" ||
-    unit.kind === "style" ||
-    unit.kind === "style-attribute" ||
-    unit.kind === "data"
-  )
-    ensureShallow(text, "it");
-  switch (unit.kind) {
-    case "page-script":
-    case "parent-script":
-    case "script": {
-      const script = parseScript(text);
-      const [error] = script.errors;
-      if (error !== undefined) throw new Unreadable(`does not parse: ${error}`);
-      return { form: "script", text, script, saved: measure(unit, text) };
+};
+
+const decodeScript = (unit: Unit): Facts => {
+  const text = textIn(unit);
+  ensureShallow(text, "it");
+  const script = parseScript(text);
+  const [error] = script.errors;
+  if (error !== undefined) throw new Unreadable(`does not parse: ${error}`);
+  return { form: "script", text, script, saved: measure(unit, text) };
+};
+
+const decodeStyle = (unit: Unit): Facts => {
+  const text = textIn(unit);
+  ensureShallow(text, "it");
+  return { form: "style", text, saved: measure(unit, text) };
+};
+
+const decodeMarkup =
+  (form: "page" | "vector") =>
+  (unit: Unit): Facts => {
+    const text = textIn(unit);
+    let markup: Markup;
+    try {
+      markup = readMarkup(text, form);
+    } catch (error) {
+      throw new Unreadable(`is not well-formed XML: ${messageOf(error)}`);
     }
-    case "style":
-    case "style-attribute":
-      return { form: "style", text, saved: measure(unit, text) };
-    case "markup":
-    case "vector":
-      return {
-        form: "markup",
-        text,
-        markup: readMarkup(text, unit.kind === "markup" ? "page" : "vector"),
-      };
-    case "data":
-      try {
-        return { form: "data", text, value: JSON.parse(text) };
-      } catch (error) {
-        throw new Unreadable(`is not valid JSON: ${messageOf(error)}`);
-      }
-    default:
-      return { form: "text", text };
+    if (unit.where === undefined && !markup.hasRoot)
+      throw new Unreadable(
+        form === "page"
+          ? "is not an HTML page: it has no doctype and no html tag"
+          : "is not an SVG image: it parses to no svg element",
+      );
+    return { form: "markup", text, markup };
+  };
+
+const decodeData = (unit: Unit): Facts => {
+  const text = textIn(unit);
+  ensureShallow(text, "it");
+  try {
+    return { form: "data", text, value: JSON.parse(text) };
+  } catch (error) {
+    throw new Unreadable(`is not valid JSON: ${messageOf(error)}`);
   }
+};
+
+const decodeRaster = (unit: Unit): Facts => {
+  const problem = pngProblem(unit.bytes);
+  if (problem !== undefined) throw new Unreadable(`is not a PNG of image data alone: ${problem}`);
+  return { form: "raster" };
+};
+
+const decodeText = (unit: Unit): Facts => ({ form: "text", text: textIn(unit) });
+
+interface KindRow {
+  /** What a file of this kind ends in. A kind with none is found by path, or is only ever carried inside a file. */
+  readonly suffixes: readonly string[];
+  readonly builtBy: string;
+  /** The step that minified it, which the check runs again. */
+  readonly step?: Step;
+  readonly decodedBy: string;
+  /** The facts in the unit, or `Unreadable` with why the decoder rejects it. */
+  readonly decode: (unit: Unit) => Facts;
+}
+
+/**
+ * Every kind of file an XPI may ship: the suffixes it ends in, the build step that writes it, and the parser that
+ * decodes it. A path whose suffix no row names cannot be decoded, and fails cannot-judge like any file a parser rejects.
+ */
+export const KINDS: Readonly<Record<Kind, KindRow>> = {
+  "page-script": {
+    suffixes: [".js"],
+    builtBy: MINIFIED["page-script"].builtBy,
+    step: MINIFIED["page-script"],
+    decodedBy: "oxc-parser",
+    decode: decodeScript,
+  },
+  "parent-script": {
+    suffixes: [],
+    builtBy: MINIFIED["parent-script"].builtBy,
+    step: MINIFIED["parent-script"],
+    decodedBy: "oxc-parser",
+    decode: decodeScript,
+  },
+  script: {
+    suffixes: [],
+    builtBy: "nothing; the build writes no inline script, so one is judged like the parent script",
+    step: MINIFIED["parent-script"],
+    decodedBy: "oxc-parser",
+    decode: decodeScript,
+  },
+  style: {
+    suffixes: [".css"],
+    builtBy: MINIFIED.style.builtBy,
+    step: MINIFIED.style,
+    decodedBy: "lightningcss",
+    decode: decodeStyle,
+  },
+  "vector-style": {
+    suffixes: [],
+    builtBy: MINIFIED["vector-style"].builtBy,
+    step: MINIFIED["vector-style"],
+    decodedBy: "lightningcss",
+    decode: decodeStyle,
+  },
+  "style-attribute": {
+    suffixes: [],
+    builtBy: "nothing; the build writes no style attribute, so one is judged like a stylesheet",
+    step: { ...MINIFIED.style, run: minifyStyleAttribute },
+    decodedBy: "lightningcss, as a declaration list",
+    decode: decodeStyle,
+  },
+  vector: {
+    suffixes: [".svg"],
+    builtBy: "extension.js, which copies src/icons as written, on one line",
+    decodedBy: "saxes, an XML 1.0 parser, then an svg root element",
+    decode: decodeMarkup("vector"),
+  },
+  markup: {
+    suffixes: [".html"],
+    builtBy: "extension.js, which writes each page shell and loads every script by src",
+    decodedBy: "parse5, then a doctype or an html tag",
+    decode: decodeMarkup("page"),
+  },
+  data: {
+    suffixes: [".json"],
+    builtBy: "JSON.stringify: the manifest by extension.js, the schema by build-experiment.ts",
+    decodedBy: "JSON.parse",
+    decode: decodeData,
+  },
+  raster: {
+    suffixes: [".png"],
+    builtBy: "write-icons.ts, which renders the SVG master with resvg",
+    decodedBy: "PNG chunks, each with a valid checksum, image chunks only, ending at IEND",
+    decode: decodeRaster,
+  },
+  notice: {
+    suffixes: [".LICENSE.txt"],
+    builtBy: "SwcJsMinimizerRspackPlugin, which extracts legal comments into <chunk>.LICENSE.txt",
+    decodedBy: "UTF-8",
+    decode: decodeText,
+  },
+  "source-map": {
+    suffixes: [".map"],
+    builtBy: "nothing; the build writes no source map",
+    decodedBy: "UTF-8",
+    decode: decodeText,
+  },
+  source: {
+    suffixes: [".ts", ".tsx", ".mts", ".cts", ".jsx", ".vue", ".svelte", ".scss", ".sass", ".less"],
+    builtBy: "nothing; the build ships no source file",
+    decodedBy: "UTF-8",
+    decode: decodeText,
+  },
+};
+
+export const kindOf = (path: string): Kind | undefined =>
+  PARENT_SCRIPT.includes(path)
+    ? "parent-script"
+    : (Object.entries(KINDS) as Array<[Kind, KindRow]>).find(([, row]) =>
+        row.suffixes.some((suffix) => path.endsWith(suffix)),
+      )?.[0];
+
+/** Reads a unit into facts, or throws `Unreadable` with the reason it cannot be judged. */
+const read = (unit: Unit): Facts => {
+  if (unit.kind === undefined)
+    throw new Unreadable("ends in no suffix of KINDS, so no parser in the check can read it");
+  return KINDS[unit.kind].decode(unit);
 };
 
 export const readUnit = (unit: Unit): Read => {
@@ -419,6 +495,13 @@ const PRETTY_FUNCTION = `function collectHeaders(entries) {
 /** The same function on one line: no line break to find, so only re-minifying can tell it is not minified. */
 const ONE_LINE_FUNCTION =
   "function collectHeaders(entries) { const result = []; for (const entry of entries) { if (entry.name === undefined) { continue; } result.push({ name: entry.name, value: String(entry.value) }); } return result; }";
+
+/** The toolbar icon with its style run through the stylesheet step, which is how 8f7feff built it. */
+const rangeSyntaxIcon = (fixtures: Fixtures): string =>
+  fixtures.toolbarSvg.replace(
+    /<style>(.*?)<\/style>/s,
+    (_, css: string) => `<style>${MINIFIED.style.run(css)}</style>`,
+  );
 
 const inPage = (body: string): string => `<!DOCTYPE html><html><body>${body}</body></html>`;
 
@@ -706,6 +789,94 @@ export const RULES: readonly Rule[] = [
         },
         path: "shared/framework.js",
       },
+      {
+        name: "the toolbar icon as 8f7feff shipped it: its style minified with media ranges, a bare < in XML",
+        changes: (fixtures) => ({ "icons/toolbar.svg": rangeSyntaxIcon(fixtures) }),
+        path: "icons/toolbar.svg",
+      },
+      {
+        name: "an ampersand outside an entity in a vector",
+        changes: (fixtures) => ({
+          "icons/toolbar.svg": fixtures.toolbarSvg.replace(
+            'aria-label="One-Click HAR"',
+            'aria-label="One & Two"',
+          ),
+        }),
+        path: "icons/toolbar.svg",
+      },
+      {
+        name: "V14 a notes file",
+        changes: () => ({ "NOTES.md": "# notes\n" }),
+        path: "NOTES.md",
+      },
+      {
+        name: "N04 an unminified module with an .mjs suffix",
+        changes: (fixtures) => ({ "experiment/api.mjs": fixtures.unminifiedParent }),
+        path: "experiment/api.mjs",
+      },
+      {
+        name: "N05 an unminified script with a .cjs suffix",
+        changes: (fixtures) => ({ "experiment/api.cjs": fixtures.unminifiedParent }),
+        path: "experiment/api.cjs",
+      },
+      {
+        name: "N06 one long readable function in an .mjs file",
+        changes: () => ({
+          "experiment/api.mjs": `export function readHeaders(entries) { const result = []; for (const entry of entries) { if (entry.name !== undefined) { result.push({ name: entry.name, value: String(entry.value) }); } } return result; } export default readHeaders;`,
+        }),
+        path: "experiment/api.mjs",
+      },
+      {
+        name: "A08 a font the allowlist does not name",
+        changes: () => ({ "fonts/icon.woff2": "wOF2" }),
+        path: "fonts/icon.woff2",
+      },
+      {
+        name: "E24 a WebAssembly module saved with a .wasm suffix",
+        changes: () => ({ "experiment/engine.wasm": WASM_MODULE }),
+        path: "experiment/engine.wasm",
+        alsoFails: ["foreign-content"],
+      },
+      {
+        name: "E25 a nested XPI saved with an .xpi suffix",
+        changes: () => ({ "vendor/inner.xpi": ZIP_ARCHIVE }),
+        path: "vendor/inner.xpi",
+        alsoFails: ["foreign-content"],
+      },
+      {
+        name: "a script named like an icon",
+        changes: (fixtures) => ({ "icons/16.png": fixtures.unminifiedParent }),
+        path: "icons/16.png",
+      },
+      {
+        name: "E12 a source map appended after PNG image data",
+        changes: (fixtures) => ({
+          "icons/16.png": new Uint8Array([...fixtures.png, ...encode(SOURCE_MAP)]),
+        }),
+        path: "icons/16.png",
+      },
+      {
+        name: "M19 a source map with its version key last, appended after PNG image data",
+        changes: (fixtures) => ({
+          "icons/16.png": new Uint8Array([...fixtures.png, ...encode(SOURCE_MAP_VERSION_LAST)]),
+        }),
+        path: "icons/16.png",
+      },
+      {
+        name: "a source map in a PNG text chunk",
+        changes: (fixtures) => ({ "icons/16.png": withTextChunk(fixtures.png, SOURCE_MAP) }),
+        path: "icons/16.png",
+      },
+      {
+        name: "a script named as a vector image",
+        changes: (fixtures) => ({ "icons/icon.svg": fixtures.minifiedParent }),
+        path: "icons/icon.svg",
+      },
+      {
+        name: "a script named as a page",
+        changes: (fixtures) => ({ "action/index.html": fixtures.minifiedParent }),
+        path: "action/index.html",
+      },
     ],
   },
   {
@@ -758,56 +929,6 @@ export const RULES: readonly Rule[] = [
     ],
   },
   {
-    id: "unknown-file-type",
-    inspects: "path",
-    decides: "the path ends in no suffix of KIND_BY_SUFFIX, so the file's kind cannot be checked",
-    check: ({ unit }) =>
-      unit.kind === undefined
-        ? "not a file type an XPI ships; add it to KIND_BY_SUFFIX if it should"
-        : undefined,
-    plants: [
-      {
-        name: "V14 a notes file",
-        changes: () => ({ "NOTES.md": "# notes\n" }),
-        path: "NOTES.md",
-      },
-      {
-        name: "N04 an unminified module with an .mjs suffix",
-        changes: (fixtures) => ({ "experiment/api.mjs": fixtures.unminifiedParent }),
-        path: "experiment/api.mjs",
-      },
-      {
-        name: "N05 an unminified script with a .cjs suffix",
-        changes: (fixtures) => ({ "experiment/api.cjs": fixtures.unminifiedParent }),
-        path: "experiment/api.cjs",
-      },
-      {
-        name: "N06 one long readable function in an .mjs file",
-        changes: () => ({
-          "experiment/api.mjs": `export function readHeaders(entries) { const result = []; for (const entry of entries) { if (entry.name !== undefined) { result.push({ name: entry.name, value: String(entry.value) }); } } return result; } export default readHeaders;`,
-        }),
-        path: "experiment/api.mjs",
-      },
-      {
-        name: "A08 a font the allowlist does not name",
-        changes: () => ({ "fonts/icon.woff2": "wOF2" }),
-        path: "fonts/icon.woff2",
-      },
-      {
-        name: "E24 a WebAssembly module saved with a .wasm suffix",
-        changes: () => ({ "experiment/engine.wasm": WASM_MODULE }),
-        path: "experiment/engine.wasm",
-        alsoFails: ["foreign-content"],
-      },
-      {
-        name: "E25 a nested XPI saved with an .xpi suffix",
-        changes: () => ({ "vendor/inner.xpi": ZIP_ARCHIVE }),
-        path: "vendor/inner.xpi",
-        alsoFails: ["foreign-content", CANNOT_JUDGE],
-      },
-    ],
-  },
-  {
     id: "dev-only-file",
     inspects: "path",
     decides:
@@ -851,7 +972,7 @@ export const RULES: readonly Rule[] = [
           [DUPLICATE_OF("experiment/parent.js")]: fixtures.unminifiedParent,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
+        alsoFails: ["comment", "not-minified"],
       },
     ],
   },
@@ -884,83 +1005,6 @@ export const RULES: readonly Rule[] = [
         changes: (fixtures) => ({ "experiment/parent.js": fixtures.png }),
         path: "experiment/parent.js",
         alsoFails: [CANNOT_JUDGE],
-      },
-    ],
-  },
-  {
-    id: "not-a-png",
-    inspects: "contents",
-    decides:
-      "a .png is not the PNG signature followed by image chunks with valid checksums, ending at IEND",
-    check: ({ unit }) => {
-      if (unit.kind !== "raster") return undefined;
-      const problem = pngProblem(unit.bytes);
-      return problem === undefined ? undefined : `not a PNG of image data alone: ${problem}`;
-    },
-    plants: [
-      {
-        name: "a script named like an icon",
-        changes: (fixtures) => ({ "icons/16.png": fixtures.unminifiedParent }),
-        path: "icons/16.png",
-      },
-      {
-        name: "E12 a source map appended after PNG image data",
-        changes: (fixtures) => ({
-          "icons/16.png": new Uint8Array([...fixtures.png, ...encode(SOURCE_MAP)]),
-        }),
-        path: "icons/16.png",
-      },
-      {
-        name: "M19 a source map with its version key last, appended after PNG image data",
-        changes: (fixtures) => ({
-          "icons/16.png": new Uint8Array([...fixtures.png, ...encode(SOURCE_MAP_VERSION_LAST)]),
-        }),
-        path: "icons/16.png",
-      },
-      {
-        name: "a source map in a PNG text chunk",
-        changes: (fixtures) => ({ "icons/16.png": withTextChunk(fixtures.png, SOURCE_MAP) }),
-        path: "icons/16.png",
-      },
-    ],
-  },
-  {
-    id: "not-vector",
-    inspects: "contents",
-    decides: "a .svg file parses to no <svg> element",
-    check: (read) =>
-      read.unit.kind === "vector" &&
-      read.unit.where === undefined &&
-      "facts" in read &&
-      read.facts.form === "markup" &&
-      !read.facts.markup.hasRoot
-        ? "not an SVG image: it parses to no svg element"
-        : undefined,
-    plants: [
-      {
-        name: "a script named as a vector image",
-        changes: (fixtures) => ({ "icons/icon.svg": fixtures.minifiedParent }),
-        path: "icons/icon.svg",
-      },
-    ],
-  },
-  {
-    id: "not-markup",
-    inspects: "contents",
-    decides: "a .html file has no doctype and no <html> tag",
-    check: (read) =>
-      read.unit.kind === "markup" &&
-      read.unit.where === undefined &&
-      "facts" in read &&
-      read.facts.form === "markup" &&
-      !read.facts.markup.hasRoot
-        ? "not an HTML page: it has no doctype and no html tag"
-        : undefined,
-    plants: [
-      {
-        name: "a script named as a page",
-        changes: (fixtures) => ({ "action/index.html": fixtures.minifiedParent }),
-        path: "action/index.html",
       },
     ],
   },
@@ -1084,7 +1128,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}\n//# sourceMappingURL=parent.js.map\n`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
+        alsoFails: ["comment", "not-minified"],
       },
       {
         name: "N03 an inline data: source map on the minified parent script",
@@ -1092,7 +1136,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}\n//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ==\n`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
+        alsoFails: ["comment", "not-minified"],
       },
       {
         name: "E17 a sourceMappingURL hidden after a division-looking comment opener",
@@ -1100,7 +1144,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}a++/2;//# sourceMappingURL=parent.js.map`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
+        alsoFails: ["comment", "not-minified"],
       },
       {
         name: "E18 an inline data: source map hidden after a division-looking comment opener",
@@ -1108,7 +1152,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}a++/2;/*# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ== */0`,
         }),
         path: "experiment/parent.js",
-        alsoFails: ["not-minified"],
+        alsoFails: ["comment", "not-minified"],
       },
     ],
   },
@@ -1142,7 +1186,7 @@ export const RULES: readonly Rule[] = [
         name: "V15 React's development build named like the bundle",
         changes: (fixtures) => ({ "vendor/react.js": fixtures.reactDevelopment }),
         path: "vendor/react.js",
-        alsoFails: ["not-minified"],
+        alsoFails: ["comment", "not-minified"],
       },
       {
         name: "N07 React's development build renamed to a .json file",
@@ -1177,15 +1221,32 @@ export const RULES: readonly Rule[] = [
     id: "comment",
     inspects: "contents",
     decides:
-      "the HTML parser finds a comment in a page or vector, which the build writes without comments",
+      "a page, vector or script holds a comment no build step writes: every one but the page step's own pointer to <chunk>.LICENSE.txt, on the first line",
     check: (read) => {
       if (!("facts" in read)) return undefined;
-      const { facts } = read;
-      if (facts.form !== "markup") return undefined;
-      const [first] = facts.markup.comments;
+      const { facts, unit } = read;
+      if (facts.form === "markup") {
+        const [first] = facts.markup.comments;
+        return first === undefined
+          ? undefined
+          : `${plural(facts.markup.comments.length, "comment")}; the first is <!--${excerpt(first)}-->`;
+      }
+      if (facts.form !== "script") return undefined;
+      const pointer = KINDS[unit.kind ?? "source"].step?.comment?.(unit.path);
+      const stray = facts.script.comments.filter(
+        ({ start, end }) =>
+          !(
+            start === 0 &&
+            unit.where === undefined &&
+            pointer !== undefined &&
+            facts.text.slice(start, end) === pointer &&
+            facts.text[end] === "\n"
+          ),
+      );
+      const [first] = stray;
       return first === undefined
         ? undefined
-        : `${plural(facts.markup.comments.length, "comment")}; the first is <!--${excerpt(first)}-->`;
+        : `${plural(stray.length, "comment")} the build does not write; the first, at line ${lineOf(facts.text, first.start)}, is ${excerpt(facts.text.slice(first.start, first.end))}`;
     },
     plants: [
       {
@@ -1194,6 +1255,35 @@ export const RULES: readonly Rule[] = [
           "icons/toolbar.svg": fixtures.toolbarSvg.replace("<rect", "<!-- bars --><rect"),
         }),
         path: "icons/toolbar.svg",
+      },
+      {
+        name: "a one byte legal comment in a page script",
+        changes: (fixtures) => ({ "shared/payload.js": `/*!a*/${fixtures.minifiedParent}` }),
+        path: "shared/payload.js",
+      },
+      {
+        name: "a function in a 28 byte legal comment, as rspack keeps it with extractComments off",
+        changes: () => ({
+          "shared/main.js": '(()=>{"use strict";console.log(/*! function f(){return 1} */"x")})();',
+        }),
+        path: "shared/main.js",
+      },
+      {
+        name: "the page pointer naming another chunk's notice",
+        changes: (fixtures) => ({
+          "shared/framework.js": fixtures.framework.replace(
+            "framework.js.LICENSE.txt",
+            "vendor.js.LICENSE.txt",
+          ),
+        }),
+        path: "shared/framework.js",
+      },
+      {
+        name: "the page pointer below the first line",
+        changes: () => ({
+          "shared/payload.js": `console.log(1);\n/*! LICENSE: payload.js.LICENSE.txt */\n`,
+        }),
+        path: "shared/payload.js",
       },
       {
         name: "A13 an HTML comment holding readable source 30 times",
@@ -1216,7 +1306,7 @@ export const RULES: readonly Rule[] = [
           : undefined;
       }
       if (facts.form !== "script" && facts.form !== "style") return undefined;
-      const margin = PRODUCERS[unit.kind ?? "source"].step?.margin ?? 0;
+      const margin = KINDS[unit.kind ?? "source"].step?.margin ?? 0;
       return facts.saved > margin
         ? `the build's minifier removes ${facts.saved} more bytes (${((facts.saved / facts.text.length) * 100).toFixed(1)}%); minified output gives up at most ${margin}`
         : undefined;
@@ -1228,6 +1318,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}\n// tidy this up later\n`,
         }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "E16 a readable function in a comment after an increment and a division",
@@ -1235,11 +1326,13 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `${fixtures.minifiedParent}a++/2;/* function readHeaders(entries) { return entries.map((entry) => entry.name); } */0`,
         }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "V01 an unminified parent script",
         changes: (fixtures) => ({ "experiment/parent.js": fixtures.unminifiedParent }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "N01 a readable function inside a one-line /*! comment on the parent, whose step drops every comment",
@@ -1247,6 +1340,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/*! function readHeaders(entries) { return entries.map((entry) => entry.name); } */\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "a /*! comment of prose over 400 characters on the parent",
@@ -1254,6 +1348,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/*! ${"This notice is far longer than a pointer to a license file needs to be. ".repeat(8)}*/\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "a @license comment that assigns a value on the parent",
@@ -1261,6 +1356,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/** @license token = readHeaders(entries) */\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "E20 a legal comment of calls and comparisons on the parent",
@@ -1268,6 +1364,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/*! ${"readHeaders(entries)===entries.length&&check(entries)===true&&".repeat(5)}*/\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "the page build's license pointer on the parent, which the parent step never writes",
@@ -1275,6 +1372,7 @@ export const RULES: readonly Rule[] = [
           "experiment/parent.js": `/*! LICENSE: parent.js.LICENSE.txt */\n${fixtures.minifiedParent}`,
         }),
         path: "experiment/parent.js",
+        alsoFails: ["comment"],
       },
       {
         name: "a readable function in a legal comment beside the page pointer, which the page step moves to the notice",
@@ -1285,6 +1383,7 @@ export const RULES: readonly Rule[] = [
           ),
         }),
         path: "shared/framework.js",
+        alsoFails: ["comment"],
       },
       {
         name: "a page script that kept its legal comment, as rspack writes with extractComments off and comments all",
@@ -1292,6 +1391,7 @@ export const RULES: readonly Rule[] = [
           "shared/main.js": `console.log(/*! @license MIT\n${PRETTY_FUNCTION}${"Permission is hereby granted, free of charge, to any person obtaining a copy. ".repeat(10)}*/"x");`,
         }),
         path: "shared/main.js",
+        alsoFails: ["comment"],
       },
       {
         name: "a React @license comment kept in a page script, which the page step moves to the notice",
@@ -1299,6 +1399,12 @@ export const RULES: readonly Rule[] = [
           "shared/payload.js": `/**\n * @license React v19.3.1\n * react.production.js\n *\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n *\n * This source code is licensed under the MIT license found in the\n * LICENSE file in the root directory of this source tree.\n */\n${fixtures.minifiedParent}`,
         }),
         path: "shared/payload.js",
+        alsoFails: ["comment"],
+      },
+      {
+        name: "a vector style with spaces between its rules",
+        changes: (fixtures) => ({ "icons/toolbar.svg": fixtures.toolbarSvg.replaceAll("}", "} ") }),
+        path: "icons/toolbar.svg",
       },
       {
         name: "V09 a pretty stylesheet",
@@ -1410,6 +1516,7 @@ export const RULES: readonly Rule[] = [
           "action/index.html": inPage("<script>/*! @license MIT, see LICENSE */a();</script>"),
         }),
         path: "action/index.html",
+        alsoFails: ["comment"],
       },
       {
         name: "E19 spaced stylesheet rules joined by U+2028",

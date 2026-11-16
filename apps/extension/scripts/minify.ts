@@ -27,9 +27,9 @@ const SCRIPT_OPTIONS = {
 // rspack's own condition for `extractComments: true`, written out so the check looks for the comments the build moves.
 const LEGAL_COMMENT = /@preserve|@lic|@cc_on|^\**!/;
 
-/** The line SwcJsMinimizerRspackPlugin writes at the top of a chunk whose legal comments it moved to a notice. */
+/** The comment SwcJsMinimizerRspackPlugin writes on the first line of a chunk whose legal comments it moved. */
 const licensePointer = (path: string): string =>
-  `/*! LICENSE: ${NodePath.posix.basename(path)}.LICENSE.txt */\n`;
+  `/*! LICENSE: ${NodePath.posix.basename(path)}.LICENSE.txt */`;
 
 /** A script step: SWC with `SCRIPT_OPTIONS`, after moving comments that match `extractComments`, if set. */
 const scriptStep = <Extract extends RegExp | undefined>(extractComments: Extract) => ({
@@ -41,7 +41,7 @@ const scriptStep = <Extract extends RegExp | undefined>(extractComments: Extract
         extractComments.test(value),
       );
     const minified = experiments.swc.minifySync(code, SCRIPT_OPTIONS).code;
-    return moved ? `${licensePointer(path)}${minified}` : minified;
+    return moved ? `${licensePointer(path)}\n${minified}` : minified;
   },
 });
 
@@ -73,6 +73,17 @@ const minifyStyle = untilSettled((code) =>
   transform({ ...STYLE_OPTIONS, filename: "style.css", code: Buffer.from(code) }).code.toString(),
 );
 
+// An SVG's <style> is XML character data, where a bare `<` is not allowed. lightningcss writes media ranges as
+// `(width<=14px)`, so for a vector it writes them as `(max-width:14px)`, the form that needs no `<`.
+const minifyVectorStyle = untilSettled((code) =>
+  transform({
+    ...STYLE_OPTIONS,
+    include: Features.MediaRangeSyntax,
+    filename: "style.css",
+    code: Buffer.from(code),
+  }).code.toString(),
+);
+
 /** The declarations of a `style` attribute, which are not a stylesheet and parse differently. */
 export const minifyStyleAttribute = untilSettled((code) =>
   transformStyleAttribute({
@@ -82,9 +93,9 @@ export const minifyStyleAttribute = untilSettled((code) =>
   }).code.toString(),
 );
 
-// What a second run of a script step still saves on honest output, measured: 0 bytes on every packed script but 1 on
-// shared/framework.js, and at most 8 on the libraries minify.test.ts builds (vue, parent build). 16 is twice that.
-// One 210 byte readable function saves 89.
+// What a second run of a script step still saves on honest output, measured: 0 bytes on every packed script, and at
+// most 8 on the libraries minify.test.ts builds (vue, parent build). 16 is twice that. A comment never counts against
+// it: check-xpi fails any comment but the one a step writes. One 210 byte readable function saves 89.
 const SCRIPT_MARGIN_BYTES = 16;
 
 export interface Step {
@@ -93,6 +104,8 @@ export interface Step {
   readonly run: (code: string, path: string) => string;
   /** At most how many bytes a second run saves on the step's own output. */
   readonly margin: number;
+  /** The one comment the step writes into a file at `path`, on its first line, if it writes any. */
+  readonly comment?: (path: string) => string;
 }
 
 /** Each kind of minified file the build ships, keyed by the kind check-xpi gives a packed file. */
@@ -102,6 +115,7 @@ export const MINIFIED = {
       "rspack's SwcJsMinimizerRspackPlugin in the page build, which moves legal comments to <chunk>.LICENSE.txt, leaves a pointer to it and drops every other comment",
     ...scriptStep(LEGAL_COMMENT),
     margin: SCRIPT_MARGIN_BYTES,
+    comment: licensePointer,
   },
   "parent-script": {
     builtBy: "build-experiment.ts, which drops every comment, legal ones too",
@@ -111,6 +125,12 @@ export const MINIFIED = {
   style: {
     builtBy: "the StyleMinimizer in the rspack page build, run until a pass changes nothing",
     run: minifyStyle,
+    margin: 0,
+  },
+  "vector-style": {
+    builtBy:
+      "toolbar-icon.ts, which writes the icon's <style> already minified, with media ranges as min- and max-",
+    run: minifyVectorStyle,
     margin: 0,
   },
 } as const satisfies Readonly<Record<string, Step>>;

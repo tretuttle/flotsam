@@ -53,7 +53,19 @@ describe("readMarkup", () => {
     expect(readMarkup("<html><p>x</p></html>", "page").hasRoot).toBe(true);
     expect(readMarkup("var a=1;", "page").hasRoot).toBe(false);
     expect(readMarkup('<svg viewBox="0 0 1 1"><g/></svg>\n', "vector").hasRoot).toBe(true);
-    expect(readMarkup("var a=1;", "vector").hasRoot).toBe(false);
+    expect(readMarkup('<g xmlns="http://www.w3.org/2000/svg"/>', "vector").hasRoot).toBe(false);
+  });
+
+  it("reads a vector as XML, so text a browser's XML parser rejects cannot be read", () => {
+    expect(() => readMarkup("var a=1;", "vector")).toThrow(/^1:8: text data outside of root node/);
+    expect(() =>
+      readMarkup("<svg><style>@media (width<=14px){a{b:c}}</style></svg>", "vector"),
+    ).toThrow(/^1:2\d: /);
+    const cdata = readMarkup(
+      "<svg><style><![CDATA[@media (width<=14px){a{b:c}}]]></style></svg>",
+      "vector",
+    );
+    expect(cdata.bodies.map(({ kind }) => kind)).toEqual(["vector-style"]);
   });
 
   it("counts comments and line-break layout inside a vector, not a trailing newline", () => {

@@ -10,7 +10,7 @@ import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { bundleParent } from "./build-experiment.ts";
 import { CANNOT_JUDGE } from "./check-xpi.ts";
 import { extensionRoot } from "./manifest.ts";
-import { minifyScript } from "./minify.ts";
+import { MINIFIED, minifyScript } from "./minify.ts";
 import { RULES, type Changes, type Fixtures } from "./xpi-rules.ts";
 import { renderPng } from "./write-icons.ts";
 import { parseScript } from "./xpi-source.ts";
@@ -197,6 +197,26 @@ const bySortKey = (a: Failure, b: Failure): number =>
   `${a.path}:${a.rule}`.localeCompare(`${b.path}:${b.rule}`);
 
 describe.concurrent("check-xpi", () => {
+  it("names the XML error in the toolbar icon whose style the stylesheet step wrote, as 8f7feff shipped it", async () => {
+    const broken = fixtures.toolbarSvg.replace(
+      /<style>(.*?)<\/style>/s,
+      (_, css: string) => `<style>${MINIFIED.style.run(css)}</style>`,
+    );
+    const result = await check("range-syntax-icon", { "icons/toolbar.svg": broken });
+    expect(result.stderr).toMatch(
+      /^FAIL icons\/toolbar\.svg: cannot-judge: is not well-formed XML: 1:221: disallowed character in tag name$/m,
+    );
+    expect(result.status).toBe(1);
+  });
+
+  it("fails a file whose suffix names no kind it can decode", async () => {
+    const result = await check("unknown-suffix", { "fonts/icon.woff2": "wOF2" });
+    expect(result.stderr).toMatch(
+      /^FAIL fonts\/icon\.woff2: cannot-judge: ends in no suffix of KINDS/m,
+    );
+    expect(result.status).toBe(1);
+  });
+
   it("passes an archive shaped like the real XPI", async () => {
     const result = await check("clean", {});
     expect(result.failures).toEqual([]);

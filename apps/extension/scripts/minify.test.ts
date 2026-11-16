@@ -226,6 +226,17 @@ describe.concurrent("legal comments, as each script step handles them", () => {
     expect(result.status).toBe(0);
   });
 
+  it("a page build that keeps a 28 byte one fails, though removing it would save less than the margin", async () => {
+    const result = await checkBuilt(
+      "short-legal",
+      'console.log(/*! function f(){return 1} */ "x");',
+      "page, comments kept and not extracted",
+    );
+    expect(text(result.files["shared/vendor.js"])).toContain("/*! function f(){return 1} */");
+    expect(result.stderr).toMatch(/^FAIL shared\/vendor\.js: comment: /m);
+    expect(result.status).toBe(1);
+  });
+
   it.each([
     "page, comments kept and not extracted",
     "page, legal comments kept beside the pointer",
