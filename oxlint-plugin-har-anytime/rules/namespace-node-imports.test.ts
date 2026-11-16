@@ -2,9 +2,9 @@ import { assert, describe } from "@effect/vitest";
 
 import { createOxlintRuleHarness } from "../test/utils.ts";
 
-const rule = createOxlintRuleHarness("flotsam/namespace-node-imports");
+const rule = createOxlintRuleHarness("har-anytime/namespace-node-imports");
 
-describe("flotsam/namespace-node-imports", () => {
+describe("har-anytime/namespace-node-imports", () => {
   rule.valid(
     "allows canonical Node namespaces",
     `

@@ -4,16 +4,16 @@ import { createOxlintRuleHarness } from "../test/utils.ts";
 
 const EM_DASH = "\u2014";
 
-const rule = createOxlintRuleHarness("flotsam/no-emoji", {
+const rule = createOxlintRuleHarness("har-anytime/no-emoji", {
   filename: "fixture.tsx",
 });
 
-describe("flotsam/no-emoji", () => {
+describe("har-anytime/no-emoji", () => {
   rule.valid("allows plain product copy", 'const copy = "Export captured responses as HAR";');
 
   rule.valid(
     "allows copyright, registered, and trademark symbols",
-    `const legal = "© 2026 Flotsam ${EM_DASH} ® and ™ are typography, not emoji";`,
+    `const legal = "© 2026 HAR Anytime ${EM_DASH} ® and ™ are typography, not emoji";`,
   );
 
   rule.valid("allows non-emoji arrow U+2192", 'const arrow = "Click Export → then Save";');
@@ -113,7 +113,7 @@ describe("flotsam/no-emoji", () => {
     (output) => {
       assert.include(output, 'Emoji "🎉" is not allowed in product UI. Use an icon instead.');
       assert.notInclude(output, 'Emoji "📦"');
-      assert.strictEqual(output.match(/flotsam\(no-emoji\)/gu)?.length, 1);
+      assert.strictEqual(output.match(/har-anytime\(no-emoji\)/gu)?.length, 1);
     },
   );
 });

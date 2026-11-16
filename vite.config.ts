@@ -45,7 +45,7 @@ export default defineConfig({
   lint: {
     ignorePatterns: ["dist", "node_modules", "pnpm-lock.yaml", "*.tsbuildinfo"],
     plugins: ["eslint", "oxc", "react", "unicorn", "typescript"],
-    jsPlugins: ["./oxlint-plugin-flotsam/index.ts"],
+    jsPlugins: ["./oxlint-plugin-har-anytime/index.ts"],
     categories: {
       correctness: "warn",
       suspicious: "warn",
@@ -110,19 +110,19 @@ export default defineConfig({
       "typescript/require-array-sort-compare": "off",
       "typescript/restrict-template-expressions": "off",
       "typescript/unbound-method": "off",
-      "flotsam/namespace-node-imports": "error",
-      "flotsam/no-low-value-comments": "error",
-      "flotsam/require-suppression-reason": "error",
+      "har-anytime/namespace-node-imports": "error",
+      "har-anytime/no-low-value-comments": "error",
+      "har-anytime/require-suppression-reason": "error",
     },
     overrides: [
       {
         files: ["apps/*/src/**", "packages/*/src/**"],
         excludeFiles: ["**/*.{test,spec}.{ts,tsx,js,jsx,mts,cts,mjs,cjs}"],
-        rules: { "flotsam/no-em-dash-copy": "error", "flotsam/no-emoji": "error" },
+        rules: { "har-anytime/no-em-dash-copy": "error", "har-anytime/no-emoji": "error" },
       },
       {
         files: ["apps/*/src/**", "packages/*/src/**"],
-        rules: { "flotsam/no-unreasoned-state-sync": "error" },
+        rules: { "har-anytime/no-unreasoned-state-sync": "error" },
       },
     ],
     options: {

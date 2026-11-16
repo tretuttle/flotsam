@@ -1,5 +1,5 @@
 {
-  "name": "@flotsam/oxlint-plugin-flotsam",
+  "name": "@har-anytime/oxlint-plugin-har-anytime",
   "private": true,
   "type": "module",
   "scripts": {

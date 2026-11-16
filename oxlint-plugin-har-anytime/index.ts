@@ -9,7 +9,7 @@ import requireSuppressionReason from "./rules/require-suppression-reason.ts";
 
 export default definePlugin({
   meta: {
-    name: "flotsam",
+    name: "har-anytime",
   },
   rules: {
     "namespace-node-imports": namespaceNodeImports,

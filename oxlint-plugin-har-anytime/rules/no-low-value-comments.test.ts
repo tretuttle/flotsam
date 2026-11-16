@@ -2,9 +2,9 @@ import { assert, describe } from "@effect/vitest";
 
 import { createOxlintRuleHarness } from "../test/utils.ts";
 
-const rule = createOxlintRuleHarness("flotsam/no-low-value-comments");
+const rule = createOxlintRuleHarness("har-anytime/no-low-value-comments");
 
-describe("flotsam/no-low-value-comments", () => {
+describe("har-anytime/no-low-value-comments", () => {
   rule.valid(
     "allows concise why-comments and external issue references",
     `
@@ -18,7 +18,7 @@ describe("flotsam/no-low-value-comments", () => {
   rule.valid(
     "allows license headers over four lines",
     `/*
- * Copyright (c) 2026 Flotsam
+ * Copyright (c) 2026 HAR Anytime
  * Line 2
  * Line 3
  * Line 4
