@@ -16,6 +16,9 @@
     "typecheck": "effect-tsgo tsrs --noEmit"
   },
   "devDependencies": {
+    "ajv": "6.12.6",
+    "har-schema": "2.0.0",
+    "har-validator": "5.1.5",
     "vite-plus": "catalog:"
   }
 }
