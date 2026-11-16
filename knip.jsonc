@@ -8,6 +8,9 @@
       "entry": ["src/*/main.tsx", "experiment/parent.ts", "scripts/*.ts", "extension.config.js"],
     },
     "packages/*": {
+      // Only package.json `exports` and the tests are entries. Knip's default entries include src/index.ts, which
+      // would let a barrel file there pass unused.
+      "entry": [],
       // These workspace packages are private to this monorepo.
       "includeEntryExports": true,
     },
