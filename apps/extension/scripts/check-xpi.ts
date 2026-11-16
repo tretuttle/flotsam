@@ -12,6 +12,7 @@ import {
   minifySaving,
   RULES,
   syntaxOf,
+  type Rule,
   type Unit,
 } from "./xpi-rules.ts";
 import {
@@ -43,12 +44,24 @@ const readXpi = (xpi: Uint8Array): readonly Unit[] =>
       };
     });
 
+/**
+ * A rule that throws on a file has not judged it, so the file fails. Without this a crash would end the run with a
+ * stack trace and no line naming the file.
+ */
+export const judge = (check: Rule["check"], unit: Unit): string | undefined => {
+  try {
+    return check(unit);
+  } catch (error) {
+    return `the check could not judge this file: ${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
 export const inspectXpi = (xpi: Uint8Array): readonly Violation[] =>
   readXpi(xpi).flatMap((file) => {
     const units = [file, ...inlineBodies(file)];
     return RULES.flatMap(({ id, inspects, check }) =>
       (inspects === "path" ? [file] : units).flatMap((unit) => {
-        const detail = check(unit);
+        const detail = judge(check, unit);
         return detail === undefined
           ? []
           : [
@@ -75,10 +88,16 @@ export const describeMeasurements = (xpi: Uint8Array): readonly string[] =>
     const breaks = lineBreaksOutsideData(file.text, [...facts.data, ...facts.comments], legal);
     const counted =
       syntax === "vector" ? (hasLineTerminator(file.text.trim()) ? 1 : 0) : breaks.length;
-    const saved = minifySaving(file);
+    const minified = minifySaving(file);
+    const saved =
+      minified === undefined
+        ? "has no minifier"
+        : minified.ok
+          ? `saves ${String(minified.saved).padStart(5)} B`
+          : `FAILS (${minified.error})`;
     const margin = minifyMargin(file.text.length);
     return [
-      `${file.path.padEnd(32)} ${String(file.bytes.length).padStart(7)} B  re-minify saves ${String(saved ?? 0).padStart(5)} B (margin ${margin})  line breaks ${counted}  comments ${ordinary.length}  legal ${legal.length}`,
+      `${file.path.padEnd(32)} ${String(file.bytes.length).padStart(7)} B  re-minify ${saved} (margin ${margin})  line breaks ${counted}  comments ${ordinary.length}  legal ${legal.length}`,
     ];
   });
 

@@ -3,17 +3,24 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import { experiments } from "@rspack/core";
 import { zipSync } from "fflate";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { oneClickHarApi, namespace } from "../experiment/contract.ts";
 import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { bundleParent } from "./build-experiment.ts";
 import { extensionRoot } from "./manifest.ts";
-import { RULES, type Changes, type Fixtures } from "./xpi-rules.ts";
+import { judge } from "./check-xpi.ts";
+import { RULES, type Changes, type Fixtures, type Unit } from "./xpi-rules.ts";
 import { renderPng } from "./write-icons.ts";
 
 const checkScript = NodePath.join(extensionRoot, "scripts", "check-xpi.ts");
 const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+const ONE_LINE_FUNCTION =
+  "function collectHeaders(entries) { const result = []; for (const entry of entries) { if (entry.name === undefined) { continue; } result.push({ name: entry.name, value: String(entry.value) }); } return result; }";
+
+const inertPage = `<!DOCTYPE html><html><body><a href="#top" onclick="a()" style="margin:0">go</a><a href="javascript:void(0)">x</a><iframe srcdoc="&lt;p&gt;hi&lt;/p&gt;"></iframe></body></html>`;
 
 const REAL_PAGE = `<!DOCTYPE html><html lang="en"><head>
     <meta charset="utf-8">
@@ -58,7 +65,15 @@ beforeAll(async () => {
       "utf8",
     ),
     toolbarSvg,
-    framework: `/*! LICENSE: framework.js.LICENSE.txt */\n${Array.from({ length: 250 }, () => minifiedParent.trim()).join(";")}`,
+    framework: `/*! LICENSE: framework.js.LICENSE.txt */\n${
+      experiments.swc.minifySync(
+        NodeFS.readFileSync(
+          NodePath.join(reactDom, "cjs", "react-dom-client.production.js"),
+          "utf8",
+        ),
+        { mangle: true, compress: true, format: { comments: false } },
+      ).code
+    }`,
     reactLicense: NodeFS.readFileSync(NodePath.join(reactDom, "LICENSE")),
   };
   const master = NodeFS.readFileSync(
@@ -102,8 +117,11 @@ const check = (
   }
   const xpi = NodePath.join(workDir, `${name.replaceAll(/\W+/g, "-").slice(0, 80)}.xpi`);
   NodeFS.writeFileSync(xpi, zipSync(entries));
+  // Node warns on stderr when both NO_COLOR and FORCE_COLOR are set, and the test counts stderr lines.
+  const { NO_COLOR: _noColor, FORCE_COLOR: _forceColor, ...env } = process.env;
   const run = NodeChildProcess.spawnSync(process.execPath, [checkScript, xpi], {
     encoding: "utf8",
+    env,
   });
   const failures = [...run.stderr.matchAll(/^FAIL (\S+): ([\w-]+): /gm)].map(([, path, rule]) => ({
     path: path ?? "",
@@ -202,6 +220,25 @@ describe("check-xpi", () => {
       changes: () => ({ "experiment/info.json": '{\n  "description": "line one\\nline two"\n}\n' }),
     },
     {
+      name: "A06 a script with an array nested 2000 deep on one line",
+      changes: () => ({
+        "shared/payload.js": `var a=${"[".repeat(2000)}1${"]".repeat(2000)};console.log(a);`,
+      }),
+    },
+    {
+      name: "three lines of prose with code keywords in one string",
+      changes: () => ({
+        "shared/payload.js":
+          'var t="If you return the form, the class starts at nine.\\nFor the second week, while the lab is open, bring a laptop.\\nYou may leave when it is done, if you wish.";console.log(t);',
+      }),
+    },
+    {
+      name: "a minified link, handler and style in a page",
+      changes: () => ({
+        "options/index.html": inertPage,
+      }),
+    },
+    {
       name: "a page that loads its script by src",
       changes: () => ({
         "options/index.html":
@@ -231,6 +268,30 @@ describe("check-xpi", () => {
       expect(result.stderr.trim().split("\n")).toHaveLength(expected.length);
       expect(result.stderr).toMatch(new RegExp(`^FAIL ${plant.path}: ${rule.id}: .+`, "m"));
     });
+  });
+
+  // The margin is the detection floor of size: one function saves less than it, so it can hide in a large bundle.
+  it("A02b passes one readable function appended to the large bundle, which saves under the margin", () => {
+    const result = check("a02b", {
+      "shared/framework.js": `${fixtures.framework};${ONE_LINE_FUNCTION}`,
+    });
+    expect(result.failures).toEqual([]);
+  });
+
+  it("fails a file naming the file and the rule when a rule throws on it", () => {
+    const unit: Unit = {
+      path: "experiment/parent.js",
+      where: undefined,
+      kind: "script",
+      bytes: encode("x"),
+      text: "x",
+    };
+    expect(
+      judge(() => {
+        throw new Error("boom");
+      }, unit),
+    ).toContain("boom");
+    expect(judge(() => undefined, unit)).toBeUndefined();
   });
 
   it("lists each rule once, and every extra rule a plant expects is a rule", () => {
