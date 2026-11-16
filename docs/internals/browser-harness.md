@@ -1,27 +1,33 @@
 # Browser harness
 
-`tools/browser-harness` is the proof tool. A weakness here weakens every later proof, so these decisions are deliberate.
+`tools/browser-harness` is the single launcher, fixture server, and proof runner for every Gecko browser. Extension scripts (`verify:browser`, `screenshot:toolbar`) launch through it rather than keeping separate spawn, profile, or shutdown code.
 
-## A sample ends when the last resource finished
+## Check discovery and version oracle
 
-A sample runs from navigation start to the last of the 200 page resources finishing: stylesheet applied, script executed, image loaded, JSON body read. The page records each finish with `performance.now()` and reports the latest. Navigation `loadEventEnd` was used before. It excludes the 50 fetches that can end after the load event, and it reads 0 while the load event is still running.
+`browser-harness check` discovers every `*.ts` file under `tools/browser-harness/checks/` in sorted filename order. `environment` compares `oneClickHar.getEnvironment()` against the browser's own WebDriver session capabilities (`name`, `version`, `buildId`) instead of `application.ini` on disk, waits for `WebExtensionPolicy.getByID(id).active` rather than racing startup, and verifies schema refusals and DevTools open/close state. `restart` installs the XPI, shuts the browser down cleanly, relaunches on the same profile without reinstalling, and verifies the extension stays active. `cost-baseline` runs the rotated three-arm cost check.
 
-A run that fails is kept in `failures` with its reason and counted in `errors`. The command exits 1 when any run failed. A run also fails when the server did not see exactly the scenario's requests, including an extra request or a resource the page never finished. `baseline` writes a file only when `errors` is 0.
+## Three-arm cost measurement and baselines
 
-## Baselines compare only like with like
+`browser-harness cost` measures `off` (no extension), `extension` (packed XPI installed), and `panel` (Network panel open on the tab before navigation) across the cost pages (`cost-images`, `cost-heavy`, `cost-mixed`). Arms rotate inside each round so machine load drift affects every arm evenly, round 0 is dropped as warmup, and scored rounds report median, spread, and machine load. The budget for `extension` is `off + 0.5 * (panel - off)`. CI runs a short profile (`--short`, 3 rounds on `cost-images`); full runs use 6 rounds across all three cost pages.
 
-A baseline file is named after platform, architecture, CPU count and model, browser name, version, build ID and headless or window. The same fields are inside the file, and a test fails if the name and contents disagree, if any run failed, or if a summary is missing. Compare two baselines only when their names match except for the capture, and when `sampleDefinition` matches.
+A sample ends when the page reports its last resource finished (`performance.now()`), and any failed or unexpected request fails the run (`errors > 0`). Baseline commands refuse to write files when `errors > 0`. Baselines under `tools/browser-harness/baselines/` and `baselines/cost/` encode machine, browser name, version, build ID, and display mode in both filename and JSON, and are compared only when those fields match.
 
-## One launch, one remote protocol
+## Fixture server ground truth
 
-A launch uses WebDriver BiDi unless `--protocol marionette` is passed. The process starts only that listener, so the choice does not depend on which port opens first. Marionette returns script results as `{value: ...}`. Closing a tab switches the session back to the window it started on, so the next tab still has a browsing context.
+Every non-control response from the fixture server carries a monotonic `X-Seq` header, and the server records a per-sequence SHA-256 (`wireSha256` and `decodedSha256`) alongside a request log. This covers both static pinned fixtures (`src/pinned-responses.ts`, measured with `curl` and `sha256sum`) and dynamic or streaming identity fixtures (`/poll`, cancelled 4 MiB download, 304 revalidation, cache hit, 302-to-307 redirect chain, service worker synthesize and passthrough, endless NDJSON stream, refused loopback port, and `Content-Disposition: attachment` download link). Control queries under `/__harness/` do not increment `X-Seq` or enter the fixture request log.
 
-## Expected bytes are pinned, not computed
+## One launch, one remote protocol, and launch modes
 
-`src/pinned-responses.ts` holds the SHA-256 and length of every response, measured with curl and coreutils `sha256sum` against the running server. `har-check` and the tests compare against these constants. A digest table computed at run time from the generator agrees with the generator even when the generator is wrong. Changing a fixture means changing its pin in the same commit.
+A remote launch uses WebDriver BiDi unless `--protocol marionette` is passed (required for chrome-privileged DevTools and policy checks). Closing a tab in Marionette switches back to the initial window handle so subsequent tabs remain valid.
 
-## The harness owns a whole process tree
+`launchBrowser` accepts a named `launchMode`:
 
-On Linux and macOS the browser is spawned as a process group leader, and cleanup signals the group. Zen 1.25t and 1.24.2b on Linux put every child process (forkserver, content, socket, utility) in that group, observed with `ps -g`. On Windows `taskkill /T` walks parent links instead, so a child whose parent already died is not reached there. Every acquired resource, the fixture server, the profile directory, the browser group and the remote socket, sits on one disposable stack, so a failed launch or an interrupt releases all of it.
+- `recommended` (default): starts BiDi or Marionette with Gecko Remote Agent's recommended preferences (`remote.prefs.recommended` stays `true`). Observed on Zen Twilight 1.25t, this modifies 130 preferences on the default/user branch, including setting `security.fileuri.strict_origin_policy` to `false` (giving `file://` documents universal file-origin access), disabling `privacy.trackingprotection.pbmode.enabled`, `signon.autofillForms`, `security.certerrors.mitm.priming.enabled`, `security.remote_settings.intermediates.enabled`, `extensions.update.enabled`, `extensions.systemAddon.update.enabled`, `network.captive-portal-service.enabled`, `network.connectivity-service.enabled`, setting `security.notification_enable_delay` to `0`, `security.webauthn.related_origin_requests_mode` to `1`, and enabling `focusmanager.testmode`.
+- `real-defaults`: starts BiDi or Marionette with `remote.prefs.recommended` set to `false` in `user.js`, preserving Gecko's real default preferences. Observed on Zen Twilight 1.25t, `security.fileuri.strict_origin_policy` remains `true` (and the other recommended overrides above are not applied). Checks that probe `file://` or default browser security policies must ask for `real-defaults`.
+- `none`: launches the browser with no `-marionette`, no `--remote-debugging-port`, no `devtools.debugger.remote-enabled`, no `remote.active-protocols`, and no `MOZ_REMOTE_ALLOW_SYSTEM_ACCESS`, optionally passing CLI `urls` directly so a check can test an untouched browser process.
 
-Browsers run headless unless `--show-window` is passed. The binary is always an input (`--binary` or `BROWSER_HARNESS_BINARY`). A profile directory inside a live Zen or Firefox family profile root, listed per platform in `BROWSER_PLATFORMS`, is refused. The temporary directory is checked, including the path it resolves to, before a profile directory is created. macOS and Windows compare those paths without case.
+## Process-tree ownership and orphan cleanup
+
+On Linux and macOS the browser spawns as a process group leader and cleanup kills the group (`SIGKILL`); on Windows `taskkill /T /F` ends the tree. Every resource (server, profile directory, browser group, remote socket, and active-launch lease) sits on an `AsyncDisposableStack`. Before each launch, `reapOrphanedLaunches` scans `<tmpdir>/one-click-har-leases/` for leases whose `harnessPid` is no longer alive (such as after an untrappable `SIGKILL` of the harness process), verifies the profile directory is outside live browser profile roots, terminates any remaining browser group matching that PID/profile, and removes the orphaned profile directory.
+
+Browsers run headless unless `--show-window` is passed. The binary must come from `--binary`, `BROWSER_HARNESS_BINARY`, or `GECKO_BINARY` with no platform-specific default. Any profile path resolving inside a live Zen, Firefox, LibreWolf, Floorp, or Waterfox profile root is refused before creation (case-folded on macOS and Windows).
