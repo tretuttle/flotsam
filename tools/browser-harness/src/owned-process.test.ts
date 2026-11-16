@@ -172,6 +172,29 @@ describe("owned process trees", () => {
     await removeDirectoryBounded(directory);
     expect(NodeFS.existsSync(directory)).toBe(false);
   });
+
+  it.runIf(currentPlatformName() !== "win32")(
+    "includes stderr when profile directory removal fails and exits immediately",
+    async () => {
+      const parent = await NodeFSP.mkdtemp(
+        NodePath.join(NodeOS.tmpdir(), "one-click-har-readonly-"),
+      );
+      directories.push(parent);
+      const locked = NodePath.join(parent, "locked");
+      await NodeFSP.mkdir(locked);
+      await NodeFSP.writeFile(NodePath.join(locked, "file"), "data");
+      await NodeFSP.chmod(locked, 0o555);
+      await NodeFSP.chmod(parent, 0o555);
+      try {
+        await expect(removeDirectoryBounded(locked)).rejects.toThrow(
+          /profile removal exited 1[\s\S]*EACCES/,
+        );
+      } finally {
+        await NodeFSP.chmod(parent, 0o755);
+        await NodeFSP.chmod(locked, 0o755);
+      }
+    },
+  );
 });
 
 async function spawnTree(): Promise<{ leader: OwnedChild; descendantPid: number }> {
@@ -196,7 +219,7 @@ function firstLine(owner: OwnedChild): Promise<string> {
       const end = text.indexOf("\n");
       if (end !== -1) resolve(text.slice(0, end).trim());
     });
-    owner.child.once("exit", (code) =>
+    owner.child.once("close", (code) =>
       reject(new Error(`child exited ${String(code)} before a line`)),
     );
   });

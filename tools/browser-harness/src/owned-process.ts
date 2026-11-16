@@ -179,7 +179,7 @@ export async function removeDirectoryBounded(directory: string): Promise<void> {
   worker.child.stderr?.on("data", (chunk: Buffer) => {
     stderr = (stderr + chunk.toString("utf8")).slice(-2000);
   });
-  const exit = await waitForExit(worker.child, PROFILE_REMOVAL_MS);
+  const exit = await waitForClose(worker.child, PROFILE_REMOVAL_MS);
   if (exit === "timeout") {
     await killOwnedTree(worker.pid, []);
     throw new Error(
@@ -272,14 +272,14 @@ function assertPid(pid: number): void {
   if (!Number.isInteger(pid) || pid <= 0) throw new Error(`invalid pid ${String(pid)}`);
 }
 
-function waitForExit(
+function waitForClose(
   child: NodeChildProcess.ChildProcess,
   timeoutMs: number,
 ): Promise<number | "timeout"> {
-  if (child.exitCode !== null) return Promise.resolve(child.exitCode);
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve("timeout"), timeoutMs);
-    child.once("exit", (code) => {
+    // Wait for `close` rather than `exit` so stderr finishes draining before errors are composed.
+    child.once("close", (code) => {
       clearTimeout(timer);
       resolve(code ?? 1);
     });

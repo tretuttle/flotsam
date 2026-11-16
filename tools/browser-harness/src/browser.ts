@@ -308,17 +308,15 @@ export async function launchBrowser(
       stdio: ["ignore", "ignore", "pipe"],
       env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1", MOZ_DISABLE_AUTO_UPDATE: "1" },
     });
+    const closed = watchChildClose(spawned.child);
     await lease.setSpawnedPid(spawned.pid);
     stack.defer(() => killOwnedTree(spawned.pid, []));
-    const exited = waitForChildExit(spawned.child, null).then(
-      () => exitStatus(spawned.child) ?? "code 0",
-    );
     const owned = stack.move();
     return {
       spawnedPid: spawned.pid,
       profileDir: directory,
       launchMode: "none",
-      exited,
+      exited: closed,
       [Symbol.asyncDispose]: () => owned.disposeAsync(),
     };
   }
@@ -357,17 +355,21 @@ export async function launchBrowser(
     stdio: ["ignore", "ignore", "pipe"],
     env,
   });
-  await lease.setSpawnedPid(spawned.pid);
-  let browserPid: number | null = null;
-  stack.defer(() => killOwnedTree(spawned.pid, browserPid === null ? [] : [browserPid]));
+  let closedStatus: string | null = null;
+  const closed = watchChildClose(spawned.child, (status) => {
+    closedStatus = status;
+  });
   let stderrTail = "";
   spawned.child.stderr?.on("data", (chunk: Buffer) => {
     stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
   });
+  await lease.setSpawnedPid(spawned.pid);
+  let browserPid: number | null = null;
+  stack.defer(() => killOwnedTree(spawned.pid, browserPid === null ? [] : [browserPid]));
   const remote = await connectRemote({
     protocol,
     port,
-    exitStatus: () => exitStatus(spawned.child),
+    exitStatus: () => closedStatus,
     stderr: () => stderrTail,
     signal: remoteRequest.signal,
   });
@@ -397,9 +399,8 @@ export async function launchBrowser(
     takeChromeScreenshot: (selector) => remote.takeChromeScreenshot(selector),
     closeTab: (context) => remote.closeTab(context),
     quit: async () => {
-      const exited = waitForChildExit(spawned.child, 10_000);
       await remote.quit();
-      await exited;
+      await raceTimeout(closed, 10_000);
     },
     [Symbol.asyncDispose]: () => owned.disposeAsync(),
   };
@@ -423,29 +424,45 @@ async function resolveProfileDir(
   return profileDir;
 }
 
-function waitForChildExit(
+function watchChildClose(
   child: {
-    exitCode: number | null;
-    signalCode: string | null;
-    once: (event: "exit", cb: () => void) => void;
+    once: (
+      event: "close",
+      cb: (code: number | null, signal: NodeJS.Signals | null) => void,
+    ) => void;
   },
-  timeoutMs: number | null,
-): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  onClose?: (status: string) => void,
+): Promise<string> {
   return new Promise((resolve) => {
-    const timer = timeoutMs === null ? null : setTimeout(resolve, timeoutMs);
-    timer?.unref();
-    child.once("exit", () => {
-      if (timer !== null) clearTimeout(timer);
-      resolve();
+    child.once("close", (code, signal) => {
+      const status = formatExitStatus(code, signal);
+      onClose?.(status);
+      resolve(status);
     });
   });
 }
 
-function exitStatus(child: { exitCode: number | null; signalCode: string | null }): string | null {
-  if (child.exitCode !== null) return `code ${String(child.exitCode)}`;
-  if (child.signalCode !== null) return `signal ${child.signalCode}`;
-  return null;
+function formatExitStatus(code: number | null, signal: NodeJS.Signals | string | null): string {
+  if (code !== null) return `code ${String(code)}`;
+  if (signal !== null) return `signal ${signal}`;
+  return "code 0";
+}
+
+function raceTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    timer.unref();
+    void promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+    );
+  });
 }
 
 function realpathIfPresent(path: string): string {
