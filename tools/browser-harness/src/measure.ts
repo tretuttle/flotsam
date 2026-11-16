@@ -11,7 +11,7 @@ import {
 import { readProcessorTimeMs, readWorkingSetBytes } from "./owned-process.ts";
 import { type RemoteProtocol } from "./remote.ts";
 import { startFixtureServer } from "./server.ts";
-import { launchZen } from "./zen.ts";
+import { launchBrowser } from "./browser.ts";
 
 export type Summary = {
   readonly median: number;
@@ -47,7 +47,7 @@ export type MeasureResult = {
   readonly browserCpuMs: number;
   readonly limiter: string;
   readonly extensionPath: string | null;
-  readonly zen: {
+  readonly browser: {
     readonly binaryPath: string;
     readonly version: string;
     readonly buildId: string;
@@ -60,7 +60,7 @@ export type MeasureResult = {
 export type BaselineFile = {
   readonly capturedAt: string;
   readonly extension: null;
-  readonly zen: MeasureResult["zen"];
+  readonly browser: MeasureResult["browser"];
   readonly machine: MachineInfo;
   readonly page: {
     readonly resourceCount: number;
@@ -95,7 +95,7 @@ export async function measurePage(options: {
   extensionPath: string | null;
 }): Promise<MeasureResult> {
   const server = await startFixtureServer();
-  const browser = await launchZen({
+  const browser = await launchBrowser({
     binaryPath: options.binaryPath,
     extensionPath: options.extensionPath,
   });
@@ -107,7 +107,7 @@ export async function measurePage(options: {
       server.resetRequestCount();
       const context = await browser.openTab(`${server.origin}/`);
       try {
-        const timing = parsePageTiming(await browser.evaluate(context, "window.__zenReady"));
+        const timing = parsePageTiming(await browser.evaluate(context, "window.__harnessReady"));
         const parentWorkingSetBytes = readWorkingSetBytes(browser.browserPid);
         const requestCount = server.requestCount();
         const served = new Set(server.requestPaths());
@@ -154,7 +154,7 @@ export async function measurePage(options: {
       browserCpuMs,
       limiter: limiterNote(wallTimeMs, browserCpuMs),
       extensionPath: options.extensionPath,
-      zen: {
+      browser: {
         binaryPath: options.binaryPath,
         version: browser.version,
         buildId: browser.buildId,
@@ -182,7 +182,7 @@ export async function captureBaseline(options: {
   const file: BaselineFile = {
     capturedAt: new Date().toISOString(),
     extension: null,
-    zen: measured.zen,
+    browser: measured.browser,
     machine: measured.machine,
     page: {
       resourceCount: measured.expectedResourceCount,
@@ -248,9 +248,9 @@ function limiterNote(wallTimeMs: number, browserCpuMs: number): string {
   const timing =
     "Load time is navigation timing, loadEventEnd minus startTime. Wall time also includes the working-set query after each load. Each run loaded 200 uncached localhost resources.";
   if (browserCpuMs / wallTimeMs >= 0.4) {
-    return `The Zen parent used ${String(percent)} percent of one core across the runs, so parent CPU is on the critical path. ${timing}`;
+    return `The browser parent used ${String(percent)} percent of one core across the runs, so parent CPU is on the critical path. ${timing}`;
   }
-  return `The Zen parent used ${String(percent)} percent of one core across the runs, so parent CPU does not fill the load time. ${timing}`;
+  return `The browser parent used ${String(percent)} percent of one core across the runs, so parent CPU does not fill the load time. ${timing}`;
 }
 
 function at(values: readonly number[], index: number): number {

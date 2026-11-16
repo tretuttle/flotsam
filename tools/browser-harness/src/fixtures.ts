@@ -204,7 +204,7 @@ function pageHtml(): string {
     jsonPaths.push(`/r/json/${name}`);
   }
   const script = [
-    "window.__zenReady = (async () => {",
+    "window.__harnessReady = (async () => {",
     `  const jsonPaths = ${JSON.stringify(jsonPaths)};`,
     "  const jsonMissing = [];",
     "  let jsonOk = 0;",
@@ -239,7 +239,7 @@ function pageHtml(): string {
     "      imageMissing.push(path);",
     "    }",
     "  }));",
-    "  const jsOk = globalThis.__zenResources ?? 0;",
+    "  const jsOk = globalThis.__harnessResources ?? 0;",
     "  const missing = cssMissing.concat(imageMissing, jsonMissing);",
     `  if (jsOk !== ${String(SMALL_PER_KIND)}) missing.push("js-executed:" + String(jsOk));`,
     '  const navigation = performance.getEntriesByType("navigation")[0];',
@@ -256,7 +256,7 @@ function pageHtml(): string {
 function smallText(kind: SmallKind, index: number): string {
   const name = String(index);
   if (kind === "css") return `.r-${name}{color:#010101}\n`;
-  if (kind === "js") return `globalThis.__zenResources=(globalThis.__zenResources??0)+1;\n`;
+  if (kind === "js") return `globalThis.__harnessResources=(globalThis.__harnessResources??0)+1;\n`;
   if (kind === "image") {
     return `<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="#${name.padStart(6, "0")}"/></svg>`;
   }

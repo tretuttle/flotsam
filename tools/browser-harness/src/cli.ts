@@ -33,7 +33,7 @@ async function main(argv: readonly string[]): Promise<void> {
 
 async function runHarCheck(args: readonly string[]): Promise<void> {
   const file = args[0];
-  if (file === undefined || args.length !== 1) usage("usage: zen-harness har-check <file.har>");
+  if (file === undefined || args.length !== 1) usage("usage: browser-harness har-check <file.har>");
   const result = await checkHarFile(file, expectedBodies());
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.stderr.write(`${formatHarCheck(result)}\n`);
@@ -66,7 +66,7 @@ type Command =
 
 function parseCommand(argv: readonly string[]): Command {
   const [command, ...rest] = argv;
-  if (command === undefined) usage("usage: zen-harness <serve|measure|baseline|har-check>");
+  if (command === undefined) usage("usage: browser-harness <serve|measure|baseline|har-check>");
   const flags = readFlags(rest);
   if (command === "serve") {
     if (flags.size > 0) usage("serve takes no flags");

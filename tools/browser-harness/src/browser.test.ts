@@ -4,12 +4,12 @@ import * as NodePath from "node:path";
 import * as NodeZlib from "node:zlib";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
-  assertOutsideLiveZenProfiles,
+  assertOutsideLiveProfiles,
   browserIsOwned,
   LAUNCH_PREFS,
   prepareProfile,
   renderUserJs,
-} from "./zen.ts";
+} from "./browser.ts";
 
 const directories: string[] = [];
 
@@ -21,7 +21,7 @@ afterEach(async () => {
   );
 });
 
-describe("Zen profile", () => {
+describe("browser profile", () => {
   it("writes the prefs that let an isolated window load an experiment", async () => {
     const directory = await prepareProfile(null);
     directories.push(directory);
@@ -44,8 +44,8 @@ describe("Zen profile", () => {
   it("refuses a directory inside the live Zen profiles folder", () => {
     const env = { APPDATA: NodePath.join(NodeOS.tmpdir(), "FlotsamAppData") };
     const live = NodePath.join(env.APPDATA, "zen", "Profiles", "abc.default");
-    expect(() => assertOutsideLiveZenProfiles(live, env)).toThrow(/live Zen profile/);
-    expect(() => assertOutsideLiveZenProfiles(NodeOS.tmpdir(), env)).not.toThrow();
+    expect(() => assertOutsideLiveProfiles(live, env)).toThrow(/live Zen profile/);
+    expect(() => assertOutsideLiveProfiles(NodeOS.tmpdir(), env)).not.toThrow();
   });
 
   it("sideloads an unpacked extension and an xpi by gecko id", async () => {

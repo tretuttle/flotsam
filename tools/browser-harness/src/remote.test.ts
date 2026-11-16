@@ -26,7 +26,7 @@ describe("remote control", () => {
     expect(remote.browserPid).toBe(77);
     expect(remote.userAgent).toBe("ZenTest");
     const context = await remote.openTab("http://127.0.0.1/");
-    expect(await remote.evaluate(context, "window.__zenReady")).toBe('{"ok":true}');
+    expect(await remote.evaluate(context, "window.__harnessReady")).toBe('{"ok":true}');
     await remote.closeTab(context);
     remote.dispose();
   });
@@ -44,7 +44,7 @@ describe("remote control", () => {
     expect(remote.browserPid).toBe(88);
     expect(remote.userAgent).toBe("ZenMarionette");
     const context = await remote.openTab("http://127.0.0.1/");
-    expect(await remote.evaluate(context, "window.__zenReady")).toBe('{"ok":true}');
+    expect(await remote.evaluate(context, "window.__harnessReady")).toBe('{"ok":true}');
     await remote.closeTab(context);
     remote.dispose();
   });

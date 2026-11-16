@@ -1,14 +1,14 @@
 {
-  "name": "@har-anytime/zen-harness",
+  "name": "@har-anytime/browser-harness",
   "private": true,
   "bin": {
-    "zen-harness": "./src/cli.ts"
+    "browser-harness": "./src/cli.ts"
   },
   "type": "module",
   "scripts": {
     "test": "vp test run --config ../../vite.config.ts --dir .",
     "typecheck": "effect-tsgo tsrs --noEmit",
-    "zen-harness": "node src/cli.ts"
+    "browser-harness": "node src/cli.ts"
   },
   "devDependencies": {
     "@types/node": "catalog:",

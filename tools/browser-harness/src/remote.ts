@@ -32,7 +32,7 @@ export async function connectRemote(options: {
     const exitCode = options.exitCode();
     if (exitCode !== null) {
       throw new Error(
-        `Zen exited with code ${String(exitCode)} before remote control opened\n${options.stderr()}`,
+        `Browser exited with code ${String(exitCode)} before remote control opened\n${options.stderr()}`,
       );
     }
   };
@@ -56,7 +56,7 @@ export async function connectRemote(options: {
     await delay(100);
   }
   throw new Error(
-    `timed out waiting for Zen remote control\nBiDi: ${bidiError}\nMarionette: ${marionetteError}\n${options.stderr()}`,
+    `timed out waiting for browser remote control\nBiDi: ${bidiError}\nMarionette: ${marionetteError}\n${options.stderr()}`,
   );
 }
 

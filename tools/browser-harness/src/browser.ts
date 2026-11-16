@@ -37,7 +37,7 @@ export const LAUNCH_PREFS: readonly Pref[] = [
   { name: "signon.rememberSignons", value: false },
 ];
 
-export type ZenSession = {
+export type BrowserSession = {
   readonly spawnedPid: number;
   readonly browserPid: number;
   readonly version: string;
@@ -64,14 +64,14 @@ export function browserIsOwned(
   return browserPid === spawnedPid || parentPid === spawnedPid;
 }
 
-function liveZenProfilesDir(env: NodeJS.ProcessEnv): string | null {
+function liveProfilesDir(env: NodeJS.ProcessEnv): string | null {
   const appData = env.APPDATA;
   if (appData === undefined || appData.length === 0) return null;
   return NodePath.join(appData, "zen", "Profiles");
 }
 
-export function assertOutsideLiveZenProfiles(directory: string, env: NodeJS.ProcessEnv): void {
-  const live = liveZenProfilesDir(env);
+export function assertOutsideLiveProfiles(directory: string, env: NodeJS.ProcessEnv): void {
+  const live = liveProfilesDir(env);
   if (live === null) return;
   if (isInside(NodePath.resolve(live), NodePath.resolve(directory))) {
     throw new Error(`refusing to use the live Zen profile directory ${directory}`);
@@ -83,8 +83,8 @@ export async function prepareProfile(
   env: NodeJS.ProcessEnv = process.env,
   extraPrefs: readonly Pref[] = [],
 ): Promise<string> {
-  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-zen-"));
-  assertOutsideLiveZenProfiles(directory, env);
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "har-anytime-browser-"));
+  assertOutsideLiveProfiles(directory, env);
   await NodeFSP.writeFile(
     NodePath.join(directory, "user.js"),
     renderUserJs([...LAUNCH_PREFS, ...extraPrefs]),
@@ -94,10 +94,10 @@ export async function prepareProfile(
   return directory;
 }
 
-export async function launchZen(request: {
+export async function launchBrowser(request: {
   binaryPath: string;
   extensionPath: string | null;
-}): Promise<ZenSession> {
+}): Promise<BrowserSession> {
   await NodeFSP.access(request.binaryPath);
   const bidiPort = await freePort();
   const marionettePort = await freePort();
@@ -121,7 +121,7 @@ export async function launchZen(request: {
   const spawnedPid = child.pid;
   if (spawnedPid === undefined) {
     await releaseOwnedProfile([], directory);
-    throw new Error("Zen did not start");
+    throw new Error("Browser did not start");
   }
   let remote: RemoteControl | null = null;
   try {
@@ -147,7 +147,7 @@ export async function launchZen(request: {
   }
 }
 
-function sessionFrom(remote: RemoteControl, spawnedPid: number, directory: string): ZenSession {
+function sessionFrom(remote: RemoteControl, spawnedPid: number, directory: string): BrowserSession {
   let releasePromise: Promise<void> | null = null;
   return {
     spawnedPid,
