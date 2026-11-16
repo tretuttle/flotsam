@@ -10,7 +10,7 @@
     "screenshot:toolbar": "node scripts/screenshot-toolbar.ts",
     "test": "vp test run --config ../../vite.config.ts --dir .",
     "typecheck": "effect-tsgo tsrs --noEmit && effect-tsgo tsrs --noEmit -p experiment",
-    "verify:zen": "node scripts/verify-zen.ts"
+    "verify:browser": "node scripts/verify-browser.ts"
   },
   "dependencies": {
     "react": "19.3.1",
