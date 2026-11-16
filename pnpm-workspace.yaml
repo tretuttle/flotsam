@@ -1,6 +1,6 @@
 packages:
   - apps/*
-  - oxlint-plugin-har-anytime
+  - oxlint-plugin-one-click-har
   - packages/*
   - scripts
 

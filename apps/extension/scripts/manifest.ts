@@ -33,4 +33,4 @@ export const buildDir = NodePath.join(extensionRoot, "dist", "firefox");
 
 /** Where `pack` writes the XPI for a manifest version. */
 export const xpiPath = (version: string): string =>
-  NodePath.join(extensionRoot, "dist", `har-anytime-${version}.xpi`);
+  NodePath.join(extensionRoot, "dist", `one-click-har-${version}.xpi`);

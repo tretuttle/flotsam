@@ -9,7 +9,7 @@ import requireSuppressionReason from "./rules/require-suppression-reason.ts";
 
 export default definePlugin({
   meta: {
-    name: "har-anytime",
+    name: "one-click-har",
   },
   rules: {
     "namespace-node-imports": namespaceNodeImports,

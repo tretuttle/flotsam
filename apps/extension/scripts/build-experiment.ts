@@ -4,7 +4,7 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { build } from "vite-plus/pack";
-import { harAnytimeApi, namespace } from "../experiment/contract.ts";
+import { oneClickHarApi, namespace } from "../experiment/contract.ts";
 import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { extensionRoot, readManifest } from "./manifest.ts";
 
@@ -46,7 +46,7 @@ if (import.meta.main) {
   NodeFS.mkdirSync(NodePath.dirname(schemaFile), { recursive: true });
   NodeFS.writeFileSync(
     schemaFile,
-    `${JSON.stringify(toGeckoSchema(namespace, harAnytimeApi), null, 2)}\n`,
+    `${JSON.stringify(toGeckoSchema(namespace, oneClickHarApi), null, 2)}\n`,
   );
   await bundleParent(NodePath.resolve(extensionRoot, outRoot, experiment.parent.script), true);
 }

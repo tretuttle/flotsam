@@ -100,17 +100,17 @@ export const createOxlintRuleHarness = (
   const run: RuleHarness["run"] = Effect.fnUntraced(function* (source: string) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const fixtureDir = yield* fs.makeTempDirectoryScoped({ prefix: "har-anytime-oxlint-" });
+    const fixtureDir = yield* fs.makeTempDirectoryScoped({ prefix: "one-click-har-oxlint-" });
     const configPath = path.join(fixtureDir, ".oxlintrc.json");
     const sourcePath = path.join(fixtureDir, options.filename ?? "fixture.ts");
     const repoRoot = path.join(import.meta.dirname, "..", "..");
     const oxlintBin = path.join(path.dirname(oxlintPackageJsonPath), "bin", "oxlint");
-    const pluginPath = path.join(repoRoot, "oxlint-plugin-har-anytime", "index.ts");
+    const pluginPath = path.join(repoRoot, "oxlint-plugin-one-click-har", "index.ts");
 
     yield* fs.writeFileString(
       configPath,
       yield* encodeOxlintConfig({
-        jsPlugins: [{ name: "har-anytime", specifier: pluginPath }],
+        jsPlugins: [{ name: "one-click-har", specifier: pluginPath }],
         rules: { [ruleName]: ["error", ...(options.ruleOptions ?? [])] },
       }),
     );

@@ -1,10 +1,12 @@
 {
-  "name": "@har-anytime/monorepo",
+  "name": "@one-click-har/monorepo",
   "private": true,
   "type": "module",
   "scripts": {
     "prepare": "vp config --no-agent",
     "agent-context:check": "node scripts/agent-context-budget.ts",
+    "rename:fix": "node scripts/rename-identifiers.ts",
+    "rename:check": "node scripts/rename-identifiers.ts --check",
     "typecheck": "vp run -r --cache typecheck",
     "lint": "vp lint --report-unused-disable-directives",
     "knip": "knip",
@@ -12,7 +14,7 @@
     "test": "vp run -r test",
     "fmt": "vp fmt",
     "fmt:check": "vp fmt --check",
-    "check": "vp fmt --check && vp lint --report-unused-disable-directives && knip --no-config-hints && vp run typecheck && vp run test && vp run agent-context:check"
+    "check": "vp fmt --check && vp lint --report-unused-disable-directives && knip --no-config-hints && vp run typecheck && vp run test && vp run agent-context:check && vp run rename:check"
   },
   "devDependencies": {
     "@effect/tsgo": "0.67.1",

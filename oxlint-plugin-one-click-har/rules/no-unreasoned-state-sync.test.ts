@@ -3,13 +3,13 @@ import { assert, describe } from "@effect/vitest";
 import { createOxlintRuleHarness } from "../test/utils.ts";
 
 const reports = (output: string) =>
-  output.match(/har-anytime\(no-unreasoned-state-sync\)/g)?.length ?? 0;
+  output.match(/one-click-har\(no-unreasoned-state-sync\)/g)?.length ?? 0;
 const lint = (filename: string) =>
-  createOxlintRuleHarness("har-anytime/no-unreasoned-state-sync", { filename });
+  createOxlintRuleHarness("one-click-har/no-unreasoned-state-sync", { filename });
 
 const component = lint("apps/extension/src/Panel.tsx");
 
-describe("har-anytime/no-unreasoned-state-sync", () => {
+describe("one-click-har/no-unreasoned-state-sync", () => {
   component.invalid(
     "reports every effect hook, including member calls",
     `import React, { useEffect } from "react";
@@ -36,7 +36,7 @@ const alias = useEffect;
   component.valid(
     "accepts an effect whose suppression states its reason",
     `export function Panel() {
-  // oxlint-disable-next-line har-anytime/no-unreasoned-state-sync -- subscribes to browser runtime port events
+  // oxlint-disable-next-line one-click-har/no-unreasoned-state-sync -- subscribes to browser runtime port events
   React.useEffect(() => {});
   return null;
 }

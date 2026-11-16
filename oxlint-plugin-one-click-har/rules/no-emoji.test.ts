@@ -4,11 +4,11 @@ import { createOxlintRuleHarness } from "../test/utils.ts";
 
 const EM_DASH = "\u2014";
 
-const rule = createOxlintRuleHarness("har-anytime/no-emoji", {
+const rule = createOxlintRuleHarness("one-click-har/no-emoji", {
   filename: "fixture.tsx",
 });
 
-describe("har-anytime/no-emoji", () => {
+describe("one-click-har/no-emoji", () => {
   rule.valid("allows plain product copy", 'const copy = "Export captured responses as HAR";');
 
   rule.valid(
@@ -113,7 +113,7 @@ describe("har-anytime/no-emoji", () => {
     (output) => {
       assert.include(output, 'Emoji "🎉" is not allowed in product UI. Use an icon instead.');
       assert.notInclude(output, 'Emoji "📦"');
-      assert.strictEqual(output.match(/har-anytime\(no-emoji\)/gu)?.length, 1);
+      assert.strictEqual(output.match(/one-click-har\(no-emoji\)/gu)?.length, 1);
     },
   );
 });
