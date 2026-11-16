@@ -53,6 +53,14 @@ describe("formatHarFilename", () => {
     expect(name.length).toBe(64);
     expect(name.endsWith("_20261116-050000Z_redacted.har")).toBe(true);
     expect(name.startsWith(".")).toBe(false);
+
+    const dotBoundary = formatHarFilename({
+      host: "api.service.example.com",
+      timeRange: { start: toIsoDateTime("2026-11-16T05:00:00Z")! },
+      maxLength: 25,
+    });
+    expect(dotBoundary).toBe("api_20261116-050000Z.har");
+    expect(dotBoundary).not.toContain("._");
   });
 
   it("drops URL userinfo and keeps the filename tail inside maxLength", () => {

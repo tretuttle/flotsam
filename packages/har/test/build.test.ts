@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildHar, type BuildHarEntryInput } from "../src/build.ts";
+import { buildHar, buildHarEntry, type BuildHarEntryInput } from "../src/build.ts";
 import { toHarUrl, toIsoDateTime, toMimeType, toPageId } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
 
@@ -276,5 +276,28 @@ describe("buildHar", () => {
         entries: [],
       }),
     ).toThrow(/creator/);
+
+    const single = buildHarEntry({
+      pageref: toPageId("p_stream")!,
+      startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+      request: {
+        method: "POST",
+        url: toHarUrl("https://a.example/stream?x=1")!,
+        headers: [{ name: "Content-Type", value: "application/json" }],
+        postData: { text: '{"a":1}' },
+      },
+      response: {
+        status: 200,
+        headers: [{ name: "Content-Type", value: "application/json" }],
+        content: { text: '{"ok":true}' },
+      },
+      timings: { send: 2, wait: 3, receive: 4, ssl: 10 },
+    });
+    expect(single.pageref).toBe("p_stream");
+    expect(single.time).toBe(9);
+    expect(single.request.queryString).toEqual([{ name: "x", value: "1" }]);
+    expect(single.request.bodySize).toBe(7);
+    expect(single.response.content.size).toBe(11);
+    expect(single.response.content.mimeType).toBe("application/json");
   });
 });

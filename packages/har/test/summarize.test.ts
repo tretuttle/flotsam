@@ -237,5 +237,45 @@ describe("summarizeHar", () => {
     expect(classifyEntryBodyState(doc.log.entries[1]!)).toBe("present");
     expect(classifyEntryBodyState(doc.log.entries[2]!)).toBe("empty");
     expect(summarizeHar(doc).bodies.empty).toBe(2);
+
+    const cutShort = buildHar({
+      creator: { name: "Caller", version: "1" },
+      entries: [
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/cut1")! },
+          response: {
+            status: 200,
+            content: {
+              mimeType: toMimeType("text/plain")!,
+              size: 100,
+              text: "partial-bytes-before-failure",
+            },
+          },
+          _harExport: { bodyIncomplete: true },
+        },
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:01.000Z")!,
+          request: { method: "GET", url: toHarUrl("https://a.example/cut2")! },
+          response: {
+            status: 200,
+            content: {
+              mimeType: toMimeType("text/plain")!,
+              size: 100,
+              text: "partial-bytes-aborted",
+            },
+          },
+          _harExport: { bodyIncomplete: true, bodyMissing: "network-aborted" },
+        },
+      ],
+    });
+    expect(classifyEntryBodyState(cutShort.log.entries[0]!)).toBe("unavailable");
+    expect(classifyEntryBodyState(cutShort.log.entries[1]!)).toBe("aborted");
+    const cutSummary = summarizeHar(cutShort);
+    expect(cutSummary.bodies.withBody).toBe(0);
+    expect(cutSummary.bodies.withoutBody).toBe(2);
+    expect(cutSummary.bodies.missing).toBe(2);
+    expect(cutSummary.bodies.missingByReason.unavailable).toBe(1);
+    expect(cutSummary.bodies.missingByReason.aborted).toBe(1);
   });
 });

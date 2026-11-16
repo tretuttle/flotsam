@@ -752,6 +752,8 @@ describe("parseHar and parseHarJson", () => {
     "browser-cookie-expires",
   ]);
 
+  const DROPPED_FIXTURE_RULES = new Set<HarValidationRule>(["page-object", "entry-object"]);
+
   it("covers every validator rule with a passing and a failing fixture", () => {
     expect(Object.keys(ruleFixtures).sort()).toEqual([...HAR_VALIDATION_RULES].sort());
 
@@ -767,15 +769,68 @@ describe("parseHar and parseHarJson", () => {
         match,
         `expected a ${rule} problem, got ${failed.problems.map((problem) => problem.rule).join(", ")}`,
       ).toBeDefined();
-      expect(match?.severity).toBe(NOTE_RULES.has(rule) ? "note" : "error");
+      const expectedSeverity = NOTE_RULES.has(rule)
+        ? "note"
+        : DROPPED_FIXTURE_RULES.has(rule)
+          ? "dropped"
+          : "error";
+      expect(match?.severity).toBe(expectedSeverity);
     }
   });
 
-  it("keeps the other entries when one entry is unusable", () => {
+  it("marks every lost entry and lost page as dropped, includes method and url when known, and keeps salvaged entries", () => {
     const result = parseHar(
       cloneHar((har) => {
+        const pages = (har.log as Record<string, unknown>).pages as Array<unknown>;
+        pages.push({
+          id: "page_0",
+          title: "https://example.com/dup",
+          startedDateTime: "2026-11-16T05:01:00.000Z",
+          pageTimings: { onContentLoad: -1, onLoad: -1 },
+        });
+        pages.push("not-a-page");
+        pages.push({
+          id: "page_bad_title",
+          title: 42,
+          startedDateTime: "2026-11-16T05:02:00.000Z",
+          pageTimings: {},
+        });
+        pages.push({
+          id: "page_bad_timings",
+          title: "bad timings",
+          startedDateTime: "2026-11-16T05:03:00.000Z",
+          pageTimings: "invalid",
+        });
+
         const entries = (har.log as Record<string, unknown>).entries as Array<unknown>;
-        entries.push({ startedDateTime: "not-a-date" });
+        const goodTemplate = JSON.parse(JSON.stringify(entries[0])) as Record<string, unknown>;
+        entries.push(null);
+        entries.push("GET https://example.com/raw-line");
+        entries.push([1, 2]);
+        entries.push({ ...JSON.parse(JSON.stringify(goodTemplate)), request: undefined });
+        entries.push({
+          ...JSON.parse(JSON.stringify(goodTemplate)),
+          request: { method: "POST", url: "/relative/drop" },
+        });
+        entries.push({
+          ...JSON.parse(JSON.stringify(goodTemplate)),
+          request: { method: "DELETE", url: 42 },
+        });
+
+        const badResponse = JSON.parse(JSON.stringify(goodTemplate)) as Record<string, unknown>;
+        (badResponse.request as Record<string, unknown>).url = "https://example.com/salvage-res";
+        badResponse.response = "HTTP/1.1 200 OK";
+        entries.push(badResponse);
+
+        const badTime = JSON.parse(JSON.stringify(goodTemplate)) as Record<string, unknown>;
+        (badTime.request as Record<string, unknown>).url = "https://example.com/salvage-time";
+        badTime.time = -5;
+        entries.push(badTime);
+
+        const badDate = JSON.parse(JSON.stringify(goodTemplate)) as Record<string, unknown>;
+        (badDate.request as Record<string, unknown>).url = "https://example.com/salvage-date";
+        badDate.startedDateTime = "not-a-valid-date";
+        entries.push(badDate);
       }),
     );
 
@@ -783,15 +838,34 @@ describe("parseHar and parseHarJson", () => {
     if (!result.ok) {
       return;
     }
-    expect(result.document.log.entries).toHaveLength(1);
-    expect(
-      result.problems.some(
-        (problem) => problem.rule === "entry-object" || problem.rule === "iso-datetime",
-      ),
-    ).toBe(true);
+
+    expect(result.document.log.pages?.map((page) => page.id)).toEqual(["page_0", "page_0__1"]);
+    const droppedPages = result.problems.filter(
+      (problem) => problem.path.startsWith("$.log.pages") && problem.severity === "dropped",
+    );
+    expect(droppedPages).toHaveLength(3);
+
+    expect(result.document.log.entries.map((entry) => entry.request.url)).toEqual([
+      "https://example.com/?view=full",
+      "https://example.com/salvage-res",
+      "https://example.com/salvage-time",
+      "https://example.com/salvage-date",
+    ]);
+    expect(result.document.log.entries[1]!.response.status).toBe(0);
+    expect(result.document.log.entries[2]!.time).toBe(0);
+    expect(result.document.log.entries[3]!.startedDateTime).toBe("1970-01-01T00:00:00.000Z");
+
+    const droppedEntries = result.problems.filter(
+      (problem) => problem.path.startsWith("$.log.entries") && problem.severity === "dropped",
+    );
+    expect(droppedEntries).toHaveLength(6);
+    expect(droppedEntries.some((problem) => problem.message.includes("POST /relative/drop"))).toBe(
+      true,
+    );
+    expect(droppedEntries.some((problem) => problem.message.includes("(DELETE)"))).toBe(true);
   });
 
-  it("reports negative send, wait, and receive and drops only that entry", () => {
+  it("reports negative send, wait, and receive and keeps the salvaged entry", () => {
     const result = parseHar(
       cloneHar((har) => {
         const entries = (har.log as Record<string, unknown>).entries as Array<
@@ -845,7 +919,7 @@ describe("parseHar and parseHarJson", () => {
     expect(result.problems.some((problem) => problem.severity === "dropped")).toBe(true);
   });
 
-  it("keeps unknown keys on postData and headers", () => {
+  it("keeps unknown keys on postData, headers, and content", () => {
     const result = parseHar(
       cloneHar((har) => {
         const entry = (
@@ -859,15 +933,18 @@ describe("parseHar and parseHarJson", () => {
           vendorTrace: "keep-post",
         };
         request.headers = [{ name: "Accept", value: "text/html", size: 12 }];
+        const response = entry.response as Record<string, unknown>;
+        (response.content as Record<string, unknown>).url = "blob:keep-content-url";
       }),
     );
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
     }
-    const request = result.document.log.entries[0]!.request;
-    expect(request.postData?.vendorTrace).toBe("keep-post");
-    expect(request.headers[0]?.size).toBe(12);
+    const entry = result.document.log.entries[0]!;
+    expect(entry.request.postData?.vendorTrace).toBe("keep-post");
+    expect(entry.request.headers[0]?.size).toBe(12);
+    expect(entry.response.content.url).toBe("blob:keep-content-url");
   });
 
   it("reports a page with a bad date and keeps the page", () => {
@@ -888,21 +965,35 @@ describe("parseHar and parseHarJson", () => {
     expect(problem?.severity).not.toBe("dropped");
   });
 
-  it("rejects an empty creator name or version", () => {
+  it("rejects an empty creator name and keeps an empty creator version with a note", () => {
     const nameless = parseHar(
       cloneHar((har) => {
         (har.log as Record<string, unknown>).creator = { name: "", version: "1" };
       }),
     );
-    const versionless = parseHar(
+    const missingVersion = parseHar(
+      cloneHar((har) => {
+        (har.log as Record<string, unknown>).creator = { name: "Caller" };
+      }),
+    );
+    const emptyVersion = parseHar(
       cloneHar((har) => {
         (har.log as Record<string, unknown>).creator = { name: "Caller", version: "" };
       }),
     );
     expect(nameless.ok).toBe(false);
-    expect(versionless.ok).toBe(false);
+    expect(missingVersion.ok).toBe(false);
+    expect(emptyVersion.ok).toBe(true);
     if (!nameless.ok) {
       expect(nameless.problems.some((problem) => problem.rule === "creator-object")).toBe(true);
+    }
+    if (emptyVersion.ok) {
+      expect(emptyVersion.document.log.creator.version).toBe("");
+      expect(
+        emptyVersion.problems.some(
+          (problem) => problem.rule === "creator-object" && problem.severity === "note",
+        ),
+      ).toBe(true);
     }
   });
 

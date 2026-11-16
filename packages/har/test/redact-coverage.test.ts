@@ -4,14 +4,19 @@ import { decodeAsciiBase64, encodeAsciiBase64 } from "./ascii-base64.ts";
 import { buildHar } from "../src/build.ts";
 import {
   HAR_REDACTION_PLACES,
-  REDACTION_DETECTORS,
   REDACTION_LEVELS,
   toHarUrl,
   toIsoDateTime,
   toMimeType,
+  type HarRedactionPlace,
 } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
-import { REDACTION_LEVEL_TABLE, redactHar } from "../src/redact.ts";
+import {
+  ALLOWLISTED_HEADER_NAMES,
+  REDACTION_LEVEL_TABLE,
+  URL_HEADER_NAMES,
+  redactHar,
+} from "../src/redact.ts";
 
 const PNG =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -48,51 +53,29 @@ function entry(start: string, url: string, extra: Record<string, unknown> = {}) 
 }
 
 describe("redaction coverage", () => {
-  it("states each level as one guarantee and enforces it", () => {
-    const secret = "Aa1entropySecretValue99";
-    const doc = buildHar({
-      creator: { name: "Caller", version: "1" },
-      entries: [
-        {
-          startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
-          request: {
-            method: "POST",
-            url: toHarUrl("https://api.example/a")!,
-            postData: {
-              mimeType: toMimeType("text/plain")!,
-              text: secret,
-            },
-          },
-          response: {
-            status: 200,
-            content: { mimeType: toMimeType("text/plain")!, text: secret },
-          },
-          _requestContext: { apiKey: secret },
-        },
-      ],
+  it("defines standard and shareable guarantees and leaves bodies byte-identical under standard", () => {
+    expect(Object.keys(REDACTION_LEVEL_TABLE)).toEqual([...REDACTION_LEVELS]);
+    expect(ALLOWLISTED_HEADER_NAMES.has("content-type")).toBe(true);
+    expect(ALLOWLISTED_HEADER_NAMES.has("content-length")).toBe(true);
+    expect(URL_HEADER_NAMES.has("location")).toBe(true);
+    expect(URL_HEADER_NAMES.has("referer")).toBe(true);
+
+    const jsBundle = [
+      "const B64='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';",
+      "function layout(prevReachedMinPanes=0,nextPaneWidth24=1){return prevReachedMinPanes+nextPaneWidth24;}",
+      "export default layout;",
+    ].join("\n");
+    const htmlBody =
+      '<!doctype html><link rel="stylesheet" href="/assets/index-k0-HAKZI.css" integrity="sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC" crossorigin><script type="module" src="/assets/index-C4tyqWfb.js"></script>';
+    const jsonBody = JSON.stringify({
+      id: "1849203849102938471",
+      stripeId: "pi_3MtwBwLkdIwHu7ix28a3tqPa",
+      sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      uuid: "123e4567-e89b-12d3-a456-426614174000",
+      i18nKey: "checkout.Payment2Method.Label",
+      icon: PNG,
     });
 
-    const strict = redactHar(doc, { level: "strict" });
-    const strictText = JSON.stringify(strict.document);
-    expect(Object.keys(REDACTION_LEVEL_TABLE)).toEqual([...REDACTION_LEVELS]);
-    expect(REDACTION_LEVEL_TABLE.default.detectors).toEqual([...REDACTION_DETECTORS]);
-    expect(strict.report.guarantee).toBe(REDACTION_LEVEL_TABLE.strict.guarantee);
-    expect(strictText).not.toContain(secret);
-    expect(strict.document.log.entries[0]!.request.postData?.text).toBe("");
-    expect(strict.document.log.entries[0]!.response.content.text).toBeUndefined();
-    expect(strict.document.log.entries[0]!._requestContext).toBeUndefined();
-    expect(
-      strict.report.places.find((place) => place.place === "response-body-other")?.canStillHold,
-    ).toBe("Nothing can remain. The field was removed.");
-
-    const loose = redactHar(doc);
-    expect(loose.report.guarantee).toBe(REDACTION_LEVEL_TABLE.default.guarantee);
-    expect(JSON.stringify(loose.document)).not.toContain(secret);
-  });
-
-  it("keeps hashes, UUIDs, and base64 images, and removes hex in a query", () => {
-    const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    const uuid = "123e4567-e89b-12d3-a456-426614174000";
     const doc = buildHar({
       creator: { name: "Caller", version: "1" },
       entries: [
@@ -100,90 +83,190 @@ describe("redaction coverage", () => {
           startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
           request: {
             method: "GET",
-            url: toHarUrl(`https://cdn.example/a?sig=${hash}`)!,
+            url: toHarUrl(
+              "https://cdn.example/assets/index-C4tyqWfb.js?snowflake=1849203849102938471",
+            )!,
+            headers: [
+              { name: "Content-Type", value: "application/javascript" },
+              { name: "X-Request-Id", value: "pi_3MtwBwLkdIwHu7ix28a3tqPa" },
+            ],
+          },
+          response: {
+            status: 200,
+            content: {
+              mimeType: toMimeType("application/javascript")!,
+              text: jsBundle,
+            },
+          },
+        },
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:01.000Z")!,
+          request: {
+            method: "GET",
+            url: toHarUrl("https://app.example/index.html")!,
+          },
+          response: {
+            status: 200,
+            content: {
+              mimeType: toMimeType("text/html")!,
+              text: htmlBody,
+            },
+          },
+        },
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:02.000Z")!,
+          request: {
+            method: "POST",
+            url: toHarUrl("https://app.example/api/order")!,
+            postData: {
+              mimeType: toMimeType("application/json")!,
+              text: jsonBody,
+            },
           },
           response: {
             status: 200,
             content: {
               mimeType: toMimeType("application/json")!,
-              text: JSON.stringify({ checksum: hash, id: uuid, icon: PNG }),
+              text: jsonBody,
             },
           },
-          comment: `${hash} ${uuid}`,
+          _requestContext: { trace: "keep-in-standard" },
         },
       ],
     });
-    const { document, report } = redactHar(doc);
-    const body = document.log.entries[0]!.response.content.text ?? "";
-    expect(document.log.entries[0]!.request.url).not.toContain(hash);
-    expect(body).toContain(hash);
-    expect(body).toContain(uuid);
-    expect(body).toContain(PNG);
-    expect(document.log.entries[0]!.comment).toContain(uuid);
-    const query = report.places.find((place) => place.place === "request-url-query");
-    expect(query?.canStillHold).toContain("Hex of 16 or more characters");
-    const json = report.places.find((place) => place.place === "response-body-json");
-    expect(json?.canStillHold).toContain("hex hash");
-    expect(json?.canStillHold).toContain("UUID");
-    expect(json?.canStillHold).toContain("base64 image");
+
+    const standard = redactHar(doc, { level: "standard" });
+    expect(standard.report.guarantee).toBe(REDACTION_LEVEL_TABLE.standard.guarantee);
+    expect(standard.document.log.entries[0]!.response.content.text).toBe(jsBundle);
+    expect(standard.document.log.entries[0]!.request.url).toContain(
+      "snowflake=1849203849102938471",
+    );
+    expect(standard.document.log.entries[1]!.response.content.text).toBe(htmlBody);
+    expect(standard.document.log.entries[2]!.request.postData?.text).toBe(jsonBody);
+    expect(standard.document.log.entries[2]!.response.content.text).toBe(jsonBody);
+    expect(standard.document.log.entries[2]!._requestContext).toEqual({
+      trace: "keep-in-standard",
+    });
+
+    const shareable = redactHar(doc, { level: "shareable" });
+    expect(shareable.report.guarantee).toBe(REDACTION_LEVEL_TABLE.shareable.guarantee);
+    expect(shareable.document.log.entries[0]!.request.url).toBe(
+      "https://cdn.example/assets/index-C4tyqWfb.js",
+    );
+    expect(shareable.document.log.entries[0]!.request.queryString).toEqual([]);
+    expect(
+      shareable.document.log.entries[0]!.request.headers.find((h) => h.name === "Content-Type")
+        ?.value,
+    ).toBe("application/javascript");
+    expect(
+      shareable.document.log.entries[0]!.request.headers.find((h) => h.name === "X-Request-Id")
+        ?.value,
+    ).toBe("");
+    expect(shareable.document.log.entries[0]!.response.content.text).toBeUndefined();
+    expect(shareable.document.log.entries[1]!.response.content.text).toBeUndefined();
+    expect(shareable.document.log.entries[2]!.request.postData?.text).toBe("");
+    expect(shareable.document.log.entries[2]!.response.content.text).toBeUndefined();
+    expect(shareable.document.log.entries[2]!._requestContext).toBeUndefined();
+    expect(
+      shareable.report.places.find((place) => place.place === "response-body-other")?.status,
+    ).toBe("removed");
+    expect(
+      shareable.report.places.find((place) => place.place === "request-url-path")?.status,
+    ).toBe("kept-by-allowlist");
   });
 
-  it("strips userinfo without a userinfo name and does not call a short query inspected-clean", () => {
+  it("keeps custom fields at all 19 HAR levels under standard and removes them all under shareable", () => {
+    const customTag = (tag: string) => ({
+      _u: `keep-${tag}`,
+      vendorNote: `keep-${tag}-plain`,
+    });
+    const levels = [
+      "log",
+      "creator",
+      "browser",
+      "page",
+      "pageTimings",
+      "entry",
+      "request",
+      "reqCookie",
+      "reqHeader",
+      "query",
+      "postData",
+      "param",
+      "response",
+      "resCookie",
+      "resHeader",
+      "content",
+      "cache",
+      "cacheEntry",
+      "timings",
+    ] as const;
+
     const parsed = parseHar({
       log: {
         version: "1.2",
-        creator: { name: "Caller", version: "1" },
-        entries: [
-          entry("2026-11-16T05:00:00.000Z", "https://api.example/home", {
-            request: {
-              method: "GET",
-              url: "https://api.example/home",
-              httpVersion: "HTTP/1.1",
-              cookies: [],
-              headers: [
-                {
-                  name: "Referer",
-                  value: "https://user:SECRETUSER@app.example/back?password=ab",
-                },
-              ],
-              queryString: [],
-              headersSize: -1,
-              bodySize: 0,
-            },
-          }),
+        ...customTag("log"),
+        creator: { name: "u", version: "1", ...customTag("creator") },
+        browser: { name: "b", version: "1", ...customTag("browser") },
+        pages: [
+          {
+            id: "p1",
+            title: "t",
+            startedDateTime: "2026-11-16T00:00:00.000Z",
+            pageTimings: { onLoad: 1, ...customTag("pageTimings") },
+            ...customTag("page"),
+          },
         ],
-      },
-    });
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) {
-      return;
-    }
-    const { document, report } = redactHar(parsed.document, {
-      rules: [{ id: "ref", target: "header-url", names: ["referer"] }],
-    });
-    const referer = document.log.entries[0]!.request.headers[0]?.value ?? "";
-    expect(referer).not.toContain("SECRETUSER");
-    expect(referer).toContain("password=ab");
-    const userinfo = report.places.find((place) => place.place === "request-url-userinfo");
-    const header = report.places.find((place) => place.place === "url-header");
-    expect(userinfo?.status).toBe("removed");
-    expect(userinfo?.detectors).toContain("url");
-    expect(header?.status).not.toBe("not-examined");
-    expect(header?.canStillHold).toContain("shorter than 20");
-    expect(report.notInspected).not.toContain("url-header");
-    expect(report.notInspected).not.toContain("request-url-userinfo");
-  });
-
-  it("keeps a JWT when the token detector is off and says so", () => {
-    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.Aaa1bbbCcc2dddEee3fffGh";
-    const parsed = parseHar({
-      log: {
-        version: "1.2",
-        creator: { name: "Caller", version: "1" },
         entries: [
           {
-            ...entry("2026-11-16T05:00:00.000Z", "https://api.example/a"),
-            comment: jwt,
+            pageref: "p1",
+            startedDateTime: "2026-11-16T00:00:01.000Z",
+            time: 1,
+            ...customTag("entry"),
+            request: {
+              method: "POST",
+              url: "https://u.example/a?x=1",
+              httpVersion: "HTTP/1.1",
+              ...customTag("request"),
+              cookies: [{ name: "c", value: "v", ...customTag("reqCookie") }],
+              headers: [{ name: "h", value: "v", ...customTag("reqHeader") }],
+              queryString: [{ name: "x", value: "1", ...customTag("query") }],
+              postData: {
+                mimeType: "application/x-www-form-urlencoded",
+                text: "",
+                params: [{ name: "p", value: "v", ...customTag("param") }],
+                ...customTag("postData"),
+              },
+              headersSize: -1,
+              bodySize: -1,
+            },
+            response: {
+              status: 200,
+              statusText: "OK",
+              httpVersion: "HTTP/1.1",
+              ...customTag("response"),
+              cookies: [{ name: "c", value: "v", ...customTag("resCookie") }],
+              headers: [{ name: "h", value: "v", ...customTag("resHeader") }],
+              content: {
+                size: 1,
+                mimeType: "text/plain",
+                text: "a",
+                ...customTag("content"),
+              },
+              redirectURL: "",
+              headersSize: -1,
+              bodySize: -1,
+            },
+            cache: {
+              ...customTag("cache"),
+              beforeRequest: {
+                lastAccess: "2026-11-16T00:00:00.000Z",
+                eTag: "e",
+                hitCount: 1,
+                ...customTag("cacheEntry"),
+              },
+            },
+            timings: { send: 0, wait: 0, receive: 0, ...customTag("timings") },
           },
         ],
       },
@@ -192,63 +275,27 @@ describe("redaction coverage", () => {
     if (!parsed.ok) {
       return;
     }
-    const { document, report } = redactHar(parsed.document, {
-      detectors: ["structured-removal", "name-match", "url", "json-walk"],
-    });
-    expect(document.log.entries[0]!.comment).toContain(jwt);
-    const comment = report.places.find((place) => place.place === "comment");
-    expect(comment?.detectors).not.toContain("token-shape");
-    expect(comment?.canStillHold).toContain("token-shaped value can remain");
-  });
 
-  it("marks every place not examined when no detector runs", () => {
-    const parsed = parseHar({
-      log: {
-        version: "1.2",
-        creator: { name: "Caller", version: "1" },
-        entries: [entry("2026-11-16T05:00:00.000Z", "https://api.example/a")],
-      },
-    });
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) {
-      return;
+    const standardText = JSON.stringify(redactHar(parsed.document, { level: "standard" }).document);
+    const shareableResult = redactHar(parsed.document, { level: "shareable" });
+    const shareableText = JSON.stringify(shareableResult.document);
+
+    for (const lv of levels) {
+      expect(standardText).toContain(`"keep-${lv}"`);
+      expect(standardText).toContain(`"keep-${lv}-plain"`);
+      expect(shareableText).not.toContain(`"keep-${lv}"`);
+      expect(shareableText).not.toContain(`"keep-${lv}-plain"`);
     }
-    const { report } = redactHar(parsed.document, { detectors: [] });
-    expect(report.notInspected).toEqual([...HAR_REDACTION_PLACES]);
-    expect(report.places.every((place) => place.status === "not-examined")).toBe(true);
-    expect(report.places.every((place) => place.canStillHold.includes("not examined"))).toBe(true);
+    expect(
+      shareableResult.report.places.find((p) => p.place === "other-custom-field")?.status,
+    ).toBe("removed");
   });
 
-  it("removes the round 2 planted secrets", () => {
+  it("accounts for all 24 round-2 planted secrets under standard and removes all except the URL path under shareable", () => {
     const secret = (key: string) => `SECRET_${key}_9c2e`;
     const jwt = (key: string) => `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIke${key}In0.${secret(key)}`;
     const signed = `https://bucket.s3.amazonaws.com/f.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20261116&X-Amz-Signature=${secret("S3_SIG")}&X-Amz-Security-Token=${secret("S3_STS")}`;
-    const keys = [
-      "RB_SIGNEDURL",
-      "WS_JWT",
-      "REDIR_SETCOOKIE",
-      "REDIR_RESCOOKIE",
-      "GQL_BEARER",
-      "CUSTOM_APIKEY",
-      "S3_SIG",
-      "S3_STS",
-      "GKEY",
-      "IMPLICIT_LOC",
-      "IMPLICIT_REDIR",
-      "TEXTPLAIN_JSON",
-      "X_AUTH_TOKEN",
-      "WS_PROTOCOL",
-      "B64_JSON",
-      "HTML_CSRF",
-      "ENTRY_COMMENT",
-      "PATH_TOKEN",
-      "WS_URL",
-      "STACK_URL",
-      "ID_TOKEN_ARRAY",
-      "SAFARI_COOKIE",
-      "CACHE_ETAG",
-      "REFRESH_COOKIE_HDR",
-    ];
+
     const parsed = parseHar({
       log: {
         version: "1.2",
@@ -513,12 +560,68 @@ describe("redaction coverage", () => {
     if (!parsed.ok) {
       return;
     }
-    const { document } = redactHar(parsed.document);
-    const decoded = document.log.entries
+
+    const removedInStd = [
+      "REDIR_SETCOOKIE",
+      "REDIR_RESCOOKIE",
+      "S3_SIG",
+      "S3_STS",
+      "GKEY",
+      "X_AUTH_TOKEN",
+      "WS_URL",
+      "SAFARI_COOKIE",
+      "REFRESH_COOKIE_HDR",
+    ];
+    const notExaminedInStd: ReadonlyArray<readonly [string, HarRedactionPlace]> = [
+      ["RB_SIGNEDURL", "response-body-json"],
+      ["WS_JWT", "websocket"],
+      ["GQL_BEARER", "body-json"],
+      ["CUSTOM_APIKEY", "other-custom-field"],
+      ["IMPLICIT_LOC", "url-header"],
+      ["IMPLICIT_REDIR", "redirect-url"],
+      ["TEXTPLAIN_JSON", "body-json"],
+      ["WS_PROTOCOL", "named-header"],
+      ["B64_JSON", "response-body-base64"],
+      ["HTML_CSRF", "response-body-other"],
+      ["ENTRY_COMMENT", "comment"],
+      ["PATH_TOKEN", "request-url-path"],
+      ["STACK_URL", "initiator"],
+      ["ID_TOKEN_ARRAY", "response-body-json"],
+      ["CACHE_ETAG", "cache"],
+    ];
+
+    const std = redactHar(parsed.document, { level: "standard" });
+    const stdDecoded = std.document.log.entries
       .filter((item) => item.response.content.encoding === "base64" && item.response.content.text)
       .map((item) => decodeAsciiBase64(item.response.content.text ?? ""));
-    const out = [JSON.stringify(document), ...decoded].join("\n");
-    const stayed = keys.filter((key) => out.includes(secret(key)));
-    expect(stayed).toEqual([]);
+    const stdOut = [JSON.stringify(std.document), ...stdDecoded].join("\n");
+
+    for (const key of removedInStd) {
+      expect(stdOut).not.toContain(secret(key));
+    }
+    for (const [key, place] of notExaminedInStd) {
+      expect(stdOut).toContain(secret(key));
+      const cov = std.report.places.find((item) => item.place === place);
+      expect(cov?.status).toBe("kept-not-examined");
+      expect(cov?.detail).toBe("not examined: may contain secrets");
+      expect(cov?.count).toBeGreaterThan(0);
+    }
+
+    const shareable = redactHar(parsed.document, { level: "shareable" });
+    const shareOut = JSON.stringify(shareable.document);
+    for (const key of removedInStd) {
+      expect(shareOut).not.toContain(secret(key));
+    }
+    for (const [key] of notExaminedInStd) {
+      if (key === "PATH_TOKEN") {
+        expect(shareOut).toContain(secret(key));
+      } else {
+        expect(shareOut).not.toContain(secret(key));
+      }
+    }
+    expect(shareable.report.places.find((item) => item.place === "request-url-path")?.status).toBe(
+      "kept-by-allowlist",
+    );
+    expect(shareable.report.places).toHaveLength(HAR_REDACTION_PLACES.length);
   });
 });

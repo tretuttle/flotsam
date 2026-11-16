@@ -1,190 +1,48 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { decodeAsciiBase64, encodeAsciiBase64 } from "./ascii-base64.ts";
-import { HAR_REDACTION_PLACES, type HarRedactionPlace } from "../src/model.ts";
+import {
+  HAR_REDACTION_PLACES,
+  type HarDocument,
+  type HarModelStringField,
+  type HarRedactionPlace,
+  type RedactionLevel,
+} from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
-import { redactHar } from "../src/redact.ts";
+import {
+  HAR_MODEL_FIELD_TABLE,
+  HAR_PLACE_TABLE,
+  type HarPlaceRule,
+  redactHar,
+} from "../src/redact.ts";
 
-const CASES = 2000;
-const PNG =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-
-const SLOTS = [
-  "request-url-query",
-  "request-url-userinfo",
-  "request-url-fragment",
-  "request-url-path",
-  "named-header",
-  "url-header",
-  "cookie",
-  "query-string",
-  "body-param",
-  "body-json",
-  "body-form",
-  "body-multipart",
-  "request-body-other",
-  "redirect-url",
-  "response-body-json",
-  "response-body-base64",
-  "page-title",
-  "initiator",
-  "response-body-other",
-  "websocket",
-  "cache",
-  "comment",
-  "other-custom-field",
-] as const satisfies readonly HarRedactionPlace[];
-
-type Slot = (typeof SLOTS)[number];
-type Kind =
-  | "jwt"
-  | "bearer"
-  | "entropy"
-  | "url-credential"
-  | "listed-name"
-  | "short-random"
-  | "hex-hash"
-  | "uuid"
-  | "image-base64";
-
-const KINDS: readonly Kind[] = [
-  "jwt",
-  "bearer",
-  "entropy",
-  "url-credential",
-  "listed-name",
-  "short-random",
-  "hex-hash",
-  "uuid",
-  "image-base64",
-];
-
-const QUERY_PLACES = new Set<HarRedactionPlace>([
-  "request-url-query",
-  "request-url-fragment",
-  "query-string",
-]);
-
-const NAMED = new Set<Slot>([
-  "request-url-query",
-  "request-url-fragment",
-  "query-string",
-  "body-param",
-  "body-json",
-  "body-form",
-  "body-multipart",
-  "response-body-json",
-  "response-body-base64",
-  "other-custom-field",
-  "websocket",
-]);
-
-function mulberry32(seed: number): () => number {
-  let state = seed;
-  return () => {
-    state = (state + 0x6d2b79f5) | 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function mixed(rng: () => number, index: number, length: number): string {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-  const head = `A${index.toString(36)}a1`;
-  let body = head;
-  while (body.length < length) {
-    body += alphabet[Math.floor(rng() * alphabet.length)] ?? "A";
-  }
-  return body.slice(0, length);
-}
-
-function hex(rng: () => number, index: number): string {
-  const digits = "0123456789abcdef";
-  let body = index.toString(16).padStart(6, "0");
-  while (body.length < 64) {
-    body += digits[Math.floor(rng() * 16)] ?? "0";
-  }
-  return body.slice(0, 64);
-}
-
-function uuid(index: number): string {
-  return `123e4567-e89b-42d3-a456-${index.toString(16).padStart(12, "0")}`;
-}
-
-function stamp(index: number): string {
-  return new Date(Date.UTC(2026, 0, 1) + index * 1000).toISOString();
-}
-
-interface Planted {
-  readonly index: number;
+interface PlantedMarker {
+  readonly field: HarModelStringField;
   readonly place: HarRedactionPlace;
-  readonly kind: Kind;
   readonly marker: string;
-  readonly wholesale: boolean;
 }
 
-function payload(
-  kind: Kind,
-  index: number,
-  rng: () => number,
-): { readonly marker: string; readonly text: string } {
-  if (kind === "jwt") {
-    const marker = mixed(rng, index, 24);
-    return { marker, text: `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.${marker}` };
-  }
-  if (kind === "bearer") {
-    const marker = mixed(rng, index, 24);
-    return { marker, text: `Bearer ${marker}` };
-  }
-  if (kind === "entropy") {
-    const marker = mixed(rng, index, 24);
-    return { marker, text: marker };
-  }
-  if (kind === "url-credential") {
-    const marker = mixed(rng, index, 18);
-    return { marker, text: `https://user:${marker}@files.example/a` };
-  }
-  if (kind === "listed-name") {
-    const marker = `v${String(index)}`;
-    return { marker, text: marker };
-  }
-  if (kind === "short-random") {
-    const marker = `q${String(index)}z`;
-    return { marker, text: marker };
-  }
-  if (kind === "hex-hash") {
-    const marker = hex(rng, index);
-    return { marker, text: marker };
-  }
-  if (kind === "uuid") {
-    const marker = uuid(index);
-    return { marker, text: marker };
-  }
-  return { marker: PNG, text: PNG };
-}
+const STANDARD_REMOVED_PLACES: ReadonlySet<HarRedactionPlace> = new Set([
+  "request-url-userinfo",
+  "request-url-query-secret",
+  "header-value-secret",
+  "cookie",
+  "query-string-secret",
+  "body-param-secret",
+]);
 
-function chooseSlot(natural: Slot, kind: Kind): Slot {
-  let slot: Slot = natural;
-  if (kind === "listed-name" && !NAMED.has(slot)) {
-    slot = "body-json";
-  }
-  if (kind === "image-base64") {
-    slot = "response-body-other";
-  }
-  if (kind === "url-credential" && (slot === "request-url-path" || slot === "cookie")) {
-    slot = "request-url-userinfo";
-  }
-  if (kind !== "url-credential" && slot === "request-url-userinfo") {
-    slot = "comment";
-  }
-  return slot;
-}
+const SHAREABLE_KEPT_PLACES: ReadonlySet<HarRedactionPlace> = new Set([
+  "request-url-host",
+  "request-url-path",
+  "header-name",
+  "header-value-allowlisted",
+  "protocol-metadata",
+]);
 
-function blank(index: number, url: string): Record<string, unknown> {
+function baseEntry(index: number, url = "https://plain.example/item"): Record<string, unknown> {
   return {
-    pageref: `p${String(index)}`,
-    startedDateTime: stamp(index),
+    pageref: "p_base",
+    startedDateTime: new Date(Date.UTC(2026, 0, 1, 0, 0, index + 1)).toISOString(),
     time: 5,
     request: {
       method: "GET",
@@ -202,302 +60,600 @@ function blank(index: number, url: string): Record<string, unknown> {
       httpVersion: "HTTP/1.1",
       cookies: [],
       headers: [],
-      content: { size: 1, mimeType: "text/plain", text: "ok" },
+      content: { size: 2, mimeType: "text/plain", text: "ok" },
       redirectURL: "",
       headersSize: -1,
-      bodySize: 1,
+      bodySize: 2,
     },
     cache: {},
-    timings: { send: 1, wait: 1, receive: 1 },
+    timings: { send: 1, wait: 2, receive: 2 },
   };
 }
 
-function plant(slot: Slot, kind: Kind, text: string, index: number): Record<string, unknown> {
-  const key = kind === "listed-name" ? "password" : "note";
-  const wrapped =
-    text.includes("://") ||
-    kind === "hex-hash" ||
-    kind === "uuid" ||
-    kind === "short-random" ||
-    kind === "image-base64"
-      ? text
-      : `https://files.example/a?${key}=${encodeURIComponent(text)}`;
-  if (slot === "request-url-query") {
-    return blank(index, `https://ex.test/a?${key}=${encodeURIComponent(text)}`);
-  }
-  if (slot === "request-url-userinfo") {
-    return blank(index, text.includes("://") ? text : `https://user:${text}@files.example/a`);
-  }
-  if (slot === "request-url-fragment") {
-    return blank(index, `https://ex.test/cb#${key}=${encodeURIComponent(text)}`);
-  }
-  if (slot === "request-url-path") {
-    return blank(index, `https://ex.test/p/${encodeURIComponent(text)}`);
-  }
-  if (slot === "page-title") {
-    return blank(index, "https://ex.test/title");
-  }
-  if (slot === "named-header") {
-    const row = blank(index, "https://ex.test/h");
-    (row.request as Record<string, unknown>).headers = [
-      { name: `X-Custom-${String(index)}`, value: text },
-    ];
-    return row;
-  }
-  if (slot === "url-header") {
-    const row = blank(index, "https://ex.test/h");
-    (row.request as Record<string, unknown>).headers = [{ name: "Referer", value: wrapped }];
-    return row;
-  }
-  if (slot === "cookie") {
-    const row = blank(index, "https://ex.test/c");
-    (row.request as Record<string, unknown>).cookies = [{ name: "sid", value: text }];
-    return row;
-  }
-  if (slot === "query-string") {
-    const row = blank(index, "https://ex.test/q");
-    (row.request as Record<string, unknown>).queryString = [{ name: key, value: text }];
-    return row;
-  }
-  if (
-    slot === "body-param" ||
-    slot === "body-json" ||
-    slot === "body-form" ||
-    slot === "body-multipart" ||
-    slot === "request-body-other"
-  ) {
-    const row = blank(index, "https://ex.test/b");
-    const request = row.request as Record<string, unknown>;
-    request.method = "POST";
-    if (slot === "body-param") {
-      request.postData = {
-        mimeType: "application/x-www-form-urlencoded",
-        params: [{ name: key, value: text }],
-        text: "",
-      };
-    } else if (slot === "body-json") {
-      request.postData = {
-        mimeType: "application/json",
-        params: [],
-        text: JSON.stringify({ [key]: text }),
-      };
-    } else if (slot === "body-form") {
-      request.postData = {
-        mimeType: "application/x-www-form-urlencoded",
-        params: [],
-        text: `${key}=${encodeURIComponent(text)}`,
-      };
-    } else if (slot === "body-multipart") {
-      request.postData = {
-        mimeType: "multipart/form-data; boundary=b",
-        params: [],
-        text: `--b\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${text}\r\n--b--`,
-      };
-    } else {
-      request.postData = { mimeType: "text/plain", params: [], text: `note ${text}` };
+function buildMarkerDocument(): {
+  readonly document: HarDocument;
+  readonly markers: readonly PlantedMarker[];
+  readonly plantedFields: ReadonlySet<HarModelStringField>;
+} {
+  const markers: PlantedMarker[] = [];
+  const plantedFields = new Set<HarModelStringField>();
+  let seq = 0;
+
+  const nextMarker = (field: HarModelStringField, place: HarRedactionPlace): string => {
+    seq += 1;
+    plantedFields.add(field);
+    if (field === "log.version") {
+      const m = "1.947281";
+      markers.push({ field, place, marker: m });
+      return m;
     }
-    return row;
-  }
-  if (slot === "redirect-url") {
-    const row = blank(index, "https://ex.test/r");
-    (row.response as Record<string, unknown>).redirectURL = wrapped;
-    return row;
-  }
-  if (slot === "response-body-json") {
-    const row = blank(index, "https://ex.test/j");
-    (row.response as Record<string, unknown>).content = {
-      size: text.length,
-      mimeType: "application/json",
-      text: JSON.stringify({ [key]: text }),
-    };
-    return row;
-  }
-  if (slot === "response-body-base64") {
-    const row = blank(index, "https://ex.test/b64");
-    (row.response as Record<string, unknown>).content = {
-      size: text.length,
-      mimeType: "application/json",
-      encoding: "base64",
-      text: encodeAsciiBase64(JSON.stringify({ [key]: text })),
-    };
-    return row;
-  }
-  if (slot === "response-body-other") {
-    const row = blank(index, "https://ex.test/html");
-    (row.response as Record<string, unknown>).content = {
-      size: text.length,
-      mimeType: "text/html",
-      text: kind === "image-base64" ? text : `<p>${text}</p>`,
-    };
-    return row;
-  }
-  if (slot === "initiator") {
-    const row = blank(index, "https://ex.test/i");
-    row._initiator = {
-      type: "script",
+    if (field === "log.pages[].startedDateTime") {
+      const m = "2031-07-19T14:23:45.671Z";
+      markers.push({ field, place, marker: m });
+      return m;
+    }
+    if (field === "entry.startedDateTime") {
+      const m = "2032-08-21T15:34:56.782Z";
+      markers.push({ field, place, marker: m });
+      return m;
+    }
+    if (place === "request-url-host") {
+      const m = `marker-host-${String(seq)}.example`;
+      markers.push({ field, place, marker: m });
+      return m;
+    }
+    const slug = `${field}_${place}`.replace(/[^A-Za-z0-9]+/gu, "_");
+    const m = `MARKER_${String(seq)}_${slug}`;
+    markers.push({ field, place, marker: m });
+    return m;
+  };
+
+  const logVersion = nextMarker("log.version", "protocol-metadata");
+  const logComment = nextMarker("log.comment", "comment");
+  const logCustom = nextMarker("log.<custom>", "other-custom-field");
+
+  const creatorName = nextMarker("log.creator.name", "protocol-metadata");
+  const creatorVersion = nextMarker("log.creator.version", "protocol-metadata");
+  const creatorComment = nextMarker("log.creator.comment", "comment");
+  const creatorCustom = nextMarker("log.creator.<custom>", "other-custom-field");
+
+  const browserName = nextMarker("log.browser.name", "protocol-metadata");
+  const browserVersion = nextMarker("log.browser.version", "protocol-metadata");
+  const browserComment = nextMarker("log.browser.comment", "comment");
+  const browserCustom = nextMarker("log.browser.<custom>", "other-custom-field");
+
+  const pageStarted = nextMarker("log.pages[].startedDateTime", "protocol-metadata");
+  const pageId = nextMarker("log.pages[].id", "protocol-metadata");
+  const pageTitleUserinfo = nextMarker("log.pages[].title", "request-url-userinfo");
+  const pageTitleQuerySecret = nextMarker("log.pages[].title", "request-url-query-secret");
+  const pageTitlePlain = nextMarker("log.pages[].title", "page-title");
+  const pageComment = nextMarker("log.pages[].comment", "comment");
+  const pageCustom = nextMarker("log.pages[].<custom>", "other-custom-field");
+  const pageTimingsComment = nextMarker("log.pages[].pageTimings.comment", "comment");
+  const pageTimingsCustom = nextMarker("log.pages[].pageTimings.<custom>", "other-custom-field");
+
+  const entryPageref = nextMarker("entry.pageref", "protocol-metadata");
+  const entryStarted = nextMarker("entry.startedDateTime", "protocol-metadata");
+  const entryServerIp = nextMarker("entry.serverIPAddress", "other-custom-field");
+  const entryConnection = nextMarker("entry.connection", "other-custom-field");
+  const entryComment = nextMarker("entry.comment", "comment");
+  const entrySecurityState = nextMarker("entry._securityState", "other-custom-field");
+  const entryPriority = nextMarker("entry._priority", "other-custom-field");
+  const entryResourceType = nextMarker("entry._resourceType", "other-custom-field");
+  const entryFromCache = nextMarker("entry._fromCache", "other-custom-field");
+  const entryConnectionId = nextMarker("entry._connectionId", "other-custom-field");
+  const entryCustom = nextMarker("entry.<custom>", "other-custom-field");
+
+  const initiatorType = nextMarker("entry._initiator.type", "initiator");
+  const initiatorUrl = nextMarker("entry._initiator.url", "initiator");
+  const initiatorRequestId = nextMarker("entry._initiator.requestId", "initiator");
+  const frameFn = nextMarker("entry._initiator.stack.callFrames[].functionName", "initiator");
+  const frameScript = nextMarker("entry._initiator.stack.callFrames[].scriptId", "initiator");
+  const frameUrl = nextMarker("entry._initiator.stack.callFrames[].url", "initiator");
+
+  const wsType = nextMarker("entry._webSocketMessages[].type", "websocket");
+  const wsData = nextMarker("entry._webSocketMessages[].data", "websocket");
+
+  const reqMethod = nextMarker("request.method", "protocol-metadata");
+  const reqUrlUserinfo = nextMarker("request.url", "request-url-userinfo");
+  const reqUrlHost = nextMarker("request.url", "request-url-host");
+  const reqUrlPath = nextMarker("request.url", "request-url-path");
+  const reqUrlQuerySecret = nextMarker("request.url", "request-url-query-secret");
+  const reqUrlQueryOther = nextMarker("request.url", "request-url-query");
+  const reqUrlFragment = nextMarker("request.url", "request-url-fragment");
+  const reqHttpVersion = nextMarker("request.httpVersion", "protocol-metadata");
+  const reqComment = nextMarker("request.comment", "comment");
+  const reqCustom = nextMarker("request.<custom>", "other-custom-field");
+
+  const reqCookieName = nextMarker("request.cookies[].name", "cookie-metadata");
+  const reqCookieValue = nextMarker("request.cookies[].value", "cookie");
+  const reqCookiePath = nextMarker("request.cookies[].path", "cookie-metadata");
+  const reqCookieDomain = nextMarker("request.cookies[].domain", "cookie-metadata");
+  const reqCookieExpires = nextMarker("request.cookies[].expires", "cookie-metadata");
+  const reqCookieComment = nextMarker("request.cookies[].comment", "comment");
+  const reqCookieCustom = nextMarker("request.cookies[].<custom>", "other-custom-field");
+
+  const reqHeaderName = nextMarker("request.headers[].name", "header-name");
+  const reqHeaderSecret = nextMarker("request.headers[].value", "header-value-secret");
+  const reqHeaderAllowlisted = nextMarker("request.headers[].value", "header-value-allowlisted");
+  const reqHeaderUrl = nextMarker("request.headers[].value", "url-header");
+  const reqHeaderNamed = nextMarker("request.headers[].value", "named-header");
+  const reqHeaderComment = nextMarker("request.headers[].comment", "comment");
+  const reqHeaderCustom = nextMarker("request.headers[].<custom>", "other-custom-field");
+
+  const qsName = nextMarker("request.queryString[].name", "query-string");
+  const qsSecret = nextMarker("request.queryString[].value", "query-string-secret");
+  const qsOther = nextMarker("request.queryString[].value", "query-string");
+  const qsComment = nextMarker("request.queryString[].comment", "comment");
+  const qsCustom = nextMarker("request.queryString[].<custom>", "other-custom-field");
+
+  const postMime = nextMarker("request.postData.mimeType", "protocol-metadata");
+  const postTextJson = nextMarker("request.postData.text", "body-json");
+  const postTextForm = nextMarker("request.postData.text", "body-form");
+  const postTextMultipart = nextMarker("request.postData.text", "body-multipart");
+  const postTextOther = nextMarker("request.postData.text", "request-body-other");
+  const postComment = nextMarker("request.postData.comment", "comment");
+  const postCustom = nextMarker("request.postData.<custom>", "other-custom-field");
+
+  const paramName = nextMarker("request.postData.params[].name", "body-param");
+  const paramSecret = nextMarker("request.postData.params[].value", "body-param-secret");
+  const paramOther = nextMarker("request.postData.params[].value", "body-param");
+  const paramFile = nextMarker("request.postData.params[].fileName", "body-param");
+  const paramContentType = nextMarker("request.postData.params[].contentType", "body-param");
+  const paramComment = nextMarker("request.postData.params[].comment", "comment");
+  const paramCustom = nextMarker("request.postData.params[].<custom>", "other-custom-field");
+
+  const resStatusText = nextMarker("response.statusText", "protocol-metadata");
+  const resHttpVersion = nextMarker("response.httpVersion", "protocol-metadata");
+  const resRedirectUrl = nextMarker("response.redirectURL", "redirect-url");
+  const resComment = nextMarker("response.comment", "comment");
+  const resError = nextMarker("response._error", "other-custom-field");
+  const resCustom = nextMarker("response.<custom>", "other-custom-field");
+
+  const resCookieName = nextMarker("response.cookies[].name", "cookie-metadata");
+  const resCookieValue = nextMarker("response.cookies[].value", "cookie");
+  const resCookiePath = nextMarker("response.cookies[].path", "cookie-metadata");
+  const resCookieDomain = nextMarker("response.cookies[].domain", "cookie-metadata");
+  const resCookieExpires = nextMarker("response.cookies[].expires", "cookie-metadata");
+  const resCookieComment = nextMarker("response.cookies[].comment", "comment");
+  const resCookieCustom = nextMarker("response.cookies[].<custom>", "other-custom-field");
+
+  const resHeaderName = nextMarker("response.headers[].name", "header-name");
+  const resHeaderSecret = nextMarker("response.headers[].value", "header-value-secret");
+  const resHeaderAllowlisted = nextMarker("response.headers[].value", "header-value-allowlisted");
+  const resHeaderUrl = nextMarker("response.headers[].value", "url-header");
+  const resHeaderNamed = nextMarker("response.headers[].value", "named-header");
+  const resHeaderComment = nextMarker("response.headers[].comment", "comment");
+  const resHeaderCustom = nextMarker("response.headers[].<custom>", "other-custom-field");
+
+  const contentMime = nextMarker("response.content.mimeType", "protocol-metadata");
+  const contentTextJson = nextMarker("response.content.text", "response-body-json");
+  const contentTextB64 = nextMarker("response.content.text", "response-body-base64");
+  const contentTextOther = nextMarker("response.content.text", "response-body-other");
+  const contentEncoding = nextMarker("response.content.encoding", "protocol-metadata");
+  const contentComment = nextMarker("response.content.comment", "comment");
+  const contentCustom = nextMarker("response.content.<custom>", "other-custom-field");
+
+  const cacheComment = nextMarker("cache.comment", "comment");
+  const cacheCustom = nextMarker("cache.<custom>", "other-custom-field");
+
+  const beforeExpires = nextMarker("cache.beforeRequest.expires", "cache");
+  const beforeLastAccess = nextMarker("cache.beforeRequest.lastAccess", "cache");
+  const beforeLastFetched = nextMarker("cache.beforeRequest.lastFetched", "cache");
+  const beforeETag = nextMarker("cache.beforeRequest.eTag", "cache");
+  const beforeFetchCount = nextMarker("cache.beforeRequest.fetchCount", "cache");
+  const beforeComment = nextMarker("cache.beforeRequest.comment", "comment");
+  const beforeDataSize = nextMarker("cache.beforeRequest._dataSize", "cache");
+  const beforeLastModified = nextMarker("cache.beforeRequest._lastModified", "cache");
+  const beforeDevice = nextMarker("cache.beforeRequest._device", "cache");
+  const beforeCustom = nextMarker("cache.beforeRequest.<custom>", "other-custom-field");
+
+  const afterExpires = nextMarker("cache.afterRequest.expires", "cache");
+  const afterLastAccess = nextMarker("cache.afterRequest.lastAccess", "cache");
+  const afterLastFetched = nextMarker("cache.afterRequest.lastFetched", "cache");
+  const afterETag = nextMarker("cache.afterRequest.eTag", "cache");
+  const afterFetchCount = nextMarker("cache.afterRequest.fetchCount", "cache");
+  const afterComment = nextMarker("cache.afterRequest.comment", "comment");
+  const afterDataSize = nextMarker("cache.afterRequest._dataSize", "cache");
+  const afterLastModified = nextMarker("cache.afterRequest._lastModified", "cache");
+  const afterDevice = nextMarker("cache.afterRequest._device", "cache");
+  const afterCustom = nextMarker("cache.afterRequest.<custom>", "other-custom-field");
+
+  const timingsComment = nextMarker("timings.comment", "comment");
+  const timingsCustom = nextMarker("timings.<custom>", "other-custom-field");
+
+  const pages = [
+    {
+      startedDateTime: pageStarted,
+      id: pageId,
+      title: `https://user:${pageTitleUserinfo}@page.example/${pageTitlePlain}?token=${pageTitleQuerySecret}`,
+      pageTimings: {
+        onContentLoad: 10,
+        onLoad: 20,
+        comment: pageTimingsComment,
+        _customPageTimings: pageTimingsCustom,
+      },
+      comment: pageComment,
+      _customPage: pageCustom,
+    },
+    {
+      startedDateTime: "2026-01-01T00:00:00.000Z",
+      id: entryPageref,
+      title: "https://page.example/second",
+      pageTimings: { onContentLoad: -1, onLoad: -1 },
+    },
+    {
+      startedDateTime: "2026-01-01T00:00:00.000Z",
+      id: "p_base",
+      title: "https://page.example/base",
+      pageTimings: { onContentLoad: -1, onLoad: -1 },
+    },
+  ];
+
+  const mainEntry = {
+    pageref: entryPageref,
+    startedDateTime: entryStarted,
+    time: 10,
+    request: {
+      method: reqMethod,
+      url: `https://user:${reqUrlUserinfo}@${reqUrlHost}/${reqUrlPath}?access_token=${reqUrlQuerySecret}&note=${reqUrlQueryOther}#${reqUrlFragment}`,
+      httpVersion: reqHttpVersion,
+      cookies: [
+        {
+          name: reqCookieName,
+          value: reqCookieValue,
+          path: reqCookiePath,
+          domain: reqCookieDomain,
+          expires: reqCookieExpires,
+          comment: reqCookieComment,
+          _customReqCookie: reqCookieCustom,
+        },
+      ],
+      headers: [
+        {
+          name: reqHeaderName,
+          value: reqHeaderNamed,
+          comment: reqHeaderComment,
+          _customReqHeader: reqHeaderCustom,
+        },
+        { name: "Authorization", value: reqHeaderSecret },
+        { name: "Content-Type", value: `application/json; extra=${reqHeaderAllowlisted}` },
+        { name: "Referer", value: reqHeaderUrl },
+      ],
+      queryString: [
+        {
+          name: qsName,
+          value: qsOther,
+          comment: qsComment,
+          _customQuery: qsCustom,
+        },
+        { name: "access_token", value: qsSecret },
+      ],
+      postData: {
+        mimeType: `application/json; boundary=${postMime}`,
+        params: [
+          {
+            name: paramName,
+            value: paramOther,
+            fileName: paramFile,
+            contentType: `text/plain; v=${paramContentType}`,
+            comment: paramComment,
+            _customParam: paramCustom,
+          },
+          { name: "password", value: paramSecret },
+        ],
+        text: JSON.stringify({ key: postTextJson }),
+        comment: postComment,
+        _customPostData: postCustom,
+      },
+      headersSize: 100,
+      bodySize: 50,
+      comment: reqComment,
+      _customRequest: reqCustom,
+    },
+    response: {
+      status: 200,
+      statusText: resStatusText,
+      httpVersion: resHttpVersion,
+      cookies: [
+        {
+          name: resCookieName,
+          value: resCookieValue,
+          path: resCookiePath,
+          domain: resCookieDomain,
+          expires: resCookieExpires,
+          comment: resCookieComment,
+          _customResCookie: resCookieCustom,
+        },
+      ],
+      headers: [
+        {
+          name: resHeaderName,
+          value: resHeaderNamed,
+          comment: resHeaderComment,
+          _customResHeader: resHeaderCustom,
+        },
+        { name: "Set-Cookie", value: resHeaderSecret },
+        { name: "Content-Length", value: resHeaderAllowlisted },
+        { name: "Location", value: resHeaderUrl },
+      ],
+      content: {
+        size: 50,
+        mimeType: `application/json; v=${contentMime}`,
+        text: JSON.stringify({ data: contentTextJson }),
+        encoding: contentEncoding,
+        comment: contentComment,
+        _customContent: contentCustom,
+      },
+      redirectURL: `https://redirect.example/${resRedirectUrl}`,
+      headersSize: 80,
+      bodySize: 50,
+      comment: resComment,
+      _error: resError,
+      _customResponse: resCustom,
+    },
+    cache: {
+      beforeRequest: {
+        expires: beforeExpires,
+        lastAccess: beforeLastAccess,
+        lastFetched: beforeLastFetched,
+        eTag: beforeETag,
+        fetchCount: beforeFetchCount,
+        comment: beforeComment,
+        _dataSize: beforeDataSize,
+        _lastModified: beforeLastModified,
+        _device: beforeDevice,
+        _customBefore: beforeCustom,
+      },
+      afterRequest: {
+        expires: afterExpires,
+        lastAccess: afterLastAccess,
+        lastFetched: afterLastFetched,
+        eTag: afterETag,
+        fetchCount: afterFetchCount,
+        comment: afterComment,
+        _dataSize: afterDataSize,
+        _lastModified: afterLastModified,
+        _device: afterDevice,
+        _customAfter: afterCustom,
+      },
+      comment: cacheComment,
+      _customCache: cacheCustom,
+    },
+    timings: {
+      send: 1,
+      wait: 2,
+      receive: 3,
+      comment: timingsComment,
+      _customTimings: timingsCustom,
+    },
+    serverIPAddress: entryServerIp,
+    connection: entryConnection,
+    comment: entryComment,
+    _securityState: entrySecurityState,
+    _priority: entryPriority,
+    _initiator: {
+      type: initiatorType,
+      url: initiatorUrl,
+      requestId: initiatorRequestId,
       stack: {
         callFrames: [
           {
-            functionName: "f",
-            scriptId: "1",
-            url: wrapped,
+            functionName: frameFn,
+            scriptId: frameScript,
+            url: frameUrl,
             lineNumber: 1,
             columnNumber: 1,
           },
         ],
       },
-    };
-    return row;
-  }
-  if (slot === "websocket") {
-    const row = blank(index, "https://ex.test/ws");
-    row._webSocketMessages = [
-      { type: "send", time: 1, opcode: 1, data: JSON.stringify({ [key]: text }) },
-    ];
-    return row;
-  }
-  if (slot === "cache") {
-    const row = blank(index, "https://ex.test/cache");
-    row.cache = { beforeRequest: { eTag: text, hitCount: 1 } };
-    return row;
-  }
-  if (slot === "other-custom-field") {
-    const row = blank(index, "https://ex.test/custom");
-    row._requestContext = { [key]: text };
-    return row;
-  }
-  const row = blank(index, "https://ex.test/comment");
-  row.comment = text;
-  return row;
-}
+    },
+    _resourceType: entryResourceType,
+    _fromCache: entryFromCache,
+    _connectionId: entryConnectionId,
+    _webSocketMessages: [
+      {
+        type: wsType,
+        time: 1,
+        opcode: 1,
+        data: wsData,
+      },
+    ],
+    _customEntry: entryCustom,
+  };
 
-function admits(
-  canStillHold: string,
-  status: string,
-  kind: Kind,
-  place: HarRedactionPlace,
-): boolean {
-  if (status === "not-examined" || canStillHold.includes("Any secret can remain")) {
-    return true;
-  }
-  if (canStillHold.includes("Nothing can remain")) {
-    return false;
-  }
-  if (kind === "image-base64") {
-    return /base64 image|not JSON/u.test(canStillHold);
-  }
-  if (kind === "uuid") {
-    return canStillHold.includes("UUID");
-  }
-  if (kind === "hex-hash") {
-    if (QUERY_PLACES.has(place) && canStillHold.includes("Hex of 16 or more characters")) {
-      return false;
-    }
-    return /hex hash/u.test(canStillHold);
-  }
-  if (kind === "short-random") {
-    return /shorter than \d+/u.test(canStillHold);
-  }
-  if (kind === "listed-name") {
-    return canStillHold.includes("listed name can remain");
-  }
-  if (kind === "url-credential") {
-    return (
-      canStillHold.includes("URL can remain") || canStillHold.includes("Userinfo was not parsed")
+  const formEntry = baseEntry(1);
+  (formEntry.request as Record<string, unknown>).method = "POST";
+  (formEntry.request as Record<string, unknown>).postData = {
+    mimeType: "application/x-www-form-urlencoded",
+    params: [],
+    text: `field=${postTextForm}`,
+  };
+  (formEntry.response as Record<string, unknown>).content = {
+    size: 40,
+    mimeType: "application/json",
+    encoding: "base64",
+    text: encodeAsciiBase64(JSON.stringify({ b64: contentTextB64 })),
+  };
+
+  const multipartEntry = baseEntry(2);
+  (multipartEntry.request as Record<string, unknown>).method = "POST";
+  (multipartEntry.request as Record<string, unknown>).postData = {
+    mimeType: "multipart/form-data; boundary=B",
+    params: [],
+    text: `--B\r\nContent-Disposition: form-data; name="note"\r\n\r\n${postTextMultipart}\r\n--B--`,
+  };
+  (multipartEntry.response as Record<string, unknown>).content = {
+    size: 20,
+    mimeType: "text/html",
+    text: `<p>${contentTextOther}</p>`,
+  };
+
+  const otherBodyEntry = baseEntry(3);
+  (otherBodyEntry.request as Record<string, unknown>).method = "POST";
+  (otherBodyEntry.request as Record<string, unknown>).postData = {
+    mimeType: "text/plain",
+    params: [],
+    text: `raw ${postTextOther}`,
+  };
+
+  const parsed = parseHar({
+    log: {
+      version: logVersion,
+      creator: {
+        name: creatorName,
+        version: creatorVersion,
+        comment: creatorComment,
+        _customCreator: creatorCustom,
+      },
+      browser: {
+        name: browserName,
+        version: browserVersion,
+        comment: browserComment,
+        _customBrowser: browserCustom,
+      },
+      pages,
+      entries: [mainEntry, formEntry, multipartEntry, otherBodyEntry],
+      comment: logComment,
+      _customLog: logCustom,
+    },
+  });
+  if (!parsed.ok) {
+    throw new Error(
+      `Failed to parse marker document: ${parsed.problems.map((p) => `${p.path} ${p.rule}`).join(", ")}`,
     );
   }
-  return canStillHold.includes("token-shaped value can remain");
+
+  return { document: parsed.document, markers, plantedFields };
 }
 
-describe("generated secret coverage", () => {
-  it("removes each planted secret or names the place that can still hold it", () => {
-    const rng = mulberry32(0xc0ffee);
-    const planted: Planted[] = [];
-    const entries: Record<string, unknown>[] = [];
-    const pages: Record<string, unknown>[] = [];
-    const seen = new Set<HarRedactionPlace>();
-    const grid = SLOTS.length * KINDS.length;
-    for (let index = 0; index < CASES; index += 1) {
-      const kind =
-        index < grid
-          ? (KINDS[index % KINDS.length] ?? "entropy")
-          : (KINDS[Math.floor(rng() * KINDS.length)] ?? "entropy");
-      const natural =
-        index < grid
-          ? (SLOTS[Math.floor(index / KINDS.length)] ?? "comment")
-          : (SLOTS[Math.floor(rng() * SLOTS.length)] ?? "comment");
-      const slot = chooseSlot(natural, kind);
-      const made = payload(kind, index, rng);
-      entries.push(plant(slot, kind, made.text, index));
-      pages.push({
-        id: `p${String(index)}`,
-        title: slot === "page-title" ? made.text : "https://ex.test/",
-        startedDateTime: stamp(index),
-        pageTimings: {},
-      });
-      planted.push({
-        index,
-        place: slot,
-        kind,
-        marker: made.marker,
-        wholesale: slot === "cookie",
-      });
-      seen.add(slot);
-    }
-    expect([...SLOTS].sort()).toEqual([...HAR_REDACTION_PLACES].sort());
-    expect([...seen].sort()).toEqual([...SLOTS].sort());
+function haystackFor(document: HarDocument): string {
+  const b64Texts = document.log.entries
+    .filter((entry) => entry.response.content.encoding === "base64" && entry.response.content.text)
+    .map((entry) => decodeAsciiBase64(entry.response.content.text ?? ""));
+  return `${JSON.stringify(document)}\n${b64Texts.join("\n")}`;
+}
 
-    const parsed = parseHar({
-      log: {
-        version: "1.2",
-        creator: { name: "Caller", version: "1" },
-        pages,
-        entries,
-      },
-    });
-    expect(
-      parsed.ok,
-      parsed.ok ? "" : parsed.problems.map((problem) => problem.message).join("\n"),
-    ).toBe(true);
-    if (!parsed.ok) {
-      return;
+function verifyLevel(
+  document: HarDocument,
+  markers: readonly PlantedMarker[],
+  level: RedactionLevel,
+  placeTable: Readonly<Record<HarRedactionPlace, HarPlaceRule>> = HAR_PLACE_TABLE,
+): readonly string[] {
+  const { document: redacted, report } = redactHar(document, { level, placeTable });
+  const hay = haystackFor(redacted);
+  const failures: string[] = [];
+
+  for (const item of markers) {
+    const present = hay.includes(item.marker);
+    const coverage = report.places.find((place) => place.place === item.place);
+    if (!coverage) {
+      failures.push(`${item.field} (${item.place}) missing from report.places`);
+      continue;
     }
-    const { document, report } = redactHar(parsed.document);
-    const failures: string[] = [];
-    for (const item of planted) {
-      const entry = document.log.entries.find(
-        (candidate) => candidate.startedDateTime === stamp(item.index),
-      );
-      const page = document.log.pages?.find(
-        (candidate) => candidate.id === `p${String(item.index)}`,
-      );
-      const decoded =
-        entry?.response.content.encoding === "base64" && entry.response.content.text
-          ? decodeAsciiBase64(entry.response.content.text)
-          : "";
-      const haystack = `${JSON.stringify(entry ?? {})}\n${JSON.stringify(page ?? {})}\n${decoded}`;
-      const stayed = haystack.includes(item.marker);
-      const coverage = report.places.find((place) => place.place === item.place);
-      if (!coverage) {
-        failures.push(`${String(item.index)} ${item.place} missing coverage`);
-        continue;
-      }
-      const benign =
-        item.kind === "hex-hash" ||
-        item.kind === "uuid" ||
-        item.kind === "image-base64" ||
-        item.kind === "short-random";
-      const removedOnPurpose =
-        item.wholesale || (item.kind === "hex-hash" && QUERY_PLACES.has(item.place));
-      if (benign && !stayed && !removedOnPurpose) {
-        failures.push(`${String(item.index)} ${item.kind} removed from ${item.place}`);
-      }
-      if (stayed && !admits(coverage.canStillHold, coverage.status, item.kind, item.place)) {
+    if (coverage.count <= 0) {
+      failures.push(`${item.field} (${item.place}) has count ${String(coverage.count)}`);
+    }
+
+    if (present) {
+      const expectedKeptStatus = level === "standard" ? "kept-not-examined" : "kept-by-allowlist";
+      if (coverage.status !== expectedKeptStatus) {
         failures.push(
-          `${String(item.index)} ${item.kind} stayed in ${item.place} (${coverage.status}: ${coverage.canStillHold})`,
+          `${item.field} (${item.place}) marker stayed in output, but report status is ${coverage.status}`,
+        );
+      }
+      if (level === "standard" && STANDARD_REMOVED_PLACES.has(item.place)) {
+        failures.push(
+          `${item.field} (${item.place}) is a credential carrier and must be removed under standard`,
+        );
+      }
+      if (level === "shareable" && !SHAREABLE_KEPT_PLACES.has(item.place)) {
+        failures.push(
+          `${item.field} (${item.place}) is not on the shareable allowlist and must be removed`,
+        );
+      }
+    } else {
+      if (coverage.status !== "removed") {
+        failures.push(
+          `${item.field} (${item.place}) marker was removed, but report status is ${coverage.status}`,
+        );
+      }
+      if (level === "standard" && !STANDARD_REMOVED_PLACES.has(item.place)) {
+        failures.push(
+          `${item.field} (${item.place}) must be kept byte-for-byte intact under standard`,
+        );
+      }
+      if (level === "shareable" && SHAREABLE_KEPT_PLACES.has(item.place)) {
+        failures.push(
+          `${item.field} (${item.place}) is on the shareable allowlist and must be kept`,
         );
       }
     }
-    expect(failures).toEqual([]);
+  }
+
+  return failures;
+}
+
+describe("total model place table and marker verification", () => {
+  it("fills every string-holding place of the HAR model with a unique marker and accounts for 100% of markers at both levels", () => {
+    const { document, markers, plantedFields } = buildMarkerDocument();
+
+    const modelFields = Object.keys(HAR_MODEL_FIELD_TABLE) as HarModelStringField[];
+    expect([...plantedFields].sort()).toEqual([...modelFields].sort());
+
+    for (const field of modelFields) {
+      const expectedPlaces = HAR_MODEL_FIELD_TABLE[field].places;
+      const plantedPlacesForField = markers
+        .filter((item) => item.field === field)
+        .map((item) => item.place);
+      expect([...plantedPlacesForField].sort()).toEqual([...expectedPlaces].sort());
+    }
+
+    const beforeHay = haystackFor(document);
+    for (const item of markers) {
+      expect(beforeHay, `missing initial marker for ${item.field} (${item.place})`).toContain(
+        item.marker,
+      );
+    }
+
+    const standardFailures = verifyLevel(document, markers, "standard");
+    expect(standardFailures).toEqual([]);
+
+    const shareableFailures = verifyLevel(document, markers, "shareable");
+    expect(shareableFailures).toEqual([]);
+  });
+
+  it("fails when any single row in HAR_PLACE_TABLE has the wrong disposition at either level", () => {
+    const { document, markers } = buildMarkerDocument();
+
+    for (const place of HAR_REDACTION_PLACES) {
+      const original = HAR_PLACE_TABLE[place];
+
+      const mutatedStandard: Record<HarRedactionPlace, HarPlaceRule> = {
+        ...HAR_PLACE_TABLE,
+        [place]: {
+          ...original,
+          standard: original.standard === "removed" ? "kept-not-examined" : "removed",
+        },
+      };
+      const standardFailures = verifyLevel(document, markers, "standard", mutatedStandard);
+      expect(
+        standardFailures.some((msg) => msg.includes(`(${place})`)),
+        `expected mutating standard row for ${place} to fail`,
+      ).toBe(true);
+
+      const mutatedShareable: Record<HarRedactionPlace, HarPlaceRule> = {
+        ...HAR_PLACE_TABLE,
+        [place]: {
+          ...original,
+          shareable: original.shareable === "removed" ? "kept-by-allowlist" : "removed",
+        },
+      };
+      const shareableFailures = verifyLevel(document, markers, "shareable", mutatedShareable);
+      expect(
+        shareableFailures.some((msg) => msg.includes(`(${place})`)),
+        `expected mutating shareable row for ${place} to fail`,
+      ).toBe(true);
+    }
   });
 });

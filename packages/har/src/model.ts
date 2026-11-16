@@ -120,7 +120,13 @@ export type HarMissingBodyReason =
 export type HarBodyState = "present" | "empty" | HarMissingBodyReason;
 
 export interface HarEntryExtension {
+  readonly source?: "both" | "recording-only" | "devtools-only" | (string & {}) | undefined;
   readonly bodyState?: HarBodyState | undefined;
+  readonly bodyMissing?: string | undefined;
+  readonly bodyIncomplete?: boolean | undefined;
+  readonly bodyCheck?: string | undefined;
+  readonly lossyText?: number | undefined;
+  readonly inProgress?: boolean | undefined;
   readonly redactedFields?: readonly string[] | undefined;
 }
 
@@ -135,14 +141,22 @@ export type HarRedactionTarget =
   | "page";
 
 export const HAR_REDACTION_PLACES = [
-  "request-url-query",
   "request-url-userinfo",
-  "request-url-fragment",
+  "request-url-host",
   "request-url-path",
+  "request-url-query-secret",
+  "request-url-query",
+  "request-url-fragment",
+  "header-name",
+  "header-value-secret",
+  "header-value-allowlisted",
   "named-header",
   "url-header",
   "cookie",
+  "cookie-metadata",
+  "query-string-secret",
   "query-string",
+  "body-param-secret",
   "body-param",
   "body-json",
   "body-form",
@@ -151,38 +165,36 @@ export const HAR_REDACTION_PLACES = [
   "redirect-url",
   "response-body-json",
   "response-body-base64",
+  "response-body-other",
   "page-title",
   "initiator",
-  "response-body-other",
   "websocket",
   "cache",
   "comment",
   "other-custom-field",
+  "protocol-metadata",
 ] as const;
 
 export type HarRedactionPlace = (typeof HAR_REDACTION_PLACES)[number];
 
-export const REDACTION_DETECTORS = [
-  "structured-removal",
-  "name-match",
-  "url",
-  "json-walk",
-  "token-shape",
-] as const;
-
-export type RedactionDetector = (typeof REDACTION_DETECTORS)[number];
-
-export const REDACTION_LEVELS = ["default", "strict"] as const;
+export const REDACTION_LEVELS = ["standard", "shareable"] as const;
 
 export type RedactionLevel = (typeof REDACTION_LEVELS)[number];
 
-export type PlaceExamStatus = "removed" | "examined" | "not-examined";
+export type RedactionLevelInput = RedactionLevel | "default" | "strict";
+
+export type PlaceExamStatus = "removed" | "kept-not-examined" | "kept-by-allowlist";
+
+export type PlaceReportDetail =
+  | "removed"
+  | "not examined: may contain secrets"
+  | "kept by allowlist";
 
 export interface HarPlaceCoverage {
   readonly place: HarRedactionPlace;
   readonly status: PlaceExamStatus;
-  readonly detectors: readonly RedactionDetector[];
-  readonly removedBy: readonly RedactionDetector[];
+  readonly count: number;
+  readonly detail: PlaceReportDetail;
   readonly canStillHold: string;
 }
 
@@ -193,7 +205,6 @@ export interface HarRedactionRecord {
   readonly target: HarRedactionTarget;
   readonly field: string;
   readonly ruleId: string;
-  readonly detector: RedactionDetector;
   readonly count: number;
 }
 
@@ -201,11 +212,13 @@ export interface HarLogRedactionExtension {
   readonly applied: true;
   readonly level: RedactionLevel;
   readonly guarantee: string;
+  readonly remainingRisk: string;
   readonly totalRemoved: number;
   readonly entriesAffected: number;
   readonly rules: readonly string[];
   readonly records: readonly HarRedactionRecord[];
   readonly places: readonly HarPlaceCoverage[];
+  readonly notExamined: readonly HarPlaceCoverage[];
   readonly notInspected: readonly HarRedactionPlace[];
 }
 
@@ -404,3 +417,95 @@ export interface HarLog extends CustomHarFields {
 export interface HarDocument {
   readonly log: HarLog;
 }
+
+type DeclaredKeys<T> = keyof {
+  [K in keyof T as string extends K ? never : number extends K ? never : K]-?: T[K];
+} &
+  string;
+
+type HoldsString<T> = [Extract<NonNullable<T>, string>] extends [never] ? false : true;
+
+type IsPureNumberOrBoolean<T> = [NonNullable<T>] extends [number | boolean] ? true : false;
+
+type StringOrUnhandledKey<T, Containers extends string = never> = {
+  [K in Exclude<DeclaredKeys<T>, Containers>]: HoldsString<T[K]> extends true
+    ? K
+    : IsPureNumberOrBoolean<T[K]> extends true
+      ? never
+      : K;
+}[Exclude<DeclaredKeys<T>, Containers>];
+
+type PrefixField<Prefix extends string, K extends string> = `${Prefix}.${K}`;
+type CustomFieldKey<T, Prefix extends string> = string extends keyof T
+  ? `${Prefix}.<custom>`
+  : never;
+
+export type HarModelStringField =
+  | PrefixField<
+      "log",
+      StringOrUnhandledKey<HarLog, "creator" | "browser" | "pages" | "entries" | "_harExport">
+    >
+  | CustomFieldKey<HarLog, "log">
+  | PrefixField<"log.creator", StringOrUnhandledKey<HarCreator>>
+  | CustomFieldKey<HarCreator, "log.creator">
+  | PrefixField<"log.browser", StringOrUnhandledKey<HarCreator>>
+  | CustomFieldKey<HarCreator, "log.browser">
+  | PrefixField<"log.pages[]", StringOrUnhandledKey<HarPage, "pageTimings">>
+  | CustomFieldKey<HarPage, "log.pages[]">
+  | PrefixField<"log.pages[].pageTimings", StringOrUnhandledKey<HarPageTimings>>
+  | CustomFieldKey<HarPageTimings, "log.pages[].pageTimings">
+  | PrefixField<
+      "entry",
+      StringOrUnhandledKey<
+        HarEntry,
+        | "request"
+        | "response"
+        | "cache"
+        | "timings"
+        | "_initiator"
+        | "_webSocketMessages"
+        | "_harExport"
+      >
+    >
+  | CustomFieldKey<HarEntry, "entry">
+  | PrefixField<"entry._initiator", StringOrUnhandledKey<ChromeInitiator, "stack">>
+  | PrefixField<
+      "entry._initiator.stack",
+      StringOrUnhandledKey<ChromeInitiatorStack, "callFrames" | "parent">
+    >
+  | PrefixField<
+      "entry._initiator.stack.callFrames[]",
+      StringOrUnhandledKey<ChromeInitiatorCallFrame>
+    >
+  | PrefixField<"entry._webSocketMessages[]", StringOrUnhandledKey<ChromeWebSocketMessage>>
+  | PrefixField<
+      "request",
+      StringOrUnhandledKey<HarRequest, "cookies" | "headers" | "queryString" | "postData">
+    >
+  | CustomFieldKey<HarRequest, "request">
+  | PrefixField<"request.cookies[]", StringOrUnhandledKey<HarCookie>>
+  | CustomFieldKey<HarCookie, "request.cookies[]">
+  | PrefixField<"request.headers[]", StringOrUnhandledKey<HarNameValue>>
+  | CustomFieldKey<HarNameValue, "request.headers[]">
+  | PrefixField<"request.queryString[]", StringOrUnhandledKey<HarNameValue>>
+  | CustomFieldKey<HarNameValue, "request.queryString[]">
+  | PrefixField<"request.postData", StringOrUnhandledKey<HarPostData, "params">>
+  | CustomFieldKey<HarPostData, "request.postData">
+  | PrefixField<"request.postData.params[]", StringOrUnhandledKey<HarPostDataParam>>
+  | CustomFieldKey<HarPostDataParam, "request.postData.params[]">
+  | PrefixField<"response", StringOrUnhandledKey<HarResponse, "cookies" | "headers" | "content">>
+  | CustomFieldKey<HarResponse, "response">
+  | PrefixField<"response.cookies[]", StringOrUnhandledKey<HarCookie>>
+  | CustomFieldKey<HarCookie, "response.cookies[]">
+  | PrefixField<"response.headers[]", StringOrUnhandledKey<HarNameValue>>
+  | CustomFieldKey<HarNameValue, "response.headers[]">
+  | PrefixField<"response.content", StringOrUnhandledKey<HarContent>>
+  | CustomFieldKey<HarContent, "response.content">
+  | PrefixField<"cache", StringOrUnhandledKey<HarCache, "beforeRequest" | "afterRequest">>
+  | CustomFieldKey<HarCache, "cache">
+  | PrefixField<"cache.beforeRequest", StringOrUnhandledKey<HarCacheEntry>>
+  | CustomFieldKey<HarCacheEntry, "cache.beforeRequest">
+  | PrefixField<"cache.afterRequest", StringOrUnhandledKey<HarCacheEntry>>
+  | CustomFieldKey<HarCacheEntry, "cache.afterRequest">
+  | PrefixField<"timings", StringOrUnhandledKey<HarTimings>>
+  | CustomFieldKey<HarTimings, "timings">;

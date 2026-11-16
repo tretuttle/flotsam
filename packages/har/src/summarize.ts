@@ -75,6 +75,29 @@ const MISSING_REASONS: readonly HarMissingBodyReason[] = [
   "unknown",
 ];
 
+const BODY_MISSING_TO_REASON: Readonly<Record<string, HarMissingBodyReason>> = {
+  "media-setting": "media-skipped",
+  "streaming-response": "not-included",
+  "not-recordable-here": "unavailable",
+  "network-aborted": "aborted",
+  "write-failed": "unavailable",
+  "over-body-cap": "size-limit",
+  "browser-closed": "aborted",
+  "recording-stopped": "aborted",
+  "removed-by-retention": "evicted",
+  "interrupted-by-crash": "unavailable",
+  "no-response": "unavailable",
+  "in-progress": "not-included",
+  "devtools-discarded": "discarded",
+  "devtools-truncated": "size-limit",
+  "not-recorded": "unavailable",
+  "omitted-by-choice": "not-included",
+  "source-error": "unavailable",
+  "upload-too-large": "size-limit",
+  "upload-not-rewindable": "unavailable",
+  "upload-never-stored": "not-included",
+};
+
 function createEmptyMissingByReason(): Record<HarMissingBodyReason, number> {
   return {
     "not-included": 0,
@@ -102,8 +125,35 @@ function base64DecodedLength(encoded: string): number {
   return Math.max(0, Math.floor((clean.length * 3) / 4) - padding);
 }
 
+function isMissingReason(state: unknown): state is HarMissingBodyReason {
+  return typeof state === "string" && MISSING_REASONS.includes(state as HarMissingBodyReason);
+}
+
+function resolveBodyMissingReason(raw: string): HarMissingBodyReason {
+  if (isMissingReason(raw)) {
+    return raw;
+  }
+  return BODY_MISSING_TO_REASON[raw] ?? "unavailable";
+}
+
 export function classifyEntryBodyState(entry: HarEntry): HarBodyState {
   const { content, status, bodySize } = entry.response;
+  const exportMeta = entry._harExport;
+  const annotated = exportMeta?.bodyState;
+  const bodyMissing = exportMeta?.bodyMissing;
+  if (
+    exportMeta?.bodyIncomplete === true ||
+    (typeof bodyMissing === "string" && bodyMissing.length > 0)
+  ) {
+    if (isMissingReason(annotated)) {
+      return annotated;
+    }
+    if (typeof bodyMissing === "string" && bodyMissing.length > 0) {
+      return resolveBodyMissingReason(bodyMissing);
+    }
+    return status === 0 ? "aborted" : "unavailable";
+  }
+
   if (status === 204 || status === 304) {
     if (content.text === undefined || content.text.length === 0) {
       return "empty";
@@ -113,9 +163,10 @@ export function classifyEntryBodyState(entry: HarEntry): HarBodyState {
     return "present";
   }
 
-  const annotated = entry._harExport?.bodyState;
   if (annotated !== undefined && annotated !== "present") {
-    return annotated;
+    if (annotated === "empty" || isMissingReason(annotated)) {
+      return annotated;
+    }
   }
   if (status === 0) {
     return "aborted";
@@ -132,8 +183,38 @@ function addNonNegative(current: number, value: number): number {
   return value >= 0 ? current + value : current;
 }
 
-function isMissingReason(state: HarBodyState): state is HarMissingBodyReason {
-  return MISSING_REASONS.includes(state as HarMissingBodyReason);
+function summarizeRedactionMetadata(
+  redaction: HarLogRedactionExtension | undefined,
+  entryCount: number,
+): HarRedactionSummary {
+  if (!redaction || redaction.applied !== true || !Array.isArray(redaction.records)) {
+    return { applied: false, totalRemoved: 0, entriesAffected: 0 };
+  }
+  const hasPlaces = Array.isArray(redaction.places) && redaction.places.length > 0;
+  let totalRemoved = 0;
+  const affectedIndices = new Set<number>();
+  for (const record of redaction.records) {
+    if (
+      typeof record?.count === "number" &&
+      record.count > 0 &&
+      typeof record.entryIndex === "number" &&
+      record.entryIndex >= -1 &&
+      record.entryIndex < entryCount
+    ) {
+      totalRemoved += record.count;
+      if (record.entryIndex >= 0) {
+        affectedIndices.add(record.entryIndex);
+      }
+    }
+  }
+  if (!hasPlaces && totalRemoved === 0) {
+    return { applied: false, totalRemoved: 0, entriesAffected: 0 };
+  }
+  return {
+    applied: true,
+    totalRemoved,
+    entriesAffected: affectedIndices.size,
+  };
 }
 
 export function summarizeEntries(
@@ -267,11 +348,7 @@ export function summarizeEntries(
       clientError,
       serverError,
     },
-    redaction: {
-      applied: options?.redaction?.applied ?? false,
-      totalRemoved: options?.redaction?.totalRemoved ?? 0,
-      entriesAffected: options?.redaction?.entriesAffected ?? 0,
-    },
+    redaction: summarizeRedactionMetadata(options?.redaction, entries.length),
   };
 }
 

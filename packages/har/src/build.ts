@@ -107,6 +107,11 @@ export interface BuildHarEntryInput extends CustomHarFields {
   readonly _harExport?: HarEntryExtension | undefined;
 }
 
+export interface BuildHarEntryOptions {
+  readonly pages?: readonly HarPage[] | undefined;
+  readonly pageIds?: ReadonlySet<PageId> | undefined;
+}
+
 export interface BuildHarInput extends CustomHarFields {
   readonly version?: string | undefined;
   readonly creator: HarCreator;
@@ -369,6 +374,32 @@ function normalizeResponse(raw: BuildHarResponseInput): HarResponse {
   };
 }
 
+export function buildHarEntry(entry: BuildHarEntryInput, options?: BuildHarEntryOptions): HarEntry {
+  const timings = normalizeTimings(entry.timings);
+  let pageref: PageId | undefined;
+  if (options?.pages !== undefined) {
+    const pageIds = options.pageIds ?? new Set(options.pages.map((page) => page.id));
+    pageref = resolvePageForEntry(entry, options.pages, pageIds);
+  } else if (options?.pageIds !== undefined) {
+    pageref = entry.pageref && options.pageIds.has(entry.pageref) ? entry.pageref : undefined;
+  } else {
+    pageref = entry.pageref;
+  }
+  return {
+    ...pickCustomFields(entry, OWNED_FIELDS.entry),
+    ...(pageref !== undefined ? { pageref } : {}),
+    startedDateTime: entry.startedDateTime,
+    time: entry.time ?? sumEntryTimings(timings),
+    request: normalizeRequest(entry.request),
+    response: normalizeResponse(entry.response),
+    cache: entry.cache ?? {},
+    timings,
+    ...(entry.serverIPAddress !== undefined ? { serverIPAddress: entry.serverIPAddress } : {}),
+    ...(entry.connection !== undefined ? { connection: entry.connection } : {}),
+    ...(entry.comment !== undefined ? { comment: entry.comment } : {}),
+  };
+}
+
 export function buildHar(input: BuildHarInput): HarDocument {
   if (input.creator.name.length === 0 || input.creator.version.length === 0) {
     throw new TypeError("buildHar requires a creator name and version.");
@@ -385,23 +416,7 @@ export function buildHar(input: BuildHarInput): HarDocument {
   const pages = normalizePages(input.pages, sortedInputs, input.defaultPageTitle);
   const pageIds = new Set(pages.map((page) => page.id));
 
-  const entries: HarEntry[] = sortedInputs.map((entry) => {
-    const timings = normalizeTimings(entry.timings);
-    const pageref = resolvePageForEntry(entry, pages, pageIds);
-    return {
-      ...pickCustomFields(entry, OWNED_FIELDS.entry),
-      ...(pageref !== undefined ? { pageref } : {}),
-      startedDateTime: entry.startedDateTime,
-      time: entry.time ?? sumEntryTimings(timings),
-      request: normalizeRequest(entry.request),
-      response: normalizeResponse(entry.response),
-      cache: entry.cache ?? {},
-      timings,
-      ...(entry.serverIPAddress !== undefined ? { serverIPAddress: entry.serverIPAddress } : {}),
-      ...(entry.connection !== undefined ? { connection: entry.connection } : {}),
-      ...(entry.comment !== undefined ? { comment: entry.comment } : {}),
-    };
-  });
+  const entries: HarEntry[] = sortedInputs.map((entry) => buildHarEntry(entry, { pages, pageIds }));
 
   const log: HarLog = {
     ...pickCustomFields(input, new Set([...OWNED_FIELDS.log, "defaultPageTitle"])),

@@ -3,10 +3,22 @@ import { describe, expect, it } from "vite-plus/test";
 import { buildHar } from "../src/build.ts";
 import { toHarUrl, toIsoDateTime, toMimeType } from "../src/model.ts";
 import { parseHar } from "../src/parse.ts";
-import { DEFAULT_REDACTION_RULES, REDACTION_LEVEL_TABLE, redactHar } from "../src/redact.ts";
+import {
+  DEFAULT_REDACTION_RULES,
+  REDACTION_LEVEL_TABLE,
+  redactHar,
+  redactHarEntry,
+  redactUrl,
+} from "../src/redact.ts";
 
 describe("redactHar", () => {
-  it("removes every listed secret across headers, cookies, query, and body and records removals", () => {
+  it("removes structurally defined credential carriers under standard and leaves bodies byte-identical", () => {
+    const jsonBodyText = JSON.stringify({
+      user: "alice",
+      nested: { password: "body-json-secret-1" },
+    });
+    const formBodyText = "client_secret=form-secret-1&grant_type=client_credentials";
+
     const doc = buildHar({
       creator: { name: "Caller", version: "1" },
       entries: [
@@ -14,7 +26,9 @@ describe("redactHar", () => {
           startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
           request: {
             method: "POST",
-            url: toHarUrl("https://api.example/oauth/token?access_token=q-secret-1&page=2")!,
+            url: toHarUrl(
+              "https://alice:url-pass-1@api.example/oauth/token?access_token=q-secret-1&page=2",
+            )!,
             headers: [
               { name: "Cookie", value: "sid=cookie-secret-1" },
               { name: "Authorization", value: "Bearer auth-secret-1" },
@@ -24,10 +38,7 @@ describe("redactHar", () => {
             cookies: [{ name: "sid", value: "cookie-secret-1" }],
             postData: {
               mimeType: toMimeType("application/json")!,
-              text: JSON.stringify({
-                user: "alice",
-                nested: { password: "body-json-secret-1" },
-              }),
+              text: jsonBodyText,
             },
           },
           response: {
@@ -49,10 +60,11 @@ describe("redactHar", () => {
             postData: {
               mimeType: toMimeType("application/x-www-form-urlencoded")!,
               params: [
-                { name: "client_secret", value: "form-secret-1" },
+                { name: "client_secret", value: "param-secret-1" },
+                { name: "clientSecret", value: "camel-param-secret-1" },
                 { name: "grant_type", value: "client_credentials" },
               ],
-              text: "client_secret=form-secret-1&grant_type=client_credentials",
+              text: formBodyText,
             },
           },
           response: {
@@ -65,21 +77,22 @@ describe("redactHar", () => {
     const { document: redacted, report } = redactHar(doc);
     const serialized = JSON.stringify(redacted);
 
-    for (const secret of [
+    for (const removedSecret of [
+      "url-pass-1",
       "cookie-secret-1",
       "auth-secret-1",
       "proxy-secret-1",
       "set-cookie-secret-1",
       "q-secret-1",
-      "body-json-secret-1",
-      "form-secret-1",
+      "param-secret-1",
+      "camel-param-secret-1",
     ]) {
-      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(removedSecret);
     }
 
     const first = redacted.log.entries[0]!;
     expect(first.request.url).toBe(
-      "https://api.example/oauth/token?access_token=%5BREDACTED%5D&page=2",
+      "https://%5BREDACTED%5D@api.example/oauth/token?access_token=%5BREDACTED%5D&page=2",
     );
     expect(first.request.queryString).toEqual([
       {
@@ -90,32 +103,47 @@ describe("redactHar", () => {
       { name: "page", value: "2" },
     ]);
     expect(first.request.headers.find((h) => h.name === "Accept")?.value).toBe("application/json");
-    expect(JSON.parse(first.request.postData!.text ?? "")).toEqual({
-      user: "alice",
-      nested: { password: "[REDACTED]" },
-    });
+    expect(first.request.postData?.text).toBe(jsonBodyText);
+    expect(first.response.content.text).toBe('{"status":"ok"}');
 
     const second = redacted.log.entries[1]!;
-    expect(second.request.postData?.text).toBe(
-      "client_secret=%5BREDACTED%5D&grant_type=client_credentials",
-    );
+    expect(second.request.postData?.params).toEqual([
+      {
+        name: "client_secret",
+        value: "[REDACTED]",
+        comment: "redacted by body:secrets",
+      },
+      {
+        name: "clientSecret",
+        value: "[REDACTED]",
+        comment: "redacted by body:secrets",
+      },
+      { name: "grant_type", value: "client_credentials" },
+    ]);
+    expect(second.request.postData?.text).toBe(formBodyText);
 
     expect(report.applied).toBe(true);
-    expect(report.level).toBe("default");
-    expect(report.guarantee).toBe(REDACTION_LEVEL_TABLE.default.guarantee);
+    expect(report.level).toBe("standard");
+    expect(report.guarantee).toBe(REDACTION_LEVEL_TABLE.standard.guarantee);
     expect(report.entriesAffected).toBe(2);
-    expect(report.totalRemoved).toBe(11);
+    expect(report.totalRemoved).toBe(13);
     expect(report.records.some((record) => record.target === "page")).toBe(true);
-    expect(report.notInspected).toEqual([]);
-    expect(report.places.every((place) => place.status !== "not-examined")).toBe(true);
+    expect(report.notInspected).toContain("body-json");
+    expect(report.notInspected).toContain("body-form");
+    expect(report.notInspected).toContain("response-body-json");
+    expect(
+      report.places.every(
+        (place) => place.status === "removed" || place.status === "kept-not-examined",
+      ),
+    ).toBe(true);
     expect(redacted.log._harExport?.redaction).toEqual(report);
     expect(first._harExport?.redactedFields).toContain("header:Authorization");
     expect(first._harExport?.redactedFields).toContain("query:access_token");
-    expect(first._harExport?.redactedFields).toContain("body:password");
+    expect(second._harExport?.redactedFields).toContain("body:client_secret");
     expect(parseHar(redacted).ok).toBe(true);
   });
 
-  it("documents the rule-table limit when a secret is planted in an unlisted place", () => {
+  it("derives report coverage from the caller's rules and supports extraRules", () => {
     expect(DEFAULT_REDACTION_RULES.some((rule) => rule.target === "header")).toBe(true);
     const unlistedHeaderSecret = "unlisted-custom-header-secret";
     const unlistedResponseBodySecret = "unlisted-response-body-secret";
@@ -127,7 +155,11 @@ describe("redactHar", () => {
           startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
           request: {
             method: "GET",
-            url: toHarUrl("https://api.example/debug")!,
+            url: toHarUrl("https://alice:pw@api.example/debug?access_token=tok1")!,
+            cookies: [
+              { name: "sid", value: "sid-val" },
+              { name: "other", value: "other-val" },
+            ],
             headers: [
               { name: "Authorization", value: "Bearer listed-secret" },
               { name: "X-Custom-Debug-Token", value: unlistedHeaderSecret },
@@ -153,15 +185,16 @@ describe("redactHar", () => {
       unlistedHeaderSecret,
     );
     expect(defaultEntry.response.content.text).toContain(unlistedResponseBodySecret);
-    const headerPlace = defaultRedacted.report.places.find((place) => place.place === "url-header");
+    const headerPlace = defaultRedacted.report.places.find(
+      (place) => place.place === "named-header",
+    );
     const bodyPlace = defaultRedacted.report.places.find(
       (place) => place.place === "response-body-json",
     );
-    expect(headerPlace?.status).toBe("examined");
-    expect(headerPlace?.canStillHold).toContain("hyphenated slug");
-    expect(bodyPlace?.status).toBe("examined");
-    expect(bodyPlace?.canStillHold).toContain("hyphenated slug");
-    expect(defaultRedacted.report.notInspected).toEqual([]);
+    expect(headerPlace?.status).toBe("kept-not-examined");
+    expect(headerPlace?.detail).toBe("not examined: may contain secrets");
+    expect(bodyPlace?.status).toBe("kept-not-examined");
+    expect(bodyPlace?.detail).toBe("not examined: may contain secrets");
 
     const withExtraRule = redactHar(doc, {
       extraRules: [
@@ -173,9 +206,100 @@ describe("redactHar", () => {
         (h) => h.name === "X-Custom-Debug-Token",
       )?.value,
     ).toBe("[REDACTED]");
+
+    const partialCookieRules = redactHar(doc, {
+      rules: [{ id: "cookie:sid", target: "cookie", names: ["sid"] }],
+    });
+    const partialEntry = partialCookieRules.document.log.entries[0]!;
+    expect(partialEntry.request.cookies.find((c) => c.name === "sid")?.value).toBe("[REDACTED]");
+    expect(partialEntry.request.cookies.find((c) => c.name === "other")?.value).toBe("other-val");
+    expect(partialEntry.request.url).toContain("alice:pw@");
+    expect(partialEntry.request.url).toContain("access_token=tok1");
+    expect(partialCookieRules.report.places.find((p) => p.place === "cookie")?.status).toBe(
+      "kept-not-examined",
+    );
+    expect(
+      partialCookieRules.report.places.find((p) => p.place === "request-url-userinfo")?.status,
+    ).toBe("kept-not-examined");
+    expect(
+      partialCookieRules.report.places.find((p) => p.place === "request-url-query-secret")?.status,
+    ).toBe("kept-not-examined");
+    expect(
+      partialCookieRules.report.places.find((p) => p.place === "header-value-secret")?.status,
+    ).toBe("kept-not-examined");
+    expect(partialCookieRules.report.notInspected).toContain("cookie");
+    expect(partialCookieRules.report.notInspected).toContain("request-url-userinfo");
+    expect(partialCookieRules.report.notInspected).toContain("request-url-query-secret");
+    expect(partialCookieRules.report.notInspected).toContain("header-value-secret");
   });
 
-  it("removes every planted secret, records the page title, and names uninspected places", () => {
+  it("supports single-entry redaction (redactHarEntry) and URL/page-title redaction (redactUrl)", () => {
+    const built = buildHar({
+      creator: { name: "Caller", version: "1" },
+      entries: [
+        {
+          startedDateTime: toIsoDateTime("2026-11-16T05:00:00.000Z")!,
+          request: {
+            method: "GET",
+            url: toHarUrl("https://bob:hunter2@api.example/items?token=sec123&page=1")!,
+            headers: [
+              { name: "Authorization", value: "Bearer sec456" },
+              { name: "Content-Type", value: "application/json" },
+              { name: "X-Custom", value: "val" },
+            ],
+            cookies: [{ name: "sid", value: "c789" }],
+          },
+          response: {
+            status: 200,
+            content: { mimeType: toMimeType("application/json")!, text: '{"ok":true}' },
+          },
+        },
+      ],
+    });
+
+    const singleStandard = redactHarEntry(built.log.entries[0]!, DEFAULT_REDACTION_RULES);
+    expect(singleStandard.touched).toBe(true);
+    expect(singleStandard.url).toBe(
+      "https://%5BREDACTED%5D@api.example/items?token=%5BREDACTED%5D&page=1",
+    );
+    expect(singleStandard.covered).toEqual([
+      "request-url-userinfo",
+      "request-url-query-secret",
+      "header-value-secret",
+      "cookie",
+      "query-string-secret",
+      "body-param-secret",
+    ]);
+    expect(singleStandard.entry.response.content.text).toBe('{"ok":true}');
+
+    const singleShareable = redactHarEntry(built.log.entries[0]!, { level: "shareable" });
+    expect(singleShareable.touched).toBe(true);
+    expect(singleShareable.url).toBe("https://api.example/items");
+    expect(singleShareable.entry.request.cookies).toEqual([]);
+    expect(singleShareable.entry.request.queryString).toEqual([]);
+    expect(singleShareable.entry.response.content.text).toBeUndefined();
+    expect(
+      singleShareable.entry.request.headers.find((h) => h.name === "Content-Type")?.value,
+    ).toBe("application/json");
+    expect(singleShareable.entry.request.headers.find((h) => h.name === "X-Custom")?.value).toBe(
+      "",
+    );
+
+    const titleStandard = redactUrl("https://user:pw@app.example/callback?code=oauth123&state=ok");
+    expect(titleStandard.touched).toBe(true);
+    expect(titleStandard.url).toBe(
+      "https://%5BREDACTED%5D@app.example/callback?code=%5BREDACTED%5D&state=ok",
+    );
+
+    const titleShareable = redactUrl(
+      "https://user:pw@app.example/callback?code=oauth123&state=ok#frag",
+      { level: "shareable" },
+    );
+    expect(titleShareable.touched).toBe(true);
+    expect(titleShareable.url).toBe("https://app.example/callback");
+  });
+
+  it("accounts for all 23 round-1 planted secrets under standard and removes all 23 under shareable", () => {
     const secret = (key: string) => `SECRET_${key}_7f3a`;
     const pair = (name: string, value: string) => ({ name, value });
     const planted = {
@@ -297,31 +421,7 @@ describe("redactHar", () => {
       cache: {},
       timings: { send: 1, wait: 1, receive: 1 },
     };
-    const keys = [
-      "URLPASS",
-      "QUERY",
-      "AUTHHDR",
-      "COOKIEHDR",
-      "XAPIKEY",
-      "REFERER",
-      "H2PATH",
-      "CSRF",
-      "COOKIEARR",
-      "PARAM",
-      "JSONPW",
-      "CAMEL",
-      "NESTED",
-      "SETCOOKIE",
-      "LOCATION",
-      "RESCOOKIE",
-      "REDIRECT",
-      "RESBODY",
-      "RESBODY2",
-      "INITIATOR",
-      "FORM",
-      "MULTIPART",
-      "PAGETITLE",
-    ];
+
     const parsed = parseHar({
       log: {
         version: "1.2",
@@ -342,18 +442,65 @@ describe("redactHar", () => {
       return;
     }
 
-    const { document, report } = redactHar(parsed.document);
-    const serialized = JSON.stringify(document);
-    const leaked = keys.filter((key) => serialized.includes(secret(key)));
-    expect(leaked).toEqual([]);
-    expect(keys.filter((key) => !serialized.includes(secret(key)))).toHaveLength(23);
-    expect(report.records.some((record) => record.target === "page")).toBe(true);
-    expect(report.notInspected).toEqual([]);
-    expect(report.places.find((place) => place.place === "request-url-userinfo")?.status).toBe(
-      "removed",
-    );
-    expect("_harAnytime" in document.log).toBe(false);
-    expect(document.log._harExport?.redaction).toEqual(report);
-    expect(parseHar(document).ok).toBe(true);
+    const { document: stdDoc, report: stdReport } = redactHar(parsed.document);
+    const stdText = JSON.stringify(stdDoc);
+
+    const removedInStandard = [
+      "URLPASS",
+      "QUERY",
+      "AUTHHDR",
+      "COOKIEHDR",
+      "XAPIKEY",
+      "CSRF",
+      "COOKIEARR",
+      "PARAM",
+      "SETCOOKIE",
+      "RESCOOKIE",
+      "PAGETITLE",
+    ];
+    for (const key of removedInStandard) {
+      expect(stdText).not.toContain(secret(key));
+    }
+
+    const unexaminedInStandard: ReadonlyArray<readonly [string, string]> = [
+      ["REFERER", "url-header"],
+      ["H2PATH", "url-header"],
+      ["LOCATION", "url-header"],
+      ["REDIRECT", "redirect-url"],
+      ["JSONPW", "body-json"],
+      ["CAMEL", "body-json"],
+      ["NESTED", "body-json"],
+      ["RESBODY", "response-body-json"],
+      ["RESBODY2", "response-body-json"],
+      ["INITIATOR", "initiator"],
+      ["FORM", "body-form"],
+      ["MULTIPART", "body-multipart"],
+    ];
+    for (const [key, place] of unexaminedInStandard) {
+      expect(stdText).toContain(secret(key));
+      const cov = stdReport.places.find((item) => item.place === place);
+      expect(cov?.status).toBe("kept-not-examined");
+      expect(cov?.detail).toBe("not examined: may contain secrets");
+      expect(cov?.count).toBeGreaterThan(0);
+      expect(stdReport.notInspected).toContain(place);
+    }
+
+    expect(stdReport.entriesAffected).toBe(1);
+    expect(stdReport.records.some((record) => record.target === "page")).toBe(true);
+    expect("_harAnytime" in stdDoc.log).toBe(false);
+    expect(stdDoc.log._harExport?.redaction).toEqual(stdReport);
+    expect(parseHar(stdDoc).ok).toBe(true);
+
+    const { document: shareDoc, report: shareReport } = redactHar(parsed.document, {
+      level: "shareable",
+    });
+    const shareText = JSON.stringify(shareDoc);
+    const all23 = [...removedInStandard, ...unexaminedInStandard.map(([key]) => key)];
+    for (const key of all23) {
+      expect(shareText).not.toContain(secret(key));
+    }
+    expect(shareReport.level).toBe("shareable");
+    expect(shareReport.remainingRisk).toContain("Host names and URL paths");
+    expect(parseHar(shareDoc).ok).toBe(true);
   });
 });

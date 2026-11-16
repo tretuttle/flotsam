@@ -120,6 +120,8 @@ export interface HarProblem {
   readonly rule: HarValidationRule;
   readonly severity: HarValidationSeverity;
   readonly message: string;
+  readonly method?: string | undefined;
+  readonly url?: string | undefined;
 }
 
 export type HarParseResult =
@@ -134,6 +136,7 @@ type JsonRecord = Record<string, unknown>;
 
 const HAR_VERSION_PATTERN = /^(\d+)\.(\d+)$/u;
 const NUMERIC_STRING_PATTERN = /^\d+$/u;
+
 function salvageDate(): IsoDateTime {
   const date = toIsoDateTime("1970-01-01T00:00:00.000Z");
   if (!date) {
@@ -162,12 +165,15 @@ class ProblemCollector {
     rule: HarValidationRule,
     message: string,
     severity?: HarValidationSeverity,
+    meta?: { readonly method?: string | undefined; readonly url?: string | undefined },
   ): void {
     this.items.push({
       path,
       rule,
       severity: severity ?? HAR_VALIDATION_SEVERITY[rule],
       message,
+      ...(meta?.method !== undefined ? { method: meta.method } : {}),
+      ...(meta?.url !== undefined ? { url: meta.url } : {}),
     });
   }
 }
@@ -204,16 +210,18 @@ function parseCreatorLike(
   if (typeof name !== "string" || name.length === 0) {
     problems.add(`${path}.name`, rule, "Expected non-empty string name.");
   }
-  if (typeof version !== "string" || version.length === 0) {
-    problems.add(`${path}.version`, rule, "Expected non-empty string version.");
+  if (typeof version !== "string") {
+    problems.add(`${path}.version`, rule, "Expected string version.");
+  } else if (version.length === 0) {
+    problems.add(
+      `${path}.version`,
+      rule,
+      "Creator version is empty. Kept because some exporters omit the version.",
+      "note",
+    );
   }
   const comment = readOptionalComment(value, path, rule, problems);
-  if (
-    typeof name !== "string" ||
-    name.length === 0 ||
-    typeof version !== "string" ||
-    version.length === 0
-  ) {
+  if (typeof name !== "string" || name.length === 0 || typeof version !== "string") {
     return null;
   }
   return {
@@ -305,7 +313,7 @@ function parsePages(
     const path = `$.log.pages[${String(index)}]`;
     const item = rawPages[index];
     if (!isPlainRecord(item)) {
-      problems.add(path, "page-object", "Expected page item to be an object.");
+      problems.add(path, "page-object", "Expected page item to be an object.", "dropped");
       continue;
     }
     const rawId = item.id;
@@ -346,6 +354,16 @@ function parsePages(
         pageTimings,
         ...(comment !== undefined ? { comment } : {}),
       });
+    } else {
+      if (validId) {
+        ids.delete(validId);
+      }
+      problems.add(
+        path,
+        "page-object",
+        `Dropped page${typeof rawId === "string" && rawId.length > 0 ? ` "${rawId}"` : ""} because required page fields could not be salvaged.`,
+        "dropped",
+      );
     }
   }
   return { pages, ids };
@@ -897,6 +915,28 @@ function parseTimings(value: unknown, path: string, problems: ProblemCollector):
   };
 }
 
+function readRawRequestMeta(rawRequest: unknown): {
+  readonly method?: string | undefined;
+  readonly url?: string | undefined;
+  readonly suffix: string;
+} {
+  if (!isPlainRecord(rawRequest)) {
+    return { suffix: "" };
+  }
+  const method =
+    typeof rawRequest.method === "string" && rawRequest.method.length > 0
+      ? rawRequest.method
+      : undefined;
+  const url =
+    typeof rawRequest.url === "string" && rawRequest.url.length > 0 ? rawRequest.url : undefined;
+  const parts = [method, url].filter((part): part is string => part !== undefined);
+  return {
+    ...(method !== undefined ? { method } : {}),
+    ...(url !== undefined ? { url } : {}),
+    suffix: parts.length > 0 ? ` (${parts.join(" ")})` : "",
+  };
+}
+
 function parseEntries(
   rawEntries: unknown,
   pageIds: ReadonlySet<PageId>,
@@ -911,7 +951,8 @@ function parseEntries(
     const path = `$.log.entries[${String(index)}]`;
     const item = rawEntries[index];
     if (!isPlainRecord(item)) {
-      problems.add(path, "entry-object", "Expected entry to be an object.");
+      const hint = typeof item === "string" && item.length > 0 ? ` (${item})` : "";
+      problems.add(path, "entry-object", `Expected entry to be an object.${hint}`, "dropped");
       continue;
     }
     let pageref: PageId | undefined;
@@ -953,12 +994,15 @@ function parseEntries(
     const cache = parseCache(item.cache, `${path}.cache`, problems);
     const timings = parseTimings(item.timings, `${path}.timings`, problems);
     const comment = readOptionalComment(item, path, "entry-object", problems);
+    const requestMeta = readRawRequestMeta(item.request);
 
     if (!request) {
       problems.add(
         path,
         "entry-object",
-        "Dropped this entry because the request URL could not be salvaged.",
+        requestMeta.suffix.length > 0
+          ? `Dropped this entry${requestMeta.suffix}: Dropped this entry because the request URL could not be salvaged.`
+          : "Dropped this entry because the request URL could not be salvaged.",
         "dropped",
       );
       continue;
@@ -1019,7 +1063,11 @@ export function parseHar(input: unknown): HarParseResult {
   const entries = parseEntries(rawLog.entries, ids, problems);
   const comment = readOptionalComment(rawLog, "$.log", "log-object", problems);
 
-  const rejectsDocument = problems.items.some((item) => DOCUMENT_REJECTION_RULES.has(item.rule));
+  const rejectsDocument = problems.items.some(
+    (item) =>
+      DOCUMENT_REJECTION_RULES.has(item.rule) &&
+      (item.rule !== "creator-object" || item.severity === "error"),
+  );
   if (rejectsDocument || version === null || !creator) {
     return { ok: false, problems: problems.items };
   }
