@@ -1,3 +1,4 @@
+import { pickCustomFields } from "./internal.ts";
 import {
   isHarUrl,
   isIsoDateTime,
@@ -81,16 +82,6 @@ const NUMERIC_STRING_PATTERN = /^\d+$/u;
 
 function isPlainRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function pickCustomFields(record: JsonRecord): CustomHarFields {
-  const custom: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(record)) {
-    if (key.startsWith("_")) {
-      custom[key] = value;
-    }
-  }
-  return custom as CustomHarFields;
 }
 
 function isNonNegativeNumber(value: unknown): value is number {

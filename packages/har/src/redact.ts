@@ -1,3 +1,4 @@
+import { safeDecodeQueryComponent } from "./internal.ts";
 import {
   toHarUrl,
   type HarCookie,
@@ -75,15 +76,6 @@ export const DEFAULT_REDACTION_RULES: readonly HarRedactionRule[] = [
 ];
 
 const DEFAULT_REPLACEMENT = "[REDACTED]";
-
-function safeDecodeComponent(raw: string): string {
-  const withSpaces = raw.replace(/\+/gu, " ");
-  try {
-    return decodeURIComponent(withSpaces);
-  } catch {
-    return withSpaces;
-  }
-}
 
 function appendComment(existing: string | undefined, note: string): string {
   if (!existing || existing.length === 0) {
@@ -240,7 +232,7 @@ function redactUrlQuery(
     }
     const eqIndex = segment.indexOf("=");
     const rawName = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
-    const decodedName = safeDecodeComponent(rawName);
+    const decodedName = safeDecodeQueryComponent(rawName);
     const rule = findMatchingRule(rules, "query", decodedName);
     if (!rule) {
       return segment;
@@ -312,7 +304,7 @@ function redactFormText(
     }
     const eqIndex = segment.indexOf("=");
     const rawName = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
-    const decodedName = safeDecodeComponent(rawName);
+    const decodedName = safeDecodeQueryComponent(rawName);
     const rule = findMatchingRule(rules, "body", decodedName);
     if (!rule) {
       return segment;

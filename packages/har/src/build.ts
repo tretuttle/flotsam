@@ -1,3 +1,4 @@
+import { pickCustomFields, safeDecodeQueryComponent, utf8ByteLength } from "./internal.ts";
 import {
   isHarUrl,
   isMimeType,
@@ -120,43 +121,6 @@ const DEFAULT_CREATOR: HarCreator = {
 
 const SPEC_TIME_PHASES = ["blocked", "dns", "connect", "send", "wait", "receive"] as const;
 
-function pickCustomFields(record: object): CustomHarFields {
-  const custom: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(record)) {
-    if (key.startsWith("_")) {
-      custom[key] = value;
-    }
-  }
-  return custom as CustomHarFields;
-}
-
-function utf8ByteLength(text: string): number {
-  let bytes = 0;
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    if (code <= 0x7f) {
-      bytes += 1;
-    } else if (code <= 0x7ff) {
-      bytes += 2;
-    } else if (code >= 0xd800 && code <= 0xdbff) {
-      bytes += 4;
-      i += 1;
-    } else {
-      bytes += 3;
-    }
-  }
-  return bytes;
-}
-
-function safeDecodeQueryComponent(raw: string): string {
-  const plusAsSpace = raw.replace(/\+/gu, " ");
-  try {
-    return decodeURIComponent(plusAsSpace);
-  } catch {
-    return plusAsSpace;
-  }
-}
-
 function parseUrlQueryString(url: HarUrl): readonly HarNameValue[] {
   const queryStart = url.indexOf("?");
   if (queryStart === -1) {
@@ -232,19 +196,24 @@ function normalizePages(
     }
   }
 
+  const assignedIds = new Set<PageId>();
   const normalized = (rawPages ?? [])
-    .map((page, index) => ({
-      index,
-      epochMs: Date.parse(page.startedDateTime),
-      page: {
-        ...pickCustomFields(page),
-        startedDateTime: page.startedDateTime,
-        id: page.id ?? allocatePageId(usedIds),
-        title: page.title,
-        pageTimings: normalizePageTimings(page.pageTimings),
-        ...(page.comment !== undefined ? { comment: page.comment } : {}),
-      } satisfies HarPage,
-    }))
+    .map((page, index) => {
+      const id = page.id && !assignedIds.has(page.id) ? page.id : allocatePageId(usedIds);
+      assignedIds.add(id);
+      return {
+        index,
+        epochMs: Date.parse(page.startedDateTime),
+        page: {
+          ...pickCustomFields(page),
+          startedDateTime: page.startedDateTime,
+          id,
+          title: page.title,
+          pageTimings: normalizePageTimings(page.pageTimings),
+          ...(page.comment !== undefined ? { comment: page.comment } : {}),
+        } satisfies HarPage,
+      };
+    })
     .sort((left, right) => left.epochMs - right.epochMs || left.index - right.index)
     .map((item) => item.page);
 
