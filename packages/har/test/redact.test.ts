@@ -487,7 +487,7 @@ describe("redactHar", () => {
 
     expect(stdReport.entriesAffected).toBe(1);
     expect(stdReport.records.some((record) => record.target === "page")).toBe(true);
-    expect("_harAnytime" in stdDoc.log).toBe(false);
+    expect("_oneClickHar" in stdDoc.log).toBe(false);
     expect(stdDoc.log._harExport?.redaction).toEqual(stdReport);
     expect(parseHar(stdDoc).ok).toBe(true);
 
