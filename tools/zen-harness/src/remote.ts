@@ -1,0 +1,489 @@
+import * as NodeNet from "node:net";
+
+const CONNECT_MS = 30_000;
+const SOCKET_MS = 15_000;
+const COMMAND_MS = 60_000;
+
+export type RemoteProtocol = "bidi" | "marionette";
+
+export type RemoteControl = {
+  readonly protocol: RemoteProtocol;
+  readonly browserPid: number;
+  readonly version: string;
+  readonly buildId: string;
+  readonly userAgent: string;
+  readonly openTab: (url: string) => Promise<string>;
+  readonly evaluate: (context: string, expression: string) => Promise<string>;
+  readonly closeTab: (context: string) => Promise<void>;
+  readonly dispose: () => void;
+};
+
+export async function connectRemote(options: {
+  readonly bidiPort: number;
+  readonly marionettePort: number;
+  readonly exitCode: () => number | null;
+  readonly stderr: () => string;
+  readonly deadlineMs?: number;
+}): Promise<RemoteControl> {
+  const deadline = Date.now() + (options.deadlineMs ?? CONNECT_MS);
+  let bidiError = "BiDi port did not open";
+  let marionetteError = "Marionette port did not open";
+  const throwIfExited = (): void => {
+    const exitCode = options.exitCode();
+    if (exitCode !== null) {
+      throw new Error(
+        `Zen exited with code ${String(exitCode)} before remote control opened\n${options.stderr()}`,
+      );
+    }
+  };
+  throwIfExited();
+  while (Date.now() < deadline) {
+    throwIfExited();
+    if (await tcpOpen(options.bidiPort)) {
+      try {
+        return await openBidi(options.bidiPort);
+      } catch (error) {
+        bidiError = errorMessage(error);
+      }
+    }
+    if (await tcpOpen(options.marionettePort)) {
+      try {
+        return await openMarionette(options.marionettePort);
+      } catch (error) {
+        marionetteError = errorMessage(error);
+      }
+    }
+    await delay(100);
+  }
+  throw new Error(
+    `timed out waiting for Zen remote control\nBiDi: ${bidiError}\nMarionette: ${marionetteError}\n${options.stderr()}`,
+  );
+}
+
+async function openBidi(port: number): Promise<RemoteControl> {
+  const bidi = await connectBidi(port);
+  try {
+    const identity = readBidiSession(
+      await bidi.call("session.new", { capabilities: { alwaysMatch: {} } }, SOCKET_MS),
+    );
+    return {
+      protocol: "bidi",
+      ...identity,
+      openTab: async (url) => {
+        const created = await bidi.call("browsingContext.create", { type: "tab" });
+        const context = readStringField(created, "context", "browsingContext");
+        await bidi.call("browsingContext.navigate", { context, url, wait: "complete" });
+        return context;
+      },
+      evaluate: async (context, expression) =>
+        readBidiString(
+          await bidi.call("script.evaluate", {
+            expression,
+            awaitPromise: true,
+            target: { context },
+          }),
+        ),
+      closeTab: async (context) => {
+        await bidi.call("browsingContext.close", { context });
+      },
+      dispose: () => bidi.close(),
+    };
+  } catch (error) {
+    bidi.close();
+    throw error;
+  }
+}
+
+async function openMarionette(port: number): Promise<RemoteControl> {
+  const marionette = await connectMarionette(port);
+  try {
+    const created = await marionette.call(
+      "WebDriver:NewSession",
+      {
+        capabilities: {
+          alwaysMatch: {
+            pageLoadStrategy: "normal",
+            timeouts: { script: COMMAND_MS, pageLoad: COMMAND_MS },
+          },
+        },
+      },
+      SOCKET_MS,
+    );
+    const identity = readMarionetteSession(created);
+    const userAgent = await readMarionetteUserAgent(marionette, identity.userAgent);
+    return {
+      protocol: "marionette",
+      browserPid: identity.browserPid,
+      version: identity.version,
+      buildId: identity.buildId,
+      userAgent,
+      openTab: async (url) => {
+        const createdWindow = await marionette.call("WebDriver:NewWindow", {
+          type: "tab",
+          focus: true,
+        });
+        const handle = readStringField(createdWindow, "handle", "WebDriver:NewWindow");
+        await marionette.call("WebDriver:SwitchToWindow", { handle, focus: true });
+        await marionette.call("WebDriver:Navigate", { url });
+        return handle;
+      },
+      evaluate: async (context, expression) => {
+        await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
+        const value = await marionette.call("WebDriver:ExecuteAsyncScript", {
+          script: MARIONETTE_ASYNC,
+          args: [expression],
+        });
+        return readMarionetteString(value);
+      },
+      closeTab: async (context) => {
+        await marionette.call("WebDriver:SwitchToWindow", { handle: context, focus: true });
+        await marionette.call("WebDriver:CloseWindow", {});
+      },
+      dispose: () => marionette.close(),
+    };
+  } catch (error) {
+    marionette.close();
+    throw error;
+  }
+}
+
+const MARIONETTE_ASYNC = [
+  "const done = arguments[arguments.length - 1];",
+  "const expression = arguments[0];",
+  "Promise.resolve(eval(expression)).then(",
+  "(value) => done(value),",
+  "(error) => done({ __harnessError: error instanceof Error ? error.message : String(error) }),",
+  ");",
+].join("");
+
+type CommandSocket = {
+  call: (name: string, params: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+  close: () => void;
+};
+
+function connectBidi(port: number): Promise<CommandSocket> {
+  const ws = new WebSocket(`ws://127.0.0.1:${String(port)}/session`);
+  const pending = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  let nextId = 1;
+  let failed: Error | null = null;
+  const socket: CommandSocket = {
+    call(method, params, timeoutMs = COMMAND_MS) {
+      if (failed !== null) return Promise.reject(failed);
+      const id = nextId;
+      nextId += 1;
+      const result = new Promise<unknown>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`${method} timed out`));
+        }, timeoutMs);
+        pending.set(id, {
+          resolve: (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          reject: (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        });
+      });
+      ws.send(JSON.stringify({ id, method, params }));
+      return result;
+    },
+    close() {
+      ws.close();
+    },
+  };
+  ws.addEventListener("message", (event) => {
+    const message: unknown = JSON.parse(frameText(event.data));
+    if (!isRecord(message) || typeof message.id !== "number") return;
+    const waiter = pending.get(message.id);
+    if (waiter === undefined) return;
+    pending.delete(message.id);
+    if (message.type === "error") {
+      const text = typeof message.message === "string" ? message.message : JSON.stringify(message);
+      waiter.reject(new Error(text));
+      return;
+    }
+    waiter.resolve(message.result);
+  });
+  ws.addEventListener("close", () => {
+    failed = new Error("BiDi socket closed");
+    for (const waiter of pending.values()) waiter.reject(failed);
+    pending.clear();
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.close();
+      reject(new Error("BiDi websocket timed out"));
+    }, SOCKET_MS);
+    ws.addEventListener(
+      "open",
+      () => {
+        clearTimeout(timer);
+        resolve(socket);
+      },
+      { once: true },
+    );
+    ws.addEventListener(
+      "error",
+      () => {
+        clearTimeout(timer);
+        reject(new Error("BiDi websocket failed"));
+      },
+      { once: true },
+    );
+  });
+}
+
+function connectMarionette(port: number): Promise<CommandSocket> {
+  const socket = NodeNet.connect(port, "127.0.0.1");
+  let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  const pending = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  let nextId = 1;
+  let failed: Error | null = null;
+  let opened = false;
+
+  function send(value: unknown): void {
+    const payload = Buffer.from(JSON.stringify(value), "utf8");
+    socket.write(`${String(payload.length)}:${payload.toString("utf8")}`);
+  }
+
+  const commands: CommandSocket = {
+    call(name, params, timeoutMs = COMMAND_MS) {
+      if (failed !== null) return Promise.reject(failed);
+      const id = nextId;
+      nextId += 1;
+      const result = new Promise<unknown>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`${name} timed out`));
+        }, timeoutMs);
+        pending.set(id, {
+          resolve: (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          reject: (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        });
+      });
+      send([0, id, name, params]);
+      return result;
+    },
+    close() {
+      socket.destroy();
+    },
+  };
+
+  function fail(error: Error): void {
+    if (failed !== null) return;
+    failed = error;
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+    socket.destroy();
+  }
+
+  function onMessage(message: unknown, ready: (value: CommandSocket) => void): void {
+    if (!opened) {
+      opened = true;
+      if (!isRecord(message) || message.applicationType !== "gecko") {
+        const error = new Error(`Marionette hello was ${JSON.stringify(message)}`);
+        fail(error);
+        return;
+      }
+      send({ marionetteProtocol: 3 });
+      ready(commands);
+      return;
+    }
+    if (!Array.isArray(message) || message[0] !== 1 || typeof message[1] !== "number") return;
+    const waiter = pending.get(message[1]);
+    if (waiter === undefined) return;
+    pending.delete(message[1]);
+    const error = message[2];
+    if (error !== null && error !== undefined) {
+      const text = isRecord(error)
+        ? (stringField(error, "message") ?? stringField(error, "error") ?? JSON.stringify(error))
+        : String(error);
+      waiter.reject(new Error(text));
+      return;
+    }
+    waiter.resolve(message[3]);
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      fail(new Error("Marionette handshake timed out"));
+      reject(new Error("Marionette handshake timed out"));
+    }, SOCKET_MS);
+    socket.on("data", (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length > 0) {
+        const next = takeLengthMessage(buffer);
+        if (next === null) return;
+        buffer = next.rest;
+        onMessage(next.message, (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        });
+      }
+    });
+    socket.on("error", () => {
+      clearTimeout(timer);
+      const error = new Error("Marionette socket failed");
+      fail(error);
+      reject(error);
+    });
+    socket.on("close", () => {
+      if (opened) fail(new Error("Marionette socket closed"));
+    });
+  });
+}
+
+function takeLengthMessage(
+  buffer: Buffer,
+): { message: unknown; rest: Buffer<ArrayBufferLike> } | null {
+  const colon = buffer.indexOf(0x3a);
+  if (colon <= 0) return null;
+  const length = Number(buffer.toString("ascii", 0, colon));
+  if (!Number.isInteger(length) || length < 0) return null;
+  const start = colon + 1;
+  if (buffer.length < start + length) return null;
+  const message: unknown = JSON.parse(buffer.toString("utf8", start, start + length));
+  return { message, rest: buffer.subarray(start + length) };
+}
+
+type BrowserIdentity = {
+  browserPid: number;
+  version: string;
+  buildId: string;
+  userAgent: string;
+};
+
+function readBidiSession(result: unknown): BrowserIdentity {
+  const capabilities = recordField(result, "capabilities");
+  if (!isRecord(capabilities)) throw new Error("session.new returned no capabilities");
+  return {
+    browserPid: readPid(capabilities["moz:processID"], "session.new"),
+    version: readText(capabilities.browserVersion, "browser version"),
+    buildId: readText(capabilities["moz:buildID"], "build id"),
+    userAgent: readText(capabilities.userAgent, "user agent"),
+  };
+}
+
+function readMarionetteSession(result: unknown): BrowserIdentity {
+  const capabilities = recordField(result, "capabilities");
+  if (!isRecord(capabilities)) throw new Error("WebDriver:NewSession returned no capabilities");
+  const userAgent = capabilities.userAgent;
+  return {
+    browserPid: readPid(capabilities["moz:processID"], "WebDriver:NewSession"),
+    version: readText(capabilities.browserVersion, "browser version"),
+    buildId: readText(capabilities["moz:buildID"], "build id"),
+    userAgent: typeof userAgent === "string" ? userAgent : "",
+  };
+}
+
+async function readMarionetteUserAgent(
+  marionette: CommandSocket,
+  current: string,
+): Promise<string> {
+  if (current.length > 0) return current;
+  const value = await marionette.call("WebDriver:ExecuteScript", {
+    script: "return navigator.userAgent",
+    args: [],
+  });
+  return readText(value, "user agent");
+}
+
+function readBidiString(result: unknown): string {
+  if (!isRecord(result)) throw new Error("script.evaluate returned no result");
+  if (result.type === "exception") {
+    throw new Error(
+      `script.evaluate failed: ${JSON.stringify(result.exceptionDetails ?? result.exception)}`,
+    );
+  }
+  const remote = result.result;
+  if (!isRecord(remote) || remote.type !== "string" || typeof remote.value !== "string") {
+    throw new Error(`script.evaluate returned ${JSON.stringify(result)}`);
+  }
+  return remote.value;
+}
+
+function readMarionetteString(value: unknown): string {
+  if (isRecord(value) && typeof value.__harnessError === "string") {
+    throw new Error(value.__harnessError);
+  }
+  if (typeof value !== "string")
+    throw new Error(`Marionette evaluate returned ${JSON.stringify(value)}`);
+  return value;
+}
+
+function readPid(value: unknown, source: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${source} returned no moz:processID`);
+  }
+  return value;
+}
+
+function readText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0)
+    throw new Error(`remote control returned no ${label}`);
+  return value;
+}
+
+function readStringField(value: unknown, key: string, source: string): string {
+  const field = recordField(value, key);
+  if (typeof field !== "string" || field.length === 0)
+    throw new Error(`${source} returned no ${key}`);
+  return field;
+}
+
+function stringField(value: Record<string, unknown>, key: string): string | null {
+  const field = value[key];
+  return typeof field === "string" ? field : null;
+}
+
+function recordField(value: unknown, key: string): unknown {
+  if (!isRecord(value)) return undefined;
+  return value[key];
+}
+
+function frameText(data: unknown): string {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
+  }
+  if (Buffer.isBuffer(data)) return data.toString("utf8");
+  return String(data);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function tcpOpen(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = NodeNet.connect(port, "127.0.0.1", () => {
+      socket.end();
+      resolve(true);
+    });
+    socket.on("error", () => resolve(false));
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

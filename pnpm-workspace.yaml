@@ -3,6 +3,7 @@ packages:
   - oxlint-plugin-one-click-har
   - packages/*
   - scripts
+  - tools/*
 
 catalog:
   "@effect/platform-node": 4.1.2

@@ -1,0 +1,17 @@
+{
+  "name": "@har-anytime/zen-harness",
+  "private": true,
+  "bin": {
+    "zen-harness": "./src/cli.ts"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "vp test run --config ../../vite.config.ts --dir .",
+    "typecheck": "effect-tsgo tsrs --noEmit",
+    "zen-harness": "node src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}
