@@ -2,21 +2,31 @@
 // Only the members this parent script uses are declared.
 
 declare const tabBrand: unique symbol;
-/** A browser tab element in the parent process. Opaque here: it is only passed back to DevTools. */
+/** A browser tab element in the parent process. Passed back to DevTools, and read for its browser. */
 interface NativeTab {
   readonly [tabBrand]: true;
-}
-
-interface ExtensionContext {
-  readonly extension: {
-    readonly tabManager: {
-      /** Throws an `ExtensionError` when no tab has this ID. */
-      get(tabId: number): { readonly nativeTab: NativeTab };
-    };
+  readonly linkedBrowser: {
+    readonly browserId: number;
+    readonly currentURI: Uri | null;
+    readonly browsingContext: { readonly usePrivateBrowsing: boolean } | null;
   };
 }
 
+interface ExtensionObject {
+  readonly tabManager: {
+    /** Throws an `ExtensionError` when no tab has this ID, or for a private tab this add-on may not see. */
+    get(tabId: number): { readonly nativeTab: NativeTab };
+  };
+  readonly version: string;
+  readonly manifest: { readonly name: string };
+}
+
+interface ExtensionContext {
+  readonly extension: ExtensionObject;
+}
+
 declare class ExtensionAPI {
+  readonly extension: ExtensionObject;
   /** Present only when the manifest's experiment entry lists `"events": ["startup"]`. */
   onStartup?(): void;
   /** true when the browser is closing; false for a disable, uninstall or update of this add-on. */
@@ -146,6 +156,10 @@ interface LocalFile {
   exists(): boolean;
   create(type: number, permissions: number): void;
   moveTo(parent: LocalFile | null, name: string): void;
+  readonly diskSpaceAvailable: number;
+  /** Throws where the platform's file manager cannot select a file (row P4). */
+  reveal(): void;
+  launch(): void;
 }
 interface FileInputStream extends InputStream {
   init(file: LocalFile, ioFlags: number, perm: number, behaviorFlags: number): void;
@@ -184,6 +198,19 @@ interface XpcomClasses {
   "@mozilla.org/io/arraybuffer-input-stream;1": ArrayBufferInputStream;
   "@mozilla.org/network/async-stream-copier;1": AsyncStreamCopier;
   "@mozilla.org/timer;1": Timer;
+  "@mozilla.org/binaryinputstream;1": BinaryInputStream;
+}
+
+interface BinaryInputStream {
+  setInputStream(stream: InputStream): void;
+  readArrayBuffer(count: number, buffer: ArrayBuffer): number;
+}
+
+/** What `asyncConvertData` returns: a listener that takes the coded bytes. Request arguments may be null. */
+interface StreamConverter {
+  onStartRequest(request: null): void;
+  onDataAvailable(request: null, stream: InputStream, offset: number, count: number): void;
+  onStopRequest(request: null, status: number): void;
 }
 
 declare const Cc: {
@@ -196,6 +223,14 @@ declare const Cc: {
   };
   readonly "@mozilla.org/security/random-generator;1": {
     getService(iface: XpcomInterface): { generateRandomBytes(length: number): number[] };
+  };
+  readonly "@mozilla.org/streamConverters;1": {
+    getService(iface: XpcomInterface): {
+      asyncConvertData(from: string, to: string, listener: object, context: null): StreamConverter;
+    };
+  };
+  readonly "@mozilla.org/widget/clipboardhelper;1": {
+    getService(iface: XpcomInterface): { copyString(text: string): void };
   };
 };
 
@@ -219,6 +254,9 @@ declare const Ci: {
   readonly nsISeekableStream: XpcomInterface & { readonly NS_SEEK_SET: number };
   readonly nsISubstitutingProtocolHandler: XpcomInterface;
   readonly nsIRandomGenerator: XpcomInterface;
+  readonly nsIBinaryInputStream: XpcomInterface;
+  readonly nsIStreamConverterService: XpcomInterface;
+  readonly nsIClipboardHelper: XpcomInterface;
   readonly nsITimer: XpcomInterface & {
     readonly TYPE_ONE_SHOT: number;
     readonly TYPE_REPEATING_SLACK: number;
@@ -263,6 +301,7 @@ declare const Services: {
     exists(name: string): boolean;
   };
   readonly dirsvc: FileDirectoryService;
+  readonly tm: { dispatchToMainThread(run: () => void): void };
   readonly eTLD: {
     getBaseDomainFromHost(host: string): string;
   };
@@ -302,6 +341,12 @@ interface GeckoModules {
     };
   };
   "resource://gre/modules/NetUtil.sys.mjs": { readonly NetUtil: NetUtilModule };
+  "resource://gre/modules/Downloads.sys.mjs": {
+    readonly Downloads: { getPreferredDownloadsDirectory(): Promise<string> };
+  };
+  "resource://gre/modules/ExtensionUtils.sys.mjs": {
+    readonly ExtensionUtils: { readonly ExtensionError: new (message: string) => Error };
+  };
   "resource://gre/modules/AsyncShutdown.sys.mjs": {
     readonly AsyncShutdown: {
       readonly profileBeforeChange: ShutdownPhase;
@@ -314,6 +359,7 @@ declare const ChromeUtils: {
   importESModule<Url extends keyof GeckoModules>(url: Url): GeckoModules[Url];
   getXPCOMErrorName(status: number): string;
   now(): number;
+  generateQI(interfaces: readonly string[]): unknown;
 };
 
 interface IOUtilsStat {
@@ -323,7 +369,10 @@ interface IOUtilsStat {
 }
 
 declare const IOUtils: {
-  read(path: string, options?: { readonly maxBytes?: number }): Promise<Uint8Array>;
+  read(
+    path: string,
+    options?: { readonly maxBytes?: number; readonly offset?: number },
+  ): Promise<Uint8Array>;
   readUTF8(path: string): Promise<string>;
   write(
     path: string,
@@ -363,5 +412,6 @@ declare const IOUtils: {
 declare const PathUtils: {
   join(...segments: string[]): string;
   filename(path: string): string;
+  parent(path: string): string | null;
   readonly profileDir: string;
 };

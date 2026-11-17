@@ -77,6 +77,7 @@ async function snapshotArchive(
   root: SafeFolder,
   run: RunId,
   excluded: readonly Site[],
+  unfinishedExports: readonly string[],
 ): Promise<DirSnapshot> {
   const entries: SnapshotEntry[] = [];
   const logs: { readonly path: string; readonly name: Named<"log">; readonly bytes: number }[] = [];
@@ -120,7 +121,7 @@ async function snapshotArchive(
       namesBodies: text === null ? [] : bodiesNamed(wholeLines(text)),
     });
   }
-  return { current: run, excluded, entries, unfinishedExports: [] };
+  return { current: run, excluded, entries, unfinishedExports };
 }
 
 async function execute(root: SafeFolder, modes: Modes, step: ReconcileStep): Promise<void> {
@@ -158,8 +159,9 @@ export async function recover(
   modes: Modes,
   run: RunId,
   excluded: readonly Site[],
+  unfinishedExports: readonly string[],
 ): Promise<readonly ReconcileStep[]> {
-  const steps = planReconcile(await snapshotArchive(root, run, excluded));
+  const steps = planReconcile(await snapshotArchive(root, run, excluded, unfinishedExports));
   for (const step of steps) await execute(root, modes, step);
   return steps;
 }

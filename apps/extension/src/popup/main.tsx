@@ -1,5 +1,6 @@
 import { Suspense, use } from "react";
 import { createRoot } from "react-dom/client";
+import { parseTabId } from "@one-click-har/recording/ids";
 import type { Environment, ToolboxClosedReason, ToolboxState } from "../../experiment/contract.ts";
 import "../styles.css";
 import "./popup.css";
@@ -15,8 +16,9 @@ const readEnvironment = async (): Promise<Reading> => {
   if (api === undefined) return { kind: "api-missing" };
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id === undefined) return { kind: "no-active-tab" };
-    return { kind: "ready", environment: await api.getEnvironment(tab.id) };
+    const tabId = parseTabId(tab?.id);
+    if (tabId === null) return { kind: "no-active-tab" };
+    return { kind: "ready", environment: await api.getEnvironment(tabId) };
   } catch (error) {
     return { kind: "failed", message: String(error) };
   }

@@ -15,6 +15,9 @@
     "experiment/files.ts",
     "experiment/maintenance.ts",
     "experiment/recorder.ts",
-    "experiment/store.ts"
+    "experiment/store.ts",
+    "experiment/host.ts",
+    "experiment/archive-source.ts",
+    "experiment/devtools.ts"
   ]
 }

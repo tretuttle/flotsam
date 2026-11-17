@@ -1,0 +1,142 @@
+// The export slot: jobs run one at a time, in the parent process, and outlive the popup that started them. Pure: the
+// host passes the run, the clock and the id source.
+
+import type {
+  ExportId,
+  ExportJob,
+  ExportRequest,
+  ExportState,
+  WriteFailure,
+} from "@one-click-har/export/jobs";
+import type { ExportReport } from "@one-click-har/export/report";
+import type { AbortSignalLike } from "@one-click-har/export/source";
+import type { ByteCount, EpochMs } from "@one-click-har/recording/ids";
+
+/** How one run ended. A run never throws: the host turns every refusal into `write-failed`. */
+export type RunOutcome =
+  | {
+      readonly kind: "done";
+      readonly fileName: string;
+      readonly folderLabel: string;
+      readonly report: ExportReport;
+    }
+  | { readonly kind: "cancelled" }
+  | { readonly kind: "write-failed"; readonly failure: WriteFailure };
+
+export interface RunProgress {
+  readonly done: number;
+  readonly total: number;
+  readonly bytes: ByteCount;
+}
+
+export type ExportRun = (
+  job: { readonly id: ExportId; readonly request: ExportRequest },
+  control: { readonly signal: AbortSignalLike; readonly progress: (p: RunProgress) => void },
+) => Promise<RunOutcome>;
+
+/** Bytes written when cancel was asked and when the run stopped, so a check can see it stopped within one chunk. */
+export interface CancelAudit {
+  readonly bytesAtCancel: number;
+  readonly bytesAtStop: number | null;
+}
+
+/** The jobs `listExports` returns: this run's, newest first. */
+export const KEPT_JOBS = 10;
+
+interface Slot {
+  job: ExportJob;
+  readonly signal: { aborted: boolean; reason?: unknown };
+  started: boolean;
+  bytes: number;
+  audit: { bytesAtCancel: number; bytesAtStop: number | null } | null;
+}
+
+const WAITING: ExportState = { kind: "writing", done: 0, total: 0, bytes: 0 as ByteCount };
+
+const isFinal = (state: ExportState): boolean => state.kind !== "writing";
+
+export function createExportJobs(ports: {
+  readonly run: ExportRun;
+  readonly now: () => EpochMs;
+  readonly newId: () => ExportId;
+  readonly plannedName: (request: ExportRequest) => string;
+  readonly onChange: (job: ExportJob) => void;
+}) {
+  const slots: Slot[] = [];
+  let queue: Promise<void> = Promise.resolve();
+
+  const set = (slot: Slot, state: ExportState): void => {
+    slot.job = { ...slot.job, state };
+    ports.onChange(slot.job);
+  };
+
+  const execute = async (slot: Slot): Promise<void> => {
+    if (slot.signal.aborted) {
+      set(slot, { kind: "cancelled" });
+      return;
+    }
+    slot.started = true;
+    let outcome: RunOutcome;
+    try {
+      outcome = await ports.run(
+        { id: slot.job.id, request: slot.job.request },
+        {
+          signal: slot.signal,
+          progress: (p) => {
+            slot.bytes = p.bytes;
+            set(slot, { kind: "writing", done: p.done, total: p.total, bytes: p.bytes });
+          },
+        },
+      );
+    } catch (error) {
+      outcome = { kind: "write-failed", failure: { kind: "other", detail: String(error) } };
+    }
+    if (slot.audit !== null) slot.audit.bytesAtStop = slot.bytes;
+    set(slot, outcome);
+  };
+
+  const find = (id: ExportId): Slot | undefined => slots.find((slot) => slot.job.id === id);
+
+  return {
+    start: (request: ExportRequest): ExportJob => {
+      const slot: Slot = {
+        job: {
+          id: ports.newId(),
+          request,
+          fileName: ports.plannedName(request),
+          startedAt: ports.now(),
+          state: WAITING,
+        },
+        signal: { aborted: false },
+        started: false,
+        bytes: 0,
+        audit: null,
+      };
+      slots.unshift(slot);
+      const dropped = slots.findLastIndex((s, index) => index >= KEPT_JOBS && isFinal(s.job.state));
+      if (dropped !== -1) slots.splice(dropped, 1);
+      queue = queue.then(() => execute(slot));
+      return slot.job;
+    },
+    list: (): readonly ExportJob[] => slots.slice(0, KEPT_JOBS).map((slot) => slot.job),
+    /** True while the job is cancelled or stopping. A finished, failed or unknown job is not changed. */
+    cancel: (id: ExportId): boolean => {
+      const slot = find(id);
+      if (slot === undefined) return false;
+      if (slot.job.state.kind === "cancelled") return true;
+      if (isFinal(slot.job.state)) return false;
+      if (!slot.signal.aborted) {
+        slot.signal.aborted = true;
+        slot.signal.reason = undefined;
+        slot.audit = { bytesAtCancel: slot.bytes, bytesAtStop: null };
+      }
+      return true;
+    },
+    job: (id: ExportId): ExportJob | null => find(id)?.job ?? null,
+    audit: (id: ExportId): CancelAudit | null => find(id)?.audit ?? null,
+    /** Resolves when every job queued so far has ended. */
+    idle: (): Promise<void> => queue,
+  };
+}
+
+export type ExportJobs = ReturnType<typeof createExportJobs>;

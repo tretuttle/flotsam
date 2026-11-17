@@ -1,4 +1,14 @@
-import { asyncFunction, integer, returns, type ApiFunctions } from "./gecko-schema.ts";
+import {
+  parseExportId,
+  parseExportRequest,
+  type ExportId,
+  type ExportJob,
+  type PopupState,
+  type Preview,
+} from "@one-click-har/export/jobs";
+import { parseSelection } from "@one-click-har/export/selection";
+import { parseTabId, type TabId } from "@one-click-har/recording/ids";
+import { any, asyncFunction, integer, returns, type ApiFunctions } from "./gecko-schema.ts";
 
 /** The experiment namespace: `browser.oneClickHar` in extension pages, `experiment_apis.oneClickHar` in the manifest. */
 export const namespace = "oneClickHar";
@@ -40,12 +50,51 @@ export interface RecordingStatus {
   readonly problems: readonly RecordingProblem[];
 }
 
+/** The popup's tab. null when the active tab has no id (Zen's empty tab reports -1). */
+export interface PopupTabArgument {
+  readonly tabId: TabId | null;
+}
+
+/** Everything the popup's first paint needs. The recording problems are this API's own list. */
+export type PopupView = Omit<PopupState, "problems"> & {
+  readonly problems: readonly RecordingProblem[];
+};
+
+const isRecord = (raw: unknown): raw is Record<string, unknown> =>
+  typeof raw === "object" && raw !== null && !Array.isArray(raw);
+
+const parsePopupTab = (raw: unknown): PopupTabArgument | null => {
+  if (!isRecord(raw) || !Object.hasOwn(raw, "tabId")) return null;
+  if (raw["tabId"] === null) return { tabId: null };
+  const tabId = parseTabId(raw["tabId"]);
+  return tabId === null ? null : { tabId };
+};
+
+/**
+ * The one table of this API. Gecko's schema.json is written from it, pages get their client type from it, and every
+ * host runs each parameter's parser before a handler sees the value. No row carries a file path, a body byte or HAR
+ * text in either direction; `contract.test.ts` checks that over every row's types.
+ */
 export const oneClickHarApi = {
-  getEnvironment: asyncFunction([integer("tabId", { minimum: 0 })], returns<Environment>()),
+  getEnvironment: asyncFunction(
+    [integer("tabId", parseTabId, { minimum: 0 })],
+    returns<Environment>(),
+  ),
   getRecordingStatus: asyncFunction([], returns<RecordingStatus>()),
+  getPopup: asyncFunction([any("tab", parsePopupTab)], returns<PopupView>()),
+  preview: asyncFunction([any("selection", parseSelection)], returns<Preview>()),
+  startExport: asyncFunction([any("request", parseExportRequest)], returns<ExportJob>()),
+  listExports: asyncFunction([], returns<readonly ExportJob[]>()),
+  /** Stops a running export within one body chunk and deletes its .har.part. Idempotent. */
+  cancelExport: asyncFunction([any("id", parseExportId)], returns<boolean>()),
+  /** Shows a finished file in its folder. The path never leaves the host. False when the file is gone. */
+  revealExport: asyncFunction([any("id", parseExportId)], returns<boolean>()),
+  /** Puts a finished file's path on the clipboard from the host, so the page never holds it. */
+  copyExportPath: asyncFunction([any("id", parseExportId)], returns<boolean>()),
 };
 
 export type OneClickHarApi = ApiFunctions<typeof oneClickHarApi>;
+export type { ExportId };
 
 /**
  * The result's key sets at run time. Types are erased, so the contract test compares the handler's actual keys

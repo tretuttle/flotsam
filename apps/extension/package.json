@@ -17,6 +17,7 @@
     "react-dom": "19.3.1"
   },
   "devDependencies": {
+    "@one-click-har/export": "workspace:*",
     "@one-click-har/har": "workspace:*",
     "@one-click-har/recording": "workspace:*",
     "@resvg/resvg-js": "2.6.2",
