@@ -245,11 +245,12 @@ function outsideProblems(
         : []),
     ];
   }
-  const noisy =
-    first === undefined ||
-    second === undefined ||
-    first.change.entry.digest !== second.change.entry.digest;
-  return noisy ? [] : [`${describe(c)}: bytes differ from both control runs, which agree`];
+  // An unreadable file the browser keeps for itself (a script cache, a store) differs whenever the product is
+  // installed; what may not land there is recorded data, which carries the marker.
+  const leaked = c.entry.marked === true && seen.every((s) => s.change.entry.marked !== true);
+  return leaked
+    ? [`${describe(c)}: holds the recorded marker, which neither control run's copy holds`]
+    : [];
 }
 
 /**

@@ -212,26 +212,37 @@ describe("the product run against two control runs", () => {
     }
   });
 
-  it("fails bytes the two control runs agree on and the product run changed, and leaves noise alone", () => {
-    const appended = run([
-      added("profile/prefs.js", file("p+leak")),
+  it("fails an unreadable file holding the recorded marker that neither control run's copy holds", () => {
+    const leaked = run([
+      added("profile/startupCache/scriptCache.bin", file("p+leak", { marked: true })),
       added("profile/storage/x", file("s")),
     ]);
-    expect(diskProblems(evidence(appended, [same, same]))).toEqual([
-      "new file profile/prefs.js: bytes differ from both control runs, which agree",
+    const cache = run([
+      added("profile/startupCache/scriptCache.bin", file("p", { marked: false })),
+      added("profile/storage/x", file("s")),
     ]);
+    expect(diskProblems(evidence(leaked, [cache, cache]))).toEqual([
+      "new file profile/startupCache/scriptCache.bin: holds the recorded marker, which neither control run's copy holds",
+    ]);
+    // The product's own compiled scripts change the cache's bytes, with no recorded data in it.
+    const ownScripts = run([
+      added("profile/startupCache/scriptCache.bin", file("p+code", { marked: false })),
+      added("profile/storage/x", file("s")),
+    ]);
+    expect(diskProblems(evidence(ownScripts, [cache, cache]))).toEqual([]);
+    const markedToo = run([
+      added("profile/startupCache/scriptCache.bin", file("p2", { marked: true })),
+      added("profile/storage/x", file("s")),
+    ]);
+    expect(diskProblems(evidence(leaked, [cache, markedToo]))).toEqual([]);
     const reordered = run([
-      added("profile/prefs.js", file("p+leak", { orderFree: "any order p" })),
+      added(
+        "profile/startupCache/scriptCache.bin",
+        file("p+leak", { marked: true, orderFree: "any order p" }),
+      ),
       added("profile/storage/x", file("s")),
     ]);
-    expect(diskProblems(evidence(reordered, [same, same]))).toEqual([]);
-    const noisy = run([
-      added("profile/prefs.js", file("p2")),
-      added("profile/storage/x", file("s")),
-    ]);
-    expect(diskProblems(evidence(appended, [same, noisy]))).toEqual([]);
-    const onlyOne = run([added("profile/storage/x", file("s"))]);
-    expect(diskProblems(evidence(appended, [same, onlyOne]))).toEqual([]);
+    expect(diskProblems(evidence(reordered, [cache, cache]))).toEqual([]);
   });
 
   it("compares a readable file entry by entry even where both control runs differ", () => {

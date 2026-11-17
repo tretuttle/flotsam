@@ -783,9 +783,13 @@ function runDisk(options: {
   readonly plan: DiskSnapshot;
   readonly probes: DiskSnapshot;
   readonly names: RunNames;
+  readonly marker: string;
   readonly harness: Readonly<Record<string, Buffer | string>>;
 }): RunDisk {
-  const final = diffSnapshots(options.before, snapshotTree(options.base, { names: options.names }));
+  const final = diffSnapshots(
+    options.before,
+    snapshotTree(options.base, { names: options.names, marker: options.marker }),
+  );
   return {
     plan: diffSnapshots(options.before, options.plan),
     probes: diffSnapshots(options.before, options.probes),
@@ -1118,6 +1122,7 @@ async function controlRun(
       plan: planSnapshot,
       probes: probesSnapshot,
       names: [...names, ...browserNames(storeId, [...pids, last.pid])],
+      marker: plan.marker,
       harness: {
         ...installed,
         [`profile/extensions/${plan.recorderId}.xpi`]: plan.standInXpi,
@@ -1668,6 +1673,7 @@ const check: HarnessCheck = {
       plan: planSnapshot,
       probes: probesSnapshot,
       names: [...names, ...browserNames(storeId, [...pids, last.pid])],
+      marker,
       harness: {
         ...installed,
         [`profile/extensions/${recorderId}.xpi`]: NodeFS.readFileSync(context.extensionPath),
