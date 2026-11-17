@@ -675,6 +675,43 @@ async function secondProfileKey(
   return result;
 }
 
+/**
+ * Waits until a launch has lived `minLifetimeMs` and its workspace has not changed for `quietMs`, at most `maxMs`.
+ * The browser runs late tasks once it has been idle 20 s and writes on its own after that; every run waits the same
+ * way, so each ends with that work done rather than cut off at a moment that depends on the machine's load.
+ */
+async function settle(
+  base: string,
+  options: {
+    readonly since: number;
+    readonly minLifetimeMs: number;
+    readonly quietMs: number;
+    readonly maxMs: number;
+  },
+): Promise<void> {
+  const deadline = Date.now() + options.maxMs;
+  let last = JSON.stringify(snapshotTree(base));
+  let quietSince = Date.now();
+  while (Date.now() < deadline) {
+    if (
+      Date.now() - quietSince >= options.quietMs &&
+      Date.now() - options.since >= options.minLifetimeMs
+    )
+      return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const now = JSON.stringify(snapshotTree(base));
+    if (now !== last) {
+      last = now;
+      quietSince = Date.now();
+    }
+  }
+}
+
+const SETTLE_QUIET_MS = 3000;
+const SETTLE_MAX_MS = 90_000;
+/** Past the browser's 20 s idle threshold for its late tasks, with time for them to finish. */
+const SHORT_LAUNCH_LIFETIME_MS = 40_000;
+
 async function runNoMarionetteLaunch(options: {
   readonly position: "file-no-marionette";
   readonly binaryPath: string;
@@ -686,7 +723,10 @@ async function runNoMarionetteLaunch(options: {
   readonly extraPrefs: readonly Pref[];
   readonly server: Awaited<ReturnType<typeof startIsolationServer>>;
   readonly signal: AbortSignal;
+  /** The workspace folder, watched until the launch settles. */
+  readonly base: string;
 }): Promise<{ readonly problem: string | null; readonly pid: number }> {
+  const since = Date.now();
   await using session = await launchBrowser({
     binaryPath: options.binaryPath,
     extensionPath: null,
@@ -705,6 +745,12 @@ async function runNoMarionetteLaunch(options: {
       r.kind === "position-done" && r.position === options.position,
     POSITION_TIMEOUT_MS,
   );
+  await settle(options.base, {
+    since,
+    minLifetimeMs: SHORT_LAUNCH_LIFETIME_MS,
+    quietMs: SETTLE_QUIET_MS,
+    maxMs: SETTLE_MAX_MS,
+  });
   return {
     problem: done === null ? `${options.position}: timed out waiting for page completion` : null,
     pid: session.spawnedPid,
@@ -1045,6 +1091,12 @@ async function controlRun(
       await readPages(session, plan.recorderId, pageUrls, false);
       probesSnapshot = snapshotTree(workspace.base, { marker: plan.marker });
       await session.evaluateChrome(CHROME_QUIESCE_TABS_SCRIPT);
+      await settle(workspace.base, {
+        since: 0,
+        minLifetimeMs: 0,
+        quietMs: SETTLE_QUIET_MS,
+        maxMs: SETTLE_MAX_MS,
+      });
       await session.quit();
     }
     const last = await runNoMarionetteLaunch({
@@ -1054,6 +1106,7 @@ async function controlRun(
       profileDir: workspace.profileDir,
       dataHome: workspace.dataHome,
       home: workspace.home,
+      base: workspace.base,
       url: `${savedPageUrl}?pos=file-no-marionette`,
       extraPrefs: plan.noMarionettePrefs,
       server,
@@ -1582,6 +1635,12 @@ const check: HarnessCheck = {
 
       probesSnapshot = snapshotTree(workspace.base, { marker });
       await session.evaluateChrome(CHROME_QUIESCE_TABS_SCRIPT);
+      await settle(workspace.base, {
+        since: 0,
+        minLifetimeMs: 0,
+        quietMs: SETTLE_QUIET_MS,
+        maxMs: SETTLE_MAX_MS,
+      });
       context.log("isolation: quitting marionette session");
       await session.quit();
     }
@@ -1594,6 +1653,7 @@ const check: HarnessCheck = {
       profileDir: workspace.profileDir,
       dataHome: workspace.dataHome,
       home: workspace.home,
+      base: workspace.base,
       url: `${savedPageUrl}?pos=file-no-marionette`,
       extraPrefs: noMarionetteExtraPrefs,
       server,
