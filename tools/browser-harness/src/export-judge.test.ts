@@ -229,6 +229,8 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       theirs: ["/w/out/theirs.har.part"],
       timing: null,
       outside: [{ path: "/w/profile/sessionstore.jsonlz4", exportBytes: false }],
+      written: null,
+      source: null,
     };
     expect(judgeRow(failed)).toEqual([]);
     const ran = '{"started":"/w/out/a.har.part","head":"{"}\n{"ended":"/w/out/a.har.part"}\n';
@@ -272,8 +274,35 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       state: { kind: "done", fileName: "a (2).har" },
       served: "{}",
       files: ["a (2).har"],
+      written: {
+        bytes: 10,
+        sha256: "5d5b09f6dcb2d53a5fffc60c4ac0d55fabdf556069d6631545f42aa6e3500f2e",
+        fixtures: [],
+      },
     };
     expect(judgeRow(done)).toEqual([]);
+    // A done export is judged by its bytes: one that cannot be read, one missing a fixture's body, and a copy that is
+    // not the unnamed file (round 8d's mutant M3 finished an empty part) each fail.
+    expect(judgeRow({ ...done, written: null })).toEqual([
+      "the finished file could not be read back",
+    ]);
+    expect(
+      judgeRow({ ...done, written: { ...done.written, fixtures: ["HAR is not JSON"] } }),
+    ).toEqual(["the finished file: HAR is not JSON"]);
+    const copied = { ...done, source: { bytes: 10, sha256: done.written.sha256 } };
+    expect(judgeRow(copied)).toEqual([]);
+    expect(
+      judgeRow({
+        ...copied,
+        written: {
+          bytes: 0,
+          sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          fixtures: [],
+        },
+      }),
+    ).toEqual([
+      "the finished file (0 bytes, e3b0c44298fc) is not the unnamed file (10 bytes, 5d5b09f6dcb2)",
+    ]);
     expect(judgeRow({ ...done, files: ["a (2).har", "a.har.part"] })).toEqual([
       "files: a (2).har, a.har.part",
     ]);
@@ -332,6 +361,8 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       theirs: [],
       timing: { tookMs: 400, withinMs: 5000 },
       outside: [],
+      written: null,
+      source: null,
     };
     expect(judgeRow(cancelled)).toEqual([]);
     expect(

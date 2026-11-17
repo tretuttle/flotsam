@@ -208,12 +208,30 @@ export const openReadWrite = (
   return stream;
 };
 
-/** Up to `bytes` first bytes through `stream`, from its start. */
-export const readStart = (stream: FileRandomAccessStream, bytes: number): Uint8Array => {
-  stream.seek(Ci.nsISeekableStream.NS_SEEK_SET, 0);
+/** Up to `bytes` bytes through `stream`, from `offset`; fewer only at its end. */
+export const readAt = (
+  stream: FileRandomAccessStream,
+  offset: number,
+  bytes: number,
+): Uint8Array => {
+  stream.seek(Ci.nsISeekableStream.NS_SEEK_SET, offset);
   const reader = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
   reader.setInputStream(stream);
-  return Uint8Array.from(reader.readByteArray(Math.min(bytes, stream.size)));
+  const buffer = new ArrayBuffer(Math.max(0, Math.min(bytes, stream.size - offset)));
+  return new Uint8Array(buffer, 0, reader.readArrayBuffer(buffer.byteLength, buffer));
+};
+
+/** A new SHA-256 over the bytes it is given, as lowercase hex. */
+export const sha256 = () => {
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(Ci.nsICryptoHash);
+  hash.init(Ci.nsICryptoHash.SHA256);
+  return {
+    update: (bytes: Uint8Array): void => hash.update(bytes, bytes.length),
+    hex: (): string =>
+      Array.from(hash.finish(false), (byte) =>
+        byte.charCodeAt(0).toString(16).padStart(2, "0"),
+      ).join(""),
+  };
 };
 
 /**
@@ -223,7 +241,7 @@ export const readStart = (stream: FileRandomAccessStream, bytes: number): Uint8A
 export const readHead = async (path: string, bytes: number): Promise<Uint8Array> => {
   const stream = openReadWrite(path, 0, 0);
   try {
-    return stream.size < bytes ? new Uint8Array(0) : readStart(stream, bytes);
+    return stream.size < bytes ? new Uint8Array(0) : readAt(stream, 0, bytes);
   } finally {
     stream.close();
   }

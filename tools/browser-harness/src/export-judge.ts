@@ -369,6 +369,19 @@ export type RowObservation = {
   readonly timing: { readonly tookMs: number; readonly withinMs: number } | null;
   /** Files under the profile and the archive that are new or changed, except the row's own, and whether each holds export bytes. */
   readonly outside: readonly { readonly path: string; readonly exportBytes: boolean }[];
+  /**
+   * A finished export's file, read back from the folder: its length, its SHA-256, and what the fixtures check found
+   * wrong in it, every fixture body against its pinned SHA-256. null when there is no file to read.
+   */
+  readonly written: FileRead | null;
+  /** The unnamed file while the link waited, read through /proc/<pid>/fd from outside; null where there was none. */
+  readonly source: { readonly bytes: number; readonly sha256: string } | null;
+};
+
+export type FileRead = {
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly fixtures: readonly string[];
 };
 
 /** Parts the journal says started and never ended: what the next start would act on. */
@@ -442,6 +455,18 @@ export function judgeRow(o: RowObservation): readonly string[] {
       problems.push(
         `took the named route because ${String(kept.because)}, expected ${o.expect.because}`,
       );
+    // Done is a claim about the file's bytes: the fixture's bodies, and the unnamed file's when there was one.
+    if (o.written === null) problems.push("the finished file could not be read back");
+    else {
+      problems.push(...o.written.fixtures.map((problem) => `the finished file: ${problem}`));
+      if (
+        o.source !== null &&
+        (o.source.bytes !== o.written.bytes || o.source.sha256 !== o.written.sha256)
+      )
+        problems.push(
+          `the finished file (${String(o.written.bytes)} bytes, ${o.written.sha256.slice(0, 12)}) is not the unnamed file (${String(o.source.bytes)} bytes, ${o.source.sha256.slice(0, 12)})`,
+        );
+    }
   }
   if (state.route !== undefined && state.route !== "link" && state.route !== "named")
     problems.push(`the page's route is ${JSON.stringify(state.route)}, not a route's kind`);

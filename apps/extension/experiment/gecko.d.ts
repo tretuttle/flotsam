@@ -222,6 +222,7 @@ interface XpcomClasses {
   "@mozilla.org/timer;1": Timer;
   "@mozilla.org/binaryinputstream;1": BinaryInputStream;
   "@mozilla.org/intl/converter-output-stream;1": ConverterOutputStream;
+  "@mozilla.org/security/hash;1": CryptoHash;
 }
 
 interface ConverterOutputStream {
@@ -230,6 +231,13 @@ interface ConverterOutputStream {
   writeString(text: string): boolean;
   flush(): void;
   close(): void;
+}
+
+interface CryptoHash {
+  init(algorithm: number): void;
+  update(bytes: Uint8Array, length: number): void;
+  /** The digest, as a string of byte values when `base64` is false. */
+  finish(base64: boolean): string;
 }
 
 interface BinaryInputStream {
@@ -296,6 +304,7 @@ declare const Ci: {
   readonly nsIStreamConverterService: XpcomInterface;
   readonly nsIClipboardHelper: XpcomInterface;
   readonly nsIConverterOutputStream: XpcomInterface;
+  readonly nsICryptoHash: XpcomInterface & { readonly SHA256: number };
   readonly nsITimer: XpcomInterface & {
     readonly TYPE_ONE_SHOT: number;
     readonly TYPE_REPEATING_SLACK: number;

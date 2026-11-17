@@ -93,8 +93,8 @@ export const holdFolderIn =
         await worker.ask({ op: "write", fd, text });
       },
       size: () => worker.ask<number>({ op: "size", fd }),
-      readHead: async (bytes) =>
-        new Uint8Array(await worker.ask<ArrayBuffer>({ op: "head", fd, bytes })),
+      read: async (offset, bytes) =>
+        new Uint8Array(await worker.ask<ArrayBuffer>({ op: "read", fd, offset, bytes })),
       readText: (offset, bytes) => worker.ask({ op: "read-text", fd, offset, bytes }),
       link: (name) => worker.ask<boolean>({ op: "link", fd, folder, name }),
       close: () => closeFd(fd),

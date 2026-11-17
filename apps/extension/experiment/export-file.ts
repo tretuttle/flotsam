@@ -148,8 +148,8 @@ export interface FileHandle {
   readonly flush: () => void;
   /** The file's length, through the handle. */
   readonly size: () => number;
-  /** The file's first `bytes` bytes, through the handle. */
-  readonly readHead: (bytes: number) => Uint8Array;
+  /** Up to `bytes` bytes from `offset`, through the handle; fewer only at the file's end. */
+  readonly read: (offset: number, bytes: number) => Uint8Array;
   /** Sets the file's length through the handle. */
   readonly resize: (bytes: number) => void;
   readonly close: () => void;
@@ -175,6 +175,11 @@ export interface ExportPlatform {
   readonly rename: (from: string, to: string) => Promise<void>;
   readonly remove: (path: string) => Promise<void>;
   readonly freeBytes: (folder: string) => number;
+  /** A new SHA-256 over the bytes it is given, as lowercase hex. */
+  readonly sha256: () => {
+    readonly update: (bytes: Uint8Array) => void;
+    readonly hex: () => string;
+  };
   /** Where the platform can hold a folder open and create unnamed files in it; absent elsewhere. */
   readonly holdFolder?: (realFolder: string) => Promise<HeldFolder>;
   /** Why there is no `holdFolder`. */
@@ -206,7 +211,8 @@ export interface UnnamedFile {
   readonly identity: FileIdentity;
   readonly write: (text: string) => Promise<void>;
   readonly size: () => Promise<number>;
-  readonly readHead: (bytes: number) => Promise<Uint8Array>;
+  /** Up to `bytes` bytes from `offset`; fewer only at the file's end. */
+  readonly read: (offset: number, bytes: number) => Promise<Uint8Array>;
   /** Whole UTF-8 sequences from `offset`, at most `bytes` of them, and how many bytes they took. */
   readonly readText: (
     offset: number,
@@ -248,13 +254,22 @@ export interface PartJournal {
 /** A part being written: appended through its one handle, then confirmed and renamed, or discarded. */
 export interface Part {
   readonly append: (text: string, needBytes: number) => Promise<void>;
-  /** Confirms the part is this export's file holding what was written, renames it, and returns the name it got. */
-  readonly finish: (planned: string) => Promise<string>;
+  /**
+   * Confirms the part is this export's file holding what was written, and, given `copyOf`, that its bytes are exactly
+   * those, then renames it and returns the name it got.
+   */
+  readonly finish: (planned: string, copyOf?: FileDigest) => Promise<string>;
   /** Deletes the part if it is still this export's file. Returns at once if a timed-out rename is still running. */
   readonly discard: () => Promise<void>;
   /** True once the export named its file and then could not prove the name still holds it: nothing is named. */
   readonly unconfirmed: () => boolean;
   readonly route: () => ExportRoute;
+}
+
+/** A whole file's length and SHA-256. */
+export interface FileDigest {
+  readonly bytes: number;
+  readonly sha256: string;
 }
 
 export interface ExportFolder {
@@ -438,6 +453,21 @@ export function exportFiles(
     });
     const step = <T>(call: () => T | Promise<T>, needBytes = 0): Promise<T> =>
       run(folder, true, call, needBytes);
+    /** The length and SHA-256 of what `read` gives from the start to the end, one bounded read per step. */
+    const digestOf = async (
+      read: (offset: number) => Uint8Array | Promise<Uint8Array>,
+    ): Promise<FileDigest> => {
+      const hash = platform.sha256();
+      let bytes = 0;
+      for (;;) {
+        if (limits.signal.aborted) throw new ExportCancelled();
+        const at = bytes;
+        const chunk = await step(() => bounded(Promise.resolve(read(at))));
+        if (chunk.length === 0) return { bytes, sha256: hash.hex() };
+        hash.update(chunk);
+        bytes += chunk.length;
+      }
+    };
 
     const openPart = (path: string, journal: PartJournal, route: ExportRoute): Part => {
       const handle = platform.createExclusive(path);
@@ -473,7 +503,7 @@ export function exportFiles(
       };
       /** The handle's file holds what this export wrote: its length, and its first bytes. */
       const holdsWritten = (): boolean =>
-        handle.size() === written && sameBytes(handle.readHead(head.length), head);
+        handle.size() === written && sameBytes(handle.read(0, head.length), head);
       /**
        * After a rename to `target`, the export is done only when the folder is still the one resolved at start, by its
        * real path and the entry's, and `target` is the handle's file holding what was written. Otherwise the rename is
@@ -533,12 +563,17 @@ export function exportFiles(
           journaled = true;
           await step(() => bounded(journal.started(path, head)));
         },
-        finish: async (planned) => {
+        finish: async (planned, copyOf) => {
           await step(() => {
             handle.flush();
             stillFolder(folder);
             if (!follows(path) || !holdsWritten()) refuse("file-replaced");
           });
+          if (copyOf !== undefined) {
+            const copied = await digestOf((at) => handle.read(at, COPY_BYTES));
+            if (copied.bytes !== copyOf.bytes || copied.sha256 !== copyOf.sha256)
+              refuse("copy-mismatch");
+          }
           for (let n = 1; n <= NAME_TRIES; n += 1) {
             if (limits.signal.aborted) throw new ExportCancelled();
             const name = numbered(planned, n);
@@ -624,7 +659,7 @@ export function exportFiles(
         held.close();
       };
       const holdsWritten = async (): Promise<boolean> =>
-        (await file.size()) === written && sameBytes(await file.readHead(head.length), head);
+        (await file.size()) === written && sameBytes(await file.read(0, head.length), head);
       /** Why the held folder is no longer at the folder's path: deleted, or moved and something else put there. */
       const away = async (): Promise<Refused | null> => {
         const now = await held.where();
@@ -640,7 +675,10 @@ export function exportFiles(
           refuse("file-replaced");
         if (!(await bounded(holdsWritten()))) refuse("file-replaced");
       };
-      /** Copies the whole file, as written, to a new named part, which then finishes as the named route does. */
+      /**
+       * Copies the whole file, as written, to a new named part, which then finishes as the named route does, once its
+       * length and SHA-256 are the unnamed file's, each read back on its own.
+       */
       const toNamed = async (planned: string, route: ExportRoute): Promise<string> => {
         const { part } = await namedPart(planned, journal, route);
         moved = part;
@@ -652,8 +690,9 @@ export function exportFiles(
           await part.append(chunk.text, chunk.bytes);
           offset += chunk.bytes;
         }
+        const source = await digestOf((at) => file.read(at, COPY_BYTES));
         close();
-        return part.finish(planned);
+        return part.finish(planned, source);
       };
       return {
         append: async (text, needBytes) => {

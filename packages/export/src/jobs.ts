@@ -88,6 +88,8 @@ export type WriteFailure =
   | { readonly kind: "name-taken" }
   /** The disk or the file system reported an input/output error. */
   | { readonly kind: "io-error" }
+  /** The bytes copied to a named part, when the link could not be made, were not the export's, by length or SHA-256. */
+  | { readonly kind: "copy-mismatch" }
   /** A file call was still running after the export's time limit for one call. */
   | { readonly kind: "timed-out" }
   /** An error the table does not name. */

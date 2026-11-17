@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import { WriteRefused } from "@one-click-har/export/run";
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -111,6 +112,23 @@ class MemoryFs {
   noFdLink = false;
   /** The last unnamed file made, as another process reaches it through /proc/<pid>/fd. */
   lastUnnamed: FileNode | null = null;
+  /**
+   * Bytes the disk still takes; null for room enough. A write past them stores what fits, a short write, and then
+   * throws what the next write meets: the worker's ENOSPC, or the name Gecko gave the part's handle.
+   */
+  room: number | null = null;
+  /** Set to make readText hand back its last byte changed, as a copy that is not byte-exact would. */
+  copyCorrupts = false;
+
+  /** Appends `text` to `node` as far as the room allows, then throws `full` if not all of it fit. */
+  private store(node: FileNode, text: string, full: unknown): void {
+    const bytes = [...Buffer.from(text)];
+    const taken = this.room === null ? bytes : bytes.slice(0, this.room);
+    node.bytes.push(...taken);
+    if (this.room === null) return;
+    this.room -= taken.length;
+    if (taken.length < bytes.length) throw full;
+  }
 
   /** Holds the folder at `path` open, as file-worker.ts does with a directory descriptor. */
   holdFolder = async (path: string): Promise<HeldFolder> => {
@@ -133,11 +151,13 @@ class MemoryFs {
         return {
           file: {
             identity: { dev: "m", ino: this.ino(node) },
-            write: async (text) => void node.bytes.push(...Buffer.from(text)),
+            write: async (text) => this.store(node, text, { name: "ENOSPC" }),
             size: async () => node.bytes.length,
-            readHead: async (bytes) => Uint8Array.from(node.bytes.slice(0, bytes)),
+            read: async (offset, bytes) =>
+              Uint8Array.from(node.bytes.slice(offset, offset + bytes)),
             readText: async (offset, bytes) => {
               const taken = node.bytes.slice(offset, offset + bytes);
+              if (this.copyCorrupts && taken.length > 0) taken[taken.length - 1] = 0x20;
               return { text: Buffer.from(taken).toString(), bytes: taken.length };
             },
             link: async (name) => {
@@ -226,11 +246,11 @@ class MemoryFs {
         return {
           write: (text) => {
             this.check("createExclusive");
-            node.bytes.push(...Buffer.from(text));
+            this.store(node, text, { name: "NS_ERROR_FILE_NO_DEVICE_SPACE" });
           },
           flush: () => undefined,
           size: () => node.bytes.length,
-          readHead: (bytes) => Uint8Array.from(node.bytes.slice(0, bytes)),
+          read: (offset, bytes) => Uint8Array.from(node.bytes.slice(offset, offset + bytes)),
           resize: (bytes) => {
             node.bytes.length = Math.min(node.bytes.length, bytes);
             while (node.bytes.length < bytes) node.bytes.push(0);
@@ -267,7 +287,11 @@ class MemoryFs {
         this.removes.push(`remove ${path}`);
         this.nodes.delete(this.resolveParent(path));
       },
-      freeBytes: () => 1 << 30,
+      freeBytes: () => this.room ?? 1 << 30,
+      sha256: () => {
+        const hash = NodeCrypto.createHash("sha256");
+        return { update: (bytes) => void hash.update(bytes), hex: () => hash.digest("hex") };
+      },
     };
   }
 }
@@ -1191,6 +1215,45 @@ describe("an export folder held open, its file unnamed until one link", () => {
     const { part } = await exportOnce(at);
     at.fs.fail.set("rename", new DOMException("x", "NotReadableError"));
     expect(await finishOrDiscard(part)).toEqual({ kind: "other" });
+    expect(inDownloads(at.fs)).toEqual([]);
+    expect(at.journal.unended()).toEqual([]);
+  });
+
+  it("a short write and then a full disk on the unnamed file end disk-full, with nothing left", async () => {
+    const at = held();
+    at.fs.room = OPENING.length + 10;
+    const rest = "x".repeat(100);
+    const failure = await failureOf(
+      exportOnce(at, () => undefined, rest).then(async ({ part }) => part.finish("site.har")),
+    );
+    expect(failure).toEqual({ kind: "disk-full", needBytes: 100, freeBytes: 0 });
+    // The unnamed file took the 10 bytes that fit; closed unnamed, it is gone.
+    expect(at.fs.lastUnnamed?.bytes.length).toBe(OPENING.length + 10);
+    expect(inDownloads(at.fs)).toEqual([]);
+    expect(at.journal.lines).toEqual([]);
+  });
+
+  it("the copy's first write meeting a short write and then a full disk ends disk-full, with no part left", async () => {
+    const at = held();
+    at.fs.failUnnamed.set("link", { name: "EXDEV" });
+    const { part } = await exportOnce(at);
+    // About 8 KiB free when the copy starts, as in review: here 10 bytes of a document that needs more.
+    at.fs.room = 10;
+    expect(await finishOrDiscard(part)).toEqual({
+      kind: "disk-full",
+      needBytes: DOCUMENT.length,
+      freeBytes: 0,
+    });
+    expect(inDownloads(at.fs)).toEqual([]);
+    expect(at.journal.unended()).toEqual([]);
+  });
+
+  it("a copy whose bytes are not the unnamed file's fails as copy-mismatch, with nothing left", async () => {
+    const at = held();
+    at.fs.failUnnamed.set("link", { name: "EXDEV" });
+    at.fs.copyCorrupts = true;
+    const { part } = await exportOnce(at);
+    expect(await finishOrDiscard(part)).toEqual({ kind: "copy-mismatch" });
     expect(inDownloads(at.fs)).toEqual([]);
     expect(at.journal.unended()).toEqual([]);
   });

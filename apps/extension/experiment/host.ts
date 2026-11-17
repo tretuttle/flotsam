@@ -66,8 +66,9 @@ import {
   openReadWrite,
   pathState,
   randomBytes,
+  readAt,
   readHead,
-  readStart,
+  sha256,
   siteOfUri,
   type Modes,
 } from "./gecko-io.ts";
@@ -266,9 +267,9 @@ const geckoExportPlatform = (
       },
       flush: () => utf8.flush(),
       size: () => file.size,
-      readHead: (bytes) => {
+      read: (offset, bytes) => {
         try {
-          return readStart(file, bytes);
+          return readAt(file, offset, bytes);
         } finally {
           toEnd();
         }
@@ -285,6 +286,7 @@ const geckoExportPlatform = (
   rename: (from, to) => IOUtils.move(from, to, { noOverwrite: true }),
   remove: (path) => IOUtils.remove(path, { ignoreAbsent: true }),
   freeBytes: (folder) => localFile(folder).diskSpaceAvailable,
+  sha256,
 });
 
 /** Roots an export folder may not be in or contain, links resolved, since a folder is judged by its real path. */

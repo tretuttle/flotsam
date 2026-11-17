@@ -110,7 +110,13 @@ export type WorkerRequest =
       readonly name: string;
     }
   | { readonly id: number; readonly op: "size"; readonly fd: number }
-  | { readonly id: number; readonly op: "head"; readonly fd: number; readonly bytes: number }
+  | {
+      readonly id: number;
+      readonly op: "read";
+      readonly fd: number;
+      readonly offset: number;
+      readonly bytes: number;
+    }
   | {
       readonly id: number;
       readonly op: "read-text";
@@ -266,9 +272,16 @@ const ANSWERS: {
   identity: ({ fd }) => ofDescriptor(fd).identity,
   "identity-at": ({ folder, name }) => statx(folder, name, AT_SYMLINK_NOFOLLOW)?.identity ?? null,
   size: ({ fd }) => ofDescriptor(fd).size,
-  head: ({ fd, bytes }) => {
+  /** Up to `bytes` bytes from `offset`; fewer only at the file's end. */
+  read: ({ fd, offset, bytes }) => {
     const buffer = new Uint8Array(bytes);
-    const read = checked(call.pread(fd, buffer, bytes, 0));
+    let read = 0;
+    while (read < bytes) {
+      const rest = buffer.subarray(read);
+      const got = checked(call.pread(fd, rest, rest.length, offset + read));
+      if (got === 0) break;
+      read += got;
+    }
     return buffer.slice(0, read).buffer;
   },
   /** Whole UTF-8 sequences from `offset`: the text and how many bytes it took. Fewer bytes only at the file's end. */

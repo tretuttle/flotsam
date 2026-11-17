@@ -10,6 +10,7 @@ import {
   waitForActiveExtensionUrl,
 } from "../src/browser.ts";
 import {
+  type FileRead,
   judgeNextStart,
   judgeRow,
   type RowObservation,
@@ -24,7 +25,9 @@ import {
   waitForJob,
 } from "../src/export-session.ts";
 import { FIXTURES_PAGE_PATH } from "../src/fixtures.ts";
+import { checkEntries, formatHarCheck, parseHarEntries } from "../src/har.ts";
 import { callHook, recordingWorkspace } from "../src/recording-session.ts";
+import { SCENARIOS } from "../src/scenarios.ts";
 import { startFixtureServer } from "../src/server.ts";
 
 const NAME = "export-failures";
@@ -37,14 +40,16 @@ const NAMED_PARTS_PREF = "extensions.oneClickHar.harness.namedParts";
 
 type Place = { readonly base: string; readonly folder: string; readonly profile: string };
 /**
- * What a row acts on mid-export: the part's path (named parts only), the browser's own process, and `maskProcFd`,
- * which hides that process's /proc/<pid>/fd inside its own mount namespace (mask-proc-fd.c).
+ * What a row acts on mid-export: the part's path (named parts only), the browser's own process, `maskProcFd`, which
+ * hides that process's /proc/<pid>/fd inside its own mount namespace, and `fill`, which fills the file system holding a
+ * folder there until `bytes` are free (both mask-proc-fd.c).
  */
 type During = Place & {
   readonly part: string;
   readonly name: string;
   readonly pid: number;
   readonly maskProcFd: () => void;
+  readonly fill: (folder: string, bytes: number) => void;
 };
 
 type Row = {
@@ -52,6 +57,8 @@ type Row = {
   readonly fileName: string;
   /** The folder settings.json names, made in the state this cause needs. */
   readonly folder: (base: string, profile: string) => string;
+  /** The page whose tab is exported; the fixtures page by default. */
+  readonly page?: string;
   /** A tmpfs mounted inside the browser's mount namespace, over the folder or one above it. */
   readonly mount?: { readonly options: string; readonly at?: (base: string) => string };
   /** Done just before the export starts. */
@@ -769,6 +776,24 @@ const UNNAMED_ROWS: readonly Row[] = [
     expect: doneNamed("fd-link-lost"),
   },
   {
+    cause:
+      "/proc/<pid>/fd masked while the link waits and 8 KiB left free: the copy's first write meets a full disk",
+    fileName: "copy-full",
+    page: "/r/json/0",
+    mount: { options: "size=4m", at: (b) => `${b}/copy-full` },
+    folder: (b) => `${dir(`${b}/copy-full`)}/out`,
+    pause: {
+      at: "before-link",
+      act: ({ base, maskProcFd, fill }) => {
+        maskProcFd();
+        fill(`${base}/copy-full`, 8192);
+        return () => true;
+      },
+      withinMs: COPY_MS,
+    },
+    expect: failed("disk-full"),
+  },
+  {
     cause: "/proc/<pid>/fd masked after the link: the folder is proved through its path instead",
     fileName: "proc-after-link",
     folder: (b) => dir(`${b}/proc-after-link`),
@@ -794,6 +819,8 @@ const UNNAMED_ROWS: readonly Row[] = [
     fileName: `link-${errno.toLowerCase()}`,
     folder: (b) => dir(`${b}/link-${errno.toLowerCase()}`),
     fault: { op: "link", errno },
+    // Held where the link waits only so the unnamed file can be read before the copy; nothing changes there.
+    pause: { at: "before-link", act: () => () => true, withinMs: COPY_MS },
     expect: doneNamed("link-refused"),
   })),
   ...(
@@ -894,6 +921,69 @@ const sha256 = (path: string): string => {
 /** Every export file opens with this, the document's start and its random id. */
 const EXPORT_OPENING = '{"log":{"_harExportId"';
 
+const digest = (bytes: Buffer): string =>
+  NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+
+/**
+ * The unnamed export file `pid` holds open, read through /proc/<pid>/fd from outside its namespace: its length and
+ * SHA-256. The kernel names it `<folder>/#<inode> (deleted)`, and it opens as an export does.
+ */
+const unnamedFile = (pid: number): RowObservation["source"] => {
+  const fds = `/proc/${String(pid)}/fd`;
+  for (const fd of NodeFS.readdirSync(fds)) {
+    const target = (() => {
+      try {
+        return NodeFS.readlinkSync(`${fds}/${fd}`);
+      } catch {
+        return "";
+      }
+    })();
+    if (!target.includes("/#") || !target.endsWith(" (deleted)")) continue;
+    const bytes = contents(`${fds}/${fd}`);
+    if (
+      bytes === null ||
+      !bytes.subarray(0, EXPORT_OPENING.length).equals(Buffer.from(EXPORT_OPENING))
+    )
+      continue;
+    return { bytes: bytes.length, sha256: digest(bytes) };
+  }
+  return null;
+};
+
+/**
+ * A finished export's file, read back: its length, its SHA-256, and every fixture body in it against its pinned
+ * SHA-256. A body may be absent only where the file says so (`_harExport.bodyMissing`: the browser aborts the video's
+ * load). Only the fixtures page has pinned bodies, so a row that exports another page cannot end done.
+ */
+const readBack = (path: string, page: string | undefined): FileRead | null => {
+  const bytes = contents(path);
+  if (bytes === null) return null;
+  const fixtures = (): readonly string[] => {
+    if (page !== undefined)
+      return [`exported ${page}, which has no pinned bodies to check it against`];
+    try {
+      const har = JSON.parse(bytes.toString("utf8")) as {
+        log?: {
+          entries?: { request?: { url?: string }; _harExport?: { bodyMissing?: unknown } }[];
+        };
+      };
+      const saidMissing = new Set(
+        (har.log?.entries ?? [])
+          .filter((entry) => entry._harExport?.bodyMissing !== undefined)
+          .map((entry) => entry.request?.url),
+      );
+      const checked = checkEntries(parseHarEntries(har), SCENARIOS.fixtures);
+      const problems = checked.problems.filter(
+        (problem) => problem.kind !== "empty" || !saidMissing.has(problem.url),
+      );
+      return problems.length === 0 ? [] : [formatHarCheck({ ...checked, ok: false, problems })];
+    } catch (error) {
+      return [`is not a HAR: ${String(error)}`];
+    }
+  };
+  return { bytes: bytes.length, sha256: digest(bytes), fixtures: fixtures() };
+};
+
 /**
  * Whether a file holds any of an export's bytes. The browser rewrites prefs.js itself during a long row, so prefs.js is
  * judged by this rather than by its hash: no export byte may reach it.
@@ -976,18 +1066,22 @@ const namespacesRefused = (): string | null => {
 const HOLD_SOURCE = NodePath.join(import.meta.dirname, "..", "native", "hold-part-call.c");
 const MASK_SOURCE = NodePath.join(import.meta.dirname, "..", "native", "mask-proc-fd.c");
 
-/** Hides `pid`'s /proc/<pid>/fd inside its own mount namespace, with mask-proc-fd.c built into `folder`. */
-const maskProcFdOf = (folder: string, pid: number) => (): void => {
-  const program = NodePath.join(folder, "mask-proc-fd");
-  if (!NodeFS.existsSync(program)) {
-    const built = NodeChildProcess.spawnSync("cc", ["-O2", "-o", program, MASK_SOURCE], {
-      encoding: "utf8",
-    });
-    if (built.status !== 0) throw new Error(`no C compiler for mask-proc-fd.c: ${built.stderr}`);
-  }
-  const masked = NodeChildProcess.spawnSync(program, [String(pid)], { encoding: "utf8" });
-  if (masked.status !== 0) throw new Error(`mask-proc-fd ${String(pid)}: ${masked.stderr}`);
-};
+/** mask-proc-fd.c, built into `folder`, run on `pid`'s mount namespace with `args`; what it printed. */
+const inMountNamespace =
+  (folder: string, pid: number) =>
+  (...args: readonly string[]): string => {
+    const program = NodePath.join(folder, "mask-proc-fd");
+    if (!NodeFS.existsSync(program)) {
+      const built = NodeChildProcess.spawnSync("cc", ["-O2", "-o", program, MASK_SOURCE], {
+        encoding: "utf8",
+      });
+      if (built.status !== 0) throw new Error(`no C compiler for mask-proc-fd.c: ${built.stderr}`);
+    }
+    const ran = NodeChildProcess.spawnSync(program, [String(pid), ...args], { encoding: "utf8" });
+    if (ran.status !== 0)
+      throw new Error(`mask-proc-fd ${[pid, ...args].join(" ")}: ${ran.stderr}`);
+    return ran.stdout;
+  };
 
 /** Builds hold-part-call.c into `folder`; the error text when no C compiler can. */
 const buildHold = (folder: string): string | { readonly error: string } => {
@@ -1086,8 +1180,11 @@ async function runRow(
       ...(row.named === true ? { extraPrefs: [{ name: NAMED_PARTS_PREF, value: true }] } : {}),
     });
     const page = await openExtensionPage(session, extensionPath);
-    const tab = await session.openTab(`${server.origin}${FIXTURES_PAGE_PATH}`);
-    await session.evaluate(tab, "window.__harnessReady");
+    const tab = await session.openTab(`${server.origin}${row.page ?? FIXTURES_PAGE_PATH}`);
+    await session.evaluate(
+      tab,
+      row.page === undefined ? "window.__harnessReady" : "document.readyState",
+    );
     const tabId = await newestPageTab(page);
     const before = exportBytesIn(prefs);
     const outsideBefore = filesUnder(base, []);
@@ -1098,15 +1195,30 @@ async function runRow(
       await callHook(session, { kind: "export-pause", point: row.pause.at, action: "arm" });
     if (row.fault !== undefined) await callHook(session, { kind: "export-fault", ...row.fault });
     const name = `${folder}/${row.fileName}.har`;
+    const helper = inMountNamespace(base, session.browserPid);
+    /** Gecko aborts when it next makes shared memory without /proc/self/fd, so a mask lasts only for the export. */
+    let masked = false;
+    const unmask = (): void => {
+      if (masked) helper("unmask");
+      masked = false;
+    };
     const at: During = {
       ...place,
       part: `${name}.part`,
       name,
       pid: session.browserPid,
-      maskProcFd: maskProcFdOf(base, session.browserPid),
+      maskProcFd: () => {
+        helper();
+        masked = true;
+      },
+      fill: (filled, bytes) => {
+        const free = Number(helper("fill", filled, String(bytes)));
+        if (free > bytes) throw new Error(`${filled} still has ${String(free)} bytes free`);
+      },
     };
     row.atStart?.(at);
     let route: unknown = null;
+    let source: RowObservation["source"] = null;
     try {
       const job = await startExport(page, {
         selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
@@ -1127,6 +1239,7 @@ async function runRow(
         const paused = await pauseAndAct(session, page, job.id, row.pause, at, keepTheirs);
         timing = paused.timing;
         state = paused.state;
+        source = paused.source;
         holdProblems.push(...paused.problems);
       }
       if (row.hold !== undefined && holdDir !== null) {
@@ -1139,12 +1252,14 @@ async function runRow(
       // A held row's export that never ended is judged as it is, so the next rows still run.
       if (state === undefined || ended({ state } as Parameters<typeof ended>[0]))
         state = (await waitForJob(page, job.id, ended)).state;
+      unmask();
       journal = await journalSettled(NodePath.join(workspace.root(), "exports.jsonl"));
       route = await callHook(session, { kind: "export-route", id: job.id });
     } finally {
       if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
       if (row.pause !== undefined)
         await callHook(session, { kind: "export-pause", point: row.pause.at, action: "release" });
+      unmask();
       wakeFifoReaders(base);
       row.after?.(place);
     }
@@ -1177,6 +1292,14 @@ async function runRow(
       theirs: theirsBefore,
       timing,
       outside: changedOutside(base, outsideBefore, theirsReal, folderInode),
+      written:
+        (state as { kind?: string }).kind === "done"
+          ? readBack(
+              NodePath.join(folder, String((state as { fileName?: unknown }).fileName)),
+              row.page,
+            )
+          : null,
+      source,
     };
   }
   // The next start, which reads the journal and deletes what it can prove an unfinished export left.
@@ -1286,6 +1409,7 @@ async function pauseAndAct(
   readonly timing: RowObservation["timing"];
   readonly problems: readonly string[];
   readonly state: unknown;
+  readonly source: RowObservation["source"];
 }> {
   const hook = (action: "reached" | "release") =>
     callHook(session, { kind: "export-pause", point: pause.at, action });
@@ -1297,13 +1421,18 @@ async function pauseAndAct(
         timing: null,
         problems: [`the ${pause.at} pause was never reached: ${JSON.stringify(job.state)}`],
         state: job.state,
+        source: null,
       };
     await sleep(20);
   }
+  // What a copy to a named part must equal, read before the row acts and before the link can name the file.
+  const source = pause.at === "before-link" ? unnamedFile(at.pid) : null;
   const inPlace = pause.act(at);
   const observeBy = Date.now() + 10_000;
   while (!inPlace() && Date.now() < observeBy) await sleep(20);
   const problems = inPlace() ? [] : ["the row's change was not in place before the release"];
+  if (pause.at === "before-link" && source === null)
+    problems.push("the unnamed file could not be read while the link waited");
   acted();
   if (pause.cancel === true)
     await value(page, `browser.oneClickHar.cancelExport(${JSON.stringify(id)}).then(String)`);
@@ -1319,7 +1448,7 @@ async function pauseAndAct(
   await hook("release");
   // What a held export does once let go after its job ended: it must name nothing.
   await sleep(500);
-  return { timing, problems, state: job.state };
+  return { timing, problems, state: job.state, source };
 }
 
 /**
@@ -1388,6 +1517,8 @@ const check: HarnessCheck = {
       theirs: ["/w/out/theirs.har.part"],
       timing: { tookMs: 15_020, withinMs: PROMPTLY_MS },
       outside: [{ path: "/w/profile/x.har", exportBytes: true }],
+      written: null,
+      source: null,
     });
     if (planted.length < 7)
       problems.push(
