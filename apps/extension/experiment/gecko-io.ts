@@ -192,11 +192,12 @@ export const openReadWrite = (
   path: string,
   flags: number,
   mode: number,
+  behavior = 0,
 ): FileRandomAccessStream => {
   const stream = Cc["@mozilla.org/network/file-random-access-stream;1"].createInstance(
     Ci.nsIFileRandomAccessStream,
   );
-  stream.init(localFile(path), PR_RDWR | flags, mode, 0);
+  stream.init(localFile(path), PR_RDWR | flags, mode, behavior);
   for (const iface of [
     Ci.nsIInputStream,
     Ci.nsIOutputStream,

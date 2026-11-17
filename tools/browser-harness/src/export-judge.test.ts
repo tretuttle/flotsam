@@ -215,6 +215,7 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       journal: "",
       theirs: ["/w/out/theirs.har.part"],
       timing: null,
+      outside: [{ path: "/w/profile/sessionstore.jsonlz4", exportBytes: false }],
     };
     expect(judgeRow(failed)).toEqual([]);
     const ran = '{"started":"/w/out/a.har.part","head":"{"}\n{"ended":"/w/out/a.har.part"}\n';
@@ -236,6 +237,10 @@ describe("the tab, cancel, disk-full and crash judges", () => {
         served: '{"detail":"NotAllowedError /w/out/a.har.part jar:file:///w/profile/x.xpi"}',
         files: ["a.har.part"],
         untouched: [{ path: "/w/profile/prefs.js", before: "a", after: "b" }],
+        outside: [
+          { path: "/w/profile/sessionstore.jsonlz4", exportBytes: false },
+          { path: "/w/profile/a.har", exportBytes: true },
+        ],
       }),
     ).toEqual([
       'ended {"kind":"write-failed","failure":{"kind":"other","detail":"/w/out/a.har.part"}}, expected write-failed access-denied',
@@ -246,6 +251,7 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       "a file:// URL reached the page",
       "a jar:file: URL reached the page",
       "/w/profile/prefs.js changed",
+      "/w/profile/a.har, outside the folder, holds export bytes",
     ]);
     const done = {
       ...failed,
@@ -278,6 +284,7 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       journal: "",
       theirs: [],
       timing: { tookMs: 400, withinMs: 5000 },
+      outside: [],
     };
     expect(judgeRow(cancelled)).toEqual([]);
     expect(

@@ -47,13 +47,14 @@ type Row = {
   readonly after?: (at: Place) => void;
   /** What the row itself put in the folder, before or during the export: not the export's, each left as it was. */
   readonly theirs?: readonly string[];
-  /** The export's first call on its part after its first MiB, held by hold-part-call.c while the row acts. */
+  /** The export's rename of its part, held by hold-part-call.c (armed before the export starts) while the row acts. */
   readonly hold?: Hold;
   readonly expect: (fileName: string) => RowOutcome;
 };
 
 type Hold = {
-  readonly act: (at: Place & { readonly part: string }) => void;
+  /** Changes the files while the rename is held, and returns whether the change is in place, checked before the release. */
+  readonly act: (at: Place & { readonly part: string }) => () => boolean;
   /** Cancel while the call is held, and let it go once the export has ended. */
   readonly cancel?: true;
   /** Let the call go only once the export has ended. */
@@ -82,6 +83,16 @@ const locked = (path: string): string => {
 const replace = (part: string, make: (path: string) => void): void => {
   NodeFS.rmSync(part);
   make(part);
+};
+const lstat = (path: string): NodeFS.Stats | undefined =>
+  NodeFS.lstatSync(path, { throwIfNoEntry: false });
+const absent = (path: string) => (): boolean => lstat(path) === undefined;
+const isFifo = (path: string) => (): boolean => lstat(path)?.isFIFO() === true;
+/** The folder moved to `<base>/<moved>` and a link to the profile put in its place. */
+const folderToProfile = ({ base, folder, profile }: Place, moved: string): string => {
+  NodeFS.renameSync(folder, `${base}/${moved}`);
+  NodeFS.symlinkSync(profile, folder);
+  return `${base}/${moved}`;
 };
 const mkfifo = (path: string): void => {
   const made = NodeChildProcess.spawnSync("mkfifo", ["-m", "600", path], { encoding: "utf8" });
@@ -257,7 +268,13 @@ const ROWS: readonly Row[] = [
     cause: "a FIFO takes the part's name while the rename waits (put back, never opened)",
     fileName: "held-fifo",
     folder: (b) => dir(`${b}/held-fifo`),
-    hold: { act: ({ part }) => replace(part, mkfifo), withinMs: PROMPTLY_MS },
+    hold: {
+      act: ({ part }) => {
+        replace(part, mkfifo);
+        return isFifo(part);
+      },
+      withinMs: PROMPTLY_MS,
+    },
     theirs: ["held-fifo.har.part"],
     expect: failed("file-replaced"),
   },
@@ -265,7 +282,14 @@ const ROWS: readonly Row[] = [
     cause: "cancel while the rename waits, a FIFO at the part's name",
     fileName: "held-cancel",
     folder: (b) => dir(`${b}/held-cancel`),
-    hold: { act: ({ part }) => replace(part, mkfifo), cancel: true, withinMs: PROMPTLY_MS },
+    hold: {
+      act: ({ part }) => {
+        replace(part, mkfifo);
+        return isFifo(part);
+      },
+      cancel: true,
+      withinMs: PROMPTLY_MS,
+    },
     theirs: ["held-cancel.har.part"],
     expect: cancelled,
   },
@@ -273,20 +297,56 @@ const ROWS: readonly Row[] = [
     cause: "the rename still waiting at the step limit (the late rename cleaned up)",
     fileName: "held-late",
     folder: (b) => dir(`${b}/held-late`),
-    hold: { act: () => undefined, keep: true, withinMs: STEP_MS + PROMPTLY_MS },
+    hold: { act: () => () => true, keep: true, withinMs: STEP_MS + PROMPTLY_MS },
     expect: failed("timed-out"),
+  },
+  {
+    cause:
+      "a copy of the part, its size and bytes at another inode, takes its name while the rename waits (put back)",
+    fileName: "held-copy",
+    folder: (b) => dir(`${b}/held-copy`),
+    hold: {
+      act: ({ base, part }) => {
+        const own = lstat(part)?.ino;
+        NodeFS.copyFileSync(part, `${base}/held-copy.tmp`);
+        NodeFS.renameSync(`${base}/held-copy.tmp`, part);
+        return () => lstat(part)?.isFile() === true && lstat(part)?.ino !== own;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["held-copy.har.part"],
+    expect: failed("file-replaced"),
   },
   {
     cause: "folder replaced by a link to the profile while the rename waits",
     fileName: "held-folder-link",
     folder: (b) => dir(`${b}/held-folder-link`),
     hold: {
-      act: ({ base, folder, profile }) => {
-        NodeFS.renameSync(folder, `${base}/held-folder-moved`);
-        NodeFS.symlinkSync(profile, folder);
+      act: (at) => {
+        folderToProfile(at, "held-folder-moved");
+        return () => lstat(at.folder)?.isSymbolicLink() === true;
       },
       withinMs: PROMPTLY_MS,
     },
+    expect: failed("folder-refused"),
+  },
+  {
+    cause:
+      "folder replaced by a link to the profile while the rename waits, the part hard-linked there under its name",
+    fileName: "held-folder-plant",
+    folder: (b) => dir(`${b}/held-folder-plant`),
+    hold: {
+      act: (at) => {
+        const moved = folderToProfile(at, "held-plant-moved");
+        const name = NodePath.basename(at.part);
+        NodeFS.linkSync(`${moved}/${name}`, `${at.profile}/${name}`);
+        return () =>
+          lstat(at.folder)?.isSymbolicLink() === true &&
+          lstat(`${at.profile}/${name}`)?.ino === lstat(`${moved}/${name}`)?.ino;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["held-folder-plant.har.part"],
     expect: failed("folder-refused"),
   },
   {
@@ -294,7 +354,10 @@ const ROWS: readonly Row[] = [
     fileName: "held-folder-gone",
     folder: (b) => dir(`${b}/held-folder-gone`),
     hold: {
-      act: ({ folder }) => NodeFS.rmSync(folder, { recursive: true, force: true }),
+      act: ({ folder }) => {
+        NodeFS.rmSync(folder, { recursive: true, force: true });
+        return absent(folder);
+      },
       withinMs: PROMPTLY_MS,
     },
     expect: failed("folder-missing"),
@@ -303,7 +366,13 @@ const ROWS: readonly Row[] = [
     cause: "part deleted while the rename waits",
     fileName: "held-part-gone",
     folder: (b) => dir(`${b}/held-part-gone`),
-    hold: { act: ({ part }) => NodeFS.rmSync(part), withinMs: PROMPTLY_MS },
+    hold: {
+      act: ({ part }) => {
+        NodeFS.rmSync(part);
+        return absent(part);
+      },
+      withinMs: PROMPTLY_MS,
+    },
     expect: failed("file-replaced"),
   },
   {
@@ -349,10 +418,19 @@ const LIST = `const done = arguments[arguments.length - 1];
   done(listed);
 })();`;
 
-const sha256 = (path: string): string =>
-  NodeFS.existsSync(path)
-    ? NodeCrypto.createHash("sha256").update(NodeFS.readFileSync(path)).digest("hex")
-    : "absent";
+/** The browser keeps writing its profile while a row is judged: a file gone between the listing and the read is absent. */
+const contents = (path: string): Buffer | null => {
+  try {
+    return NodeFS.readFileSync(path);
+  } catch {
+    return null;
+  }
+};
+
+const sha256 = (path: string): string => {
+  const bytes = contents(path);
+  return bytes === null ? "absent" : NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+};
 
 /** Every export file opens with this, the document's start and its random id. */
 const EXPORT_OPENING = '{"log":{"_harExportId"';
@@ -361,12 +439,11 @@ const EXPORT_OPENING = '{"log":{"_harExportId"';
  * Whether a file holds any of an export's bytes. The browser rewrites prefs.js itself during a long row, so prefs.js is
  * judged by this rather than by its hash: no export byte may reach it.
  */
-const exportBytesIn = (path: string): string =>
-  !NodeFS.existsSync(path)
-    ? "absent"
-    : NodeFS.readFileSync(path).includes(EXPORT_OPENING)
-      ? "holds export bytes"
-      : "no export bytes";
+const exportBytesIn = (path: string): string => {
+  const bytes = contents(path);
+  if (bytes === null) return "absent";
+  return bytes.includes(EXPORT_OPENING) ? "holds export bytes" : "no export bytes";
+};
 
 /** What is at a path, never following a link there: a file by its hash, a link by its target. */
 const fingerprint = (path: string): string => {
@@ -378,11 +455,35 @@ const fingerprint = (path: string): string => {
   return stat.isFile() ? `file ${sha256(path)}` : "other";
 };
 
+/**
+ * Files under the profile and the archive that are new or changed since `before`, and whether each holds an export's
+ * bytes. The browser rewrites its own files during a row; none of them may take an export byte. The journal holds the
+ * head only as escaped JSON text, so it is judged by its lines, not here.
+ */
+const changedOutside = (
+  roots: readonly string[],
+  before: ReadonlyMap<string, string>,
+  theirs: ReadonlySet<string>,
+): RowObservation["outside"] => {
+  const changed: { path: string; exportBytes: boolean }[] = [];
+  for (const root of roots)
+    for (const [path, print] of filesUnder(root, []))
+      if (before.get(path) !== print && !theirs.has(path))
+        changed.push({ path, exportBytes: exportBytesIn(path) === "holds export bytes" });
+  return changed;
+};
+
 /** Every non-folder entry under `root`, by path, except in the folders the browser itself owns. */
 const filesUnder = (root: string, skip: readonly string[]): Map<string, string> => {
   const found = new Map<string, string>();
   const walk = (folder: string): void => {
-    for (const entry of NodeFS.readdirSync(folder, { withFileTypes: true })) {
+    let entries: NodeFS.Dirent[];
+    try {
+      entries = NodeFS.readdirSync(folder, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
       const path = NodePath.join(folder, entry.name);
       if (skip.includes(path)) continue;
       if (entry.isDirectory()) walk(path);
@@ -477,6 +578,18 @@ async function runRow(
     { mode: 0o700 },
   );
   const theirs = (row.theirs ?? []).map((name) => NodePath.join(folder, name));
+  /** The real paths of the row's own files once it acted: a file it planted outside the folder is judged as its. */
+  const theirsReal = new Set<string>();
+  const keepTheirs = (): void => {
+    for (const path of theirs) {
+      if (!kept.has(path)) kept.set(path, fingerprint(path));
+      if (lstat(path) === undefined) continue;
+      // The folder's real path, so a file planted through a link is found where it is; a dangling link stays as named.
+      theirsReal.add(
+        NodePath.join(NodeFS.realpathSync(NodePath.dirname(path)), NodePath.basename(path)),
+      );
+    }
+  };
   /** Every file there before the export, then what the row put in place: none may change, now or at the next start. */
   const kept = filesUnder(base, [profile, workspace.dataHome]);
   const theirsBefore = theirs.filter((path) => fingerprint(path) !== "absent");
@@ -500,6 +613,9 @@ async function runRow(
     await session.evaluate(tab, "window.__harnessReady");
     const tabId = await newestPageTab(page);
     const before = exportBytesIn(prefs);
+    const outsideRoots = [profile, workspace.dataHome];
+    const outsideBefore = new Map(outsideRoots.flatMap((root) => [...filesUnder(root, [])]));
+    if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "arm"), "");
     try {
       const job = await startExport(page, {
         selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
@@ -509,21 +625,28 @@ async function runRow(
         fileName: row.fileName,
       });
       const part = `${folder}/${row.fileName}.har.part`;
-      if (row.during !== undefined || row.hold !== undefined) {
+      if (row.during !== undefined) {
         const writing = await waitForJob(
           page,
           job.id,
           (j) => ended(j) || (j.state.kind === "writing" && j.state.bytes >= MIB),
         );
-        if (writing.state.kind === "writing") row.during?.({ ...place, part });
-        if (writing.state.kind === "writing" && row.hold !== undefined && holdDir !== null) {
-          const held = await holdAndAct(page, job.id, holdDir, row.hold, { ...place, part });
-          timing = held.timing;
-          state = held.state;
-          holdProblems.push(...held.problems);
-        }
+        if (writing.state.kind === "writing") row.during({ ...place, part });
       }
-      for (const path of theirs) if (!kept.has(path)) kept.set(path, fingerprint(path));
+      if (row.hold !== undefined && holdDir !== null) {
+        const held = await holdAndAct(
+          page,
+          job.id,
+          holdDir,
+          row.hold,
+          { ...place, part },
+          keepTheirs,
+        );
+        timing = held.timing;
+        state = held.state;
+        holdProblems.push(...held.problems);
+      }
+      keepTheirs();
       // A held row's export that never ended is judged as it is, so the next rows still run.
       if (state === undefined || ended({ state } as Parameters<typeof ended>[0]))
         state = (await waitForJob(page, job.id, ended)).state;
@@ -544,7 +667,7 @@ async function runRow(
     >;
     const named = (path: string): readonly string[] =>
       (listed[path] ?? []).filter(
-        (name) => name.startsWith(row.fileName) && !theirs.includes(NodePath.join(folder, name)),
+        (name) => name.startsWith(row.fileName) && !(row.theirs ?? []).includes(name),
       );
     observation = {
       expect: row.expect(row.fileName),
@@ -559,6 +682,7 @@ async function runRow(
       journal,
       theirs: theirsBefore,
       timing,
+      outside: changedOutside(outsideRoots, outsideBefore, theirsReal),
     };
   }
   // The next start, which reads the journal and deletes what it can prove an unfinished export left.
@@ -587,13 +711,17 @@ async function runRow(
   };
 }
 
-/** Arms the hold, waits for the export's held call, acts, and times how long the export then takes to end. */
+/**
+ * Waits for the export's held call, armed before the export started so it cannot be missed. Only a held rename is
+ * acted on; the row's change must be in place before the call is let go. Times how long the export then takes to end.
+ */
 async function holdAndAct(
   page: Parameters<typeof waitForJob>[0],
   id: string,
   holdDir: string,
   hold: Hold,
   at: Place & { readonly part: string },
+  acted: () => void,
 ): Promise<{
   readonly timing: RowObservation["timing"];
   readonly problems: readonly string[];
@@ -601,19 +729,39 @@ async function holdAndAct(
 }> {
   const reached = NodePath.join(holdDir, "at");
   const go = (): void => NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
-  NodeFS.writeFileSync(NodePath.join(holdDir, "arm"), "");
-  const reachBy = Date.now() + 60_000;
-  while (!NodeFS.existsSync(reached)) {
+  /** The held call's kind once the shim has written its whole line. */
+  const heldCall = (): string | null => {
+    const line = NodeFS.existsSync(reached) ? NodeFS.readFileSync(reached, "utf8") : "";
+    return line.endsWith("\n") ? (line.split(" ")[0] ?? "") : null;
+  };
+  const reachBy = Date.now() + 120_000;
+  let held = heldCall();
+  while (held === null) {
     const job = await waitForJob(page, id, () => true);
-    if (ended(job) || Date.now() > reachBy)
+    if (ended(job) || Date.now() > reachBy) {
+      go();
       return {
         timing: null,
         problems: [`the held call was never reached: ${JSON.stringify(job.state)}`],
         state: job.state,
       };
+    }
     await sleep(20);
+    held = heldCall();
   }
-  hold.act(at);
+  if (held !== "rename") {
+    go();
+    return {
+      timing: null,
+      problems: [`the held call was ${held}, not the rename`],
+      state: undefined,
+    };
+  }
+  const inPlace = hold.act(at);
+  const observeBy = Date.now() + 10_000;
+  while (!inPlace() && Date.now() < observeBy) await sleep(20);
+  const problems = inPlace() ? [] : ["the row's change was not in place before the release"];
+  acted();
   if (hold.cancel === true)
     await value(page, `browser.oneClickHar.cancelExport(${JSON.stringify(id)}).then(String)`);
   else if (hold.keep !== true) go();
@@ -626,12 +774,7 @@ async function holdAndAct(
   }
   const timing = { tookMs: Date.now() - from, withinMs: hold.withinMs };
   go();
-  const held = NodeFS.readFileSync(reached, "utf8").trim().split(" ")[0];
-  return {
-    timing,
-    problems: held === "rename" ? [] : [`the held call was ${String(held)}, not the rename`],
-    state: job.state,
-  };
+  return { timing, problems, state: job.state };
 }
 
 /**
@@ -698,8 +841,9 @@ const check: HarnessCheck = {
       journal: '{"started":"/w/out/theirs.har.part","head":"{"}\n',
       theirs: ["/w/out/theirs.har.part"],
       timing: { tookMs: 15_020, withinMs: PROMPTLY_MS },
+      outside: [{ path: "/w/profile/x.har", exportBytes: true }],
     });
-    if (planted.length < 6)
+    if (planted.length < 7)
       problems.push(
         `planted detail and open journal line caught only as ${JSON.stringify(planted)}`,
       );

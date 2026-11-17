@@ -235,12 +235,12 @@ class MemoryJournal implements PartJournal {
   }
 }
 
-const setup = () => {
+const setup = (wrap: (platform: ExportPlatform, fs: MemoryFs) => ExportPlatform = (p) => p) => {
   const fs = new MemoryFs();
   for (const folder of ["/home", "/home/u", PROFILE, DOWNLOADS]) fs.folder(folder);
   fs.file(`${PROFILE}/prefs.js`, "user_pref(1);");
   const limits = new Limits();
-  const files = exportFiles(fs.platform(), (real) => !real.startsWith(PROFILE), limits);
+  const files = exportFiles(wrap(fs.platform(), fs), (real) => !real.startsWith(PROFILE), limits);
   return { fs, files, limits, journal: new MemoryJournal() };
 };
 type Setup = ReturnType<typeof setup>;
@@ -343,15 +343,28 @@ const CAUSES: readonly {
   },
 ];
 
+/** Moves the export folder to /home/u/moved, with everything in it, and puts a link to the profile in its place. */
+const folderToProfileLink = (fs: MemoryFs): void => {
+  for (const key of [...fs.nodes.keys()].filter(
+    (k) => k === DOWNLOADS || k.startsWith(`${DOWNLOADS}/`),
+  )) {
+    fs.nodes.set(key.replace(DOWNLOADS, "/home/u/moved"), fs.nodes.get(key)!);
+    fs.nodes.delete(key);
+  }
+  fs.link(DOWNLOADS, PROFILE);
+};
+
 /**
  * What happens between the pre-rename check and the rename, and how the export must end. The kind is written here.
- * `left` is every name under the export folder afterwards: a replacement is put back where it was found.
+ * `left` is every name under the export folder afterwards: a replacement is put back where it was found. `profile` is
+ * every name in the profile afterwards, each holding what it held when the row acted.
  */
 const BEFORE_RENAME: readonly {
   readonly cause: string;
   readonly act: (fs: MemoryFs, path: string) => void;
   readonly kind: string;
   readonly left: readonly string[];
+  readonly profile?: readonly string[];
 }[] = [
   {
     cause: "the folder is deleted",
@@ -361,17 +374,23 @@ const BEFORE_RENAME: readonly {
   },
   {
     cause: "the folder is replaced by a link to the profile",
-    act: (fs) => {
-      fs.nodes.set("/home/u/moved", fs.nodes.get(DOWNLOADS)!);
-      for (const key of [...fs.nodes.keys()].filter((k) => k.startsWith(`${DOWNLOADS}/`))) {
-        fs.nodes.set(key.replace(DOWNLOADS, "/home/u/moved"), fs.nodes.get(key)!);
-        fs.nodes.delete(key);
-      }
-      fs.nodes.delete(DOWNLOADS);
-      fs.link(DOWNLOADS, PROFILE);
+    act: folderToProfileLink,
+    kind: "folder-refused",
+    left: [],
+  },
+  {
+    cause:
+      "the folder is replaced by a link to the profile, the part hard-linked there under its name",
+    act: (fs, path) => {
+      folderToProfileLink(fs);
+      fs.nodes.set(
+        `${PROFILE}/site.har.part`,
+        fs.nodes.get(path.replace(DOWNLOADS, "/home/u/moved"))!,
+      );
     },
     kind: "folder-refused",
     left: [],
+    profile: [`${PROFILE}/prefs.js`, `${PROFILE}/site.har.part`],
   },
   {
     cause: "the part is deleted",
@@ -394,6 +413,13 @@ const BEFORE_RENAME: readonly {
   {
     cause: "a hard link to prefs.js takes the part's name",
     act: (fs, path) => fs.nodes.set(path, fs.nodes.get(`${PROFILE}/prefs.js`)!),
+    kind: "file-replaced",
+    left: [`${DOWNLOADS}/site.har.part`],
+  },
+  {
+    cause:
+      "a regular file of the written length and first bytes, at another inode, takes the part's name",
+    act: (fs, path) => fs.file(path, partText(fs, path)),
     kind: "file-replaced",
     left: [`${DOWNLOADS}/site.har.part`],
   },
@@ -422,7 +448,7 @@ describe("the export file boundary", () => {
 
   it.each(BEFORE_RENAME)(
     "when $cause between the check and the rename, reports $kind and changes nothing else",
-    async ({ act, kind, left }) => {
+    async ({ act, kind, left, profile = [`${PROFILE}/prefs.js`] }) => {
       const at = setup();
       const { part, path } = await exportOnce(at);
       const held = at.fs.hold("rename");
@@ -430,15 +456,17 @@ describe("the export file boundary", () => {
       await held.reached;
       act(at.fs, path);
       const replacement = at.fs.nodes.get(path);
+      const inProfile = profile.map((p) => at.fs.nodes.get(p));
       held.release();
       expect(await finished).toEqual({ kind });
       await part.discard();
       expect(inDownloads(at.fs)).toEqual(left);
       if (left.length > 0) expect(at.fs.nodes.get(path)).toBe(replacement);
       expect(at.fs.text(`${PROFILE}/prefs.js`)).toBe("user_pref(1);");
-      expect([...at.fs.nodes.keys()].filter((p) => p.startsWith(`${PROFILE}/`))).toEqual([
-        `${PROFILE}/prefs.js`,
-      ]);
+      expect([...at.fs.nodes.keys()].filter((p) => p.startsWith(`${PROFILE}/`)).sort()).toEqual(
+        profile,
+      );
+      profile.forEach((p, i) => expect(at.fs.nodes.get(p), p).toBe(inProfile[i]));
       expect(at.journal.unended()).toEqual([]);
     },
   );
@@ -567,20 +595,72 @@ describe("the export file boundary", () => {
     expect(inDownloads(at.fs)).toEqual([path]);
   });
 
-  it("a regular file of the written length that takes the part's name during the rename itself is renamed in, and nothing outside changes", async () => {
+  it("a file the export renamed into a folder that became a link is moved back out, never deleted, and the export is folder-refused", async () => {
     const at = setup();
-    at.fs.file("/home/u/notes.txt", DOCUMENT);
-    const outside = at.fs.nodes.get("/home/u/notes.txt");
     const { part, path } = await exportOnce(at);
     const held = at.fs.hold("rename");
-    const finished = part.finish("site.har");
+    const finished = failureOf(part.finish("site.har"));
     await held.reached;
-    at.fs.nodes.set(path, outside!);
+    folderToProfileLink(at.fs);
+    const ours = at.fs.nodes.get(path.replace(DOWNLOADS, "/home/u/moved"));
+    at.fs.nodes.set(`${PROFILE}/site.har.part`, ours!);
     held.release();
-    expect(await finished).toBe("site.har");
-    expect(at.fs.nodes.get(`${DOWNLOADS}/site.har`)).toBe(outside);
-    expect(at.fs.text("/home/u/notes.txt")).toBe(DOCUMENT);
-    expect(at.fs.text(`${PROFILE}/prefs.js`)).toBe("user_pref(1);");
+    expect(await finished).toEqual({ kind: "folder-refused" });
+    await part.discard();
+    expect(at.fs.moves).toEqual([
+      `${PROFILE}/site.har.part -> ${PROFILE}/site.har`,
+      `${PROFILE}/site.har -> ${PROFILE}/site.har.part`,
+    ]);
+    expect(at.fs.nodes.get(`${PROFILE}/site.har.part`)).toBe(ours);
+    expect(at.fs.nodes.get("/home/u/moved/site.har.part")).toBe(ours);
+    expect(at.fs.nodes.has(`${PROFILE}/site.har`)).toBe(false);
+    expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
+  });
+
+  it("a folder swapped for a link between the folder's check and the entry's, the file hard-linked behind it, is refused", async () => {
+    let swapAt: string | null = null;
+    const at = setup((platform, fs) => ({
+      ...platform,
+      state: (p) => {
+        if (p === swapAt) {
+          swapAt = null;
+          folderToProfileLink(fs);
+          fs.nodes.set(`${PROFILE}/site.har`, fs.nodes.get("/home/u/moved/site.har")!);
+        }
+        return platform.state(p);
+      },
+    }));
+    const { part, path } = await exportOnce(at);
+    swapAt = `${DOWNLOADS}/site.har`;
+    expect(await failureOf(part.finish("site.har"))).toEqual({ kind: "folder-refused" });
+    await part.discard();
+    const ours = at.fs.nodes.get("/home/u/moved/site.har");
+    expect(at.fs.nodes.get(`${PROFILE}/site.har.part`)).toBe(ours);
+    expect([...at.fs.nodes.keys()].filter((p) => p.startsWith(`${PROFILE}/`)).sort()).toEqual([
+      `${PROFILE}/prefs.js`,
+      `${PROFILE}/site.har.part`,
+    ]);
+    expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
+  });
+
+  it("a file not the export's, renamed in a folder that became a link, is put back under the name it had", async () => {
+    const at = setup();
+    const { part } = await exportOnce(at);
+    const held = at.fs.hold("rename");
+    const finished = failureOf(part.finish("site.har"));
+    await held.reached;
+    folderToProfileLink(at.fs);
+    const theirs = at.fs.file(`${PROFILE}/site.har.part`, "theirs");
+    held.release();
+    expect(await finished).toEqual({ kind: "folder-refused" });
+    await part.discard();
+    expect(at.fs.nodes.get(`${PROFILE}/site.har.part`)).toBe(theirs);
+    expect(at.fs.nodes.has(`${PROFILE}/site.har`)).toBe(false);
+    expect(at.fs.moves).toEqual([
+      `${PROFILE}/site.har.part -> ${PROFILE}/site.har`,
+      `${PROFILE}/site.har -> ${PROFILE}/site.har.part`,
+    ]);
+    expect(at.fs.nodes.get("/home/u/moved/site.har.part")).toBeDefined();
   });
 
   it("a rename still running after the step limit ends the export timed-out, and the file is deleted once it lands", async () => {

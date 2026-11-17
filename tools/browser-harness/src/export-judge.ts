@@ -342,6 +342,8 @@ export type RowObservation = {
   readonly theirs: readonly string[];
   /** How long the export took to end after the row's held call was let go or its cancel was asked, and the limit. */
   readonly timing: { readonly tookMs: number; readonly withinMs: number } | null;
+  /** Files under the profile and the archive that are new or changed, except the row's own, and whether each holds export bytes. */
+  readonly outside: readonly { readonly path: string; readonly exportBytes: boolean }[];
 };
 
 /** Parts the journal says started and never ended: what the next start would act on. */
@@ -403,6 +405,8 @@ export function judgeRow(o: RowObservation): readonly string[] {
     if (o.served.includes(scheme)) problems.push(`a ${scheme} URL reached the page`);
   for (const file of o.untouched)
     if (file.before !== file.after) problems.push(`${file.path} changed`);
+  for (const file of o.outside)
+    if (file.exportBytes) problems.push(`${file.path}, outside the folder, holds export bytes`);
   for (const path of openJournalEntries(o.journal))
     problems.push(`the journal leaves ${path} open`);
   for (const path of o.theirs)

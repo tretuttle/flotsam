@@ -55,6 +55,18 @@ const FS_ERROR_KINDS: {
   /** The rename found no part at its name, in a folder that is still the export's. */
   NotFoundError: "file-replaced",
 };
+/** A failure that is only its kind. */
+type Refused = Exclude<WriteFailure["kind"], "disk-full">;
+
+/** `check`'s answer, or `otherwise` when it throws: a check that could not run proves nothing. */
+const proven = <T>(check: () => T, otherwise: T): T => {
+  try {
+    return check();
+  } catch {
+    return otherwise;
+  }
+};
+
 const errorName = (error: unknown): string | null => {
   const name =
     typeof error === "object" && error !== null ? (error as { name?: unknown }).name : null;
@@ -201,12 +213,12 @@ export function exportFiles(
       return null;
     }
   };
-  const refuse = (kind: Exclude<WriteFailure["kind"], "disk-full">): never => {
+  const refuse = (kind: Refused): never => {
     throw new WriteRefused({ kind } as WriteFailure);
   };
 
   /** Why `folder` is no longer the real, unlinked folder it was resolved to, or null while it still is. */
-  const folderProblem = (folder: string): WriteFailure["kind"] | null => {
+  const folderProblem = (folder: string): Refused | null => {
     try {
       const state = platform.state(folder).kind;
       if (state === "missing") return "folder-missing";
@@ -219,8 +231,17 @@ export function exportFiles(
   };
   const stillFolder = (folder: string): void => {
     const problem = folderProblem(folder);
-    if (problem !== null) refuse(problem as Exclude<WriteFailure["kind"], "disk-full">);
+    if (problem !== null) refuse(problem);
   };
+
+  /**
+   * A regular file at `target` whose real path is not `target`: in a folder that resolves elsewhere. A link at
+   * `target` is the file's problem, not the folder's.
+   */
+  const entryOutside = (target: string): Refused | null =>
+    platform.state(target).kind !== "link" && platform.realPath(target) !== target
+      ? "folder-refused"
+      : null;
 
   /** Free space first, then a folder that is no longer the export's, then the error's name. */
   const classify = (
@@ -332,32 +353,33 @@ export function exportFiles(
       const holdsWritten = (): boolean =>
         handle.size() === written && sameBytes(handle.readHead(head.length), head);
       /**
-       * After a rename to `target`: whether what it moved is a regular file of the written length. Anything else took
-       * the part's name between the check and the rename, and goes back where it was found.
+       * After a rename to `target`, the export is done only when the folder is still the one resolved at start, by its
+       * real path and the entry's, and `target` is the handle's file holding what was written. Otherwise the rename is
+       * undone, wherever it landed and whatever it moved, so nothing keeps a name the export gave it, and the kind says
+       * why: the folder first, then the file.
        */
-      const landed = async (target: string): Promise<boolean> => {
+      const landed = async (target: string): Promise<Refused | null> => {
         at = target;
-        const state = platform.state(target);
-        if (state.kind === "file" && state.size === written) return true;
+        const moved = proven(() => folderProblem(folder) ?? entryOutside(target), "folder-refused");
+        const ours = proven(() => follows(target) && holdsWritten(), false);
+        if (moved === null && ours) return null;
         await bounded(platform.rename(target, path)).then(
           () => {
             at = path;
           },
           () => undefined,
         );
-        return false;
+        return moved ?? "file-replaced";
       };
       const ended = async (): Promise<void> => {
         if (journaled) await bounded(journal.ended(path));
       };
-      /** Deletes the file at `at` if it is this export's: through the handle while it is open, else by its head. */
+      /**
+       * Deletes the file at `at` only when the folder is still the export's and the handle shows the file is its own:
+       * nothing is deleted through a folder that became a link, and nothing that is not this export's file.
+       */
       const cleanUp = async (): Promise<void> => {
-        let ours = false;
-        try {
-          ours = open ? follows(at) : await carriesHead(platform, at, head, written);
-        } catch {
-          ours = false;
-        }
+        const ours = open && proven(() => folderProblem(folder) === null && follows(at), false);
         try {
           close();
         } catch {
@@ -394,7 +416,6 @@ export function exportFiles(
             handle.flush();
             stillFolder(folder);
             if (!follows(path) || !holdsWritten()) refuse("file-replaced");
-            close();
           });
           for (let n = 1; n <= NAME_TRIES; n += 1) {
             if (limits.signal.aborted) throw new ExportCancelled();
@@ -417,8 +438,11 @@ export function exportFiles(
               },
             );
             if (!renamed) continue;
-            if (!(await step(() => landed(target)))) refuse("file-replaced");
+            const refused = await step(() => landed(target));
+            if (refused !== null) refuse(refused);
             if (limits.signal.aborted) throw new ExportCancelled();
+            // The handle stays open until here, so the checks after the rename prove the file by it.
+            await step(close);
             // Nothing is left at the part's path, so an end line that failed to land costs nothing.
             await ended().catch(() => undefined);
             return name;

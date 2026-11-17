@@ -157,6 +157,11 @@ const yieldNow = (): Promise<void> =>
 const EXPORT_STEP_MS = 15_000;
 const PR_CREATE_FILE = 0x08;
 const PR_EXCL = 0x80;
+/**
+ * nsIFileInputStream.SHARE_DELETE: on Windows the part is opened so it can be renamed while its handle is open, which
+ * the checks after the rename need. Other platforms ignore it.
+ */
+const SHARE_DELETE = 1 << 5;
 
 const realPathOf = (path: string): string => {
   const file = localFile(path);
@@ -174,7 +179,7 @@ const geckoExportPlatform = (modes: Modes): ExportPlatform => ({
   makeFolder: (folder) =>
     IOUtils.makeDirectory(folder, { createAncestors: true, ignoreExisting: true }),
   createExclusive: (path) => {
-    const file = openReadWrite(path, PR_CREATE_FILE | PR_EXCL, modes.file ?? 0o644);
+    const file = openReadWrite(path, PR_CREATE_FILE | PR_EXCL, modes.file ?? 0o644, SHARE_DELETE);
     const utf8 = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(
       Ci.nsIConverterOutputStream,
     );
