@@ -302,13 +302,12 @@ function identityProblem(
   const proven = planned.map((unit) => wanted.filter((check) => ran(unit).includes(check)));
   const off = planned.filter((_, i) => proven[i]?.length !== 1).map(unitKey);
   const matched = new Set(proven.flat());
+  // `one` is a list of one: exactly that target, once.
   const fits =
     off.length === 0 &&
     (identity.kind === "every"
       ? planned.length > 0
-      : identity.kind === "one"
-        ? planned.length === 1
-        : matched.size === wanted.length && planned.length === wanted.length);
+      : matched.size === wanted.length && planned.length === wanted.length);
   return fits
     ? null
     : `planned ${shown(planned.map(unitKey))} is not the ${identity.role}${off.length > 0 ? `; not proven: ${off.join(", ")}` : ""}`;
@@ -374,7 +373,8 @@ function judgeBrowserRow(
   if (wrong !== null) return { verdict: "NO-RESULT", summary: wrong };
   const denial = denialAt(spec, position);
   if (spec.shape === "each") return eachVerdict(spec, denial, raw, planned, input);
-  const unit = planned.length === 1 ? planned[0] : undefined;
+  // The identity already held a single or pair probe to exactly one unit.
+  const [unit] = planned;
   if (!fitsShape(spec.shape, unit)) {
     return {
       verdict: "NO-RESULT",

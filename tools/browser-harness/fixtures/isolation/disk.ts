@@ -124,9 +124,12 @@ type Place = { readonly path: RegExp; readonly kind: "file" | "directory" };
 
 const escape = (text: string): string => text.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 
-/** The app folder, the random key folder and everything in it, the key file in the profile, and an export. */
+/**
+ * The app folder, the random key folder and everything in it, the key file in the profile, and an export. The key is
+ * 32 lowercase hex digits (`locateArchive` reads no other), so it needs no escaping.
+ */
 function placesOf(area: ProductArea): readonly Place[] {
-  const keyFolder = `data/one-click-har/${escape(area.archiveKey)}`;
+  const keyFolder = `data/one-click-har/${area.archiveKey}`;
   return [
     { path: /^data\/one-click-har$/u, kind: "directory" },
     { path: new RegExp(`^${keyFolder}(/.+)?$`, "u"), kind: "directory" },

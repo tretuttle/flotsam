@@ -573,6 +573,11 @@ describe("isolation judge", () => {
       target: "t",
     });
     expect(readObservation({ outcome: "load,error", text: "x", target: "t" })).not.toBeNull();
+    expect(readObservation({ outcome: "message", text: "x", target: "t" })).toEqual({
+      outcome: "message",
+      text: "x",
+      target: "t",
+    });
     expect(readObservation({ outcome: "fetch maybe, link load", text: "x", target: "t" })).toBe(
       null,
     );
@@ -787,7 +792,36 @@ describe("isolation judge", () => {
         observed: summary,
       });
     }
+    expect(
+      judged(
+        {
+          ...passingInput(),
+          targets: { ...PLAN.targets, "inventory-read": [first!, second!, first!] },
+        },
+        "inventory-read",
+        "web",
+      ).observed,
+    ).toBe(`planned ["${first!}","${second!}","${first!}"] is not the inventory`);
     const walks = unitsOf("resource-traversal") as readonly string[];
+    const deny = (u: string) => at(u, "fetch error, link error", NETWORK);
+    const oneWalk = {
+      ...withRow("resource-traversal", "web", each([deny(walks[0]!)])),
+      targets: { ...PLAN.targets, "resource-traversal": [walks[0]!] },
+    };
+    expect(judged(oneWalk, "resource-traversal", "web")).toMatchObject({
+      verdict: "BLOCKED",
+      ok: true,
+    });
+    const linkLoaded = withRow(
+      "resource-all",
+      "web",
+      each(
+        (unitsOf("resource-all") as readonly string[]).map((u, i) =>
+          i === 0 ? at(u, "fetch error, link load", NETWORK) : deny(u),
+        ),
+      ),
+    );
+    expect(judged(linkLoaded, "resource-all", "web").verdict).toBe("LEAKS-EXISTENCE");
     const offRoute = {
       ...passingInput(),
       targets: { ...PLAN.targets, "resource-traversal": [...walks, "resource://gre/x"] },

@@ -68,7 +68,7 @@ export const checkKey = (check: WitnessCheck): string =>
   JSON.stringify(
     Object.entries(check)
       .filter(([, value]) => value !== undefined)
-      .sort(([a], [b]) => (a < b ? -1 : 1)),
+      .sort(),
   );
 
 export const fileHref = (path: string, directory = false): string =>

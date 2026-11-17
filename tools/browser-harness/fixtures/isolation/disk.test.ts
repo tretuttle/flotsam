@@ -180,6 +180,11 @@ describe("the control run", () => {
     ]);
   });
 
+  it("tells apart a folder from a file the control run left at the same place and mode", () => {
+    const folder = added("profile/x", { ...dir, mode: 0o600 });
+    expect(beyondControl(run([folder]), run([added("profile/x")]))).toEqual([folder]);
+  });
+
   it("matches on the uuid's role, never on the uuid", () => {
     const sameUuid = run(
       [added("profile/storage/default/moz-extension+++C1^userContextId=4294967295", dir)],
@@ -229,6 +234,9 @@ describe("the product's places", () => {
       added("Xdata/one-click-har", dir),
       added("downloads/.har"),
       added("downloads/a.harX"),
+      added(`Xdata/one-click-har/${KEY}/x`),
+      added(`x/data/one-click-har/${KEY}`, dir),
+      added("home/one-click-har.archive-key"),
     ];
     expect(productWriteProblems(writes, AREA)).toEqual([
       "new file profile/storage/leaked-log.jsonl: outside the key folder, the key file and the export folder",
@@ -254,6 +262,9 @@ describe("the product's places", () => {
       "new directory Xdata/one-click-har: outside the key folder, the key file and the export folder",
       "new file downloads/.har: outside the key folder, the key file and the export folder",
       "new file downloads/a.harX: outside the key folder, the key file and the export folder",
+      `new file Xdata/one-click-har/${KEY}/x: outside the key folder, the key file and the export folder`,
+      `new directory x/data/one-click-har/${KEY}: outside the key folder, the key file and the export folder`,
+      "new file home/one-click-har.archive-key: outside the key folder, the key file and the export folder",
     ]);
   });
 
