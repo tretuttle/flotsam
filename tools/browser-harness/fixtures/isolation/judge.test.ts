@@ -260,10 +260,13 @@ function passingRows(): BrowserRowReport[] {
 const passingChecks = (): ExtraCheckResult[] =>
   (Object.keys(EXTRA_CHECKS) as ExtraCheckId[]).map((id) => ({ id, ok: true, detail: "held" }));
 
+// Built once: every test copies what it changes.
+const PASSING_ROWS = passingRows();
+
 function passingInput(): IsolationRunInput {
   return {
     context: CTX,
-    browserRows: passingRows(),
+    browserRows: PASSING_ROWS,
     targets: PLAN.targets,
     witness: WITNESS,
     syntheticControls: [
@@ -469,12 +472,15 @@ describe("isolation judge", () => {
     expect(result.rows.filter((r) => !r.ok)).toEqual([]);
   });
 
+  // One BLOCKED row per probe, and every row whose position declares its own denial.
   const blockedRows = expandExpectedRows(false).filter(
-    (r) =>
+    (r, i, rows) =>
       r.spec !== null &&
       r.expected.kind === "BLOCKED" &&
       !(r.id === "planted-resource" && r.position === "web") &&
-      unitsOf(r.id).length > 0,
+      unitsOf(r.id).length > 0 &&
+      (denialOf(r.spec, r.position) !== r.spec.deny ||
+        rows.findIndex((o) => o.id === r.id && o.expected.kind === "BLOCKED") === i),
   );
   it.each(blockedRows.map((r) => [r.id, r.position] as const))(
     "judges a leak at %s@%s as its kind, fails the row, and names it in the report",
