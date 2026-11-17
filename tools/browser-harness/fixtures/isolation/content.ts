@@ -200,21 +200,17 @@ function sqliteRead(path: string, names: RunNames): Pick<Structured, "entries" |
         }),
       );
       db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      // SQLite's own page count, which it reads from the header only when the header is current.
+      const { page_count: pages } = db.prepare("PRAGMA page_count").get() as { page_count: number };
+      const { page_size: size } = db.prepare("PRAGMA page_size").get() as { page_size: number };
       db.close();
-      return { entries, unaccounted: sqliteUnaccounted(NodeFS.readFileSync(copy)) };
+      return { entries, unaccounted: Math.max(0, NodeFS.statSync(copy).size - pages * size) };
     } finally {
       if (db.isOpen) db.close();
     }
   } finally {
     NodeFS.rmSync(dir, { recursive: true, force: true });
   }
-}
-
-/** Bytes past the pages a SQLite header counts (page size times the in-header page count). */
-function sqliteUnaccounted(bytes: Buffer): number {
-  const raw = bytes.readUInt16BE(16);
-  const pageSize = raw === 1 ? 65536 : raw;
-  return Math.max(0, bytes.length - pageSize * bytes.readUInt32BE(28));
 }
 
 /** A file's text: a mozlz4 file's decompressed JSON, any other file's bytes as UTF-8. */
