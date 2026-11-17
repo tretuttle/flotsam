@@ -76,14 +76,15 @@ const classifyFsError = (
   return { kind: kind ?? "other" } as WriteFailure;
 };
 
-/** What is at a path, without following a link there. */
+/** What is at a path, without following a link there. `size` is the size lstat gives, whatever the kind. */
 export type PathState =
-  | { readonly kind: "missing" | "link" | "folder" | "other" }
-  | { readonly kind: "file"; readonly size: number };
+  | { readonly kind: "missing" }
+  | { readonly kind: "file" | "link" | "folder" | "other"; readonly size: number };
 
 /** One open file. Every byte of a part goes through the handle its exclusive create returned. */
 export interface FileHandle {
   readonly write: (text: string) => void;
+  readonly flush: () => void;
   readonly close: () => void;
 }
 
@@ -105,27 +106,37 @@ export interface ExportPlatform {
   readonly freeBytes: (folder: string) => number;
 }
 
+/**
+ * Where a part is recorded so the next start can delete it after a crash. `started` comes only once the part exists
+ * and holds `head`, its first bytes, which carry the export's random id; `ended` once the part is renamed, deleted,
+ * or found to be no longer this export's.
+ */
+export interface PartJournal {
+  readonly started: (path: string, head: string) => Promise<void>;
+  readonly ended: (path: string) => Promise<void>;
+}
+
 /** A part being written: appended through its one handle, then confirmed and renamed, or discarded. */
 export interface Part {
   readonly append: (text: string, needBytes: number) => Promise<void>;
   /** Closes the handle, confirms the part is still this export's file, and renames it. Returns the name it got. */
   readonly finish: (planned: string) => Promise<string>;
+  /** Deletes the part if it is still this export's file. */
   readonly discard: () => Promise<void>;
 }
 
 export interface ExportFolder {
   readonly path: string;
-  /** A free name for `planned` and its part, then the part, created exclusively. */
-  /** `beforeCreate` runs with the part's path before it exists, so the journal names it before any byte. */
+  /** A free name for `planned` and its part, then the part, created exclusively. Nothing is journaled yet. */
   readonly createPart: (
     planned: string,
-    beforeCreate: (path: string) => Promise<void>,
+    journal: PartJournal,
   ) => Promise<{ readonly part: Part; readonly path: string }>;
 }
 
 const NAME_TRIES = 100;
-/** How much of the part's start is compared with what this export wrote first. */
-const HEAD_BYTES = 64;
+/** How much of the part's first write is its identity: the document's opening, with the export's random id. */
+const HEAD_BYTES = 128;
 
 /** `name.har`, `name (2).har`, and on. */
 const numbered = (planned: string, n: number): string => {
@@ -137,6 +148,23 @@ const asciiPrefix = (text: string, max: number): string => {
   let end = 0;
   while (end < text.length && end < max && text.charCodeAt(end) < 0x80) end += 1;
   return text.slice(0, end);
+};
+
+const sameBytes = (found: Uint8Array, text: string): boolean =>
+  found.length === text.length && found.every((byte, index) => byte === text.charCodeAt(index));
+
+/**
+ * Whether the file at `path` is a regular file, not a link, whose first bytes are `head`. A head names one export,
+ * so this is the proof that a part is that export's own. Its kind is read before any byte, so a FIFO is never opened.
+ */
+export const carriesHead = async (
+  io: Pick<ExportPlatform, "state" | "readHead">,
+  path: string,
+  head: string,
+): Promise<boolean> => {
+  const state = io.state(path);
+  if (head.length === 0 || state.kind !== "file" || state.size < head.length) return false;
+  return sameBytes(await io.readHead(path, head.length), head);
 };
 
 /**
@@ -195,10 +223,12 @@ export function exportFiles(platform: ExportPlatform, allowed: (realFolder: stri
       return planned;
     });
 
-    const openPart = (path: string): Part => {
+    const openPart = (path: string, journal: PartJournal): Part => {
       const handle = platform.createExclusive(path);
       let written = 0;
+      /** The first write's ASCII start; once `journaled`, it is on disk and in the journal. */
       let head = "";
+      let journaled = false;
       let open = true;
       const close = (): void => {
         if (!open) return;
@@ -209,23 +239,41 @@ export function exportFiles(platform: ExportPlatform, allowed: (realFolder: stri
         stillFolder(folder);
         const state = platform.state(path);
         if (state.kind !== "file" || state.size !== written) refuse("file-replaced");
-        const expected = Array.from(head, (c) => c.charCodeAt(0));
-        const found = Array.from(await platform.readHead(path, expected.length));
-        if (found.join() !== expected.join()) refuse("file-replaced");
+        const found = await platform.readHead(path, head.length);
+        if (!sameBytes(found, head)) refuse("file-replaced");
+      };
+      /** Journaled, the part must carry its whole head; before that, as much of it as reached the file. */
+      const stillOurs = async (): Promise<boolean> => {
+        if (platform.state(folder).kind !== "folder" || platform.realPath(folder) !== folder)
+          return false;
+        const state = platform.state(path);
+        if (state.kind !== "file") return false;
+        const length = Math.min(state.size, head.length);
+        if (journaled && length < head.length) return false;
+        return sameBytes(await platform.readHead(path, length), head.slice(0, length));
       };
       return {
-        append: (text, needBytes) =>
-          run(
+        append: async (text, needBytes) => {
+          const first = written === 0 && !journaled;
+          await run(
             folder,
-            () => {
+            async () => {
+              if (first) head = asciiPrefix(text, HEAD_BYTES);
               handle.write(text);
-              if (written === 0) head = asciiPrefix(text, HEAD_BYTES);
               written += needBytes;
+              if (!first) return;
+              handle.flush();
+              stillFolder(folder);
+              if (!(await carriesHead(platform, path, head))) refuse("file-replaced");
             },
             needBytes,
-          ),
-        finish: (planned) =>
-          run(folder, async () => {
+          );
+          if (!first) return;
+          await journal.started(path, head);
+          journaled = true;
+        },
+        finish: async (planned) => {
+          const name = await run(folder, async () => {
             close();
             await confirm();
             for (let n = 1; n <= NAME_TRIES; n += 1) {
@@ -241,32 +289,41 @@ export function exportFiles(platform: ExportPlatform, allowed: (realFolder: stri
               if (renamed) return name;
             }
             return refuse("name-taken");
-          }),
+          });
+          // Nothing is left at the part's path, so an end line that failed to land costs nothing.
+          if (journaled) await journal.ended(path).catch(() => undefined);
+          return name;
+        },
         discard: async () => {
           try {
             close();
           } catch {
             // The handle's last error is already the export's failure.
           }
-          if (platform.state(folder).kind !== "folder" || platform.realPath(folder) !== folder)
-            return;
-          if (platform.state(path).kind !== "missing")
-            await platform.remove(path).catch(() => undefined);
+          const ours = await stillOurs().catch(() => false);
+          if (ours) {
+            try {
+              await platform.remove(path);
+            } catch {
+              // Still this export's file, and still journaled: the next start deletes it.
+              return;
+            }
+          }
+          if (journaled) await journal.ended(path);
         },
       };
     };
 
     return {
       path: folder,
-      createPart: async (planned, beforeCreate) => {
+      createPart: async (planned, journal) => {
         for (let n = 1; n <= NAME_TRIES; n += 1) {
           const name = numbered(planned, n);
           const final = platform.join(folder, name);
           const path = `${final}${PART_SUFFIX}`;
-          await beforeCreate(path);
           const part = await run(folder, () => {
             stillFolder(folder);
-            return openPart(path);
+            return openPart(path, journal);
           }).catch((error: unknown) => {
             if (isTaken(error)) return null;
             throw error;
@@ -288,7 +345,8 @@ export type PartSink = HarSink & {
 
 /**
  * The export's sink. A refused append is the only failure that fails an export: `append` throws WriteRefused with
- * the bytes it needed, and nothing after it is written.
+ * the bytes it needed, and nothing after it is written. The first piece, the document's opening with the export's
+ * random id, is appended alone and at once, so the part is journaled before the rest is written.
  */
 export function createPartSink(
   append: (text: string, needBytes: number) => Promise<void>,
@@ -298,6 +356,7 @@ export function createPartSink(
   let pendingUnits = 0;
   let pendingBytes = 0;
   let written = 0;
+  let opened = false;
   const flush = async (): Promise<void> => {
     if (pending.length === 0) return;
     const text = pending.join("");
@@ -314,23 +373,34 @@ export function createPartSink(
       pending.push(text);
       pendingUnits += text.length;
       pendingBytes += utf8Length(text);
-      if (pendingUnits >= SINK_BATCH_UNITS) await flush();
+      if (opened && pendingUnits < SINK_BATCH_UNITS) return;
+      opened = true;
+      await flush();
     },
     bytesWritten: () => (written + pendingBytes) as ByteCount,
     close: flush,
   };
 }
 
-/**
- * `exports.jsonl` in the archive: a line naming a part before its first byte, and one when it was renamed or deleted.
- * A part named by a start line and no end line was left by a crash, and the next start deletes it (crash row 13).
- */
-export const journalLine = (event: "started" | "ended", partPath: string): string =>
-  `${JSON.stringify({ [event]: partPath })}\n`;
+/** One line of `exports.jsonl` in the archive. */
+export type JournalEntry =
+  | { readonly started: string; readonly head: string }
+  | { readonly ended: string };
 
-/** Only `.har.part` paths are ever deleted from the journal, so a damaged line cannot name another file. */
-export const unfinishedExports = (journal: string): readonly string[] => {
-  const open = new Set<string>();
+export const journalLine = (entry: JournalEntry): string => `${JSON.stringify(entry)}\n`;
+
+/** A part the journal says started and never ended, with the first bytes that prove a file at its path is it. */
+export interface JournaledPart {
+  readonly path: string;
+  readonly head: string;
+}
+
+/**
+ * Started and never ended, so left by a crash (crash row 13). Only `.har.part` paths with a head are listed: a damaged
+ * line cannot name another file, and a line with no head proves nothing about the file at its path.
+ */
+export const unfinishedExports = (journal: string): readonly JournaledPart[] => {
+  const open = new Map<string, string>();
   for (const line of journal.split("\n")) {
     let parsed: unknown;
     try {
@@ -339,9 +409,19 @@ export const unfinishedExports = (journal: string): readonly string[] => {
       continue;
     }
     if (typeof parsed !== "object" || parsed === null) continue;
-    const { started, ended } = parsed as { started?: unknown; ended?: unknown };
-    if (typeof started === "string" && started.endsWith(`.har${PART_SUFFIX}`)) open.add(started);
+    const { started, head, ended } = parsed as {
+      started?: unknown;
+      head?: unknown;
+      ended?: unknown;
+    };
+    if (
+      typeof started === "string" &&
+      started.endsWith(`.har${PART_SUFFIX}`) &&
+      typeof head === "string" &&
+      head.length > 0
+    )
+      open.set(started, head);
     if (typeof ended === "string") open.delete(ended);
   }
-  return [...open];
+  return [...open].map(([path, head]) => ({ path, head }));
 };

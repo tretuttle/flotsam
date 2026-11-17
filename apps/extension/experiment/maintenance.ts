@@ -23,8 +23,10 @@ import {
   type DirSnapshot,
   type ReconcileStep,
   type SnapshotEntry,
+  type UnfinishedExport,
 } from "@one-click-har/recording/reconcile";
-import { type Modes, writeAtomic } from "./gecko-io.ts";
+import { carriesHead, type JournaledPart } from "./export-file.ts";
+import { type Modes, pathState, readHead, writeAtomic } from "./gecko-io.ts";
 
 const relative = (root: string, path: string): readonly string[] =>
   path.slice(root.length + 1).split(/[\\/]/);
@@ -77,7 +79,7 @@ async function snapshotArchive(
   root: SafeFolder,
   run: RunId,
   excluded: readonly Site[],
-  unfinishedExports: readonly string[],
+  journaled: readonly JournaledPart[],
 ): Promise<DirSnapshot> {
   const entries: SnapshotEntry[] = [];
   const logs: { readonly path: string; readonly name: Named<"log">; readonly bytes: number }[] = [];
@@ -121,10 +123,30 @@ async function snapshotArchive(
       namesBodies: text === null ? [] : bodiesNamed(wholeLines(text)),
     });
   }
+  const unfinishedExports: UnfinishedExport[] = [];
+  for (const { path, head } of journaled)
+    unfinishedExports.push({ path, at: await whatIsAt(path, head) });
   return { current: run, excluded, entries, unfinishedExports };
 }
 
-async function execute(root: SafeFolder, modes: Modes, step: ReconcileStep): Promise<void> {
+const GECKO_IO = { state: pathState, readHead };
+
+/** A path the journal names that cannot even be looked at is never taken for the export's part. */
+const whatIsAt = async (path: string, head: string): Promise<UnfinishedExport["at"]> => {
+  try {
+    if (pathState(path).kind === "missing") return "gone";
+    return (await carriesHead(GECKO_IO, path, head)) ? "ours" : "other";
+  } catch {
+    return "other";
+  }
+};
+
+async function execute(
+  root: SafeFolder,
+  modes: Modes,
+  step: ReconcileStep,
+  heads: ReadonlyMap<string, string>,
+): Promise<void> {
   const at = (segments: readonly string[]): string => PathUtils.join(root, ...segments);
   switch (step.kind) {
     case "delete-excluded-site":
@@ -144,7 +166,12 @@ async function execute(root: SafeFolder, modes: Modes, step: ReconcileStep): Pro
       return writeAtomic(path, text.slice(0, step.toBytes), modes);
     }
     case "delete-export-part":
-      return IOUtils.remove(step.path, { ignoreAbsent: true });
+      // Proved again just before the delete, in case the file changed since the snapshot.
+      if (await carriesHead(GECKO_IO, step.path, heads.get(step.path) ?? ""))
+        await IOUtils.remove(step.path, { ignoreAbsent: true });
+      return;
+    case "leave-export-part":
+      return;
     case "summarize-log": {
       const text = await IOUtils.readUTF8(at(logSegmentPath(step.segment)));
       const summary = summarize(step.segment, wholeLines(text), text.length as ByteCount);
@@ -159,9 +186,10 @@ export async function recover(
   modes: Modes,
   run: RunId,
   excluded: readonly Site[],
-  unfinishedExports: readonly string[],
+  journaled: readonly JournaledPart[],
 ): Promise<readonly ReconcileStep[]> {
-  const steps = planReconcile(await snapshotArchive(root, run, excluded, unfinishedExports));
-  for (const step of steps) await execute(root, modes, step);
+  const steps = planReconcile(await snapshotArchive(root, run, excluded, journaled));
+  const heads = new Map(journaled.map(({ path, head }) => [path, head]));
+  for (const step of steps) await execute(root, modes, step, heads);
   return steps;
 }

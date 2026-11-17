@@ -4,7 +4,17 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { DEFAULT_USER_SETTINGS } from "@one-click-har/recording/settings";
 import type { CheckContext, CheckResult, HarnessCheck } from "../src/checks.ts";
-import { judgeRow, type RowObservation, type RowOutcome } from "../src/export-judge.ts";
+import {
+  readExtensionId,
+  readExtensionPopupPath,
+  waitForActiveExtensionUrl,
+} from "../src/browser.ts";
+import {
+  judgeNextStart,
+  judgeRow,
+  type RowObservation,
+  type RowOutcome,
+} from "../src/export-judge.ts";
 import {
   ended,
   newestPageTab,
@@ -14,7 +24,7 @@ import {
   waitForJob,
 } from "../src/export-session.ts";
 import { FIXTURES_PAGE_PATH } from "../src/fixtures.ts";
-import { recordingWorkspace } from "../src/recording-session.ts";
+import { callHook, recordingWorkspace } from "../src/recording-session.ts";
 import { startFixtureServer } from "../src/server.ts";
 
 const NAME = "export-failures";
@@ -35,8 +45,10 @@ type Row = {
   /** Done once the export has written its first MiB. */
   readonly during?: (at: Place & { readonly part: string }) => void;
   readonly after?: (at: Place) => void;
-  /** Files the row itself put in the folder: not the export's, and each must be left as it was. */
+  /** What the row itself put in the folder, before or during the export: not the export's, each left as it was. */
   readonly theirs?: readonly string[];
+  /** The export's own part, changed so it can no longer be proved the export's: reported, and left where it is. */
+  readonly leaves?: readonly string[];
   readonly expect: (fileName: string) => RowOutcome;
 };
 
@@ -161,6 +173,7 @@ const ROWS: readonly Row[] = [
     folder: (b) => dir(`${b}/part-link`),
     during: ({ part, profile }) =>
       replace(part, (p) => NodeFS.symlinkSync(`${profile}/prefs.js`, p)),
+    theirs: ["part-link.har.part"],
     expect: failed("file-replaced"),
   },
   {
@@ -168,6 +181,7 @@ const ROWS: readonly Row[] = [
     fileName: "part-file",
     folder: (b) => dir(`${b}/part-file`),
     during: ({ part }) => replace(part, (p) => NodeFS.writeFileSync(p, "the attacker's own file")),
+    theirs: ["part-file.har.part"],
     expect: failed("file-replaced"),
   },
   {
@@ -175,6 +189,53 @@ const ROWS: readonly Row[] = [
     fileName: "part-hard-link",
     folder: (b) => dir(`${b}/part-hard-link`),
     during: ({ part, profile }) => replace(part, (p) => NodeFS.linkSync(`${profile}/prefs.js`, p)),
+    theirs: ["part-hard-link.har.part"],
+    expect: failed("file-replaced"),
+  },
+  {
+    cause:
+      "part replaced by a regular file with its first 4 KiB and another size (the export's id, so taken for it)",
+    fileName: "part-same-head",
+    folder: (b) => dir(`${b}/part-same-head`),
+    during: ({ part }) => {
+      const head = NodeFS.readFileSync(part).subarray(0, 4096);
+      replace(part, (p) => NodeFS.writeFileSync(p, head));
+    },
+    expect: failed("file-replaced"),
+  },
+  {
+    cause: "part's first bytes overwritten in place (same file, same size)",
+    fileName: "part-overwritten",
+    folder: (b) => dir(`${b}/part-overwritten`),
+    during: ({ part }) => {
+      const fd = NodeFS.openSync(part, "r+");
+      try {
+        NodeFS.writeSync(fd, Buffer.from(" ".repeat(32)), 0, 32, 0);
+      } finally {
+        NodeFS.closeSync(fd);
+      }
+    },
+    leaves: ["part-overwritten.har.part"],
+    expect: failed("file-replaced"),
+  },
+  {
+    cause: "part replaced by a folder",
+    fileName: "part-folder",
+    folder: (b) => dir(`${b}/part-folder`),
+    during: ({ part }) => replace(part, (p) => NodeFS.mkdirSync(p)),
+    theirs: ["part-folder.har.part"],
+    expect: failed("file-replaced"),
+  },
+  {
+    cause: "part replaced by a FIFO (never opened)",
+    fileName: "part-fifo",
+    folder: (b) => dir(`${b}/part-fifo`),
+    during: ({ part }) =>
+      replace(part, (p) => {
+        const made = NodeChildProcess.spawnSync("mkfifo", ["-m", "600", p], { encoding: "utf8" });
+        if (made.status !== 0) throw new Error(`mkfifo: ${made.stderr}`);
+      }),
+    theirs: ["part-fifo.har.part"],
     expect: failed("file-replaced"),
   },
   {
@@ -216,13 +277,29 @@ const sha256 = (path: string): string =>
     ? NodeCrypto.createHash("sha256").update(NodeFS.readFileSync(path)).digest("hex")
     : "absent";
 
-const AS_LEFT = "as the row left it";
-/** A row's own file still holds what the row wrote, and its own link still points where the row pointed it. */
-const leftAsItWas = (path: string): string => {
+/** What is at a path, never following a link there: a file by its hash, a link by its target. */
+const fingerprint = (path: string): string => {
   const stat = NodeFS.lstatSync(path, { throwIfNoEntry: false });
-  if (stat === undefined) return "gone";
-  if (stat.isSymbolicLink()) return NodeFS.readlinkSync(path) === NOWHERE ? AS_LEFT : "relinked";
-  return NodeFS.readFileSync(path, "utf8") === THEIRS ? AS_LEFT : "rewritten";
+  if (stat === undefined) return "absent";
+  if (stat.isSymbolicLink()) return `link to ${NodeFS.readlinkSync(path)}`;
+  if (stat.isFIFO()) return "fifo";
+  if (stat.isDirectory()) return "folder";
+  return stat.isFile() ? `file ${sha256(path)}` : "other";
+};
+
+/** Every non-folder entry under `root`, by path, except in the folders the browser itself owns. */
+const filesUnder = (root: string, skip: readonly string[]): Map<string, string> => {
+  const found = new Map<string, string>();
+  const walk = (folder: string): void => {
+    for (const entry of NodeFS.readdirSync(folder, { withFileTypes: true })) {
+      const path = NodePath.join(folder, entry.name);
+      if (skip.includes(path)) continue;
+      if (entry.isDirectory()) walk(path);
+      else found.set(path, fingerprint(path));
+    }
+  };
+  walk(root);
+  return found;
 };
 
 const namespacesRefused = (): string | null => {
@@ -261,70 +338,100 @@ async function runRow(
   NodeFS.writeFileSync(binary, launcher(context.binaryPath, mountAt, row.mount?.options ?? null), {
     mode: 0o700,
   });
-  await using session = await workspace.launch({
-    binaryPath: binary,
-    extensionPath,
-    display: context.display,
-    protocol: "marionette",
-    signal: context.signal,
-  });
-  const page = await openExtensionPage(session, extensionPath);
-  const tab = await session.openTab(`${server.origin}${FIXTURES_PAGE_PATH}`);
-  await session.evaluate(tab, "window.__harnessReady");
-  const tabId = await newestPageTab(page);
+  const theirs = (row.theirs ?? []).map((name) => NodePath.join(folder, name));
+  /** Every file there before the export, then what the row put in place: none may change, now or at the next start. */
+  const kept = filesUnder(base, [profile, workspace.dataHome]);
+  const theirsBefore = theirs.filter((path) => fingerprint(path) !== "absent");
   const prefs = `${profile}/prefs.js`;
-  const before = sha256(prefs);
   const place: Place = { base, folder, profile };
   let state: unknown;
-  try {
-    const job = await startExport(page, {
-      selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
-      bodies: "include",
-      redaction: "standard",
-      packaging: "har",
-      fileName: row.fileName,
+  let observation: RowObservation;
+  {
+    await using session = await workspace.launch({
+      binaryPath: binary,
+      extensionPath,
+      display: context.display,
+      protocol: "marionette",
+      signal: context.signal,
     });
-    if (row.during !== undefined) {
-      const writing = await waitForJob(
-        page,
-        job.id,
-        (j) => ended(j) || (j.state.kind === "writing" && j.state.bytes >= MIB),
-      );
-      if (writing.state.kind === "writing")
-        row.during({ ...place, part: `${folder}/${row.fileName}.har.part` });
+    const page = await openExtensionPage(session, extensionPath);
+    const tab = await session.openTab(`${server.origin}${FIXTURES_PAGE_PATH}`);
+    await session.evaluate(tab, "window.__harnessReady");
+    const tabId = await newestPageTab(page);
+    const before = sha256(prefs);
+    try {
+      const job = await startExport(page, {
+        selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
+        bodies: "include",
+        redaction: "standard",
+        packaging: "har",
+        fileName: row.fileName,
+      });
+      if (row.during !== undefined) {
+        const writing = await waitForJob(
+          page,
+          job.id,
+          (j) => ended(j) || (j.state.kind === "writing" && j.state.bytes >= MIB),
+        );
+        if (writing.state.kind === "writing")
+          row.during({ ...place, part: `${folder}/${row.fileName}.har.part` });
+      }
+      for (const path of theirs) if (!kept.has(path)) kept.set(path, fingerprint(path));
+      state = (await waitForJob(page, job.id, ended)).state;
+    } finally {
+      row.after?.(place);
     }
-    state = (await waitForJob(page, job.id, ended)).state;
-  } finally {
-    row.after?.(place);
+    const served = JSON.stringify({
+      state,
+      list: await value(page, "browser.oneClickHar.listExports()"),
+      popup: await value(page, `browser.oneClickHar.getPopup({ tabId: ${String(tabId)} })`),
+    });
+    const listed = (await session.evaluateChrome(LIST, [[folder, profile]])) as Record<
+      string,
+      readonly string[] | null
+    >;
+    const named = (path: string): readonly string[] =>
+      (listed[path] ?? []).filter(
+        (name) =>
+          name.startsWith(row.fileName) &&
+          !theirs.includes(NodePath.join(folder, name)) &&
+          !(path === folder && (row.leaves ?? []).includes(name)),
+      );
+    const journalPath = NodePath.join(workspace.root(), "exports.jsonl");
+    observation = {
+      expect: row.expect(row.fileName),
+      state,
+      served,
+      paths: [profile, folder, workspace.dataHome, base],
+      files: [...named(folder), ...named(profile)],
+      untouched: [
+        { path: "prefs.js", before, after: sha256(prefs) },
+        ...[...kept].map(([path, was]) => ({ path, before: was, after: fingerprint(path) })),
+      ],
+      journal: NodeFS.existsSync(journalPath) ? NodeFS.readFileSync(journalPath, "utf8") : "",
+      theirs: theirsBefore,
+    };
   }
-  const served = JSON.stringify({
-    state,
-    list: await value(page, "browser.oneClickHar.listExports()"),
-    popup: await value(page, `browser.oneClickHar.getPopup({ tabId: ${String(tabId)} })`),
-  });
-  const listed = (await session.evaluateChrome(LIST, [[folder, profile]])) as Record<
-    string,
-    readonly string[] | null
-  >;
-  const theirs = row.theirs ?? [];
-  const named = (path: string): readonly string[] =>
-    (listed[path] ?? []).filter((name) => name.startsWith(row.fileName) && !theirs.includes(name));
-  const observation: RowObservation = {
-    expect: row.expect(row.fileName),
-    state,
-    served,
-    paths: [profile, folder, workspace.dataHome, base],
-    files: [...named(folder), ...named(profile)],
-    untouched: [
-      { path: "prefs.js", before, after: sha256(prefs) },
-      ...theirs.map((name) => ({
-        path: name,
-        before: AS_LEFT,
-        after: leftAsItWas(`${folder}/${name}`),
-      })),
-    ],
-  };
-  return { problems: judgeRow(observation), state };
+  // The next start, which reads the journal and deletes what it can prove an unfinished export left.
+  {
+    await using session = await workspace.launch({
+      binaryPath: context.binaryPath,
+      extensionPath: null,
+      display: context.display,
+      protocol: "marionette",
+      signal: context.signal,
+    });
+    await waitForActiveExtensionUrl(
+      session,
+      await readExtensionId(extensionPath),
+      await readExtensionPopupPath(extensionPath),
+    );
+    await callHook(session, { kind: "recovery" });
+  }
+  const afterNextStart = judgeNextStart(
+    [...kept].map(([path, was]) => ({ path, before: was, after: fingerprint(path) })),
+  );
+  return { problems: [...judgeRow(observation), ...afterNextStart], state };
 }
 
 /**
@@ -369,10 +476,18 @@ const check: HarnessCheck = {
       paths: ["/w/out"],
       files: [],
       untouched: [],
+      journal: '{"started":"/w/out/theirs.har.part","head":"{"}\n',
+      theirs: ["/w/out/theirs.har.part"],
     });
-    if (planted.length < 3)
-      problems.push(`planted detail with a path caught only as ${JSON.stringify(planted)}`);
-    return finish(problems, `${seen.join("; ")}; planted detail with a path caught`, seen);
+    if (planted.length < 5)
+      problems.push(
+        `planted detail and open journal line caught only as ${JSON.stringify(planted)}`,
+      );
+    return finish(
+      problems,
+      `${seen.join("; ")}; planted detail with a path and a journal line naming the row's file caught`,
+      seen,
+    );
   },
 };
 

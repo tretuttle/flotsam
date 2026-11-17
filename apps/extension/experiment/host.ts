@@ -50,12 +50,21 @@ import {
   exportFiles,
   journalLine,
   type ExportPlatform,
+  type JournalEntry,
   type Part,
-  type PathState,
+  type PartJournal,
 } from "./export-file.ts";
 import { createExportJobs, type ExportJobs, type RunOutcome } from "./export-jobs.ts";
 import { forbiddenRoots, platform } from "./files.ts";
-import { appendText, localFile, siteOfUri, type Modes } from "./gecko-io.ts";
+import {
+  appendText,
+  localFile,
+  pathState,
+  randomBytes,
+  readHead,
+  siteOfUri,
+  type Modes,
+} from "./gecko-io.ts";
 
 /** What the host reads from a running recording. null while the archive could not be opened. */
 export interface RecordingReads {
@@ -142,18 +151,6 @@ const PR_WRONLY = 0x02;
 const PR_CREATE_FILE = 0x08;
 const PR_EXCL = 0x80;
 
-const stateOf = (path: string): PathState => {
-  const file = localFile(path);
-  try {
-    if (file.isSymlink()) return { kind: "link" };
-  } catch {
-    return { kind: "missing" };
-  }
-  if (!file.exists()) return { kind: "missing" };
-  if (file.isDirectory()) return { kind: "folder" };
-  return file.isFile() ? { kind: "file", size: file.fileSize } : { kind: "other" };
-};
-
 const realPathOf = (path: string): string => {
   const file = localFile(path);
   file.normalize();
@@ -162,7 +159,7 @@ const realPathOf = (path: string): string => {
 
 /** The only raw file calls an export makes. `exportFiles` classifies whatever they throw. */
 const geckoExportPlatform = (modes: Modes): ExportPlatform => ({
-  state: stateOf,
+  state: pathState,
   realPath: realPathOf,
   parent: (path) => PathUtils.parent(path),
   join: (folder, name) => PathUtils.join(folder, name),
@@ -182,10 +179,11 @@ const geckoExportPlatform = (modes: Modes): ExportPlatform => ({
       write: (text) => {
         if (!utf8.writeString(text)) throw new Error("short write");
       },
+      flush: () => utf8.flush(),
       close: () => utf8.close(),
     };
   },
-  readHead: (path, bytes) => IOUtils.read(path, { maxBytes: bytes }),
+  readHead,
   rename: (from, to) => IOUtils.move(from, to, { noOverwrite: true }),
   remove: (path) => IOUtils.remove(path, { ignoreAbsent: true }),
   freeBytes: (folder) => localFile(folder).diskSpaceAvailable,
@@ -341,8 +339,12 @@ export function createGeckoHost(options: {
       file: ARCHIVE_ROOTS[platform()].fileMode,
     };
     const journal = rec === null ? null : PathUtils.join(rec.root, LAYOUT.exportsJournal);
-    const note = async (event: "started" | "ended", path: string): Promise<void> => {
-      if (journal !== null) await appendText(journal, journalLine(event, path), modes);
+    const note = async (entry: JournalEntry): Promise<void> => {
+      if (journal !== null) await appendText(journal, journalLine(entry), modes);
+    };
+    const partJournal: PartJournal = {
+      started: (path, head) => note({ started: path, head }),
+      ended: (path) => note({ ended: path }),
     };
     const roots = realRoots(rec?.root ?? null);
     const files = exportFiles(
@@ -355,7 +357,7 @@ export function createGeckoHost(options: {
       const configured = await configuredFolder(rec?.settings() ?? null);
       const folder = await files.openFolder(configured.path);
       const planned = jobs.job(job.id)?.fileName ?? plannedName(job.request);
-      written = await folder.createPart(planned, (path) => note("started", path));
+      written = await folder.createPart(planned, partJournal);
       const { part } = written;
       const sink = createPartSink(part.append, (bytes) => control.progress({ ...last, bytes }));
       const report = await runExport(
@@ -375,6 +377,7 @@ export function createGeckoHost(options: {
           bodies: archiveBodies(rec?.root ?? (folder.path as SafeFolder)),
           sink,
           creator,
+          fileId: Array.from(randomBytes(16), (b) => b.toString(16).padStart(2, "0")).join(""),
           decode: decodeContent,
           yieldNow,
           onProgress: (p) => {
@@ -386,7 +389,6 @@ export function createGeckoHost(options: {
       );
       await sink.close();
       const name = await part.finish(planned);
-      await note("ended", written.path);
       finished.set(job.id, PathUtils.join(folder.path, name));
       return {
         kind: "done",
@@ -395,10 +397,7 @@ export function createGeckoHost(options: {
         report,
       };
     } catch (error) {
-      if (written !== null) {
-        await written.part.discard().catch(() => undefined);
-        await note("ended", written.path).catch(() => undefined);
-      }
+      if (written !== null) await written.part.discard().catch(() => undefined);
       if (error instanceof WriteRefused) return { kind: "write-failed", failure: error.failure };
       if (control.signal.aborted) return { kind: "cancelled" };
       return { kind: "write-failed", failure: { kind: "other" } };

@@ -27,6 +27,8 @@ Whatever is removed, the result must validate against the published HAR 1.2 sche
 
 Records and `_harExport.redactedFields` name a removal by model field path, place, rule id and count. They never carry a value, a header name, a query name or a custom key, because a level can remove those, and copying them into the report would publish what was removed.
 
+`log._harExportId` is the random id an export writes first, so recovery can prove a part on disk is that export's (see the API doc's file section). It holds nothing from a page, and the export writes it before redaction sees the log, so `redactHar` keeps it at every level and counts it in no place; otherwise the export's report and `redactHar`'s would differ by one unexamined custom field.
+
 ## Decisions
 
 - A header is on the default list when its value is a credential or a proof signed for one request: `DPoP` (RFC 9449) and `Signature` (RFC 9421) are listed. `Digest`, `Content-Digest` and `Repr-Digest` hold a hash of the body and are not.

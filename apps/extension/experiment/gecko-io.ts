@@ -1,6 +1,7 @@
 // Native helpers more than one experiment file needs. Nothing here reads a body into script.
 
 import { parseSite, type Site } from "@one-click-har/recording/ids";
+import type { PathState } from "./export-file.ts";
 
 /** POSIX modes the archive uses on Linux and macOS (rows P2). Windows ignores them and keeps the inherited ACL. */
 export interface Modes {
@@ -170,3 +171,20 @@ export const randomBytes = (length: number): Uint8Array =>
       .getService(Ci.nsIRandomGenerator)
       .generateRandomBytes(length),
   );
+
+/** What is at a path, without following a link there. */
+export const pathState = (path: string): PathState => {
+  const file = localFile(path);
+  try {
+    if (file.isSymlink()) return { kind: "link", size: file.fileSizeOfLink };
+  } catch {
+    return { kind: "missing" };
+  }
+  if (!file.exists()) return { kind: "missing" };
+  const kind = file.isDirectory() ? "folder" : file.isFile() ? "file" : "other";
+  return { kind, size: file.fileSize };
+};
+
+/** The first `bytes` bytes of a file. Only ever called on a path `pathState` just found to be a regular file. */
+export const readHead = (path: string, bytes: number): Promise<Uint8Array> =>
+  IOUtils.read(path, { maxBytes: bytes });

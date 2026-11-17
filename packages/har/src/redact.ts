@@ -404,6 +404,7 @@ const HAR_MODEL_ROWS = {
   },
   "log.comment": { kinds: ["string"], places: ["comment"] },
   "log._harExport": { kinds: ["object"], places: [] },
+  "log._harExportId": { kinds: ["string"], places: [] },
   "log.<custom>": { kinds: ["unknown"], places: ["other-custom-field"] },
   "log.creator.name": { kinds: ["string"], places: ["protocol-metadata"], whenRemoved: "redacted" },
   "log.creator.version": { kinds: ["string"], places: ["protocol-metadata"], whenRemoved: "0" },
@@ -2239,7 +2240,13 @@ export function redactHar(document: HarDocument, options?: RedactHarOptions): Re
   }
   const version = redactProtocolString(log.version, "log.version", logCtx);
   const logChanges: Record<string, unknown> = {
-    ...redactCustomFields(log, OWNED_FIELDS.log, "log.<custom>", logCtx, new Set(["_harExport"])),
+    ...redactCustomFields(
+      log,
+      OWNED_FIELDS.log,
+      "log.<custom>",
+      logCtx,
+      new Set(["_harExport", "_harExportId"]),
+    ),
     version: logCtx.isRemoved("protocol-metadata") ? "1.2" : version,
     creator: redactCreator(log.creator, "log.creator", logCtx),
     browser: log.browser ? redactCreator(log.browser, "log.browser", logCtx) : undefined,

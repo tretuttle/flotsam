@@ -151,6 +151,8 @@ interface FileOutputStream extends OutputStream {
 interface LocalFile {
   readonly path: string;
   readonly fileSize: number;
+  /** The link's own size, the length of its target. */
+  readonly fileSizeOfLink: number;
   permissions: number;
   initWithPath(path: string): void;
   exists(): boolean;
@@ -212,6 +214,7 @@ interface ConverterOutputStream {
   init(stream: OutputStream, charset: string): void;
   /** false when not every character was written. */
   writeString(text: string): boolean;
+  flush(): void;
   close(): void;
 }
 

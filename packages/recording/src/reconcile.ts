@@ -44,7 +44,17 @@ export interface DirSnapshot {
   /** Every parseable name. Unparseable names are absent and never touched. */
   readonly entries: readonly SnapshotEntry[];
   /** Unfinished export jobs from exports.jsonl. The path is the parent's; it never came from an extension page. */
-  readonly unfinishedExports: readonly string[];
+  readonly unfinishedExports: readonly UnfinishedExport[];
+}
+
+/** A part the export journal says started and never ended, and what is at its path now. */
+export interface UnfinishedExport {
+  readonly path: string;
+  /**
+   * `ours`: a regular file, not a link, that still starts with the first bytes the export journaled, which carry its
+   * random id. `other`: anything else. `gone`: nothing.
+   */
+  readonly at: "ours" | "other" | "gone";
 }
 
 export type ReconcileStep =
@@ -55,6 +65,7 @@ export type ReconcileStep =
   | { readonly kind: "delete-invalid-summary"; readonly segment: LogSegmentId }
   | { readonly kind: "truncate-log"; readonly segment: LogSegmentId; readonly toBytes: number }
   | { readonly kind: "delete-export-part"; readonly path: string }
+  | { readonly kind: "leave-export-part"; readonly path: string }
   | { readonly kind: "summarize-log"; readonly segment: LogSegmentId };
 
 const isOld = (snapshot: DirSnapshot, run: RunId | null): boolean =>
@@ -74,7 +85,10 @@ export const RECONCILE_STEPS: { readonly [K in ReconcileStep["kind"]]: string } 
   "delete-invalid-summary":
     "a summary that does not decode or no longer matches its segment's size",
   "truncate-log": "an old run's segment, without a valid summary, that ends mid-line",
-  "delete-export-part": "a .har.part the export journal says was started and never finished",
+  "delete-export-part":
+    "a .har.part the export journal says was started and never finished, still holding that export's first bytes",
+  "leave-export-part":
+    "a path the export journal names where something else now is: not this add-on's file, so left and reported",
   "summarize-log": "an old run's segment without a valid summary",
 };
 
@@ -121,7 +135,10 @@ export function planReconcile(snapshot: DirSnapshot): readonly ReconcileStep[] {
     if (e.validBytes < e.bytes)
       steps.push({ kind: "truncate-log", segment: e.name.segment, toBytes: e.validBytes });
   }
-  for (const path of snapshot.unfinishedExports) steps.push({ kind: "delete-export-part", path });
+  for (const { path, at } of snapshot.unfinishedExports) {
+    if (at === "ours") steps.push({ kind: "delete-export-part", path });
+    if (at === "other") steps.push({ kind: "leave-export-part", path });
+  }
   for (const e of oldUnsummarized) steps.push({ kind: "summarize-log", segment: e.name.segment });
   return steps;
 }
@@ -153,7 +170,8 @@ export function applyPlan(snapshot: DirSnapshot, steps: readonly ReconcileStep[]
         );
         break;
       case "delete-export-part":
-        unfinishedExports = unfinishedExports.filter((p) => p !== step.path);
+      case "leave-export-part":
+        unfinishedExports = unfinishedExports.filter((e) => e.path !== step.path);
         break;
       case "summarize-log": {
         const log = entries.filter(isLog).find((e) => e.name.segment === step.segment);

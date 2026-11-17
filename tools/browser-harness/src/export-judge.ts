@@ -335,7 +335,29 @@ export type RowObservation = {
     readonly before: string;
     readonly after: string;
   }[];
+  /** `exports.jsonl` after the export ended. */
+  readonly journal: string;
+  /** Paths the row put in place before the export started, so never the export's: no journal line may name one. */
+  readonly theirs: readonly string[];
 };
+
+/** Parts the journal says started and never ended: what the next start would act on. */
+function openJournalEntries(journal: string): readonly string[] {
+  const open = new Set<string>();
+  for (const line of journal.split("\n")) {
+    if (line.trim() === "") continue;
+    let entry: { started?: unknown; ended?: unknown };
+    try {
+      entry = JSON.parse(line) as typeof entry;
+    } catch {
+      open.add(`unreadable line ${line}`);
+      continue;
+    }
+    if (typeof entry.started === "string") open.add(entry.started);
+    if (typeof entry.ended === "string") open.delete(entry.ended);
+  }
+  return [...open];
+}
 
 const FAILURE_KEYS: readonly string[] = ["kind", "needBytes", "freeBytes"];
 
@@ -370,5 +392,19 @@ export function judgeRow(o: RowObservation): readonly string[] {
     if (o.served.includes(scheme)) problems.push(`a ${scheme} URL reached the page`);
   for (const file of o.untouched)
     if (file.before !== file.after) problems.push(`${file.path} changed`);
+  for (const path of openJournalEntries(o.journal))
+    problems.push(`the journal leaves ${path} open`);
+  for (const path of o.theirs)
+    if (o.journal.includes(JSON.stringify(path)))
+      problems.push(`the journal names ${path}, not the export's`);
   return problems;
+}
+
+/** Every file present before the row, and every file the row put in place, is as it was after the next start. */
+export function judgeNextStart(
+  kept: readonly { readonly path: string; readonly before: string; readonly after: string }[],
+): readonly string[] {
+  return kept
+    .filter((file) => file.before !== file.after)
+    .map((file) => `${file.path} was ${file.before}, after the next start ${file.after}`);
 }

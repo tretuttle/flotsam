@@ -383,6 +383,8 @@ export interface HarLog extends CustomHarFields {
   readonly entries: readonly HarEntry[];
   readonly comment?: string | undefined;
   readonly _harExport?: HarLogExtension | undefined;
+  /** Random, written first by One-Click HAR so a part on disk can be proved its export's own. Holds nothing else. */
+  readonly _harExportId?: string | undefined;
 }
 
 export interface HarDocument {

@@ -198,7 +198,10 @@ export const CRASH_ROWS: readonly CrashRow[] = [
     n: 13,
     diedDuring: "an export, mid-write (kill)",
     onDisk: "<folder>/<name>.har.part, journal says started",
-    snapshot: dir({ entries: sealedSegment, unfinishedExports: ["/home/u/Downloads/a.har.part"] }),
+    snapshot: dir({
+      entries: sealedSegment,
+      unfinishedExports: [{ path: "/home/u/Downloads/a.har.part", at: "ours" }],
+    }),
     plan: ["delete-export-part"],
     readsAs: "not-applicable",
     source: "round 1 row 13",

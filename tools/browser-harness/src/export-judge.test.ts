@@ -10,6 +10,7 @@ import {
   judgeAfterCrash,
   judgeCancel,
   judgeExport,
+  judgeNextStart,
   judgeRow,
   judgeTabCases,
   PLANTS,
@@ -211,8 +212,22 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       paths,
       files: [],
       untouched: [{ path: "/w/profile/prefs.js", before: "a", after: "a" }],
+      journal: "",
+      theirs: ["/w/out/theirs.har.part"],
     };
     expect(judgeRow(failed)).toEqual([]);
+    const ran = '{"started":"/w/out/a.har.part","head":"{"}\n{"ended":"/w/out/a.har.part"}\n';
+    expect(judgeRow({ ...failed, journal: ran })).toEqual([]);
+    expect(
+      judgeRow({
+        ...failed,
+        journal: `{"started":"/w/out/theirs.har.part","head":"{"}\n${ran}{"started":"/w/out/b.har.part","head":"{"}\n`,
+      }),
+    ).toEqual([
+      "the journal leaves /w/out/theirs.har.part open",
+      "the journal leaves /w/out/b.har.part open",
+      "the journal names /w/out/theirs.har.part, not the export's",
+    ]);
     expect(
       judgeRow({
         ...failed,
@@ -249,5 +264,15 @@ describe("the tab, cancel, disk-full and crash judges", () => {
         state: { kind: "write-failed", failure: { kind: "disk-full", needBytes: 9, freeBytes: 9 } },
       }),
     ).toHaveLength(1);
+  });
+
+  it("wants every file there before the row, and every file the row made, as it was after the next start", () => {
+    expect(judgeNextStart([{ path: "a", before: "file:1", after: "file:1" }])).toEqual([]);
+    expect(
+      judgeNextStart([
+        { path: "a", before: "file:1", after: "absent" },
+        { path: "b", before: "link:/x", after: "link:/x" },
+      ]),
+    ).toEqual(["a was file:1, after the next start absent"]);
   });
 });

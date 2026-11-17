@@ -50,6 +50,8 @@ export interface Disk {
   readonly exports: Set<string>;
   /** The export journal's started and unfinished jobs, by their .har.part path. */
   readonly journal: Set<string>;
+  /** Someone else's files at a path the journal named: a part replaced while its export ran. */
+  readonly theirs: Set<string>;
 }
 
 /** What the model knows was committed. The recovery under test never reads it. */
@@ -60,6 +62,10 @@ export interface Truth {
   readonly namedBodies: Map<string, string>;
   /** Files retention deleted on purpose: their lines and bodies are no longer expected. */
   readonly retained: Set<string>;
+  /** Export parts whose journal line landed. A part created and killed before its line is not provably the export's. */
+  readonly journaled: Set<string>;
+  /** Every file someone else put at a journaled path. None may ever be deleted. */
+  readonly theirs: Set<string>;
 }
 
 export class Crash extends Error {}
@@ -88,22 +94,28 @@ export const emptyDisk = (): Disk => ({
   siteDirs: new Set(),
   exports: new Set(),
   journal: new Set(),
+  theirs: new Set(),
 });
 export const emptyTruth = (): Truth => ({
   lines: new Map(),
   namedBodies: new Map(),
   retained: new Set(),
+  journaled: new Set(),
+  theirs: new Set(),
 });
 export const cloneDisk = (disk: Disk): Disk => ({
   files: new Map(disk.files),
   siteDirs: new Set(disk.siteDirs),
   exports: new Set(disk.exports),
   journal: new Set(disk.journal),
+  theirs: new Set(disk.theirs),
 });
 export const cloneTruth = (truth: Truth): Truth => ({
   lines: new Map([...truth.lines].map(([path, lines]) => [path, [...lines]])),
   namedBodies: new Map(truth.namedBodies),
   retained: new Set(truth.retained),
+  journaled: new Set(truth.journaled),
+  theirs: new Set(truth.theirs),
 });
 
 /** A directory's files, in an order the file system chooses: an exclusion may delete a log before or after its summary. */
@@ -342,12 +354,27 @@ export class Run {
     this.steps.run(() => this.disk.siteDirs.delete(dir));
   }
 
-  /** The export journal says started before the first byte, and finished after the rename. */
-  exportFile(): void {
+  /**
+   * The export journal says started once the part exists with its first bytes, and finished after the rename. With
+   * `replaced`, someone puts their own file at the part's path mid-export: the export leaves it and ends the line.
+   */
+  exportFile(replaced: boolean): void {
     const name = `${EXPORT_FOLDER}/export-${this.run}-${this.nextId()}.har`;
     const part = `${name}.part`;
-    this.steps.run(() => this.disk.journal.add(part));
     this.steps.run(() => this.disk.exports.add(part));
+    this.steps.run(() => {
+      this.disk.journal.add(part);
+      this.truth.journaled.add(part);
+    });
+    if (replaced) {
+      this.steps.run(() => {
+        this.disk.exports.delete(part);
+        this.disk.theirs.add(part);
+        this.truth.theirs.add(part);
+      });
+      this.steps.run(() => this.disk.journal.delete(part));
+      return;
+    }
     this.steps.run(() => {
       this.disk.exports.delete(part);
       this.disk.exports.add(name);
@@ -427,7 +454,15 @@ export function snapshotOf(disk: Disk, current: RunId): DirSnapshot {
       entries.push({ path, name, valid });
     } else entries.push({ path, name });
   }
-  return { current, excluded: excludedOn(disk), entries, unfinishedExports: [...disk.journal] };
+  const unfinishedExports = [...disk.journal].map((path) => ({
+    path,
+    at: disk.exports.has(path)
+      ? ("ours" as const)
+      : disk.theirs.has(path)
+        ? ("other" as const)
+        : ("gone" as const),
+  }));
+  return { current, excluded: excludedOn(disk), entries, unfinishedExports };
 }
 
 /** The store's executor for each step, as primitive writes a crash can interrupt too. Unknown kinds do nothing. */
@@ -454,7 +489,13 @@ export function execute(disk: Disk, plan: readonly ReconcileStep[], steps: Steps
         break;
       }
       case "delete-export-part":
-        steps.run(() => disk.exports.delete(step.path));
+        steps.run(() => {
+          disk.exports.delete(step.path);
+          disk.theirs.delete(step.path);
+        });
+        steps.run(() => disk.journal.delete(step.path));
+        break;
+      case "leave-export-part":
         steps.run(() => disk.journal.delete(step.path));
         break;
       case "summarize-log": {
