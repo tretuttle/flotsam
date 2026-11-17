@@ -66,4 +66,12 @@ describe("guard mutation operators", () => {
   it("does not pass a formatting call's argument through, since the message text stays the same", () => {
     expect([...keyed.keys()].some((key) => key.includes("call: String(id)"))).toBe(false);
   });
+
+  it("gives a method named like an Object.prototype member no swap, and still mutates around it", () => {
+    const source = 'export const hex = (n: number) => n.toString(16).startsWith("f");\n';
+    const found = generateMutants({ file: "src/y.ts", names: "all" }, source);
+    expect(found.map((m) => m.key)).toContain("src/y.ts hex method: startsWith -> endsWith");
+    expect(found.every((m) => typeof m.replacement === "string")).toBe(true);
+    expect(found.some((m) => m.key.includes("method: toString"))).toBe(false);
+  });
 });
