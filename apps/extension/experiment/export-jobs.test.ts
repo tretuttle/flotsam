@@ -86,7 +86,11 @@ describe("the export slot", () => {
     step.resolve();
     await jobs.idle();
     expect(jobs.job(job.id)?.state).toEqual({ kind: "cancelled" });
-    expect(jobs.audit(job.id)).toEqual({ bytesAtCancel: 3 * chunk, bytesAtStop: 3 * chunk });
+    expect(jobs.audit(job.id)).toEqual({
+      bytesAtCancel: 3 * chunk,
+      bytesAtStop: 3 * chunk,
+      keptFile: null,
+    });
     expect(jobs.cancel(job.id)).toBe(true);
   });
 
@@ -102,8 +106,21 @@ describe("the export slot", () => {
     expect(jobs.cancel(stuck.id)).toBe(true);
     await jobs.idle();
     expect(jobs.job(stuck.id)?.state).toEqual({ kind: "cancelled" });
-    expect(jobs.audit(stuck.id)).toEqual({ bytesAtCancel: 0, bytesAtStop: null });
+    expect(jobs.audit(stuck.id)).toEqual({ bytesAtCancel: 0, bytesAtStop: null, keptFile: null });
     expect(jobs.job(next.id)?.state.kind).toBe("done");
+  });
+
+  it("names the file a run kept when it had named it before it saw the cancel", async () => {
+    const gate = deferred<RunOutcome>();
+    const jobs = slot(async () => gate.promise);
+    const job = jobs.start(request);
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(jobs.cancel(job.id)).toBe(true);
+    gate.resolve(done);
+    await jobs.idle();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(jobs.job(job.id)?.state).toEqual({ kind: "cancelled" });
+    expect(jobs.audit(job.id)?.keptFile).toBe(done.kind === "done" ? done.fileName : null);
   });
 
   it("never runs a job cancelled while it waited, and refuses to cancel a finished or unknown job", async () => {

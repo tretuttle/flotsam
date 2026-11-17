@@ -32,8 +32,12 @@ const MIB = 1_048_576;
 /** What a row's own file holds, and where a row's own link points. */
 const THEIRS = "theirs";
 const NOWHERE = "/nonexistent";
+/** host.ts reads it only in a harness profile: exports name a `.har.part`, as where no folder can be held. */
+const NAMED_PARTS_PREF = "extensions.oneClickHar.harness.namedParts";
 
 type Place = { readonly base: string; readonly folder: string; readonly profile: string };
+/** What a row acts on mid-export: the part's path (named parts only) and the browser's own process. */
+type During = Place & { readonly part: string; readonly name: string; readonly pid: number };
 
 type Row = {
   readonly cause: string;
@@ -43,18 +47,22 @@ type Row = {
   /** A tmpfs mounted inside the browser's mount namespace, over the folder or one above it. */
   readonly mount?: { readonly options: string; readonly at?: (base: string) => string };
   /** Done once the export has written its first MiB. */
-  readonly during?: (at: Place & { readonly part: string }) => void;
+  readonly during?: (at: During) => void;
   readonly after?: (at: Place) => void;
   /** What the row itself put in the folder, before or during the export: not the export's, each left as it was. */
   readonly theirs?: readonly string[];
-  /** The export's rename of its part, held by hold-part-call.c (armed before the export starts) while the row acts. */
+  /** Named parts: the export's rename of its part, held by hold-part-call.c (armed before the export starts). */
   readonly hold?: Hold;
+  /** An unnamed file: the export held at a pause through the harness topic (armed before the export starts). */
+  readonly pause?: Hold & { readonly at: "before-link" | "after-link" };
+  /** The export names a `.har.part` and renames it, as where no folder can be held (the harness-only pref). */
+  readonly named?: true;
   readonly expect: (fileName: string) => RowOutcome;
 };
 
 type Hold = {
-  /** Changes the files while the rename is held, and returns whether the change is in place, checked before the release. */
-  readonly act: (at: Place & { readonly part: string }) => () => boolean;
+  /** Changes the files while the call is held, and returns whether the change is in place, checked before the release. */
+  readonly act: (at: During) => () => boolean;
   /** Cancel while the call is held, and let it go once the export has ended. */
   readonly cancel?: true;
   /** Let the call go only once the export has ended. */
@@ -64,6 +72,14 @@ type Hold = {
 };
 
 const failed = (failure: string) => (): RowOutcome => ({ kind: "write-failed", failure });
+/** A failure found after the link named the export's own file, which stays under `suffix`. */
+const failedKeeping =
+  (failure: string, suffix = "") =>
+  (fileName: string): RowOutcome => ({
+    kind: "write-failed",
+    failure,
+    kept: `${fileName}${suffix}.har`,
+  });
 const cancelled = (): RowOutcome => ({ kind: "cancelled" });
 /** The product's time limit for one export file call (EXPORT_STEP_MS in host.ts). */
 const STEP_MS = 15_000;
@@ -94,16 +110,35 @@ const folderToProfile = ({ base, folder, profile }: Place, moved: string): strin
   NodeFS.symlinkSync(profile, folder);
   return `${base}/${moved}`;
 };
+/** The folder moved to `<base>/<moved>`, a link to the profile put in its place, then the folder put back. */
+const folderSwappedAndBack = (at: Place, moved: string): void => {
+  folderToProfile(at, moved);
+  NodeFS.unlinkSync(at.folder);
+  NodeFS.renameSync(`${at.base}/${moved}`, at.folder);
+};
+/** The descriptors of the browser's unnamed files in `folder`: what /proc names `<folder>/#<inode> (deleted)`. */
+const unnamedIn = (pid: number, folder: string): readonly string[] =>
+  NodeFS.readdirSync(`/proc/${String(pid)}/fd`)
+    .map((fd) => `/proc/${String(pid)}/fd/${fd}`)
+    .filter((path) => {
+      try {
+        const target = NodeFS.readlinkSync(path);
+        return target.startsWith(`${folder}/#`) && target.endsWith(" (deleted)");
+      } catch {
+        return false;
+      }
+    });
 const mkfifo = (path: string): void => {
   const made = NodeChildProcess.spawnSync("mkfifo", ["-m", "600", path], { encoding: "utf8" });
   if (made.status !== 0) throw new Error(`mkfifo: ${made.stderr}`);
 };
 
 /**
- * One row per cause, each made to happen for real. Every name in FS_ERROR_KINDS is produced by a row here; `other`
+ * The same causes where the export names a `.har.part` (Windows, macOS, a Linux file system with no unnamed files),
+ * forced by the harness-only pref. Every name in FS_ERROR_KINDS is produced by a row in one of the two tables; `other`
  * is the kind for an error the table does not name, and no row may end as it.
  */
-const ROWS: readonly Row[] = [
+const NAMED_ROWS: readonly Row[] = [
   {
     cause: "read-only mount",
     fileName: "ro-mount",
@@ -383,6 +418,326 @@ const ROWS: readonly Row[] = [
   },
 ];
 
+/** The planted file `name` holds, so its bytes can be told from the export's. */
+const plant = (path: string): void => NodeFS.writeFileSync(path, THEIRS);
+/** Writes `text` over the start of every unnamed export file in `folder`, through the browser's own descriptors. */
+const overwriteUnnamed = (pid: number, folder: string): void => {
+  const found = unnamedIn(pid, folder);
+  if (found.length === 0) throw new Error(`no unnamed file of the browser in ${folder}`);
+  for (const path of found) {
+    const fd = NodeFS.openSync(path, "r+");
+    try {
+      NodeFS.writeSync(fd, Buffer.from(" ".repeat(32)), 0, 32, 0);
+    } finally {
+      NodeFS.closeSync(fd);
+    }
+  }
+};
+
+/**
+ * Linux: the export holds its folder open and its file is unnamed until one link names it, which never replaces. Each
+ * row makes its cause happen for real; the racing rows act while the export waits at a pause, before or after the
+ * link. Nothing the row put anywhere may change, and no export byte may land outside the folder the export holds.
+ */
+const UNNAMED_ROWS: readonly Row[] = [
+  {
+    cause: "read-only mount",
+    fileName: "ro-mount",
+    folder: (b) => dir(`${b}/ro`),
+    mount: { options: "ro,size=1m" },
+    expect: failed("read-only"),
+  },
+  {
+    cause: "folder to create on a read-only mount",
+    fileName: "ro-create",
+    folder: (b) => `${dir(`${b}/ro-parent`)}/below`,
+    mount: { options: "ro,size=1m", at: (b) => `${b}/ro-parent` },
+    expect: failed("read-only"),
+  },
+  {
+    cause: "folder is a file",
+    fileName: "is-file",
+    folder: (b) => {
+      NodeFS.writeFileSync(`${b}/afile`, "not a folder");
+      return `${b}/afile`;
+    },
+    expect: failed("not-a-folder"),
+  },
+  {
+    cause: "folder missing at start",
+    fileName: "missing",
+    folder: (b) => `${b}/missing/below`,
+    expect: doneAs(""),
+  },
+  {
+    cause: "folder deleted mid-export",
+    fileName: "deleted",
+    folder: (b) => dir(`${b}/deleted`),
+    during: ({ folder }) => NodeFS.rmSync(folder, { recursive: true, force: true }),
+    expect: failed("folder-missing"),
+  },
+  {
+    cause: "no permission",
+    fileName: "no-permission",
+    folder: (b) => locked(`${b}/no-permission`),
+    after: ({ folder }) => NodeFS.chmodSync(folder, 0o700),
+    expect: failed("access-denied"),
+  },
+  {
+    cause: "folder to create where this user may not write",
+    fileName: "no-permission-create",
+    folder: (b) => `${locked(`${b}/locked-parent`)}/below`,
+    after: ({ base }) => NodeFS.chmodSync(`${base}/locked-parent`, 0o700),
+    expect: failed("access-denied"),
+  },
+  {
+    cause: "full disk",
+    fileName: "full",
+    folder: (b) => dir(`${b}/full`),
+    mount: { options: "size=8m" },
+    expect: failed("disk-full"),
+  },
+  {
+    cause: "a stale part and a dangling link at the part names (never used)",
+    fileName: "part-taken",
+    folder: (b) => {
+      const folder = dir(`${b}/part-taken`);
+      NodeFS.writeFileSync(`${folder}/part-taken.har.part`, THEIRS);
+      NodeFS.symlinkSync(NOWHERE, `${folder}/part-taken (2).har.part`);
+      return folder;
+    },
+    theirs: ["part-taken.har.part", "part-taken (2).har.part"],
+    expect: doneAs(""),
+  },
+  {
+    cause: "name collision mid-export",
+    fileName: "collision",
+    folder: (b) => dir(`${b}/collision`),
+    during: ({ name }) => plant(name),
+    theirs: ["collision.har"],
+    expect: doneAs(" (2)"),
+  },
+  {
+    cause: "folder is a link to the profile",
+    fileName: "linked-folder",
+    folder: (b, profile) => {
+      NodeFS.symlinkSync(profile, `${b}/linked`);
+      return `${b}/linked`;
+    },
+    expect: failed("folder-refused"),
+  },
+  {
+    cause: "the unnamed file's first bytes overwritten through the browser's own descriptor",
+    fileName: "overwritten",
+    folder: (b) => dir(`${b}/overwritten`),
+    during: ({ pid, folder }) => overwriteUnnamed(pid, folder),
+    expect: failed("file-replaced"),
+  },
+  {
+    cause: "a foreign file written at the finished name while the link waits",
+    fileName: "raced-finish",
+    folder: (b) => dir(`${b}/raced-finish`),
+    pause: {
+      at: "before-link",
+      act: ({ name }) => {
+        plant(name);
+        return () => lstat(name)?.isFile() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["raced-finish.har"],
+    expect: doneAs(" (2)"),
+  },
+  {
+    cause: "a link to prefs.js put at the finished name while the link waits",
+    fileName: "raced-link",
+    folder: (b) => dir(`${b}/raced-link`),
+    pause: {
+      at: "before-link",
+      act: ({ name, profile }) => {
+        NodeFS.symlinkSync(`${profile}/prefs.js`, name);
+        return () => lstat(name)?.isSymbolicLink() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["raced-link.har"],
+    expect: doneAs(" (2)"),
+  },
+  {
+    cause: "a FIFO put at the finished name while the link waits (never opened)",
+    fileName: "raced-fifo",
+    folder: (b) => dir(`${b}/raced-fifo`),
+    pause: {
+      at: "before-link",
+      act: ({ name }) => {
+        mkfifo(name);
+        return isFifo(name);
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["raced-fifo.har"],
+    expect: doneAs(" (2)"),
+  },
+  {
+    cause: "a file put at the part's name while the link waits (never touched)",
+    fileName: "raced-part",
+    folder: (b) => dir(`${b}/raced-part`),
+    pause: {
+      at: "before-link",
+      act: ({ part }) => {
+        plant(part);
+        return () => lstat(part)?.isFile() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["raced-part.har.part"],
+    expect: doneAs(""),
+  },
+  {
+    cause: "folder replaced by a link to the profile while the link waits",
+    fileName: "link-folder",
+    folder: (b) => dir(`${b}/link-folder`),
+    pause: {
+      at: "before-link",
+      act: (at) => {
+        folderToProfile(at, "link-folder-moved");
+        return () => lstat(at.folder)?.isSymbolicLink() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    expect: failedKeeping("folder-refused"),
+  },
+  {
+    cause:
+      "folder replaced by a link to the profile while the link waits, files planted there at the part and finished names",
+    fileName: "plant-folder",
+    folder: (b) => dir(`${b}/plant-folder`),
+    pause: {
+      at: "before-link",
+      act: (at) => {
+        folderToProfile(at, "plant-folder-moved");
+        plant(`${at.profile}/plant-folder.har.part`);
+        plant(`${at.profile}/plant-folder.har`);
+        return () => lstat(at.folder)?.isSymbolicLink() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["plant-folder.har.part", "plant-folder.har"],
+    expect: failedKeeping("folder-refused"),
+  },
+  {
+    cause: "folder replaced by a link to the profile and put back while the link waits",
+    fileName: "plant-restore",
+    folder: (b) => dir(`${b}/plant-restore`),
+    pause: {
+      at: "before-link",
+      act: (at) => {
+        folderSwappedAndBack(at, "plant-restore-moved");
+        return () => lstat(at.folder)?.isDirectory() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    expect: doneAs(""),
+  },
+  {
+    cause: "folder deleted while the link waits",
+    fileName: "gone-folder",
+    folder: (b) => dir(`${b}/gone-folder`),
+    pause: {
+      at: "before-link",
+      act: ({ folder }) => {
+        NodeFS.rmSync(folder, { recursive: true, force: true });
+        return absent(folder);
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    expect: failed("folder-missing"),
+  },
+  {
+    cause: "cancel while the link waits",
+    fileName: "cancel-link",
+    folder: (b) => dir(`${b}/cancel-link`),
+    pause: { at: "before-link", act: () => () => true, cancel: true, withinMs: PROMPTLY_MS },
+    expect: cancelled,
+  },
+  {
+    cause: "the link still waiting at the step limit",
+    fileName: "late-link",
+    folder: (b) => dir(`${b}/late-link`),
+    pause: {
+      at: "before-link",
+      act: () => () => true,
+      keep: true,
+      withinMs: STEP_MS + PROMPTLY_MS,
+    },
+    expect: failed("timed-out"),
+  },
+  {
+    cause: "the finished name removed after the link",
+    fileName: "removed-finish",
+    folder: (b) => dir(`${b}/removed-finish`),
+    pause: {
+      at: "after-link",
+      act: ({ name }) => {
+        NodeFS.rmSync(name);
+        return absent(name);
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    expect: failedKeeping("file-replaced"),
+  },
+  {
+    cause: "a foreign file renamed over the finished name after the link",
+    fileName: "replaced-finish",
+    folder: (b) => dir(`${b}/replaced-finish`),
+    pause: {
+      at: "after-link",
+      act: ({ base, name }) => {
+        plant(`${base}/replaced-finish.tmp`);
+        NodeFS.renameSync(`${base}/replaced-finish.tmp`, name);
+        return () => lstat(name)?.size === THEIRS.length;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["replaced-finish.har"],
+    expect: failedKeeping("file-replaced"),
+  },
+  {
+    cause:
+      "folder replaced by a link to the profile after the link, a file planted there at the finished name",
+    fileName: "after-folder",
+    folder: (b) => dir(`${b}/after-folder`),
+    pause: {
+      at: "after-link",
+      act: (at) => {
+        folderToProfile(at, "after-folder-moved");
+        plant(`${at.profile}/after-folder.har`);
+        return () => lstat(at.folder)?.isSymbolicLink() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    theirs: ["after-folder.har"],
+    expect: failedKeeping("folder-refused"),
+  },
+  {
+    cause: "a name of 255 bytes with .har (the part suffix no longer counts)",
+    fileName: "n".repeat(251),
+    folder: (b) => dir(`${b}/longest`),
+    expect: doneAs(""),
+  },
+  {
+    cause: "name too long",
+    fileName: "n".repeat(300),
+    folder: (b) => dir(`${b}/long`),
+    expect: failed("name-too-long"),
+  },
+];
+
+const ROWS: readonly Row[] = [
+  ...UNNAMED_ROWS,
+  ...NAMED_ROWS.map((row) => ({ ...row, named: true as const, cause: `named part: ${row.cause}` })),
+];
+
 /**
  * The browser in its own user and mount namespace: root there to mount the row's tmpfs, then this user again in a
  * nested namespace, so file permissions apply to it as they do to the user. Every step execs, so the process the
@@ -456,20 +811,23 @@ const fingerprint = (path: string): string => {
 };
 
 /**
- * Files under the profile and the archive that are new or changed since `before`, and whether each holds an export's
- * bytes. The browser rewrites its own files during a row; none of them may take an export byte. The journal holds the
- * head only as escaped JSON text, so it is judged by its lines, not here.
+ * Files under `root` (the row's whole tree: the profile, the archive and every folder around the export's) that are
+ * new or changed since `before`, outside the folder the export holds, and whether each holds an export's bytes. The
+ * browser rewrites its own files during a row; none of them may take an export byte. The journal holds the head only
+ * as escaped JSON text, so it is judged by its lines, not here.
  */
 const changedOutside = (
-  roots: readonly string[],
+  root: string,
   before: ReadonlyMap<string, string>,
   theirs: ReadonlySet<string>,
+  folderInode: number | null,
 ): RowObservation["outside"] => {
   const changed: { path: string; exportBytes: boolean }[] = [];
-  for (const root of roots)
-    for (const [path, print] of filesUnder(root, []))
-      if (before.get(path) !== print && !theirs.has(path))
-        changed.push({ path, exportBytes: exportBytesIn(path) === "holds export bytes" });
+  for (const [path, print] of filesUnder(root, [])) {
+    if (before.get(path) === print || theirs.has(path)) continue;
+    if (folderInode !== null && lstat(NodePath.dirname(path))?.ino === folderInode) continue;
+    changed.push({ path, exportBytes: exportBytesIn(path) === "holds export bytes" });
+  }
   return changed;
 };
 
@@ -607,15 +965,19 @@ async function runRow(
       display: context.display,
       protocol: "marionette",
       signal: context.signal,
+      ...(row.named === true ? { extraPrefs: [{ name: NAMED_PARTS_PREF, value: true }] } : {}),
     });
     const page = await openExtensionPage(session, extensionPath);
     const tab = await session.openTab(`${server.origin}${FIXTURES_PAGE_PATH}`);
     await session.evaluate(tab, "window.__harnessReady");
     const tabId = await newestPageTab(page);
     const before = exportBytesIn(prefs);
-    const outsideRoots = [profile, workspace.dataHome];
-    const outsideBefore = new Map(outsideRoots.flatMap((root) => [...filesUnder(root, [])]));
+    const outsideBefore = filesUnder(base, []);
+    /** The folder the export holds, by inode, wherever a row moves it; read again at the end if the export made it. */
+    let folderInode = lstat(folder)?.isDirectory() === true ? (lstat(folder)?.ino ?? null) : null;
     if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "arm"), "");
+    if (row.pause !== undefined)
+      await callHook(session, { kind: "export-pause", point: row.pause.at, action: "arm" });
     try {
       const job = await startExport(page, {
         selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
@@ -624,24 +986,24 @@ async function runRow(
         packaging: "har",
         fileName: row.fileName,
       });
-      const part = `${folder}/${row.fileName}.har.part`;
+      const name = `${folder}/${row.fileName}.har`;
+      const at: During = { ...place, part: `${name}.part`, name, pid: session.browserPid };
       if (row.during !== undefined) {
         const writing = await waitForJob(
           page,
           job.id,
           (j) => ended(j) || (j.state.kind === "writing" && j.state.bytes >= MIB),
         );
-        if (writing.state.kind === "writing") row.during({ ...place, part });
+        if (writing.state.kind === "writing") row.during(at);
+      }
+      if (row.pause !== undefined) {
+        const paused = await pauseAndAct(session, page, job.id, row.pause, at, keepTheirs);
+        timing = paused.timing;
+        state = paused.state;
+        holdProblems.push(...paused.problems);
       }
       if (row.hold !== undefined && holdDir !== null) {
-        const held = await holdAndAct(
-          page,
-          job.id,
-          holdDir,
-          row.hold,
-          { ...place, part },
-          keepTheirs,
-        );
+        const held = await holdAndAct(page, job.id, holdDir, row.hold, at, keepTheirs);
         timing = held.timing;
         state = held.state;
         holdProblems.push(...held.problems);
@@ -653,9 +1015,12 @@ async function runRow(
       journal = await journalSettled(NodePath.join(workspace.root(), "exports.jsonl"));
     } finally {
       if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
+      if (row.pause !== undefined)
+        await callHook(session, { kind: "export-pause", point: row.pause.at, action: "release" });
       wakeFifoReaders(base);
       row.after?.(place);
     }
+    folderInode ??= lstat(folder)?.isDirectory() === true ? (lstat(folder)?.ino ?? null) : null;
     const served = JSON.stringify({
       state,
       list: await value(page, "browser.oneClickHar.listExports()"),
@@ -682,7 +1047,7 @@ async function runRow(
       journal,
       theirs: theirsBefore,
       timing,
-      outside: changedOutside(outsideRoots, outsideBefore, theirsReal),
+      outside: changedOutside(base, outsideBefore, theirsReal, folderInode),
     };
   }
   // The next start, which reads the journal and deletes what it can prove an unfinished export left.
@@ -720,7 +1085,7 @@ async function holdAndAct(
   id: string,
   holdDir: string,
   hold: Hold,
-  at: Place & { readonly part: string },
+  at: During,
   acted: () => void,
 ): Promise<{
   readonly timing: RowObservation["timing"];
@@ -774,6 +1139,57 @@ async function holdAndAct(
   }
   const timing = { tookMs: Date.now() - from, withinMs: hold.withinMs };
   go();
+  return { timing, problems, state: job.state };
+}
+
+/**
+ * Waits for the export at its pause, armed through the harness topic before the export started, acts, and lets it go
+ * once the row's change is in place: or cancels, or keeps it held until the export has ended. Times the end.
+ */
+async function pauseAndAct(
+  session: Parameters<typeof callHook>[0],
+  page: Parameters<typeof waitForJob>[0],
+  id: string,
+  pause: NonNullable<Row["pause"]>,
+  at: During,
+  acted: () => void,
+): Promise<{
+  readonly timing: RowObservation["timing"];
+  readonly problems: readonly string[];
+  readonly state: unknown;
+}> {
+  const hook = (action: "reached" | "release") =>
+    callHook(session, { kind: "export-pause", point: pause.at, action });
+  const reachBy = Date.now() + 120_000;
+  while ((await hook("reached")) !== true) {
+    const job = await waitForJob(page, id, () => true);
+    if (ended(job) || Date.now() > reachBy)
+      return {
+        timing: null,
+        problems: [`the ${pause.at} pause was never reached: ${JSON.stringify(job.state)}`],
+        state: job.state,
+      };
+    await sleep(20);
+  }
+  const inPlace = pause.act(at);
+  const observeBy = Date.now() + 10_000;
+  while (!inPlace() && Date.now() < observeBy) await sleep(20);
+  const problems = inPlace() ? [] : ["the row's change was not in place before the release"];
+  acted();
+  if (pause.cancel === true)
+    await value(page, `browser.oneClickHar.cancelExport(${JSON.stringify(id)}).then(String)`);
+  else if (pause.keep !== true) await hook("release");
+  const from = Date.now();
+  const endBy = from + pause.withinMs + 30_000;
+  let job = await waitForJob(page, id, () => true);
+  while (!ended(job) && Date.now() < endBy) {
+    await sleep(50);
+    job = await waitForJob(page, id, () => true);
+  }
+  const timing = { tookMs: Date.now() - from, withinMs: pause.withinMs };
+  await hook("release");
+  // What a held export does once let go after its job ended: it must name nothing.
+  await sleep(500);
   return { timing, problems, state: job.state };
 }
 

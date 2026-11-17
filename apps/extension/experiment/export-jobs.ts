@@ -21,7 +21,12 @@ export type RunOutcome =
       readonly report: ExportReport;
     }
   | { readonly kind: "cancelled" }
-  | { readonly kind: "write-failed"; readonly failure: WriteFailure };
+  | {
+      readonly kind: "write-failed";
+      readonly failure: WriteFailure;
+      /** The name the export's own file kept: it was named before the failure was found, and is left as it is. */
+      readonly kept?: string;
+    };
 
 export interface RunProgress {
   readonly done: number;
@@ -41,6 +46,8 @@ export type ExportRun = (
 export interface CancelAudit {
   readonly bytesAtCancel: number;
   readonly bytesAtStop: number | null;
+  /** The export's own file, when its run named it before it saw the cancel: left as it is. */
+  readonly keptFile: string | null;
 }
 
 /** The jobs `listExports` returns: this run's, newest first. */
@@ -53,7 +60,7 @@ interface Slot {
   stop: () => void;
   started: boolean;
   bytes: number;
-  audit: { bytesAtCancel: number; bytesAtStop: number | null } | null;
+  audit: { bytesAtCancel: number; bytesAtStop: number | null; keptFile: string | null } | null;
 }
 
 const WAITING: ExportState = { kind: "writing", done: 0, total: 0, bytes: 0 as ByteCount };
@@ -98,7 +105,15 @@ export function createExportJobs(ports: {
       )
       .catch((): RunOutcome => ({ kind: "write-failed", failure: { kind: "other" } }))
       .then((outcome) => {
-        if (slot.audit !== null) slot.audit.bytesAtStop = slot.bytes;
+        if (slot.audit !== null) {
+          slot.audit.bytesAtStop = slot.bytes;
+          slot.audit.keptFile =
+            outcome.kind === "done"
+              ? outcome.fileName
+              : outcome.kind === "write-failed"
+                ? (outcome.kept ?? null)
+                : null;
+        }
         return outcome;
       });
     set(slot, await Promise.race([ran, stopped]));
@@ -138,7 +153,7 @@ export function createExportJobs(ports: {
       if (!slot.signal.aborted) {
         slot.signal.aborted = true;
         slot.signal.reason = undefined;
-        slot.audit = { bytesAtCancel: slot.bytes, bytesAtStop: null };
+        slot.audit = { bytesAtCancel: slot.bytes, bytesAtStop: null, keptFile: null };
         slot.stop();
       }
       return true;

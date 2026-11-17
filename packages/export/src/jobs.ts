@@ -105,7 +105,12 @@ export type ExportState =
       readonly report: ExportReport;
     }
   | { readonly kind: "cancelled" }
-  | { readonly kind: "write-failed"; readonly failure: WriteFailure };
+  | {
+      readonly kind: "write-failed";
+      readonly failure: WriteFailure;
+      /** The name the export's own file kept: it was named before the failure was found, and is left as it is. */
+      readonly kept?: string;
+    };
 
 export interface ExportJob {
   readonly id: ExportId;

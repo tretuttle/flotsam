@@ -5,7 +5,7 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { build } from "vite-plus/pack";
-import { oneClickHarApi, namespace } from "../experiment/contract.ts";
+import { FILE_WORKER, oneClickHarApi, namespace } from "../experiment/contract.ts";
 import { toGeckoSchema } from "../experiment/gecko-schema.ts";
 import { extensionRoot, readManifest } from "./manifest.ts";
 import { MINIFIED } from "./minify.ts";
@@ -62,4 +62,9 @@ if (import.meta.main) {
     `${JSON.stringify(toGeckoSchema(namespace, oneClickHarApi), null, 2)}\n`,
   );
   await bundleParent(NodePath.resolve(extensionRoot, outRoot, experiment.parent.script), true);
+  await bundleScript(
+    NodePath.join(extensionRoot, "experiment", "file-worker.ts"),
+    NodePath.resolve(extensionRoot, outRoot, FILE_WORKER),
+    true,
+  );
 }

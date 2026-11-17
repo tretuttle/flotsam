@@ -18,6 +18,8 @@
     "experiment/store.ts",
     "experiment/host.ts",
     "experiment/archive-source.ts",
-    "experiment/devtools.ts"
+    "experiment/devtools.ts",
+    "experiment/file-worker.ts",
+    "experiment/held-folder.ts"
   ]
 }

@@ -189,8 +189,14 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       audit: { bytesAtCancel: 10, bytesAtStop: 10 + CANCEL_BOUND_BYTES },
       left: [],
       journal,
+      openUnnamed: 0,
     };
     expect(judgeCancel(ok)).toEqual([]);
+    expect(judgeCancel({ ...ok, journal: "" })).toEqual([]);
+    expect(judgeCancel({ ...ok, openUnnamed: 1 })).toHaveLength(1);
+    expect(
+      judgeCancel({ ...ok, audit: { bytesAtCancel: 10, bytesAtStop: 10, keptFile: "x.har" } }),
+    ).toHaveLength(1);
     expect(
       judgeCancel({ ...ok, audit: { bytesAtCancel: 10, bytesAtStop: 11 + CANCEL_BOUND_BYTES } }),
     ).toHaveLength(1);
@@ -199,8 +205,14 @@ describe("the tab, cancel, disk-full and crash judges", () => {
   });
 
   it("wants the next start to delete the part a killed export left", () => {
-    expect(judgeAfterCrash({ steps: ["delete-export-part"], left: [] })).toEqual([]);
-    expect(judgeAfterCrash({ steps: [], left: ["killed.har.part"] })).toHaveLength(2);
+    expect(judgeAfterCrash({ steps: ["delete-export-part"], left: [], journaled: true })).toEqual(
+      [],
+    );
+    expect(judgeAfterCrash({ steps: [], left: ["killed.har.part"], journaled: true })).toHaveLength(
+      2,
+    );
+    expect(judgeAfterCrash({ steps: [], left: [], journaled: false })).toEqual([]);
+    expect(judgeAfterCrash({ steps: [], left: ["killed.har"], journaled: false })).toHaveLength(1);
   });
 
   it("wants each cause's named kind or file, numbers only, no path to the page, nothing outside touched", () => {

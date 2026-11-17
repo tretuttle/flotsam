@@ -49,13 +49,17 @@ import {
   createPartSink,
   exportFiles,
   journalLine,
+  type ExportPause,
   type ExportPlatform,
+  type HeldFolder,
   type JournalEntry,
   type Part,
   type PartJournal,
 } from "./export-file.ts";
 import { createExportJobs, type ExportJobs, type RunOutcome } from "./export-jobs.ts";
 import { forbiddenRoots, platform } from "./files.ts";
+import type { WorkerArch } from "./file-worker.ts";
+import { holdFolderIn } from "./held-folder.ts";
 import {
   appendText,
   localFile,
@@ -169,8 +173,60 @@ const realPathOf = (path: string): string => {
   return file.path;
 };
 
+/** Architectures file-worker.ts has the open flags for. */
+const WORKER_ARCHES: { readonly [arch: string]: WorkerArch } = {
+  "x86-64": "x86-64",
+  aarch64: "aarch64",
+};
+/** Set only in a harness profile, beside `extensions.oneClickHar.harness`: exports name a part as other platforms do. */
+const NAMED_PARTS_PREF = "extensions.oneClickHar.harness.namedParts";
+
+/**
+ * Where exports hold their folder open and write an unnamed file: Linux, through file-worker.ts. Elsewhere, and in a
+ * harness profile that asks for named parts, there is none and exports use `<name>.har.part`.
+ */
+const heldFolders = (
+  workerUrl: string | null,
+  modes: Modes,
+): ((realFolder: string) => Promise<HeldFolder>) | undefined => {
+  const arch = WORKER_ARCHES[Services.sysinfo.getProperty("arch")];
+  if (workerUrl === null || Services.appinfo.OS !== "Linux" || arch === undefined) return undefined;
+  if (
+    Services.prefs.getBoolPref("extensions.oneClickHar.harness", false) &&
+    Services.prefs.getBoolPref(NAMED_PARTS_PREF, false)
+  )
+    return undefined;
+  return holdFolderIn(workerUrl, arch, modes.file ?? 0o644);
+};
+
+/** Points where a harness profile can hold an export, armed and let go through the harness topic. */
+const exportPauses = () => {
+  const armed = new Set<ExportPause>();
+  const waiting = new Map<ExportPause, () => void>();
+  return {
+    pass: (point: ExportPause): Promise<void> => {
+      if (!armed.delete(point)) return Promise.resolve();
+      return new Promise((resolve) => waiting.set(point, resolve));
+    },
+    arm: (point: ExportPause): void => {
+      armed.add(point);
+    },
+    reached: (point: ExportPause): boolean => waiting.has(point),
+    release: (point: ExportPause): boolean => {
+      const resolve = waiting.get(point);
+      waiting.delete(point);
+      resolve?.();
+      return resolve !== undefined;
+    },
+  };
+};
+
 /** The only raw file calls an export makes. `exportFiles` classifies whatever they throw. */
-const geckoExportPlatform = (modes: Modes): ExportPlatform => ({
+const geckoExportPlatform = (
+  modes: Modes,
+  holdFolder: ExportPlatform["holdFolder"],
+): ExportPlatform => ({
+  ...(holdFolder === undefined ? {} : { holdFolder }),
   state: pathState,
   realPath: realPathOf,
   parent: (path) => PathUtils.parent(path),
@@ -239,7 +295,10 @@ export function createGeckoHost(options: {
   readonly creator: { readonly name: string; readonly version: string };
   /** The add-on's own tab manager answers for every page. */
   readonly extension: ExtensionContext["extension"];
+  /** file-worker.js as a resource URL a ChromeWorker can start from; null where it is not registered. */
+  readonly workerUrl: string | null;
 }) {
+  const pauses = exportPauses();
   const { reads, creator } = options;
   const finished = new Map<ExportId, string>();
 
@@ -371,9 +430,9 @@ export function createGeckoHost(options: {
     };
     const roots = realRoots(rec?.root ?? null);
     const files = exportFiles(
-      geckoExportPlatform(modes),
+      geckoExportPlatform(modes, heldFolders(options.workerUrl, modes)),
       (real) => guardFolder(real, roots, platform()).ok,
-      { stepMs: EXPORT_STEP_MS, timer: oneShot, signal: control.signal },
+      { stepMs: EXPORT_STEP_MS, timer: oneShot, signal: control.signal, pause: pauses.pass },
     );
     let written: { readonly part: Part; readonly path: string } | null = null;
     let last = { done: 0, total: 0 };
@@ -423,8 +482,9 @@ export function createGeckoHost(options: {
     } catch (error) {
       if (written !== null) await written.part.discard().catch(() => undefined);
       if (control.signal.aborted) return { kind: "cancelled" };
-      if (error instanceof WriteRefused) return { kind: "write-failed", failure: error.failure };
-      return { kind: "write-failed", failure: { kind: "other" } };
+      const kept = written?.part.kept() ?? null;
+      const failure = error instanceof WriteRefused ? error.failure : { kind: "other" as const };
+      return { kind: "write-failed", failure, ...(kept === null ? {} : { kept }) };
     }
   };
 
@@ -446,6 +506,7 @@ export function createGeckoHost(options: {
 
   return {
     jobs,
+    pauses,
     lookup,
     popup,
     preview,

@@ -13,7 +13,7 @@ import type { ReconcileStep } from "@one-click-har/recording/reconcile";
 import { compileRoutes } from "@one-click-har/recording/routes";
 import type { StoredSettings } from "@one-click-har/recording/settings";
 import { loadActivity } from "./archive-source.ts";
-import { namespace } from "./contract.ts";
+import { FILE_WORKER, namespace } from "./contract.ts";
 import { toolboxOf } from "./devtools.ts";
 import { unfinishedExports } from "./export-file.ts";
 import { parseExportId } from "@one-click-har/export/jobs";
@@ -35,6 +35,10 @@ import { HOLD_POINTS, openStore, type HoldPoint, type Store } from "./store.ts";
 /** Set only in a harness profile's user.js. Enables the observer topic below, which only system-principal code reaches. */
 const HARNESS_PREF = "extensions.oneClickHar.harness";
 const HARNESS_TOPIC = "one-click-har-harness";
+/** The resource root file-worker.js is served under, and its path in the package. */
+const WORKER_ROOT = "one-click-har";
+const resourceHandler = () =>
+  Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsISubstitutingProtocolHandler);
 
 interface Running {
   readonly run: RunId;
@@ -141,12 +145,20 @@ type HarnessRequest =
   | { readonly kind: "exclude"; readonly site: string }
   | { readonly kind: "arm" | "reached"; readonly point: string }
   | { readonly kind: "guard"; readonly path: string }
-  | { readonly kind: "export-audit"; readonly id: string };
+  | { readonly kind: "export-audit"; readonly id: string }
+  | {
+      readonly kind: "export-pause";
+      readonly point: string;
+      readonly action: "arm" | "reached" | "release";
+    };
 
 const isHoldPoint = (value: string): value is HoldPoint =>
   (HOLD_POINTS as readonly string[]).includes(value);
 
-/** The harness's way in: flush, seal, exclude, hold the write chain at a crash point, read recovery and the guard. */
+/**
+ * The harness's way in: flush, seal, exclude, hold the write chain at a crash point or an export at a pause, read
+ * recovery and the guard.
+ */
 async function answerHarness(
   state: Running,
   host: GeckoHost,
@@ -189,6 +201,12 @@ async function answerHarness(
       if (id === null) throw new Error(`not an export id: ${request.id}`);
       return host.jobs.audit(id);
     }
+    case "export-pause": {
+      const point = request.point;
+      if (point !== "before-link" && point !== "after-link")
+        throw new Error(`not an export pause: ${point}`);
+      return host.pauses[request.action](point) ?? null;
+    }
   }
 }
 
@@ -229,6 +247,7 @@ class OneClickHarParent extends ExtensionAPI {
       reads: () => recordingReads(this.#state),
       creator: { name: this.extension.manifest.name, version: this.extension.version },
       extension: this.extension,
+      workerUrl: this.#workerUrl(),
     });
     return this.#host;
   }
@@ -257,7 +276,25 @@ class OneClickHarParent extends ExtensionAPI {
     Services.obs.addObserver(this.#harness, HARNESS_TOPIC);
   }
 
+  /**
+   * file-worker.js under a resource URL, the only kind a ChromeWorker starts from. Only system-principal code loads
+   * it: the substitution grants no content access.
+   */
+  #workerUrl(): string | null {
+    try {
+      resourceHandler().setSubstitution(WORKER_ROOT, this.extension.rootURI);
+      return `resource://${WORKER_ROOT}/${FILE_WORKER}`;
+    } catch {
+      return null;
+    }
+  }
+
   override onShutdown(isAppShutdown: boolean): void {
+    try {
+      if (this.#host !== null) resourceHandler().setSubstitution(WORKER_ROOT, null);
+    } catch {
+      // Nothing was registered.
+    }
     if (this.#harness !== null) Services.obs.removeObserver(this.#harness, HARNESS_TOPIC);
     this.#harness = null;
     for (const job of this.#host?.jobs.list() ?? [])

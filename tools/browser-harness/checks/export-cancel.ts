@@ -20,8 +20,8 @@ const CANCEL_AFTER_BYTES = 6 * MIB;
 
 /**
  * The fixtures page (two 50 MB bodies) is exported and cancelled mid-body. The export must end cancelled, having
- * written at most one more body chunk after cancel was asked, and leave neither the .har nor its .har.part, with the
- * journal's start line ended. Planted: a stop two chunks after cancel, and an export that ended done, must fail.
+ * written at most one more body chunk after cancel was asked, and leave no file: no .har, no .har.part, no unnamed
+ * file still open, no journal line open. Planted: a stop two chunks after cancel, and an export that ended done.
  */
 const check: HarnessCheck = {
   name: NAME,
@@ -71,11 +71,20 @@ const check: HarnessCheck = {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     const journal = NodePath.join(workspace.root(), "exports.jsonl");
+    const fds = `/proc/${String(session.browserPid)}/fd`;
     const observation: CancelObservation = {
       state: final.state.kind,
       audit,
       left: NodeFS.readdirSync(workspace.downloads).filter((name) => name.startsWith("cancelled")),
       journal: NodeFS.existsSync(journal) ? NodeFS.readFileSync(journal, "utf8") : "",
+      // /proc names an unnamed file `<folder>/#<inode> (deleted)`.
+      openUnnamed: NodeFS.readdirSync(fds).filter((fd) => {
+        try {
+          return NodeFS.readlinkSync(`${fds}/${fd}`).startsWith(`${workspace.downloads}/#`);
+        } catch {
+          return false;
+        }
+      }).length,
     };
     const problems = [...judgeCancel(observation)];
     if (writing.state.kind !== "writing")
@@ -92,7 +101,7 @@ const check: HarnessCheck = {
       durationMs: Date.now() - started,
       detail:
         problems.length === 0
-          ? `cancelled at ${String(audit?.bytesAtCancel)} bytes, stopped at ${String(audit?.bytesAtStop)}; no file left; journal ended; planted late stop and finished export caught`
+          ? `cancelled at ${String(audit?.bytesAtCancel)} bytes, stopped at ${String(audit?.bytesAtStop)}; no file left, named or open; journal ended; planted late stop and finished export caught`
           : problems.join("; "),
       data: observation,
     };

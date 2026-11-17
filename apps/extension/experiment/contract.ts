@@ -13,6 +13,9 @@ import { any, asyncFunction, integer, returns, type ApiFunctions } from "./gecko
 /** The experiment namespace: `browser.oneClickHar` in extension pages, `experiment_apis.oneClickHar` in the manifest. */
 export const namespace = "oneClickHar";
 
+/** Where build-experiment.ts writes file-worker.ts in the package, and the path the parent script starts it from. */
+export const FILE_WORKER = "experiment/file-worker.js";
+
 export type ToolboxState =
   | { readonly open: true; readonly host: string }
   | { readonly open: false; readonly reason: ToolboxClosedReason };

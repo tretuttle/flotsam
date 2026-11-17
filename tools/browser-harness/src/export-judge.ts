@@ -273,10 +273,16 @@ export const CANCEL_BOUND_BYTES = 4 * MIB + MIB;
 
 export type CancelObservation = {
   readonly state: string;
-  readonly audit: { readonly bytesAtCancel: number; readonly bytesAtStop: number | null } | null;
+  readonly audit: {
+    readonly bytesAtCancel: number;
+    readonly bytesAtStop: number | null;
+    readonly keptFile?: string | null;
+  } | null;
   /** Files in the export folder named like this export. */
   readonly left: readonly string[];
   readonly journal: string;
+  /** Unnamed files the browser still has open in the export folder, once the run stopped. */
+  readonly openUnnamed: number;
 };
 
 export function judgeCancel(o: CancelObservation): readonly string[] {
@@ -288,10 +294,13 @@ export function judgeCancel(o: CancelObservation): readonly string[] {
       `wrote ${String(o.audit.bytesAtStop - o.audit.bytesAtCancel)} bytes after cancel, more than one chunk (${String(CANCEL_BOUND_BYTES)})`,
     );
   if (o.left.length > 0) problems.push(`left behind: ${o.left.join(", ")}`);
+  if ((o.audit?.keptFile ?? null) !== null) problems.push(`kept ${String(o.audit?.keptFile)}`);
+  if (o.openUnnamed > 0) problems.push(`${String(o.openUnnamed)} unnamed export file still open`);
+  // An unnamed export journals nothing; a named part's start line must be ended.
   const lines = o.journal.split("\n").filter((line) => line.length > 0);
   const startedParts = lines.filter((l) => l.startsWith('{"started"')).length;
   const endedParts = lines.filter((l) => l.startsWith('{"ended"')).length;
-  if (startedParts === 0 || startedParts !== endedParts)
+  if (startedParts !== endedParts)
     problems.push(
       `journal has ${String(startedParts)} started and ${String(endedParts)} ended lines`,
     );
@@ -303,21 +312,29 @@ export type AfterCrashObservation = {
   readonly steps: readonly string[];
   /** Files named like the export in its folder, after the next start. */
   readonly left: readonly string[];
+  /** A named part, which the journal names; an unnamed file leaves nothing to journal. */
+  readonly journaled: boolean;
 };
 
-/** Crash row 13: the killed export left no .har, and the next start deleted the .har.part the journal named. */
+/**
+ * Crash row 13: the killed export left nothing named after the next start. A journaled part was deleted by the next
+ * start; an unnamed file needed no step at all.
+ */
 export function judgeAfterCrash(o: AfterCrashObservation): readonly string[] {
+  const deleted = o.steps.includes("delete-export-part");
   return [
-    ...(o.steps.includes("delete-export-part")
+    ...(deleted === o.journaled
       ? []
-      : [`recovery ran ${JSON.stringify(o.steps)}, no delete-export-part`]),
+      : [
+          `recovery ran ${JSON.stringify(o.steps)}, ${o.journaled ? "no" : "a"} delete-export-part`,
+        ]),
     ...(o.left.length === 0 ? [] : [`left after the next start: ${o.left.join(", ")}`]),
   ];
 }
 
 /** How one cause must end: a named failure kind, done under a given name, or cancelled. */
 export type RowOutcome =
-  | { readonly kind: "write-failed"; readonly failure: string }
+  | { readonly kind: "write-failed"; readonly failure: string; readonly kept?: string }
   | { readonly kind: "done"; readonly fileName: string }
   | { readonly kind: "cancelled" };
 
@@ -372,7 +389,12 @@ const FAILURE_KEYS: readonly string[] = ["kind", "needBytes", "freeBytes"];
  */
 export function judgeRow(o: RowObservation): readonly string[] {
   const problems: string[] = [];
-  const state = o.state as { kind?: string; fileName?: string; failure?: Record<string, unknown> };
+  const state = o.state as {
+    kind?: string;
+    fileName?: string;
+    failure?: Record<string, unknown>;
+    kept?: string;
+  };
   const failure = state.failure ?? {};
   if (o.timing !== null && o.timing.tookMs > o.timing.withinMs)
     problems.push(
@@ -385,6 +407,10 @@ export function judgeRow(o: RowObservation): readonly string[] {
   } else if (o.expect.kind === "write-failed") {
     if (state.kind !== "write-failed" || failure["kind"] !== o.expect.failure)
       problems.push(`ended ${JSON.stringify(o.state)}, expected write-failed ${o.expect.failure}`);
+    if (state.kept !== o.expect.kept)
+      problems.push(
+        `kept ${String(state.kept)}, expected ${o.expect.kept === undefined ? "nothing kept" : o.expect.kept}`,
+      );
     if (
       failure["kind"] === "disk-full" &&
       !(Number(failure["freeBytes"]) < Number(failure["needBytes"]))

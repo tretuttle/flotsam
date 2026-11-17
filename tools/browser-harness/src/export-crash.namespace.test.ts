@@ -33,9 +33,10 @@ const xpi = NodeFS.existsSync(distDir)
 const MIB = 1_048_576;
 
 /**
- * Crash row 13 on a real browser: killed while an export writes, the browser leaves the .har.part and no .har, and the
- * next start deletes the part because the journal named it. Planted: the journal removed before the next start, so
- * the part must be reported as left behind.
+ * Crash row 13 on a real browser, killed while an export writes. An unnamed file leaves nothing: no name was ever
+ * given, and the journal has no line. A named part (the harness-only pref, as where no folder can be held) is left, and
+ * the next start deletes it because the journal named it. Planted: a leftover named file after an unnamed export's
+ * kill, and the journal removed before the next start, must each be reported as left behind.
  */
 describe.runIf(binary !== "" && NodeFS.existsSync(binary) && xpi !== null)(
   "an export killed mid-write on a real browser",
@@ -43,11 +44,13 @@ describe.runIf(binary !== "" && NodeFS.existsSync(binary) && xpi !== null)(
     const extensionPath = NodePath.join(distDir, xpi ?? "");
 
     it.each([
-      { planted: false, caught: false },
-      { planted: true, caught: true },
+      { named: false, planted: false, caught: false },
+      { named: false, planted: true, caught: true },
+      { named: true, planted: false, caught: false },
+      { named: true, planted: true, caught: true },
     ])(
-      "journal removed before restart: $planted; leftover reported: $caught",
-      async ({ planted, caught }) => {
+      "named part: $named; planted: $planted; leftover reported: $caught",
+      async ({ named: namedParts, planted, caught }) => {
         await using server = await startFixtureServer();
         await using workspace = recordingWorkspace(`export-crash-${String(planted)}`);
         const base = {
@@ -59,7 +62,15 @@ describe.runIf(binary !== "" && NodeFS.existsSync(binary) && xpi !== null)(
         const named = () =>
           NodeFS.readdirSync(workspace.downloads).filter((n) => n.startsWith("killed"));
         {
-          await using session = await workspace.launch({ ...base, extensionPath });
+          await using session = await workspace.launch({
+            ...base,
+            extensionPath,
+            ...(namedParts
+              ? {
+                  extraPrefs: [{ name: "extensions.oneClickHar.harness.namedParts", value: true }],
+                }
+              : {}),
+          });
           const page = await openExtensionPage(session, extensionPath);
           const tab = await session.openTab(`${server.origin}${FIXTURES_PAGE_PATH}`);
           await session.evaluate(tab, "window.__harnessReady");
@@ -83,8 +94,12 @@ describe.runIf(binary !== "" && NodeFS.existsSync(binary) && xpi !== null)(
           expect(writing.state.kind).toBe("writing");
           await session.kill();
         }
-        expect(named()).toEqual(["killed.har.part"]);
-        if (planted) NodeFS.rmSync(NodePath.join(workspace.root(), "exports.jsonl"));
+        const journal = NodePath.join(workspace.root(), "exports.jsonl");
+        expect(named()).toEqual(namedParts ? ["killed.har.part"] : []);
+        if (!namedParts) expect(NodeFS.existsSync(journal)).toBe(false);
+        if (planted && namedParts) NodeFS.rmSync(journal);
+        if (planted && !namedParts)
+          NodeFS.writeFileSync(NodePath.join(workspace.downloads, "killed.har"), "");
         {
           await using session = await workspace.launch({ ...base, extensionPath: null });
           await waitForActiveExtensionUrl(
@@ -95,7 +110,11 @@ describe.runIf(binary !== "" && NodeFS.existsSync(binary) && xpi !== null)(
           const steps = (await callHook(session, { kind: "recovery" })) as readonly {
             kind: string;
           }[];
-          const problems = judgeAfterCrash({ steps: steps.map((s) => s.kind), left: named() });
+          const problems = judgeAfterCrash({
+            steps: steps.map((s) => s.kind),
+            left: named(),
+            journaled: namedParts,
+          });
           expect(problems.length > 0).toBe(caught);
         }
       },

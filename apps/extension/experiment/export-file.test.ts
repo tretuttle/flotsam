@@ -9,7 +9,9 @@ import {
   SINK_BATCH_UNITS,
   unfinishedExports,
   type ExportLimits,
+  type ExportPause,
   type ExportPlatform,
+  type HeldFolder,
   type JournaledPart,
   type JournalEntry,
   type Part,
@@ -57,11 +59,14 @@ class MemoryFs {
     return up === null ? path : this.join(this.realPath(up), this.filename(path));
   }
 
+  /** Throws for a path that does not exist, as Gecko's `normalize` does. */
   realPath = (path: string, depth = 0): string => {
     if (depth > 20)
       throw Object.assign(new Error("loop"), { name: "NS_ERROR_FILE_UNRESOLVABLE_SYMLINK" });
     const resolved = this.resolveParent(path);
     const node = this.nodes.get(resolved);
+    if (node === undefined && depth === 0 && path !== "/")
+      throw Object.assign(new Error("missing"), { name: "NS_ERROR_FILE_NOT_FOUND" });
     return node?.kind === "link" ? this.realPath(node.target, depth + 1) : resolved;
   };
 
@@ -79,6 +84,67 @@ class MemoryFs {
   fifo(path: string, size: number | FileNode = 0): void {
     this.nodes.set(path, { kind: "fifo", size });
   }
+  /** Every inode's number, given the first time it is asked for. */
+  private readonly inodes = new WeakMap<object, number>();
+  private lastInode = 0;
+  ino(node: object): string {
+    if (!this.inodes.has(node)) {
+      this.lastInode += 1;
+      this.inodes.set(node, this.lastInode);
+    }
+    return String(this.inodes.get(node));
+  }
+  /** Where `node` is named now, or null when nothing names it. */
+  pathOf(node: Node): string | null {
+    for (const [path, at] of this.nodes) if (at === node) return path;
+    return null;
+  }
+  /** Every unlink or rename of a name the platform was asked for. An unnamed export makes none. */
+  readonly removes: string[] = [];
+  /** Answers `link` and `createUnnamed` refuse with, as the kernel gave them. */
+  readonly failUnnamed = new Map<"createUnnamed" | "link", unknown>();
+  /** Set to make every folder's file system unable to hold an unnamed file. */
+  noUnnamedFiles = false;
+  /** The last unnamed file made, as another process reaches it through /proc/<pid>/fd. */
+  lastUnnamed: FileNode | null = null;
+
+  /** Holds the folder at `path` open, as file-worker.ts does with a directory descriptor. */
+  holdFolder = async (path: string): Promise<HeldFolder> => {
+    const folder = this.nodes.get(path);
+    if (folder?.kind !== "folder") throw new DOMException("x", "NotFoundError");
+    const where = (): string | null => this.pathOf(folder);
+    return {
+      where: async () => where(),
+      identityOf: async (name) => {
+        const at = where();
+        const node = at === null ? undefined : this.nodes.get(this.join(at, name));
+        return node === undefined ? null : { dev: "m", ino: this.ino(node) };
+      },
+      createUnnamed: async () => {
+        if (this.failUnnamed.has("createUnnamed")) throw this.failUnnamed.get("createUnnamed");
+        if (this.noUnnamedFiles) return null;
+        const node: FileNode = { kind: "file", bytes: [] };
+        this.lastUnnamed = node;
+        return {
+          identity: { dev: "m", ino: this.ino(node) },
+          write: async (text) => void node.bytes.push(...Buffer.from(text)),
+          size: async () => node.bytes.length,
+          readHead: async (bytes) => Uint8Array.from(node.bytes.slice(0, bytes)),
+          link: async (name) => {
+            if (this.failUnnamed.has("link")) throw this.failUnnamed.get("link");
+            const at = where();
+            if (at === null) throw { name: "ENOENT" };
+            if (this.nodes.has(this.join(at, name))) return false;
+            this.nodes.set(this.join(at, name), node);
+            return true;
+          },
+          close: () => undefined,
+        };
+      },
+      close: () => undefined,
+    };
+  };
+
   text(path: string): string {
     const node = this.nodes.get(this.realPath(path));
     return node?.kind === "file" ? Buffer.from(node.bytes).toString() : "";
@@ -183,9 +249,11 @@ class MemoryFs {
         this.nodes.delete(source);
         this.nodes.set(target, node);
         this.moves.push(`${source} -> ${target}`);
+        this.removes.push(`rename ${source}`);
       },
       remove: async (path) => {
         this.check("remove");
+        this.removes.push(`remove ${path}`);
         this.nodes.delete(this.resolveParent(path));
       },
       freeBytes: () => 1 << 30,
@@ -210,6 +278,27 @@ class Limits implements ExportLimits {
   elapse(): void {
     for (const fire of this.armed) fire();
     this.armed.clear();
+  }
+  private readonly held = new Map<ExportPause, { reached: () => void; gate: Promise<void> }>();
+  pause = async (point: ExportPause): Promise<void> => {
+    const held = this.held.get(point);
+    if (held === undefined) return;
+    this.held.delete(point);
+    held.reached();
+    await held.gate;
+  };
+  /** The export waits at `point` until released, as the harness topic holds it. */
+  hold(point: ExportPause): Hold {
+    let reached = (): void => undefined;
+    let release = (): void => undefined;
+    const atPoint = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.held.set(point, { reached, gate });
+    return { reached: atPoint, release };
   }
 }
 
@@ -663,6 +752,19 @@ describe("the export file boundary", () => {
     expect(at.fs.nodes.get("/home/u/moved/site.har.part")).toBeDefined();
   });
 
+  it("a finished name removed right after the rename is file-replaced, not a folder problem", async () => {
+    const at = setup((platform, fs) => ({
+      ...platform,
+      rename: async (from, to) => {
+        await platform.rename(from, to);
+        if (to.endsWith(".har")) fs.nodes.delete(to);
+      },
+    }));
+    const { part } = await exportOnce(at);
+    expect(await finishOrDiscard(part)).toEqual({ kind: "file-replaced" });
+    expect(inDownloads(at.fs)).toEqual([]);
+  });
+
   it("a rename still running after the step limit ends the export timed-out, and the file is deleted once it lands", async () => {
     const at = setup();
     const { part, path } = await exportOnce(at);
@@ -799,6 +901,247 @@ describe("the export file boundary", () => {
     await part.discard();
     expect(at.fs.nodes.has(path)).toBe(false);
     expect(at.journal.lines).toEqual([]);
+  });
+});
+
+/** An export folder the platform holds open, as on Linux. */
+const held = () => setup((platform, fs) => ({ ...platform, holdFolder: fs.holdFolder }));
+
+/** Names under a folder, links and FIFOs included. */
+const under = (fs: MemoryFs, folder: string): readonly string[] =>
+  [...fs.nodes.keys()].filter((p) => p.startsWith(`${folder}/`)).sort();
+
+/**
+ * The review's racing rows, made at the moment named, each with what the export must report and every name under the
+ * export folder, the folder it was moved to, and the profile afterwards. Nothing the row put anywhere may change, and
+ * the export renames and deletes nothing.
+ */
+const RACES: readonly {
+  readonly cause: string;
+  readonly at: ExportPause;
+  readonly act: (fs: MemoryFs) => void;
+  readonly ends: { readonly done: string } | { readonly kind: string; readonly kept?: string };
+  readonly left: { readonly [folder: string]: readonly string[] };
+}[] = [
+  {
+    cause: "a foreign file is written at the finished name",
+    at: "before-link",
+    act: (fs) => fs.file(`${DOWNLOADS}/site.har`, "theirs"),
+    ends: { done: "site (2).har" },
+    left: { [DOWNLOADS]: [`${DOWNLOADS}/site (2).har`, `${DOWNLOADS}/site.har`] },
+  },
+  {
+    cause: "a link to prefs.js is put at the finished name",
+    at: "before-link",
+    act: (fs) => fs.link(`${DOWNLOADS}/site.har`, `${PROFILE}/prefs.js`),
+    ends: { done: "site (2).har" },
+    left: { [DOWNLOADS]: [`${DOWNLOADS}/site (2).har`, `${DOWNLOADS}/site.har`] },
+  },
+  {
+    cause: "a file is put at the part's name",
+    at: "before-link",
+    act: (fs) => fs.file(`${DOWNLOADS}/site.har.part`, "theirs"),
+    ends: { done: "site.har" },
+    left: { [DOWNLOADS]: [`${DOWNLOADS}/site.har`, `${DOWNLOADS}/site.har.part`] },
+  },
+  {
+    cause: "the folder is replaced by a link to the profile",
+    at: "before-link",
+    act: folderToProfileLink,
+    ends: { kind: "folder-refused", kept: "site.har" },
+    left: { "/home/u/moved": ["/home/u/moved/site.har"], [PROFILE]: [`${PROFILE}/prefs.js`] },
+  },
+  {
+    cause:
+      "the folder is replaced by a link to the profile, with a file planted there at the part's name",
+    at: "before-link",
+    act: (fs) => {
+      folderToProfileLink(fs);
+      fs.file(`${PROFILE}/site.har.part`, "planted");
+    },
+    ends: { kind: "folder-refused", kept: "site.har" },
+    left: {
+      "/home/u/moved": ["/home/u/moved/site.har"],
+      [PROFILE]: [`${PROFILE}/prefs.js`, `${PROFILE}/site.har.part`],
+    },
+  },
+  {
+    cause: "the folder is replaced by a link to the profile and put back",
+    at: "before-link",
+    act: (fs) => {
+      folderToProfileLink(fs);
+      fs.nodes.delete(DOWNLOADS);
+      fs.nodes.set(DOWNLOADS, fs.nodes.get("/home/u/moved")!);
+      fs.nodes.delete("/home/u/moved");
+    },
+    ends: { done: "site.har" },
+    left: { [DOWNLOADS]: [`${DOWNLOADS}/site.har`], [PROFILE]: [`${PROFILE}/prefs.js`] },
+  },
+  {
+    cause: "the folder is deleted",
+    at: "before-link",
+    act: (fs) => fs.removeTree(DOWNLOADS),
+    ends: { kind: "folder-missing" },
+    left: { [PROFILE]: [`${PROFILE}/prefs.js`] },
+  },
+  {
+    cause: "the finished name is removed",
+    at: "after-link",
+    act: (fs) => fs.nodes.delete(`${DOWNLOADS}/site.har`),
+    ends: { kind: "file-replaced", kept: "site.har" },
+    left: { [DOWNLOADS]: [] },
+  },
+  {
+    cause: "a foreign file takes the finished name",
+    at: "after-link",
+    act: (fs) => fs.file(`${DOWNLOADS}/site.har`, "theirs"),
+    ends: { kind: "file-replaced", kept: "site.har" },
+    left: { [DOWNLOADS]: [`${DOWNLOADS}/site.har`] },
+  },
+  {
+    cause: "the finished file's first bytes are overwritten",
+    at: "after-link",
+    act: (fs) => (fs.nodes.get(`${DOWNLOADS}/site.har`) as FileNode).bytes.fill(0x20, 0, 16),
+    ends: { kind: "file-replaced", kept: "site.har" },
+    left: { [DOWNLOADS]: [`${DOWNLOADS}/site.har`] },
+  },
+  {
+    cause:
+      "the folder is replaced by a link to the profile with a file planted at the finished name",
+    at: "after-link",
+    act: (fs) => {
+      folderToProfileLink(fs);
+      fs.file(`${PROFILE}/site.har`, "planted");
+    },
+    ends: { kind: "folder-refused", kept: "site.har" },
+    left: {
+      "/home/u/moved": ["/home/u/moved/site.har"],
+      [PROFILE]: [`${PROFILE}/prefs.js`, `${PROFILE}/site.har`],
+    },
+  },
+];
+
+describe("an export folder held open, its file unnamed until one link", () => {
+  it("names only its own file, in the held folder, and renames or deletes nothing", async () => {
+    const at = held();
+    const { part } = await exportOnce(at);
+    expect(inDownloads(at.fs)).toEqual([]);
+    expect(await part.finish("site.har")).toBe("site.har");
+    expect(at.fs.text(`${DOWNLOADS}/site.har`)).toBe(DOCUMENT);
+    expect(inDownloads(at.fs)).toEqual([`${DOWNLOADS}/site.har`]);
+    expect(at.fs.removes).toEqual([]);
+    expect(at.journal.lines).toEqual([]);
+  });
+
+  it.each(RACES)(
+    "when $cause ($at), ends as written and touches nothing it did not create",
+    async ({ at: point, act, ends, left }) => {
+      const at = held();
+      const { part } = await exportOnce(at);
+      const before = new Map(at.fs.nodes);
+      const hold = at.limits.hold(point);
+      const finished = part.finish("site.har").then(
+        (name) => ({ done: name }),
+        (error: unknown) => error,
+      );
+      await hold.reached;
+      act(at.fs);
+      const acted = new Map(at.fs.nodes);
+      hold.release();
+      const outcome = await finished;
+      await part.discard();
+      if ("done" in ends) expect(outcome).toEqual(ends);
+      else {
+        expect(outcome).toBeInstanceOf(WriteRefused);
+        expect((outcome as WriteRefused).failure).toEqual({ kind: ends.kind });
+        expect(part.kept()).toBe(ends.kept ?? null);
+      }
+      for (const [folder, names] of Object.entries(left))
+        expect(under(at.fs, folder)).toEqual(names);
+      // Everything there before the export, and everything the row put down, is the same node at the same name.
+      for (const [path, node] of acted)
+        if (before.get(path) === node || !before.has(path))
+          expect(at.fs.nodes.get(path), path).toBe(node);
+      expect(at.fs.text(`${PROFILE}/prefs.js`)).toBe("user_pref(1);");
+      expect(at.fs.removes).toEqual([]);
+    },
+  );
+
+  it("an unnamed file overwritten through its descriptor is never named", async () => {
+    const at = held();
+    const { part } = await exportOnce(at, () => at.fs.lastUnnamed?.bytes.fill(0x20, 0, 16));
+    expect(await finishOrDiscard(part)).toEqual({ kind: "file-replaced" });
+    expect(part.kept()).toBeNull();
+    expect(inDownloads(at.fs)).toEqual([]);
+  });
+
+  it("a folder replaced before the finish is refused without naming anything", async () => {
+    const at = held();
+    const { part } = await exportOnce(at, () => folderToProfileLink(at.fs));
+    expect(await finishOrDiscard(part)).toEqual({ kind: "folder-refused" });
+    expect(part.kept()).toBeNull();
+    expect(under(at.fs, "/home/u/moved")).toEqual([]);
+    expect(under(at.fs, PROFILE)).toEqual([`${PROFILE}/prefs.js`]);
+  });
+
+  it("cancel while the link waits names nothing, and nothing is left", async () => {
+    const at = held();
+    const { part } = await exportOnce(at);
+    const hold = at.limits.hold("before-link");
+    const finished = part.finish("site.har").catch((e: unknown) => e);
+    await hold.reached;
+    at.limits.signal.aborted = true;
+    hold.release();
+    expect(await finished).toBeInstanceOf(ExportCancelled);
+    await part.discard();
+    expect(inDownloads(at.fs)).toEqual([]);
+    expect(part.kept()).toBeNull();
+  });
+
+  it("a link still waiting at the step limit ends timed-out, and names nothing once let go", async () => {
+    const at = held();
+    const { part } = await exportOnce(at);
+    const hold = at.limits.hold("before-link");
+    const finished = failureOf(part.finish("site.har"));
+    await hold.reached;
+    at.limits.elapse();
+    expect(await finished).toEqual({ kind: "timed-out" });
+    await part.discard();
+    hold.release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(inDownloads(at.fs)).toEqual([]);
+  });
+
+  it("reports the kernel's refusals by their errno names, with nothing left", async () => {
+    const causes = [
+      { call: "createUnnamed", errno: "EACCES", kind: "access-denied" },
+      { call: "createUnnamed", errno: "EROFS", kind: "read-only" },
+      { call: "link", errno: "ENAMETOOLONG", kind: "name-too-long" },
+    ] as const;
+    for (const { call, errno, kind } of causes) {
+      const at = held();
+      at.fs.failUnnamed.set(call, { name: errno });
+      const failure = await failureOf(
+        exportOnce(at).then(async ({ part }) => {
+          try {
+            return await part.finish("site.har");
+          } finally {
+            await part.discard();
+          }
+        }),
+      );
+      expect(failure, errno).toEqual({ kind });
+      expect(inDownloads(at.fs)).toEqual([]);
+    }
+  });
+
+  it("names a part instead where the folder's file system cannot hold an unnamed file", async () => {
+    const at = held();
+    at.fs.noUnnamedFiles = true;
+    const { part, path } = await exportOnce(at);
+    expect(path).toBe(`${DOWNLOADS}/site.har.part`);
+    expect(await part.finish("site.har")).toBe("site.har");
+    expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
   });
 });
 

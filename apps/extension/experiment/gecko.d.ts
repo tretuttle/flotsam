@@ -19,6 +19,8 @@ interface ExtensionObject {
   };
   readonly version: string;
   readonly manifest: { readonly name: string };
+  /** The add-on's packaged files. */
+  readonly rootURI: Uri;
 }
 
 interface ExtensionContext {
@@ -311,6 +313,8 @@ interface Observer {
 
 interface SubstitutingProtocolHandler {
   hasSubstitution(root: string): boolean;
+  /** `null` removes the substitution. */
+  setSubstitution(root: string, base: Uri | null): void;
   getSubstitution(root: string): Uri;
   resolveURI(uri: Uri): string;
 }
@@ -326,6 +330,7 @@ declare const Services: {
     readonly appBuildID: string;
     readonly OS: string;
   };
+  readonly sysinfo: { getProperty(name: "arch"): string };
   readonly obs: {
     addObserver(observer: Observer, topic: string): void;
     removeObserver(observer: Observer, topic: string): void;
@@ -452,3 +457,12 @@ declare const PathUtils: {
   parent(path: string): string | null;
   readonly profileDir: string;
 };
+
+/** A worker with js-ctypes, started only from a chrome or resource URL. */
+declare class ChromeWorker {
+  constructor(url: string);
+  onmessage: ((event: { readonly data: never }) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  postMessage(message: unknown, transfer?: readonly ArrayBuffer[]): void;
+  terminate(): void;
+}
