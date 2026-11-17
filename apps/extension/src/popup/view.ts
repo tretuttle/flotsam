@@ -361,7 +361,7 @@ export function reducePopup(view: PopupView, event: PopupEvent): Step {
         ? { view, command: { kind: "cancel", id: view.job.id } }
         : stay(view);
     case "back":
-      return stay(homeView(home.reading, home.choices));
+      return { view: homeView(home.reading, home.choices), command: { kind: "load" } };
     case "reload":
       return { view, command: { kind: "load" } };
     case "retry":

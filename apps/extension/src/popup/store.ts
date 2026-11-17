@@ -32,6 +32,8 @@ export interface PopupStore {
 export function createPopupStore(ports: PopupPorts): PopupStore {
   const listeners = new Set<() => void>();
   let view: PopupView | null = null;
+  /** Read once: the popup acts on the tab it opened for, even after a reload. */
+  const tab = ports.tab();
 
   const apply = (step: Step): void => {
     view = step.view;
@@ -45,7 +47,7 @@ export function createPopupStore(ports: PopupPorts): PopupStore {
   };
 
   const load = async (api: OneClickHarApi): Promise<void> => {
-    const reading = await api.getPopup({ tabId: await ports.tab() });
+    const reading = await api.getPopup({ tabId: await tab });
     if (view === null) apply(firstStep(reading));
     else dispatch({ kind: "loaded", reading });
   };

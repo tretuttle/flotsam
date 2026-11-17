@@ -167,6 +167,28 @@ describe("one click on a row", () => {
     expect(run(shown, { kind: "job", job: job(writing, "job-2") }).view).toBe(shown.view);
   });
 
+  it("reads the popup again on the way back from a result, so the rows show the new export", () => {
+    const saved: ExportState = {
+      kind: "done",
+      fileName: "app.example.com.har",
+      folderLabel: "Downloads",
+      report: emptyReport("standard", 0, { recording: 0, devtools: 0 }, {}, []),
+      route: "link",
+    };
+    const done = run(firstStep(reading()), { kind: "job", job: job(saved) });
+    const back = run(done, { kind: "back" });
+    expect(back.view.kind).toBe("ready");
+    expect(back.command).toEqual({ kind: "load" });
+    const fresh = reading({
+      rows: [{ id: "this-tab-everything", preview: preview(15) }],
+      last: job(saved),
+    });
+    expect(run(back, { kind: "loaded", reading: fresh }).view).toMatchObject({
+      kind: "ready",
+      reading: { last: { fileName: "app.example.com.har" }, rows: [{ preview: { requests: 15 } }] },
+    });
+  });
+
   it("returns home and reloads after a cancel", () => {
     const shown = run(firstStep(reading()), { kind: "job", job: job(writing) });
     expect(run(shown, { kind: "cancel" }).command).toEqual({ kind: "cancel", id: "job-1" });
