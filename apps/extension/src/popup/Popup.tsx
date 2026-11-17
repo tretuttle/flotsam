@@ -142,15 +142,15 @@ const PresetList = ({
 const Toggles = ({
   choices,
   dispatch,
-  inline,
+  legend,
 }: {
   readonly choices: Choices;
   readonly dispatch: Dispatch;
-  readonly inline: boolean;
+  readonly legend: string | null;
 }) => (
   <fieldset className="stack-s">
-    {inline && <legend className="fl">{COPY.appliesTo}</legend>}
-    <div className={inline ? "row wrap" : "stack-s"}>
+    {legend !== null && <legend className="fl">{legend}</legend>}
+    <div className="row wrap">
       <label className="check">
         <input
           type="checkbox"
@@ -175,10 +175,7 @@ const Toggles = ({
             })
           }
         />
-        <span>
-          <span className="check-l">{COPY.secrets}</span>
-          {!inline && <span className="help">{COPY.secretsHelp}</span>}
-        </span>
+        <span className="check-l">{COPY.secrets}</span>
       </label>
     </div>
     {choices.redaction === "none" && (
@@ -258,7 +255,7 @@ const Ready = ({ view, dispatch }: ScreenProps<"ready">) => (
     <PresetList reading={view.reading} ids={ALL_ROWS} dispatch={dispatch} />
     <Source reading={view.reading} />
     <hr className="divider" />
-    <Toggles choices={view.choices} dispatch={dispatch} inline />
+    <Toggles choices={view.choices} dispatch={dispatch} legend={COPY.appliesTo} />
     <button
       type="button"
       className="btn-link"
@@ -285,7 +282,7 @@ const NoTab = ({ view, dispatch }: ScreenProps<"no-tab">) => (
       dispatch={dispatch}
     />
     <hr className="divider" />
-    <Toggles choices={view.choices} dispatch={dispatch} inline />
+    <Toggles choices={view.choices} dispatch={dispatch} legend={COPY.appliesTo} />
     <LastExport reading={view.reading} dispatch={dispatch} />
   </div>
 );
@@ -438,9 +435,12 @@ const Custom = ({ view, dispatch }: ScreenProps<"custom">) => {
           ))}
         </div>
       </fieldset>
-      <label className="field">
-        <span className="fl">{COPY.range}</span>
+      <div className="span-grid">
+        <label htmlFor="custom-range" className="fl">
+          {COPY.range}
+        </label>
         <select
+          id="custom-range"
           className="ctl"
           value={draft.range}
           onChange={(e) => change({ range: e.currentTarget.value as typeof draft.range })}
@@ -451,29 +451,43 @@ const Custom = ({ view, dispatch }: ScreenProps<"custom">) => {
             </option>
           ))}
         </select>
-      </label>
-      {draft.range === "between" && (
-        <div className="row">
-          <label className="grow">
-            <span className="fl">{COPY.from}</span>
+        {draft.range === "between" && (
+          <>
+            <label htmlFor="custom-from" className="fl">
+              {COPY.from}
+            </label>
             <input
+              id="custom-from"
               className="ctl"
               type="datetime-local"
               value={draft.from}
               onChange={(e) => change({ from: e.currentTarget.value })}
             />
-          </label>
-          <label className="grow">
-            <span className="fl">{COPY.to}</span>
+            <label htmlFor="custom-to" className="fl">
+              {COPY.to}
+            </label>
             <input
+              id="custom-to"
               className="ctl"
               type="datetime-local"
               value={draft.to}
               onChange={(e) => change({ to: e.currentTarget.value })}
             />
-          </label>
-        </div>
-      )}
+          </>
+        )}
+        <label htmlFor="custom-name" className="fl">
+          {COPY.fileName}
+        </label>
+        <input
+          id="custom-name"
+          className="ctl"
+          type="text"
+          value={draft.fileName}
+          placeholder={COPY.fileNamePlaceholder}
+          spellCheck={false}
+          onChange={(e) => change({ fileName: e.currentTarget.value })}
+        />
+      </div>
       <label className="check">
         <input
           type="checkbox"
@@ -485,20 +499,8 @@ const Custom = ({ view, dispatch }: ScreenProps<"custom">) => {
           <span className="help">{COPY.onlyApiHelp}</span>
         </span>
       </label>
-      <Toggles choices={view.choices} dispatch={dispatch} inline={false} />
-      <label className="field">
-        <span className="fl">{COPY.fileName}</span>
-        <input
-          className="ctl"
-          type="text"
-          value={draft.fileName}
-          placeholder={COPY.fileNamePlaceholder}
-          spellCheck={false}
-          onChange={(e) => change({ fileName: e.currentTarget.value })}
-        />
-        <span className="help">{COPY.fileNameHelp}</span>
-      </label>
-      <div className="card row" aria-live="polite">
+      <Toggles choices={view.choices} dispatch={dispatch} legend={null} />
+      <p className="row" aria-live="polite">
         {!view.check.ok ? (
           <span className="danger-text">
             {view.check.problem === "range" ? COPY.badRange : COPY.badFileName}
@@ -512,7 +514,7 @@ const Custom = ({ view, dispatch }: ScreenProps<"custom">) => {
             <span className="nowrap">{sizeUpTo(view.preview.bodyBytesAtMost)}</span>
           </span>
         )}
-      </div>
+      </p>
       <button
         type="button"
         className="btn btn-primary btn-lg"

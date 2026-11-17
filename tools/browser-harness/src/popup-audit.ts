@@ -148,6 +148,21 @@ const DOM_AUDIT = `(w, h) => {
   }
   for (const el of doc.querySelectorAll("button, a[href], input, select, textarea, summary, [role=button]")) {
     checked.controls += 1;
+    if (["INPUT", "SELECT"].includes(el.tagName) && !["checkbox", "radio"].includes(el.type) && shown(el)) {
+      const sized = el.tagName === "SELECT" || /^(date|time|datetime-local|month|week)$/.test(el.type);
+      let needs = el.scrollWidth;
+      if (sized) {
+        const copy = el.cloneNode(true);
+        copy.removeAttribute("id");
+        copy.style.cssText = "position:absolute;visibility:hidden;width:max-content;max-width:none";
+        el.parentElement.append(copy);
+        needs = copy.getBoundingClientRect().width;
+        copy.remove();
+      }
+      const has = sized ? el.getBoundingClientRect().width : el.clientWidth;
+      if (needs > has + 1)
+        problems.push("content clipped (" + Math.round(needs) + " px in " + Math.round(has) + "): " + describe(el));
+    }
     const labelled = el.getAttribute("aria-labelledby");
     const name = [
       el.getAttribute("aria-label"),

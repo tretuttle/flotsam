@@ -34,7 +34,19 @@ const USER_DEFAULTS: readonly Pref[] = [
 const NAMES = {
   custom: "Choose range, scope and file name",
   back: "Back",
+  secrets: "Remove secrets",
 } as const;
+
+/** Every choice of Custom's time range, by its value; each one changes what the form draws. */
+const CUSTOM_RANGES = [
+  "since-tab-opened",
+  "last-5",
+  "last-15",
+  "last-60",
+  "today",
+  "everything",
+  "between",
+] as const;
 
 /** Where the popup opens: a tab by URL in a normal or private window, or Zen's empty tab (url null). */
 type Target = { readonly url: string | null; readonly private: boolean };
@@ -283,6 +295,38 @@ class PopupDriver {
     );
   }
 
+  /** Clicks the checkbox whose label reads `name`. */
+  toggle(name: string): Promise<unknown> {
+    return value(
+      this.page,
+      inPopup(`const label = [...w.document.querySelectorAll("label.check")].find((l) => l.querySelector(".check-l")?.textContent.trim() === ${JSON.stringify(name)});
+        if (label === undefined) throw new Error("no checkbox named " + ${JSON.stringify(name)});
+        label.querySelector("input").click();
+        return true;`),
+    );
+  }
+
+  /** Picks a time range in Custom as the select's change does, and waits until the form shows it. */
+  async chooseRange(range: string): Promise<void> {
+    await value(
+      this.page,
+      inPopup(`const select = w.document.querySelector("[data-view=custom] select");
+        Object.getOwnPropertyDescriptor(w.HTMLSelectElement.prototype, "value").set.call(select, ${JSON.stringify(range)});
+        select.dispatchEvent(new w.Event("change", { bubbles: true }));
+        return true;`),
+    );
+    await until(
+      () =>
+        value<boolean | null>(
+          this.page,
+          inPopup(`return w.document.querySelector("[data-view=custom] select")?.value === ${JSON.stringify(range)} &&
+            (${JSON.stringify(range)} !== "between") === (w.document.querySelector("input[type=datetime-local]") === null);`),
+        ),
+      (shown) => shown === true,
+      `Custom to show the ${range} range`,
+    );
+  }
+
   clickRow(index: number): Promise<unknown> {
     return value(
       this.page,
@@ -376,6 +420,11 @@ const PLANTS = [
   { name: "a transition", expect: "motion", css: `.preset { transition: background-color 150ms }` },
   { name: "a 420 px wide popup", expect: "px wide", css: `.popup { width: 420px !important }` },
   { name: "a 700 px tall popup", expect: "px tall", css: `.pad { min-height: 700px }` },
+  {
+    name: "a date and time cut off in a 170 px field, as the old side-by-side layout drew it",
+    expect: "clipped",
+    html: `<input data-plant="" type="datetime-local" class="ctl" aria-label="planted" style="width:170px" value="2026-11-16T13:47">`,
+  },
 ] as const;
 
 async function plantAndAudit(
@@ -490,7 +539,14 @@ const check: HarnessCheck = {
 
       await driver.click(NAMES.custom);
       await driver.view("custom");
-      await driver.capture("custom");
+      for (const secrets of ["removed", "kept"] as const) {
+        if (secrets === "kept") await driver.toggle(NAMES.secrets);
+        for (const range of CUSTOM_RANGES) {
+          await driver.chooseRange(range);
+          await driver.capture(`custom-${range}-secrets-${secrets}`);
+        }
+      }
+      await driver.toggle(NAMES.secrets);
       await driver.click(NAMES.back);
       await driver.view("ready");
 
