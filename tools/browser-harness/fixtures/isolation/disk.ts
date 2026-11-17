@@ -80,14 +80,14 @@ export function diffSnapshots(before: DiskSnapshot, after: DiskSnapshot): readon
   });
 }
 
-export type DiskOwner = "browser" | "harness" | "product";
-
-/** One allowed kind of write: where (relative to the workspace), what kind of entry, whose, and why it is allowed. */
+/**
+ * One allowed kind of write: where (relative to the workspace) and what kind of entry. `product` marks the product's
+ * own writes, which the probes must fail to read; the rest are the browser's or the harness's.
+ */
 export type DiskRule = {
   readonly path: RegExp;
   readonly kinds: readonly DiskKind[];
-  readonly owner: DiskOwner;
-  readonly why: string;
+  readonly product?: true;
 };
 
 const FILE: readonly DiskKind[] = ["file"];
@@ -95,7 +95,9 @@ const DIR: readonly DiskKind[] = ["directory"];
 const TREE: readonly DiskKind[] = ["file", "directory"];
 const VENDORS = "(zen|mozilla)";
 
-/** Gecko's own profile entries: written by the browser for every profile, whatever add-ons it runs. */
+// Gecko's own profile entries, each one written in a recorded baseline or regression run of Zen Twilight 1.25t,
+// Firefox Developer Edition 161.0 or Zen 1.24.2b. A browser that writes a name not listed here fails the check,
+// and the name is added with the run that showed it.
 const PROFILE_FILES = [
   "prefs\\.js",
   "times\\.json",
@@ -104,35 +106,28 @@ const PROFILE_FILES = [
   "addons\\.json",
   "addonStartup\\.json\\.lz4",
   "extension-preferences\\.json",
-  "extension-settings\\.json",
   "xulstore\\.json",
   "containers\\.json",
   "handlers\\.json",
   "search\\.json\\.mozlz4",
   "sessionstore\\.jsonlz4",
   "sessionCheckpoints\\.json",
-  "session-state\\.json",
   "Telemetry\\.ShutdownTime\\.txt",
-  "SiteSecurityServiceState\\.(bin|txt)",
-  "AlternateServices\\.(bin|txt)",
+  "SiteSecurityServiceState\\.bin",
   "cert9\\.db",
   "key4\\.db",
   "pkcs11\\.txt",
-  "logins\\.(db|json)",
-  "logins-backup\\.json",
-  "cert_override\\.txt",
-  "serviceworker\\.txt",
+  "logins\\.db",
   "broadcast-listeners\\.json",
-  "notificationstore\\.json",
-  "shield-preference-experiments\\.json",
-  "enumerate_devices\\.txt",
-  "ExperimentStoreData\\.json",
-  "targeting\\.snapshot\\.json",
+  "breach-alerts\\.db",
   "\\.parentlock",
   "\\.startup-incomplete",
   "activity-stream\\.[a-z_]+\\.json",
   "zen-[a-z-]+\\.json(lz4)?",
-  "(places|favicons|cookies|permissions|content-prefs|formhistory|storage|webappsstore|bounce-tracking-protection|domain_to_categories|suggest|credentialstate|protections|storage-sync-v2|places-ml|[0-9a-f]{8})\\.sqlite(-wal|-shm|-journal)?",
+  "(places|favicons|cookies|permissions|content-prefs|formhistory|storage|bounce-tracking-protection|protections)\\.sqlite(-wal)?",
+  "domain_to_categories\\.sqlite(-journal)?",
+  // Gecko names one database after a hash; its name changes per run.
+  "[0-9a-f]{8}\\.sqlite(-wal|-shm)?",
 ].join("|");
 
 const PROFILE_DIRS = [
@@ -141,10 +136,9 @@ const PROFILE_DIRS = [
   "chrome",
   "crashes",
   "datareporting",
-  "extension-store(-menus)?",
+  "extension-store",
   "minidumps",
-  "remote-settings",
-  "safebrowsing(-updating)?",
+  "safebrowsing",
   "saved-telemetry-pings",
   "security_state",
   "sessionstore-backups",
@@ -153,14 +147,6 @@ const PROFILE_DIRS = [
   "storage",
   "thumbnails",
   "zen-sessions-backup",
-  "gmp-[a-z0-9-]+",
-  "weave",
-  "shader-cache",
-  "browser-extension-data",
-  "jumpListCache",
-  "personality-provider",
-  "mediacapabilities",
-  "OfflineCache",
 ].join("|");
 
 /**
@@ -168,78 +154,28 @@ const PROFILE_DIRS = [
  * `diskRules`, because their names are only known then.
  */
 const BASE_RULES: readonly DiskRule[] = [
-  {
-    path: new RegExp(`^profile/(${PROFILE_FILES})$`, "u"),
-    kinds: FILE,
-    owner: "browser",
-    why: "a file Gecko keeps in every profile",
-  },
-  {
-    path: new RegExp(`^profile/(${PROFILE_DIRS})(/.*)?$`, "u"),
-    kinds: TREE,
-    owner: "browser",
-    why: "a folder Gecko keeps in every profile, and what it puts there",
-  },
-  {
-    path: /^profile\/lock$/u,
-    kinds: ["symlink"],
-    owner: "browser",
-    why: "Gecko's profile lock on Linux is a symlink naming the host and pid",
-  },
-  {
-    path: /^profile\/MarionetteActivePort$/u,
-    kinds: FILE,
-    owner: "harness",
-    why: "Marionette, which the harness drives, writes its port here",
-  },
-  {
-    path: /^profile\/user\.js$/u,
-    kinds: FILE,
-    owner: "harness",
-    why: "the launcher writes the harness prefs",
-  },
-  {
-    path: /^profile\/extensions(\/[^/]+\.xpi)?$/u,
-    kinds: TREE,
-    owner: "harness",
-    why: "the launcher installs the recorder and the probe add-ons",
-  },
-  {
-    path: /^home\/(\.cache|\.config|\.local|\.local\/state)$/u,
-    kinds: DIR,
-    owner: "browser",
-    why: "the XDG folders the browser creates under its HOME",
-  },
-  {
-    path: new RegExp(`^home/(\\.cache|\\.config|\\.local/state)/${VENDORS}(/.*)?$`, "u"),
-    kinds: DIR,
-    owner: "browser",
-    why: "the browser's own XDG folders; only folders, never files",
-  },
-  {
-    path: /^home\/\.cache\/fontconfig(\/CACHEDIR\.TAG)?$/u,
-    kinds: TREE,
-    owner: "browser",
-    why: "fontconfig's cache folder",
-  },
+  // Files and folders Gecko keeps in every profile, and what it puts in those folders.
+  { path: new RegExp(`^profile/(${PROFILE_FILES})$`, "u"), kinds: FILE },
+  { path: new RegExp(`^profile/(${PROFILE_DIRS})(/.*)?$`, "u"), kinds: TREE },
+  // Marionette, which the harness drives, writes its port while the browser runs.
+  { path: /^profile\/MarionetteActivePort$/u, kinds: FILE },
+  // The launcher writes the harness prefs and installs the recorder and the probe add-ons.
+  { path: /^profile\/user\.js$/u, kinds: FILE },
+  { path: /^profile\/extensions(\/[^/]+\.xpi)?$/u, kinds: TREE },
+  // The browser's XDG folders under its HOME: folders only, never files.
+  { path: /^home\/(\.cache|\.config)$/u, kinds: DIR },
+  { path: new RegExp(`^home/(\\.cache|\\.config)/${VENDORS}(/.*)?$`, "u"), kinds: DIR },
+  // The crash reporter's own client id and pending pings.
+  { path: new RegExp(`^home/\\.config/${VENDORS}/[a-z]+/Crash Reports(/.*)?$`, "u"), kinds: TREE },
+  // fontconfig's cache, and its links between cache versions.
+  { path: /^home\/\.cache\/fontconfig(\/CACHEDIR\.TAG)?$/u, kinds: TREE },
   {
     path: /^home\/\.cache\/fontconfig\/[0-9a-f]{32}-[a-z0-9]+\.cache-\d+$/u,
     kinds: ["file", "symlink"],
-    owner: "browser",
-    why: "fontconfig cache files, and its links between cache versions",
   },
-  {
-    path: /^data\/one-click-har$/u,
-    kinds: DIR,
-    owner: "product",
-    why: "the app folder that holds the key folder",
-  },
-  {
-    path: /^downloads\/[^/]+\.har$/u,
-    kinds: FILE,
-    owner: "product",
-    why: "an export in the export folder",
-  },
+  // The app folder that holds the key folder, and an export in the export folder.
+  { path: /^data\/one-click-har$/u, kinds: DIR, product: true },
+  { path: /^downloads\/[^/]+\.har$/u, kinds: FILE, product: true },
 ];
 
 const escape = (text: string): string => text.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -255,20 +191,16 @@ export function diskRules(options: {
     {
       path: new RegExp(`^data/one-click-har/${escape(options.archiveKey)}(/.*)?$`, "u"),
       kinds: TREE,
-      owner: "product",
-      why: "inside the random key folder",
+      product: true,
     },
     {
       path: new RegExp(`^profile/${escape(options.keyFileName)}$`, "u"),
       kinds: FILE,
-      owner: "product",
-      why: "the key file",
+      product: true,
     },
     ...options.harnessFiles.map((file): DiskRule => ({
       path: new RegExp(`^${escape(file)}$`, "u"),
       kinds: FILE,
-      owner: "harness",
-      why: "a file the harness wrote itself",
     })),
   ];
 }
@@ -299,6 +231,6 @@ export function productWrites(
 ): readonly DiskChange[] {
   return changes.filter((change) => {
     const rule = ruleFor(rules, change);
-    return rule === undefined || rule.owner === "product";
+    return rule === undefined || rule.product === true;
   });
 }

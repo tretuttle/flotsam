@@ -1,4 +1,5 @@
 import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -53,6 +54,29 @@ describe("disk snapshot", () => {
     expect(snap["archive"]).toMatchObject({ kind: "directory", size: 0 });
   });
 
+  it("records the exact mode and time, and calls a socket neither file nor folder", async () => {
+    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-disk-"));
+    made.push(root);
+    const path = NodePath.join(root, "f");
+    NodeFS.writeFileSync(path, "x");
+    NodeFS.chmodSync(path, 0o751);
+    const server = NodeNet.createServer();
+    await new Promise<void>((resolve) => server.listen(NodePath.join(root, "s"), resolve));
+    try {
+      const snap = snapshotTree(root);
+      expect(snap["f"]).toEqual({
+        kind: "file",
+        size: 1,
+        mtimeMs: NodeFS.lstatSync(path).mtimeMs,
+        mode: 0o751,
+        link: null,
+      });
+      expect(snap["s"]?.kind).toBe("other");
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   it("reports new paths and changed files, but not a directory whose children changed", () => {
     const before = { a: file, d: dir, l: link("x") };
     const after = {
@@ -72,6 +96,14 @@ describe("disk snapshot", () => {
     expect(diffSnapshots(before, { ...before, a: { ...file, mtimeMs: 9 } })).toHaveLength(1);
     expect(diffSnapshots(before, { ...before, d: file })).toHaveLength(1);
     expect(diffSnapshots(before, before)).toEqual([]);
+    expect(diffSnapshots(before, { ...before, a: dir })).toEqual([
+      { path: "a", change: "changed", entry: dir },
+    ]);
+    const other: DiskEntry = { ...file, kind: "other" };
+    expect(diffSnapshots(before, { ...before, a: other })).toEqual([
+      { path: "a", change: "changed", entry: other },
+    ]);
+    expect(diffSnapshots({}, { n: file })).toEqual([{ path: "n", change: "new", entry: file }]);
   });
 });
 
@@ -82,7 +114,6 @@ describe("disk rules", () => {
       added("profile/26faf9e7.sqlite-wal"),
       added("profile/zen-sessions.jsonlz4"),
       added("profile/storage/default/x/idb/1.sqlite"),
-      added("profile/lock", link("127.0.0.1:+42")),
       added("profile/extensions/one-click-har@tretuttle.github.io.xpi"),
       added("profile/MarionetteActivePort"),
       added("profile/one-click-har.archive-key"),
@@ -93,6 +124,8 @@ describe("disk rules", () => {
       added("downloads/saved-page.html"),
       added("home/.cache", dir),
       added("home/.config/mozilla/firefox/Crash Reports/events", dir),
+      added("home/.config/mozilla/firefox/Crash Reports/glean/db/data.safe.bin"),
+      added("profile/breach-alerts.db"),
       added("home/.cache/fontconfig/0a1bf7d8b1ba794ae01cd62177a1cfec-le64.cache-9", link("x")),
     ];
     expect(unallowedWrites(allowed, RULES)).toEqual([]);
@@ -108,8 +141,20 @@ describe("disk rules", () => {
       added("data/one-click-har/recent-sites.txt"),
       added(`data/one-click-har/${KEY}/link`, link("/")),
       added("home/.config/zen/sites.txt"),
+      added("home/.config/mozilla/one-click-har.txt"),
       added("home/.one-click-har", dir),
       added("profile/storage/x", link("/")),
+      added("profile/lock", link("127.0.0.1:+42")),
+      added(`profile/${KEY}`),
+      added(`data/one-click-har/${KEY}-other`, dir),
+      added("profile/one-click-harXarchive-key"),
+      added("downloads/one-click-har.archive-key"),
+      added("profile/one-click-har.archive-key.bak"),
+      added("downloads/saved-pageXhtml"),
+      added("x/downloads/saved-page.html"),
+      added("downloads/saved-page.html.bak"),
+      added("profile/prefs.js", dir),
+      added("home/.cache/zen/x"),
       added("stray.txt"),
     ];
     expect(unallowedWrites(writes, RULES)).toEqual([
@@ -121,8 +166,20 @@ describe("disk rules", () => {
       "new file data/one-click-har/recent-sites.txt",
       `new symlink data/one-click-har/${KEY}/link -> /`,
       "new file home/.config/zen/sites.txt",
+      "new file home/.config/mozilla/one-click-har.txt",
       "new directory home/.one-click-har",
       "new symlink profile/storage/x -> /",
+      "new symlink profile/lock -> 127.0.0.1:+42",
+      `new file profile/${KEY}`,
+      `new directory data/one-click-har/${KEY}-other`,
+      "new file profile/one-click-harXarchive-key",
+      "new file downloads/one-click-har.archive-key",
+      "new file profile/one-click-har.archive-key.bak",
+      "new file downloads/saved-pageXhtml",
+      "new file x/downloads/saved-page.html",
+      "new file downloads/saved-page.html.bak",
+      "new directory profile/prefs.js",
+      "new file home/.cache/zen/x",
       "new file stray.txt",
     ]);
   });
@@ -140,11 +197,16 @@ describe("disk rules", () => {
       added("profile/one-click-har.archive-key"),
       added(`data/one-click-har/${KEY}/settings.json`),
       added("profile/one-click-har-sites.txt"),
+      added("downloads/saved-page.html"),
+      added("data/one-click-har", dir),
+      added("downloads/x.har"),
     ];
     expect(productWrites(changes, RULES).map((c) => c.path)).toEqual([
       "profile/one-click-har.archive-key",
       `data/one-click-har/${KEY}/settings.json`,
       "profile/one-click-har-sites.txt",
+      "data/one-click-har",
+      "downloads/x.har",
     ]);
   });
 });

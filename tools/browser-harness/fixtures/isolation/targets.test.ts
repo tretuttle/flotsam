@@ -99,6 +99,15 @@ describe("planned targets", () => {
     ]);
     expect(plan.checks["api:oneClickHar"]).toEqual([{ kind: "fact", name: "recorder-api" }]);
     expect(plan.checks["downloads:all"]).toEqual([{ kind: "service", name: "downloads" }]);
+    expect(plan.checks["traffic:http://bank.example/"]).toEqual([
+      { kind: "fact", name: "bank-traffic" },
+    ]);
+    expect(plan.checks["store:recorder-idb"]).toEqual([{ kind: "fact", name: "recorder-idb" }]);
+    expect(plan.checks["store:recorder-storage-local"]).toEqual([
+      { kind: "fact", name: "recorder-storage" },
+    ]);
+    expect(plan.checks["clipboard:"]).toEqual([{ kind: "service", name: "clipboard" }]);
+    expect(plan.checks["notifications:"]).toEqual([{ kind: "service", name: "notifications" }]);
     expect(plan.targets["mozext-timing"]).toEqual([
       ["moz-extension://u/manifest.json", "moz-extension://r/manifest.json"],
     ]);

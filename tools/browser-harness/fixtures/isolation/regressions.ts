@@ -99,12 +99,7 @@ export const PLANTS: readonly Plant[] = [
         '  "web_accessible_resources": [{ "resources": ["popup/*", "experiment/*"], "matches": ["<all_urls>"], "extension_ids": ["*"] }],',
       ),
     ],
-    mustFail: [
-      "mozext-parent@web",
-      "mozext-every-file@web",
-      "mozext-frame-recorder@web",
-      "exposure-allowed",
-    ],
+    mustFail: ["mozext-parent@web", "mozext-every-file@web", "exposure-allowed"],
   },
   {
     id: "downloads-list",
@@ -312,7 +307,12 @@ const readEnvironment = async (): Promise<Reading> => {`,
 ${STEPS_LINE}`,
       },
     ],
-    mustFail: ["exposure-allowed", "mozext-parent@web", "mozext-every-file@web"],
+    mustFail: [
+      "exposure-allowed",
+      "mozext-parent@web",
+      "mozext-every-file@web",
+      "mozext-frame-recorder@web",
+    ],
   },
   {
     id: "downloads-symlink",

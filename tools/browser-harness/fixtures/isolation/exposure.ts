@@ -42,12 +42,10 @@ export const ALLOWED_EXPOSURE = {
     "action",
     "options_ui",
     "experiment_apis",
-    "permissions",
   ],
   /** Each experiment API: a schema and a parent script in the parent process, callable from the add-on only. */
   experimentKeys: ["schema", "parent"],
   parentScopes: ["addon_parent"],
-  windowListeners: [] as readonly string[],
 } as const;
 
 const MESSAGE_EVENTS = new Set(["message", "messageerror"]);

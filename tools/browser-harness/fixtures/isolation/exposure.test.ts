@@ -109,3 +109,18 @@ describe("recorder exposure", () => {
     expect(schemaContexts("text")).toEqual([]);
   });
 });
+
+describe("exposure edge cases", () => {
+  it("names an experiment API that is null, a single frame, and reads a null schema as nothing", () => {
+    expect(exposureProblems({ ...BASELINE, experimentApis: { x: null } })).toEqual([
+      "experiment_apis.x is not an object",
+    ]);
+    expect(
+      exposureProblems({
+        ...BASELINE,
+        pages: [BASELINE.pages[0]!, { ...BASELINE.pages[1]!, frames: 1 }],
+      }),
+    ).toEqual([`${OPTIONS} holds 1 frames`]);
+    expect(schemaContexts(null)).toEqual([]);
+  });
+});

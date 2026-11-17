@@ -96,8 +96,8 @@ function judgeArchiveKey(evidence: KeyEvidence): readonly ExtraCheckResult[] {
       id: "key-differs-across-profiles",
       ok: key !== null && secondKey !== null && key !== secondKey,
       detail:
-        second === null
-          ? `no second key: ${"missing" in evidence.second ? evidence.second.missing : ""}`
+        "missing" in evidence.second
+          ? `no second key: ${evidence.second.missing}`
           : `first ${String(key)}, second ${String(secondKey)}`,
     },
     {

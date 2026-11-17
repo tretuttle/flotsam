@@ -35,7 +35,6 @@ export type ControlReason =
 export type ExpectedOutcome =
   | { readonly kind: "BLOCKED" }
   | { readonly kind: "LEAKS-EXISTENCE"; readonly exception: DecidedException }
-  | { readonly kind: "LEAKS-EXISTENCE"; readonly control: ControlReason }
   | { readonly kind: "READ"; readonly control: ControlReason }
   | { readonly kind: "LEAKS-EXISTENCE-OR-READ"; readonly control: ControlReason };
 
@@ -71,8 +70,8 @@ const LOADS = ["load", "error", "timeout"] as const;
 const REPLIES = ["ok", "error", "timeout"] as const;
 
 /**
- * Every outcome a probe runner may report. A row whose outcome is not one of these, or that has no outcome, text or
- * target, is malformed and can only be NO-RESULT.
+ * Every outcome a probe may report for one target. A row whose outcome is not one of these, or that has no outcome,
+ * text or target, is malformed and can only be NO-RESULT. A pair's or a per-target row's own outcome is not read.
  */
 export const OUTCOMES = [
   "ok",
@@ -81,9 +80,6 @@ export const OUTCOMES = [
   "threw",
   "no-target",
   "done",
-  "same",
-  "differs",
-  "each",
   "disconnected",
   "message",
   "load",
@@ -882,7 +878,8 @@ export const EXTRA_CHECKS = {
 export type ExtraCheckId = keyof typeof EXTRA_CHECKS;
 
 export function denialAt(spec: ProbeSpec, position: Position): Denial {
-  return ("denyAt" in spec ? spec.denyAt?.[position] : undefined) ?? spec.deny;
+  const { denyAt } = spec as { readonly denyAt?: Readonly<Partial<Record<Position, Denial>>> };
+  return denyAt?.[position] ?? spec.deny;
 }
 
 function expectedOutcomeFor(spec: ProbeSpec, position: Position): ExpectedOutcome {

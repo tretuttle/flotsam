@@ -8,7 +8,7 @@ import type { Unit, Witness } from "./judge.ts";
 /** One thing a witness checks. The system principal runs every kind but `redirect` and `fact`, which the harness runs. */
 export type WitnessCheck =
   | { readonly kind: "file"; readonly path: string }
-  | { readonly kind: "load"; readonly url: string; readonly mark?: string }
+  | { readonly kind: "load"; readonly url: string; readonly mark?: string | undefined }
   | { readonly kind: "resource"; readonly name: string }
   | { readonly kind: "chrome"; readonly pkg: string }
   | { readonly kind: "addon"; readonly id: string }
@@ -87,8 +87,7 @@ export function planTargets(input: PlanInput): TargetPlan {
   };
   const fileTarget = (href: string): string => want(href, { kind: "file", path: pathOf(href) });
   const filePair = (href: string): Unit => [fileTarget(href), fileTarget(missingSibling(href))];
-  const load = (url: string, mark?: string): string =>
-    want(url, mark === undefined ? { kind: "load", url } : { kind: "load", url, mark });
+  const load = (url: string, mark?: string): string => want(url, { kind: "load", url, mark });
   const plan = (ids: readonly string[], units: readonly Unit[]): void => {
     for (const id of ids) targets[id] = [...units];
   };
@@ -112,17 +111,13 @@ export function planTargets(input: PlanInput): TargetPlan {
     ],
     [fileTarget(log)],
   );
-  plan(["fetch-file-body"], [fileTarget(fileHref(file.body))]);
+  const body = fileTarget(fileHref(file.body));
+  plan(["fetch-file-body"], [body]);
   plan(["fetch-file-dir", "iframe-file-root", "tabs-create-dir"], [root]);
   plan(["fetch-file-export", "iframe-file-export"], [fileTarget(fileHref(file.export))]);
   plan(
     ["img-file-oracle"],
-    [
-      [
-        fileTarget(fileHref(file.body)),
-        fileTarget(fileHref(NodePath.join(file.siteDir, "bodies", "0.0.body"))),
-      ],
-    ],
+    [[body, fileTarget(fileHref(NodePath.join(file.siteDir, "bodies", "0.0.body")))]],
   );
   plan(
     ["script-root-oracle"],
@@ -247,14 +242,12 @@ export function combineWitness(
 ): Readonly<Record<string, Witness>> {
   return Object.fromEntries(
     Object.entries(plan.checks).map(([target, needs]) => {
-      const got = needs.map(
-        (c) => results.get(JSON.stringify(c)) ?? { ok: false, detail: `no result for ${c.kind}` },
-      );
+      const got = needs.map((c) => [c, results.get(JSON.stringify(c))] as const);
       return [
         target,
         {
-          present: got.length > 0 && got.every((r) => r.ok),
-          detail: got.map((r) => r.detail).join("; "),
+          present: got.length > 0 && got.every(([, r]) => r?.ok === true),
+          detail: got.map(([c, r]) => r?.detail ?? `no result for ${c.kind}`).join("; "),
         },
       ];
     }),

@@ -291,3 +291,24 @@ describe("archive check details", () => {
 });
 
 const randomKeyFixed = "00112233445566778899aabbccddeeff";
+
+describe("key derivations and the key file detail", () => {
+  it("names a key two sources share after the first of them", () => {
+    const shared = { ...sources("/p/x"), userName: "same", hostName: "same" };
+    expect(keyDerivations(shared).find((g) => g.key === sha("md5", "same"))?.from).toBe(
+      "md5(userName)",
+    );
+  });
+
+  it("quotes the first 80 characters of a malformed key file", () => {
+    const text = "z".repeat(100);
+    const format = judgeArchive(evidence(randomKey(), randomKey(), { keyFileText: text })).find(
+      (c) => c.id === "key-file-format",
+    );
+    expect(format).toEqual({
+      id: "key-file-format",
+      ok: false,
+      detail: `key file text ${JSON.stringify("z".repeat(80))}`,
+    });
+  });
+});

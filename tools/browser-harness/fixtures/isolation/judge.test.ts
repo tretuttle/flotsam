@@ -1026,9 +1026,7 @@ describe("isolation judge", () => {
   it("runs the content-script rows in the file:// page, and drops the injection row, once a content script ran there", () => {
     const rows = expandExpectedRows(true);
     expect(rows.some((r) => r.id === "cs-file-injection")).toBe(false);
-    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(
-      PROBE_TABLE.filter((s) => s.positions.includes("cs-file")).length,
-    );
+    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(40);
     const judgment = judgeIsolationRun({ ...passingInput(), csFileInjected: true });
     expect(
       judgment.rows.filter((r) => r.position === "cs-file").every((r) => r.verdict === "NO-RESULT"),
@@ -1052,5 +1050,291 @@ describe("isolation judge", () => {
     expect((await readZipEntry(xpiPath, "sub/script.js")).toString("utf8")).toBe(
       "console.log(1);\n",
     );
+  });
+});
+
+describe("isolation judge details", () => {
+  const xhr = () => only("xhr-file-log");
+
+  it("reads a probe that threw at its planned target as NO-RESULT", () => {
+    expect(
+      judged(
+        withRow("xhr-file-log", "web", at(xhr(), "threw", "TypeError: x")),
+        "xhr-file-log",
+        "web",
+      ),
+    ).toMatchObject({
+      verdict: "NO-RESULT",
+      observed: `${xhr()} -> threw: TypeError: x`,
+    });
+    expect(
+      judged(
+        withRow(
+          "executescript-recorder-page",
+          "ext-bg",
+          at(only("executescript-recorder-page"), "no-target", "no tab"),
+        ),
+        "executescript-recorder-page",
+        "ext-bg",
+      ),
+    ).toMatchObject({
+      verdict: "NO-RESULT",
+      observed: `${only("executescript-recorder-page")} -> no-target: no tab`,
+    });
+  });
+
+  it("shows the first 200 characters of a malformed row, and calls a text or target of the wrong type malformed", () => {
+    const long = { outcome: "ok", text: "a".repeat(300) };
+    expect(judged(withRow("xhr-file-log", "web", long), "xhr-file-log", "web").observed).toBe(
+      `${xhr()} -> malformed ${JSON.stringify(long).slice(0, 200)}`,
+    );
+    const textNumber = { outcome: "ok", text: 7, target: xhr() };
+    expect(judged(withRow("xhr-file-log", "web", textNumber), "xhr-file-log", "web")).toMatchObject(
+      {
+        verdict: "NO-RESULT",
+        observed: `${xhr()} -> malformed ${JSON.stringify(textNumber)}`,
+      },
+    );
+    const targetNumber = {
+      outcome: "error",
+      text: "error event, status 0, readyState 4",
+      target: 5,
+    };
+    expect(
+      judged(withRow("xhr-file-log", "web", targetNumber), "xhr-file-log", "web").observed,
+    ).toBe(`${xhr()} -> malformed ${JSON.stringify(targetNumber)}`);
+  });
+
+  it("accepts every load and reply combination, and not a pair's or a per-target row's own outcome", () => {
+    for (const outcome of [
+      "load,timeout",
+      "timeout,timeout",
+      "fetch timeout, link timeout",
+      "fetch ok, link timeout",
+      "no-target",
+    ]) {
+      expect(readObservation({ outcome, text: "", target: "t" })?.outcome).toBe(outcome);
+    }
+    for (const outcome of ["same", "differs", "each", "undefined"]) {
+      expect(readObservation({ outcome, text: "", target: "t" })).toBe(null);
+    }
+  });
+
+  it("calls a pair NO-RESULT when either side is malformed or acted on another target, and READ when it carries a mark", () => {
+    const unit = pairUnit("img-file-oracle");
+    const verdictAndLine = (observed: unknown) => {
+      const r = judged(withRow("img-file-oracle", "web", observed), "img-file-oracle", "web");
+      return [r.verdict, r.observed];
+    };
+    const good = pairAt(unit, ERROR_SIDE, ERROR_SIDE);
+    const noHitTarget = {
+      ...good,
+      pair: { hit: { outcome: "error", text: "error" }, miss: good.pair.miss },
+    };
+    expect(verdictAndLine(noHitTarget)).toEqual([
+      "NO-RESULT",
+      `${unit[0]} -> malformed ${JSON.stringify(noHitTarget).slice(0, 200)}`,
+    ]);
+    const noMissTarget = {
+      ...good,
+      pair: { hit: good.pair.hit, miss: { outcome: "error", text: "error" } },
+    };
+    expect(verdictAndLine(noMissTarget)[0]).toBe("NO-RESULT");
+    expect(verdictAndLine({ outcome: "same" })).toEqual([
+      "NO-RESULT",
+      `${unit[0]} -> malformed {"outcome":"same"}`,
+    ]);
+    const otherMiss = {
+      ...good,
+      pair: { ...good.pair, miss: { ...good.pair.miss, target: "file:///x" } },
+    };
+    expect(verdictAndLine(otherMiss)).toEqual([
+      "NO-RESULT",
+      `${unit[0]} -> error: error | error: error; acted on ${unit[0]} and file:///x`,
+    ]);
+    const otherHit = {
+      ...good,
+      pair: { ...good.pair, hit: { ...good.pair.hit, target: "file:///x" } },
+    };
+    expect(verdictAndLine(otherHit)).toEqual([
+      "NO-RESULT",
+      `${unit[0]} -> error: error | error: error; acted on file:///x and ${unit[1]}`,
+    ]);
+    const marked = pairAt(unit, { outcome: "load", text: CTX.marker }, ERROR_SIDE);
+    expect(verdictAndLine(marked)).toEqual([
+      "READ",
+      `${unit[0]} -> load: ${CTX.marker} | error: error`,
+    ]);
+  });
+
+  it("refuses a plan of the wrong shape for its probe", () => {
+    const shapes: readonly (readonly [string, readonly Unit[], string])[] = [
+      [
+        "fetch-file-log",
+        ["file:///a", "file:///b"],
+        'planned ["file:///a","file:///b"], expected one single unit',
+      ],
+      [
+        "fetch-file-log",
+        [["file:///a", "file:///b"]],
+        'planned [["file:///a","file:///b"]], expected one single unit',
+      ],
+      ["img-file-oracle", ["file:///a"], 'planned ["file:///a"], expected one pair unit'],
+    ];
+    for (const [id, units, summary] of shapes) {
+      const input = {
+        ...passingInput(),
+        targets: { ...PLAN.targets, [id]: units } as Readonly<Record<string, readonly Unit[]>>,
+      };
+      expect(judged(input, id, "web")).toMatchObject({
+        verdict: "NO-RESULT",
+        ok: false,
+        observed: summary,
+      });
+    }
+    const pairForFetch = {
+      ...withRow("inventory-read", "web", each([{ target: "file:///a" }])),
+      targets: { ...PLAN.targets, "inventory-read": [["file:///a", "file:///b"] as const] },
+    };
+    expect(judged(pairForFetch, "inventory-read", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      observed:
+        "1 results for 1 planned targets; NO-RESULT file:///a -> a pair planned for a rejected probe",
+    });
+  });
+
+  it("names per-target results that are not a list, not a string, or missing a pair", () => {
+    expect(
+      judged(withRow("resource-all", "web", { each: {} }), "resource-all", "web").observed,
+    ).toBe("no per-target results");
+    const [gre, app] = unitsOf("resource-all") as readonly string[];
+    const deny = (u: unknown) => ({ outcome: "fetch error, link error", text: NETWORK, target: u });
+    expect(
+      judged(
+        withRow("resource-all", "web", each([deny(gre), deny(app), deny(5)])),
+        "resource-all",
+        "web",
+      ).observed,
+    ).toBe("3 results for 2 planned targets; unplanned null");
+    const [first] = unitsOf("script-file-oracle") as readonly (readonly [string, string])[];
+    expect(
+      judged(withRow("script-file-oracle", "web", each([])), "script-file-oracle", "web").observed,
+    ).toBe(
+      `0 results for 2 planned targets; NO-RESULT ${first![0]} -> 0 results, expected one; NO-RESULT ${(unitsOf("script-file-oracle")[1] as readonly string[])[0]!} -> 0 results, expected one`,
+    );
+  });
+
+  it("shows the first 200 characters of each injected archive document", () => {
+    const text = "b".repeat(300);
+    const input = { ...passingInput(), csArchiveInjectedDocs: [{ href: "file:///d/x", text }] };
+    expect(judged(input, "cs-in-archive-document", "cs-archive").observed).toBe(
+      `file:///d/x: ${"b".repeat(200)}`,
+    );
+  });
+
+  it("passes planted-resource@file when it reads the log, not only when it tells existence", () => {
+    const unit = pairUnit("planted-resource");
+    const read = withRow(
+      "planted-resource",
+      "file",
+      pairAt(unit, { outcome: "load", text: CTX.marker }, ERROR_SIDE),
+    );
+    expect(judged(read, "planted-resource", "file")).toMatchObject({ verdict: "READ", ok: true });
+  });
+
+  it("holds each denial to its outcome as well as its text", () => {
+    const cases: readonly (readonly [string, Position, unknown, Verdict, boolean])[] = [
+      ["fetch-file-log", "web", at(only("fetch-file-log"), "ok", NETWORK), "READ", false],
+      [
+        "downloads-search",
+        "ext-bg",
+        at(only("downloads-search"), "done", "no download items"),
+        "LEAKS-EXISTENCE",
+        false,
+      ],
+      [
+        "management-getall",
+        "ext-bg",
+        at(only("management-getall"), "ok", `${CTX.recId} | One-Click HAR`),
+        "LEAKS-EXISTENCE",
+        true,
+      ],
+      [
+        "management-getall",
+        "ext-bg",
+        at(only("management-getall"), "done", "och-probe@test"),
+        "LEAKS-EXISTENCE",
+        true,
+      ],
+      [
+        "management-getall",
+        "ext-page",
+        at(only("management-getall"), "ok", "och-probe@test"),
+        "BLOCKED",
+        false,
+      ],
+      [
+        "storage-recorder",
+        "ext-bg",
+        at(only("storage-recorder"), "error", `own ${CTX.ownMark}`),
+        "NO-RESULT",
+        false,
+      ],
+      ["iframe-file-log", "web", at(only("iframe-file-log"), "ok", BLANK), "READ", false],
+      [
+        "resource-all",
+        "web",
+        each(
+          (unitsOf("resource-all") as readonly string[]).map((u) =>
+            at(u, "fetch error, link error", "TypeError: other"),
+          ),
+        ),
+        "LEAKS-EXISTENCE",
+        false,
+      ],
+      [
+        "planted-own-war-script",
+        "web",
+        at(only("planted-own-war-script"), "error", "error; window.OCH_WAR = undefined"),
+        "BLOCKED",
+        false,
+      ],
+      [
+        "planted-own-war-script",
+        "file",
+        at(only("planted-own-war-script"), "load", "load; window.OCH_WAR = other"),
+        "READ",
+        false,
+      ],
+      [
+        "planted-own-war-fetch",
+        "file",
+        at(only("planted-own-war-fetch"), "ok", "status 200, 3 chars: abc"),
+        "READ",
+        false,
+      ],
+      [
+        "devtools-gethar",
+        "ext-devtools",
+        at(only("devtools-gethar"), "ok", "0 entries: []"),
+        "READ",
+        false,
+      ],
+      ["baseline-webrequest", "ext-bg", at(only("baseline-webrequest"), "ok", "{}"), "READ", false],
+      [
+        "fetch-file-dir",
+        "web",
+        at(only("fetch-file-dir"), "ok", `status 200: ${CTX.secretMark}`),
+        "READ",
+        false,
+      ],
+    ];
+    for (const [id, position, observed, verdict, ok] of cases) {
+      expect([id, position, judged(withRow(id, position, observed), id, position)]).toMatchObject([
+        id,
+        position,
+        { verdict, ok },
+      ]);
+    }
   });
 });

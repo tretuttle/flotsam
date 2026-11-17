@@ -120,20 +120,17 @@ const settled = (o: Observation): string =>
 const NO_ANSWER: ReadonlySet<Outcome> = new Set(["threw", "no-target", "timeout", "error"]);
 const OUTCOME_SET: ReadonlySet<string> = new Set(OUTCOMES);
 
-/** The most severe verdict; anything that is not a known verdict counts as NO-RESULT, never as BLOCKED. */
+/** The most severe verdict: a leak first, then BLOCKED only when every verdict is BLOCKED. */
 function worst(verdicts: readonly Verdict[]): Verdict {
-  for (const v of ["READ", "LEAKS-EXISTENCE", "NO-RESULT"] as const) {
-    if (verdicts.includes(v)) return v;
-  }
+  if (verdicts.includes("READ")) return "READ";
+  if (verdicts.includes("LEAKS-EXISTENCE")) return "LEAKS-EXISTENCE";
   return verdicts.every((v) => v === "BLOCKED") ? "BLOCKED" : "NO-RESULT";
 }
 
 /** A browser report as an Observation, or null when any field is missing, of the wrong type, or not a known outcome. */
 export function readObservation(value: unknown): Observation | null {
-  if (typeof value !== "object" || value === null) return null;
-  const { outcome, text, target } = value as Record<string, unknown>;
-  return typeof outcome === "string" &&
-    OUTCOME_SET.has(outcome) &&
+  const { outcome, text, target } = Object(value) as Record<string, unknown>;
+  return OUTCOME_SET.has(outcome as string) &&
     typeof text === "string" &&
     typeof target === "string"
     ? { outcome: outcome as Outcome, text, target }
@@ -141,10 +138,8 @@ export function readObservation(value: unknown): Observation | null {
 }
 
 function readPair(value: unknown): ObservedPair | null {
-  if (typeof value !== "object" || value === null) return null;
-  const { pair } = value as { readonly pair?: unknown };
-  if (typeof pair !== "object" || pair === null) return null;
-  const { hit, miss } = pair as Record<string, unknown>;
+  const { pair } = Object(value) as { readonly pair?: unknown };
+  const { hit, miss } = Object(pair) as Record<string, unknown>;
   const read = { hit: readObservation(hit), miss: readObservation(miss) };
   return read.hit === null || read.miss === null ? null : { hit: read.hit, miss: read.miss };
 }
@@ -187,12 +182,14 @@ function denies(denial: Denial, o: Observation, ctx: JudgeContext): boolean {
   }
 }
 
+/** The probe's declared leak kind; a probe that declares none (a store read) proves nothing either way. */
+const leakKind = (spec: ProbeSpec): Verdict => ("leak" in spec ? spec.leak : "NO-RESULT");
+
 /** A well-formed answer that is not the denial: what it leaked, by the probe's declared leak kind. */
 function leakOf(spec: ProbeSpec, denial: Denial, o: Observation): Verdict {
   if (denial.kind === "unreachable")
     return o.outcome.startsWith("fetch ok") ? "READ" : "LEAKS-EXISTENCE";
-  if (denial.kind === "own-value-only") return "NO-RESULT";
-  return "leak" in spec ? spec.leak : "NO-RESULT";
+  return leakKind(spec);
 }
 
 type Judged = { readonly verdict: Verdict; readonly line: string };
@@ -256,7 +253,7 @@ function judgePair(
     return { verdict: "NO-RESULT", line };
   }
   if (settled(pair.hit) === settled(pair.miss)) return { verdict: "BLOCKED", line };
-  return { verdict: "leak" in spec ? spec.leak : "NO-RESULT", line };
+  return { verdict: leakKind(spec), line };
 }
 
 function judgeUnit(
@@ -301,8 +298,8 @@ function eachVerdict(
           line: `${unitKey(unit)} -> ${String(reports.length)} results, expected one`,
         };
   });
-  const keys = new Set(planned.map(unitKey));
-  const unplanned = each.map(targetOf).filter((t) => t === null || !keys.has(t));
+  const keys = new Set<string | null>(planned.map(unitKey));
+  const unplanned = each.map(targetOf).filter((t) => !keys.has(t));
   const verdict = worst([
     ...judged.map((t) => t.verdict),
     ...(unplanned.length > 0 ? (["NO-RESULT"] as const) : []),
@@ -327,12 +324,8 @@ function judgeBrowserRow(
   if (planned === undefined) return { verdict: "NO-RESULT", summary: "no planned targets" };
   const denial = denialAt(spec, position);
   if (spec.shape === "each") return eachVerdict(spec, denial, raw, planned, input);
-  const [unit] = planned;
-  if (
-    planned.length !== 1 ||
-    unit === undefined ||
-    (typeof unit === "string") !== (spec.shape === "single")
-  ) {
+  const unit = planned.length === 1 ? planned[0] : undefined;
+  if (unit === undefined || Array.isArray(unit) !== (spec.shape === "pair")) {
     return {
       verdict: "NO-RESULT",
       summary: `planned ${shown(planned)}, expected one ${spec.shape} unit`,
@@ -387,9 +380,7 @@ function expectedLabel(expected: ExpectedOutcome): string {
     case "LEAKS-EXISTENCE-OR-READ":
       return `LEAKS-EXISTENCE or READ (${expected.control})`;
     case "LEAKS-EXISTENCE":
-      return "exception" in expected
-        ? `LEAKS-EXISTENCE (exception: ${expected.exception})`
-        : `LEAKS-EXISTENCE (${expected.control})`;
+      return `LEAKS-EXISTENCE (exception: ${expected.exception})`;
   }
 }
 

@@ -1102,27 +1102,27 @@ const check: HarnessCheck = {
 
       // Every page the recorder declares, open at once: what listens on each, what each frames, and what answers.
       context.log("isolation: reading the recorder's pages");
-      const pageTabs = new Map<string, string>([[popupUrl, popupTab]]);
-      for (const page of packed.declaredPages) {
-        if (!pageTabs.has(page)) pageTabs.set(page, await session.openTab(page));
-      }
-      // Listeners first: the echo below adds one of its own.
-      const pagesRead = (await session.evaluateChrome(CHROME_PAGES_SCRIPT, [
-        recorderId,
-      ])) as readonly {
+      // One page at a time, read while it shows: a new Marionette tab can replace an earlier one in some builds.
+      // Listeners are read before the echo, which adds one of its own.
+      const pagesRead: {
         readonly href: string;
         readonly windowListeners?: readonly string[];
         readonly frames?: number;
         readonly error?: string;
-      }[];
-      const echoes = new Map<string, string>();
-      for (const [page, tab] of pageTabs) {
-        echoes.set(
-          page,
-          await session
-            .evaluate(tab, PAGE_ECHO_EXPRESSION)
-            .catch((e: unknown) => `could not post: ${String(e)}`),
-        );
+        readonly echo: string;
+      }[] = [];
+      for (const page of packed.declaredPages) {
+        const tab = page === popupUrl ? popupTab : await session.openTab(page);
+        const read = (await session.evaluateChrome(CHROME_PAGES_SCRIPT, [recorderId])) as readonly {
+          readonly href: string;
+          readonly windowListeners?: readonly string[];
+          readonly frames?: number;
+          readonly error?: string;
+        }[];
+        const echo = await session
+          .evaluate(tab, PAGE_ECHO_EXPRESSION)
+          .catch((e: unknown) => `could not post: ${String(e)}`);
+        pagesRead.push(...read.filter((r) => r.href === page).map((r) => ({ ...r, echo })));
       }
       const atEnd = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
         recorderId,
@@ -1154,7 +1154,7 @@ const check: HarnessCheck = {
             href: p.href,
             windowListeners: p.windowListeners ?? [],
             frames: p.frames ?? 0,
-            echo: (echoes.get(p.href) ?? "none") === "none" ? null : (echoes.get(p.href) ?? null),
+            echo: p.echo === "none" ? null : p.echo,
           })),
         declaredPages: packed.declaredPages,
       };
