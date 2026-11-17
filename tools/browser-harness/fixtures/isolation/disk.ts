@@ -98,13 +98,14 @@ export function readChangedStructured(
   root: string,
   changes: readonly DiskChange[],
   names: RunNames,
+  marker = "",
 ): Readonly<Record<string, Structured>> {
   return Object.fromEntries(
     changes
       .filter((c) => c.entry.kind === "file")
       .flatMap((c) => {
         const full = NodePath.join(root, ...c.path.split("/"));
-        const read = readStructured(full, NodeFS.readFileSync(full), names);
+        const read = readStructured(full, NodeFS.readFileSync(full), names, marker);
         return read === null ? [] : [[c.path, read] as const];
       }),
   );
@@ -240,8 +241,11 @@ function outsideProblems(
     const [a, b] = theirs as [Structured, Structured];
     return [
       ...entriesBeyond(mine.entries, [a.entries, b.entries]).map((line) => `${c.path}: ${line}`),
-      ...(mine.unaccounted > Math.max(a.unaccounted, b.unaccounted)
-        ? [`${c.path}: ${String(mine.unaccounted)} bytes past its last page`]
+      // Pages a database leaves behind when it shrinks are the browser's; appended recorded data carries the marker.
+      ...(mine.strayMarked && !a.strayMarked && !b.strayMarked
+        ? [
+            `${c.path}: ${String(mine.unaccounted)} bytes past its last page hold the recorded marker`,
+          ]
         : []),
     ];
   }

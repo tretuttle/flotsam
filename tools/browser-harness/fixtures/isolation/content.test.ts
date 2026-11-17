@@ -181,8 +181,13 @@ describe("structured files", () => {
     const bytes = NodeFS.readFileSync(path);
     expect(readStructured(path, bytes, NAMES)?.unaccounted).toBe(0);
     NodeFS.appendFileSync(path, "leaked log line\n");
-    const padded = readStructured(path, NodeFS.readFileSync(path), NAMES);
+    const padded = readStructured(path, NodeFS.readFileSync(path), NAMES, "log line");
     expect(padded?.unaccounted).toBe(16);
+    expect(padded?.strayMarked).toBe(true);
+    expect(readStructured(path, NodeFS.readFileSync(path), NAMES, "OCHMARK")?.strayMarked).toBe(
+      false,
+    );
+    expect(readStructured(path, NodeFS.readFileSync(path), NAMES)?.strayMarked).toBe(false);
     expect(padded?.entries).toEqual(live?.entries);
     expect(readStructured(path, Buffer.from("SQLite format 3\0"), NAMES)).toBeNull();
   });

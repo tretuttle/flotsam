@@ -93,6 +93,7 @@ const prefs = (...names: string[]): Structured => ({
     names.map((n) => [`pref ${n}`, { fields: ["value"], rows: [["1"]] }]),
   ),
   unaccounted: 0,
+  strayMarked: false,
 });
 
 describe("disk snapshot", () => {
@@ -259,16 +260,37 @@ describe("the product run against two control runs", () => {
         evidence(control("p3", prefs("a")), [control("p1", prefs("a")), control("p2", prefs("a"))]),
       ),
     ).toEqual([]);
-    const padded: Structured = { ...prefs("a"), format: "sqlite", unaccounted: 16 };
+    const padded: Structured = {
+      ...prefs("a"),
+      format: "sqlite",
+      unaccounted: 16,
+      strayMarked: true,
+    };
+    const leftover: Structured = {
+      ...prefs("a"),
+      format: "sqlite",
+      unaccounted: 4096,
+      strayMarked: false,
+    };
+    expect(
+      diskProblems(
+        evidence(control("p3", leftover), [control("p1", prefs("a")), control("p2", prefs("a"))]),
+      ),
+    ).toEqual([]);
     expect(
       diskProblems(
         evidence(control("p3", padded), [control("p1", prefs("a")), control("p2", prefs("a"))]),
       ),
-    ).toEqual(["profile/prefs.js: 16 bytes past its last page"]);
+    ).toEqual(["profile/prefs.js: 16 bytes past its last page hold the recorded marker"]);
+    expect(
+      diskProblems(
+        evidence(control("p3", padded), [control("p1", prefs("a")), control("p2", padded)]),
+      ),
+    ).toEqual([]);
   });
 
   it("judges a database's journal and write-ahead log through the database", () => {
-    const db: Structured = { format: "sqlite", entries: {}, unaccounted: 0 };
+    const db: Structured = { format: "sqlite", entries: {}, unaccounted: 0, strayMarked: false };
     const product = run(
       [added("profile/places.sqlite-wal", file("w9")), added("profile/places.sqlite", file("x"))],
       {

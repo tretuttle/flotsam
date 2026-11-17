@@ -794,7 +794,7 @@ function runDisk(options: {
     plan: diffSnapshots(options.before, options.plan),
     probes: diffSnapshots(options.before, options.probes),
     final,
-    structured: readChangedStructured(options.base, final, options.names),
+    structured: readChangedStructured(options.base, final, options.names, options.marker),
     names: options.names,
     harness: Object.fromEntries(
       Object.entries(options.harness).map(([path, bytes]) => [

@@ -55,6 +55,8 @@ export type Structured = {
   readonly entries: Entries;
   /** Bytes past the last page a SQLite header counts; anything there is invisible to SQLite. */
   readonly unaccounted: number;
+  /** Whether those bytes hold the recorded marker: a page the browser left behind does not, appended data does. */
+  readonly strayMarked: boolean;
 };
 
 const short = (text: string): string => digest(text).slice(0, 10);
@@ -162,7 +164,11 @@ function prefEntries(text: string): Entries | null {
  * own files stay untouched; each cell is a short digest of its value with run names replaced. Then the copy is fully
  * checkpointed, so its header counts every page, and the bytes past its last page are counted.
  */
-function sqliteRead(path: string, names: RunNames): Pick<Structured, "entries" | "unaccounted"> {
+function sqliteRead(
+  path: string,
+  names: RunNames,
+  marker: string,
+): Pick<Structured, "entries" | "unaccounted" | "strayMarked"> {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-sqlite-"));
   try {
     const copy = NodePath.join(dir, "db");
@@ -204,7 +210,12 @@ function sqliteRead(path: string, names: RunNames): Pick<Structured, "entries" |
       const { page_count: pages } = db.prepare("PRAGMA page_count").get() as { page_count: number };
       const { page_size: size } = db.prepare("PRAGMA page_size").get() as { page_size: number };
       db.close();
-      return { entries, unaccounted: Math.max(0, NodeFS.statSync(copy).size - pages * size) };
+      const stray = NodeFS.readFileSync(copy).subarray(pages * size);
+      return {
+        entries,
+        unaccounted: stray.length,
+        strayMarked: marker !== "" && stray.toString("latin1").includes(marker),
+      };
     } finally {
       if (db.isOpen) db.close();
     }
@@ -224,11 +235,16 @@ export function contentText(bytes: Buffer): string {
  * Reads a file's entries by its format, found from its bytes, never its name: a SQLite database, a mozlz4 JSON
  * file, a JSON file, or a file of prefs. Null for any other file, which is compared by digest alone.
  */
-export function readStructured(path: string, bytes: Buffer, names: RunNames): Structured | null {
+export function readStructured(
+  path: string,
+  bytes: Buffer,
+  names: RunNames,
+  marker = "",
+): Structured | null {
   const head = bytes.subarray(0, 16).toString("latin1");
   if (head === SQLITE_MAGIC && bytes.length >= 100) {
     try {
-      return { format: "sqlite", ...sqliteRead(path, names) };
+      return { format: "sqlite", ...sqliteRead(path, names, marker) };
     } catch {
       return null;
     }
@@ -236,13 +252,20 @@ export function readStructured(path: string, bytes: Buffer, names: RunNames): St
   const named = withRoles(contentText(bytes), names);
   if (/^\s*[[{]/u.test(named)) {
     try {
-      return { format: "json", entries: jsonEntries(JSON.parse(named)), unaccounted: 0 };
+      return {
+        format: "json",
+        entries: jsonEntries(JSON.parse(named)),
+        unaccounted: 0,
+        strayMarked: false,
+      };
     } catch {
       // Not JSON after all; it may still set prefs.
     }
   }
   const prefs = prefEntries(named);
-  return prefs === null ? null : { format: "prefs", entries: prefs, unaccounted: 0 };
+  return prefs === null
+    ? null
+    : { format: "prefs", entries: prefs, unaccounted: 0, strayMarked: false };
 }
 
 /** A group's path, segment by segment: a JSON leaf by its keys and indexes, any other group as one segment. */
