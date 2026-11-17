@@ -168,6 +168,8 @@ describe("structured files", () => {
     const live = readStructured(path, NodeFS.readFileSync(path), NAMES);
     db.close();
     expect(live?.format).toBe("sqlite");
+    // Read while the write-ahead log still holds pages the header does not count yet: none is stray.
+    expect(live?.unaccounted).toBe(0);
     expect(live?.entries["table t"]?.fields).toEqual(["k", "v", "n"]);
     expect(live?.entries["table t"]?.rows.map((row) => row[2])).toEqual(["#", "#"]);
     expect(live?.entries["table t"]?.rows).toHaveLength(2);

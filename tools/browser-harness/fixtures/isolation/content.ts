@@ -154,9 +154,10 @@ function prefEntries(text: string): Entries | null {
 
 /**
  * Every row of every table, read from a copy so the browser's journal and write-ahead log are applied and the run's
- * own files stay untouched. Each cell is a short digest of its value with run names replaced.
+ * own files stay untouched; each cell is a short digest of its value with run names replaced. Then the copy is fully
+ * checkpointed, so its header counts every page, and the bytes past its last page are counted.
  */
-function sqliteEntries(path: string, names: RunNames): Entries {
+function sqliteRead(path: string, names: RunNames): Pick<Structured, "entries" | "unaccounted"> {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-sqlite-"));
   try {
     const copy = NodePath.join(dir, "db");
@@ -177,7 +178,7 @@ function sqliteEntries(path: string, names: RunNames): Entries {
           : value instanceof Uint8Array
             ? short(withRoles(Buffer.from(value).toString("latin1"), names))
             : valueDigest(withRoles(String(value), names));
-      return Object.fromEntries(
+      const entries = Object.fromEntries(
         tables.map(({ name }) => {
           const quoted = `"${name.replaceAll('"', '""')}"`;
           const fields = (
@@ -190,8 +191,11 @@ function sqliteEntries(path: string, names: RunNames): Entries {
           ];
         }),
       );
-    } finally {
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       db.close();
+      return { entries, unaccounted: sqliteUnaccounted(NodeFS.readFileSync(copy)) };
+    } finally {
+      if (db.isOpen) db.close();
     }
   } finally {
     NodeFS.rmSync(dir, { recursive: true, force: true });
@@ -220,11 +224,7 @@ export function readStructured(path: string, bytes: Buffer, names: RunNames): St
   const head = bytes.subarray(0, 16).toString("latin1");
   if (head === SQLITE_MAGIC && bytes.length >= 100) {
     try {
-      return {
-        format: "sqlite",
-        entries: sqliteEntries(path, names),
-        unaccounted: sqliteUnaccounted(bytes),
-      };
+      return { format: "sqlite", ...sqliteRead(path, names) };
     } catch {
       return null;
     }
