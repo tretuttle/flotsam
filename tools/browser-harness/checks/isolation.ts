@@ -105,6 +105,9 @@ const proxyPrefs = (port: number): readonly Pref[] => [
   { name: "toolkit.telemetry.firstShutdownPing.enabled", value: false },
   // No remote-settings sync, which lands an etag and its records only in the runs whose timer happened to fire.
   { name: "services.settings.server", value: "data:,#remote-settings-dummy/v1" },
+  // No crash-recovery snapshot of live tabs every 15 s, which catches each run's tabs at a different moment.
+  { name: "browser.sessionstore.resume_from_crash", value: false },
+  { name: "browser.sessionstore.interval", value: 3_600_000 },
 ];
 
 type AddonInfo = {
