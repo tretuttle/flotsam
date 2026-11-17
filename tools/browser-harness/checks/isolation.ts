@@ -108,6 +108,8 @@ const proxyPrefs = (port: number): readonly Pref[] => [
   // No crash-recovery snapshot of live tabs every 15 s, which catches each run's tabs at a different moment.
   { name: "browser.sessionstore.resume_from_crash", value: false },
   { name: "browser.sessionstore.interval", value: 3_600_000 },
+  { name: "browser.sessionstore.max_tabs_undo", value: 0 },
+  { name: "browser.sessionstore.max_windows_undo", value: 0 },
 ];
 
 type AddonInfo = {
@@ -295,6 +297,19 @@ const CHROME_PAGES_SCRIPT = `
     }
     done(pages);
   })().catch((e) => done([{ href: "", error: String(e) }]));
+`;
+
+/**
+ * Leaves one blank tab and closes the rest, so the session the browser writes at quit is the same in every run
+ * rather than each tab caught mid-load. With no closed-tab history kept, nothing of the closed tabs is written.
+ */
+const CHROME_QUIESCE_TABS_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const blank = win.gBrowser.addTab("about:blank", { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
+  win.gBrowser.selectedTab = blank;
+  for (const tab of [...win.gBrowser.tabs]) if (tab !== blank) win.gBrowser.removeTab(tab, { skipPermitUnload: true, animate: false });
+  done(win.gBrowser.tabs.length);
 `;
 
 /** The random id the profiles datastore names its database after, once it has made one. */
@@ -1029,6 +1044,7 @@ async function controlRun(
       await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [plan.recorderId]);
       await readPages(session, plan.recorderId, pageUrls, false);
       probesSnapshot = snapshotTree(workspace.base, { marker: plan.marker });
+      await session.evaluateChrome(CHROME_QUIESCE_TABS_SCRIPT);
       await session.quit();
     }
     const last = await runNoMarionetteLaunch({
@@ -1565,6 +1581,7 @@ const check: HarnessCheck = {
       };
 
       probesSnapshot = snapshotTree(workspace.base, { marker });
+      await session.evaluateChrome(CHROME_QUIESCE_TABS_SCRIPT);
       context.log("isolation: quitting marionette session");
       await session.quit();
     }
