@@ -8,7 +8,7 @@ import {
 } from "../src/browser.ts";
 import type { CheckContext, CheckResult, HarnessCheck } from "../src/checks.ts";
 import { hostProcessIo, removeDirectoryBounded } from "../src/owned-process.ts";
-import { callGetEnvironment, readPopupFacts, verifyBrowserIdentity } from "./environment.ts";
+import { callGetEnvironment, readPopupView, verifyBrowserIdentity } from "./environment.ts";
 
 export async function runRestartVerification(
   context: CheckContext,
@@ -64,10 +64,8 @@ export async function runRestartVerification(
       if (env.toolbox.open || env.toolbox.reason !== "devtools-not-started") {
         throw new Error(`${phase}: unexpected toolbox ${JSON.stringify(env.toolbox)}`);
       }
-      const text = await readPopupFacts(session, tab);
-      if (!text.includes("Not opened since the browser started")) {
-        throw new Error(`${phase}: popup text missed devtools-not-started`);
-      }
+      const view = await readPopupView(session, tab);
+      if (view !== "empty-tab") throw new Error(`${phase}: the popup drew ${view}, not empty-tab`);
       return `${session.identity.name} ${session.identity.version} (${session.identity.buildId})`;
     } finally {
       await session.closeTab(tab).catch(() => undefined);

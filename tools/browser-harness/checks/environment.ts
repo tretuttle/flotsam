@@ -46,6 +46,14 @@ const REFUSED_CALLS: ReadonlyArray<{
   { call: "an extra argument", argumentList: "0, 'extra'", message: SCHEMA_REFUSAL },
 ];
 
+/** The popup's source line with a toolbox open on its tab, written here so a change to it fails the check. */
+const DEVTOOLS_SOURCE_LINE =
+  "Includes what the open DevTools panel captured. Bodies DevTools dropped are filled in from the background recording.";
+
+/**
+ * The popup page, opened in its own tab, reads that tab: nothing is recorded there, so it draws `empty-tab` until a
+ * toolbox opens on it, and then the rows with the DevTools source line.
+ */
 const STEPS: ReadonlyArray<{
   readonly step: string;
   readonly act?: string;
@@ -55,7 +63,7 @@ const STEPS: ReadonlyArray<{
   {
     step: "before DevTools starts",
     toolbox: () => ({ open: false, reason: "devtools-not-started" }),
-    text: () => "Not opened since the browser started",
+    text: () => "empty-tab",
   },
   {
     step: "toolbox open on the tab",
@@ -65,7 +73,7 @@ const STEPS: ReadonlyArray<{
           gDevTools.showToolboxForTab(window.gBrowser.selectedTab, { toolId: "netmonitor" })
             .then((tb) => done(tb.hostType), (err) => done({ error: String(err) }));`,
     toolbox: (host) => ({ open: true, host }),
-    text: (host) => `Open on this tab (${host})`,
+    text: () => `ready: ${DEVTOOLS_SOURCE_LINE}`,
   },
   {
     step: "toolbox closed again",
@@ -75,7 +83,7 @@ const STEPS: ReadonlyArray<{
           gDevTools.closeToolboxForTab(window.gBrowser.selectedTab)
             .then(() => done(null), (err) => done({ error: String(err) }));`,
     toolbox: () => ({ open: false, reason: "no-toolbox-for-tab" }),
-    text: () => "Not open on this tab",
+    text: () => "empty-tab",
   },
 ];
 
@@ -115,7 +123,8 @@ export async function callGetEnvironment(
     | { error: string };
 }
 
-export async function readPopupFacts(
+/** The popup's view, and its source line when it draws one: `empty-tab`, or `ready: <line>`. */
+export async function readPopupView(
   session: Pick<BrowserSession, "evaluate">,
   context: string,
 ): Promise<string> {
@@ -123,9 +132,10 @@ export async function readPopupFacts(
     context,
     `new Promise((resolve, reject) => {
       const read = () => {
-        const el = document.querySelector("dl.facts, p.facts");
-        if (!el) return null;
-        return el.innerText || el.textContent || "";
+        const view = document.querySelector(".popup[data-view]")?.dataset.view;
+        if (view === undefined) return null;
+        const source = document.querySelector(".src");
+        return source === null ? view : view + ": " + source.textContent.trim();
       };
       const immediate = read();
       if (immediate !== null) { resolve(immediate); return; }
@@ -139,7 +149,7 @@ export async function readPopupFacts(
       });
       const timer = setTimeout(() => {
         observer.disconnect();
-        reject(new Error("popup facts element not found"));
+        reject(new Error("the popup drew no view"));
       }, 15000);
       observer.observe(document.documentElement, { childList: true, subtree: true });
     })`,
@@ -222,7 +232,7 @@ export async function runEnvironmentVerification(
         if (typeof nextHost === "string") host = nextHost;
       }
       await session.reloadTab(tab);
-      const popupText = await readPopupFacts(session, tab);
+      const popupView = await readPopupView(session, tab);
       const rawEnv = await callGetEnvironment(session, tab, null);
       if ("error" in rawEnv) {
         failures.push(`${step.step}: getEnvironment failed: ${rawEnv.error}`);
@@ -232,12 +242,7 @@ export async function runEnvironmentVerification(
       const identityProblem = verifyBrowserIdentity(env.browser, oracle);
       if (identityProblem !== null) failures.push(`${step.step}: browser: ${identityProblem}`);
       checkEqual(`${step.step}: toolbox`, env.toolbox, step.toolbox(host));
-      const lines = popupText
-        .trim()
-        .split(/\r?\n/u)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      checkEqual(`${step.step}: popup DevTools line`, lines.at(-1), step.text(host));
+      checkEqual(`${step.step}: popup view`, popupView, step.text(host));
     }
   } finally {
     await session.closeTab(tab).catch(() => undefined);
