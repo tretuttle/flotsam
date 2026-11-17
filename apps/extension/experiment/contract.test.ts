@@ -202,6 +202,7 @@ describe("oneClickHar contract", () => {
       | "file-replaced"
       | "name-too-long"
       | "name-taken"
+      | "timed-out"
       | "other"
     >();
     expectTypeOf<FailureText<FailureOf<typeof oneClickHarApi>>>().toEqualTypeOf<never>();

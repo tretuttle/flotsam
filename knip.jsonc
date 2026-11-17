@@ -53,6 +53,7 @@
         "coredumpctl",
         "unshare",
         "mkfifo",
+        "cc",
       ],
     },
   },

@@ -148,6 +148,17 @@ interface StreamListenerTee extends StreamListener {
 interface FileOutputStream extends OutputStream {
   init(file: LocalFile, ioFlags: number, perm: number, behaviorFlags: number): void;
 }
+/** One open file for reading and writing, with one position for both. Each interface is reached by QueryInterface. */
+interface FileRandomAccessStream extends InputStream, OutputStream {
+  init(file: LocalFile, ioFlags: number, perm: number, behaviorFlags: number): void;
+  QueryInterface(iface: XpcomInterface): FileRandomAccessStream;
+  /** nsISeekableStream. */
+  seek(whence: number, offset: number): void;
+  /** nsISeekableStream: the file ends at the current position, shorter or longer. */
+  setEOF(): void;
+  /** nsIFileMetadata: the open file's own length. */
+  readonly size: number;
+}
 interface LocalFile {
   readonly path: string;
   readonly fileSize: number;
@@ -201,6 +212,7 @@ interface XpcomClasses {
   "@mozilla.org/network/stream-listener-tee;1": StreamListenerTee;
   "@mozilla.org/network/file-output-stream;1": FileOutputStream;
   "@mozilla.org/network/file-input-stream;1": FileInputStream;
+  "@mozilla.org/network/file-random-access-stream;1": FileRandomAccessStream;
   "@mozilla.org/file/local;1": LocalFile;
   "@mozilla.org/io/multiplex-input-stream;1": MultiplexInputStream;
   "@mozilla.org/io/arraybuffer-input-stream;1": ArrayBufferInputStream;
@@ -221,6 +233,7 @@ interface ConverterOutputStream {
 interface BinaryInputStream {
   setInputStream(stream: InputStream): void;
   readArrayBuffer(count: number, buffer: ArrayBuffer): number;
+  readByteArray(count: number): number[];
 }
 
 /** What `asyncConvertData` returns: a listener that takes the coded bytes. Request arguments may be null. */
@@ -268,7 +281,13 @@ declare const Ci: {
   readonly nsIAsyncStreamCopier: XpcomInterface;
   readonly nsIEventTarget: XpcomInterface;
   readonly nsIInputStream: XpcomInterface;
-  readonly nsISeekableStream: XpcomInterface & { readonly NS_SEEK_SET: number };
+  readonly nsISeekableStream: XpcomInterface & {
+    readonly NS_SEEK_SET: number;
+    readonly NS_SEEK_END: number;
+  };
+  readonly nsIFileRandomAccessStream: XpcomInterface;
+  readonly nsIFileMetadata: XpcomInterface;
+  readonly nsIOutputStream: XpcomInterface;
   readonly nsISubstitutingProtocolHandler: XpcomInterface;
   readonly nsIRandomGenerator: XpcomInterface;
   readonly nsIBinaryInputStream: XpcomInterface;

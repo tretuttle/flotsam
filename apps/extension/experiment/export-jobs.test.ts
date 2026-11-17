@@ -90,6 +90,22 @@ describe("the export slot", () => {
     expect(jobs.cancel(job.id)).toBe(true);
   });
 
+  it("ends a job cancelled the moment cancel is asked, even while its run never returns, and runs the next", async () => {
+    let runs = 0;
+    const jobs = slot(async () => {
+      runs += 1;
+      return runs === 1 ? new Promise<RunOutcome>(() => undefined) : done;
+    });
+    const stuck = jobs.start(request);
+    const next = jobs.start(request);
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(jobs.cancel(stuck.id)).toBe(true);
+    await jobs.idle();
+    expect(jobs.job(stuck.id)?.state).toEqual({ kind: "cancelled" });
+    expect(jobs.audit(stuck.id)).toEqual({ bytesAtCancel: 0, bytesAtStop: null });
+    expect(jobs.job(next.id)?.state.kind).toBe("done");
+  });
+
   it("never runs a job cancelled while it waited, and refuses to cancel a finished or unknown job", async () => {
     const gate = deferred<RunOutcome>();
     let runs = 0;

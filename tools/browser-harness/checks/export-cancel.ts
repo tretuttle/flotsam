@@ -60,10 +60,16 @@ const check: HarnessCheck = {
       `browser.oneClickHar.cancelExport(${JSON.stringify(job.id)}).then(String)`,
     );
     const final = await waitForJob(page, job.id, ended);
-    const audit = (await callHook(session, {
-      kind: "export-audit",
-      id: job.id,
-    })) as CancelObservation["audit"];
+    // The job ends cancelled at once; the audit's stop comes when the run itself has stopped and cleaned up.
+    let audit: CancelObservation["audit"] = null;
+    for (const by = Date.now() + 10_000; Date.now() < by;) {
+      audit = (await callHook(session, {
+        kind: "export-audit",
+        id: job.id,
+      })) as CancelObservation["audit"];
+      if (audit?.bytesAtStop !== null && audit?.bytesAtStop !== undefined) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const journal = NodePath.join(workspace.root(), "exports.jsonl");
     const observation: CancelObservation = {
       state: final.state.kind,

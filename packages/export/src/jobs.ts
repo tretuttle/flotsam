@@ -86,6 +86,8 @@ export type WriteFailure =
   | { readonly kind: "file-replaced" }
   | { readonly kind: "name-too-long" }
   | { readonly kind: "name-taken" }
+  /** A file call was still running after the export's time limit for one call. */
+  | { readonly kind: "timed-out" }
   /** An error the table does not name. */
   | { readonly kind: "other" };
 

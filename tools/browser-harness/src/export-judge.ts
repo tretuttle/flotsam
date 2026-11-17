@@ -315,10 +315,11 @@ export function judgeAfterCrash(o: AfterCrashObservation): readonly string[] {
   ];
 }
 
-/** How one cause must end: a named failure kind, or done under a given name. */
+/** How one cause must end: a named failure kind, done under a given name, or cancelled. */
 export type RowOutcome =
   | { readonly kind: "write-failed"; readonly failure: string }
-  | { readonly kind: "done"; readonly fileName: string };
+  | { readonly kind: "done"; readonly fileName: string }
+  | { readonly kind: "cancelled" };
 
 export type RowObservation = {
   readonly expect: RowOutcome;
@@ -339,6 +340,8 @@ export type RowObservation = {
   readonly journal: string;
   /** Paths the row put in place before the export started, so never the export's: no journal line may name one. */
   readonly theirs: readonly string[];
+  /** How long the export took to end after the row's held call was let go or its cancel was asked, and the limit. */
+  readonly timing: { readonly tookMs: number; readonly withinMs: number } | null;
 };
 
 /** Parts the journal says started and never ended: what the next start would act on. */
@@ -369,7 +372,15 @@ export function judgeRow(o: RowObservation): readonly string[] {
   const problems: string[] = [];
   const state = o.state as { kind?: string; fileName?: string; failure?: Record<string, unknown> };
   const failure = state.failure ?? {};
-  if (o.expect.kind === "write-failed") {
+  if (o.timing !== null && o.timing.tookMs > o.timing.withinMs)
+    problems.push(
+      `ended ${String(o.timing.tookMs)} ms after the row let it go, more than ${String(o.timing.withinMs)}`,
+    );
+  if (o.expect.kind === "cancelled") {
+    if (state.kind !== "cancelled")
+      problems.push(`ended ${JSON.stringify(o.state)}, expected cancelled`);
+    if (o.files.length > 0) problems.push(`left behind: ${o.files.join(", ")}`);
+  } else if (o.expect.kind === "write-failed") {
     if (state.kind !== "write-failed" || failure["kind"] !== o.expect.failure)
       problems.push(`ended ${JSON.stringify(o.state)}, expected write-failed ${o.expect.failure}`);
     if (

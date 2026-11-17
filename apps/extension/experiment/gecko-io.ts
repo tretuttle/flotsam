@@ -185,6 +185,56 @@ export const pathState = (path: string): PathState => {
   return { kind, size: file.fileSize };
 };
 
-/** The first `bytes` bytes of a file. Only ever called on a path `pathState` just found to be a regular file. */
-export const readHead = (path: string, bytes: number): Promise<Uint8Array> =>
-  IOUtils.read(path, { maxBytes: bytes });
+const PR_RDWR = 0x04;
+
+/** Opens for reading and writing: an open that never waits, since a FIFO opened both ways has its own writer. */
+export const openReadWrite = (
+  path: string,
+  flags: number,
+  mode: number,
+): FileRandomAccessStream => {
+  const stream = Cc["@mozilla.org/network/file-random-access-stream;1"].createInstance(
+    Ci.nsIFileRandomAccessStream,
+  );
+  stream.init(localFile(path), PR_RDWR | flags, mode, 0);
+  for (const iface of [
+    Ci.nsIInputStream,
+    Ci.nsIOutputStream,
+    Ci.nsISeekableStream,
+    Ci.nsIFileMetadata,
+  ])
+    stream.QueryInterface(iface);
+  return stream;
+};
+
+/** Up to `bytes` first bytes through `stream`, from its start. */
+export const readStart = (stream: FileRandomAccessStream, bytes: number): Uint8Array => {
+  stream.seek(Ci.nsISeekableStream.NS_SEEK_SET, 0);
+  const reader = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
+  reader.setInputStream(stream);
+  return Uint8Array.from(reader.readByteArray(Math.min(bytes, stream.size)));
+};
+
+/**
+ * The first `bytes` bytes of what is at `path`, or fewer. The open never waits, and nothing is read from a file that
+ * reports fewer bytes than asked, which is every FIFO and device: a read there could wait for a writer.
+ */
+export const readHead = async (path: string, bytes: number): Promise<Uint8Array> => {
+  const stream = openReadWrite(path, 0, 0);
+  try {
+    return stream.size < bytes ? new Uint8Array(0) : readStart(stream, bytes);
+  } finally {
+    stream.close();
+  }
+};
+
+/** A one-shot timer, cancelled once the call it bounds settles, so none is left armed after an export. */
+export const oneShot = (
+  ms: number,
+): { readonly elapsed: Promise<void>; readonly cancel: () => void } => {
+  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+  const elapsed = new Promise<void>((resolve) => {
+    timer.initWithCallback({ notify: () => resolve() }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+  });
+  return { elapsed, cancel: () => timer.cancel() };
+};

@@ -47,12 +47,27 @@ type Row = {
   readonly after?: (at: Place) => void;
   /** What the row itself put in the folder, before or during the export: not the export's, each left as it was. */
   readonly theirs?: readonly string[];
-  /** The export's own part, changed so it can no longer be proved the export's: reported, and left where it is. */
-  readonly leaves?: readonly string[];
+  /** The export's first call on its part after its first MiB, held by hold-part-call.c while the row acts. */
+  readonly hold?: Hold;
   readonly expect: (fileName: string) => RowOutcome;
 };
 
+type Hold = {
+  readonly act: (at: Place & { readonly part: string }) => void;
+  /** Cancel while the call is held, and let it go once the export has ended. */
+  readonly cancel?: true;
+  /** Let the call go only once the export has ended. */
+  readonly keep?: true;
+  /** How long the export may take to end: from the release, or from the cancel or the hold when it is kept. */
+  readonly withinMs: number;
+};
+
 const failed = (failure: string) => (): RowOutcome => ({ kind: "write-failed", failure });
+const cancelled = (): RowOutcome => ({ kind: "cancelled" });
+/** The product's time limit for one export file call (EXPORT_STEP_MS in host.ts). */
+const STEP_MS = 15_000;
+/** How long an export may take to end once nothing holds it. */
+const PROMPTLY_MS = 5_000;
 const doneAs =
   (suffix: string) =>
   (fileName: string): RowOutcome => ({ kind: "done", fileName: `${fileName}${suffix}.har` });
@@ -67,6 +82,10 @@ const locked = (path: string): string => {
 const replace = (part: string, make: (path: string) => void): void => {
   NodeFS.rmSync(part);
   make(part);
+};
+const mkfifo = (path: string): void => {
+  const made = NodeChildProcess.spawnSync("mkfifo", ["-m", "600", path], { encoding: "utf8" });
+  if (made.status !== 0) throw new Error(`mkfifo: ${made.stderr}`);
 };
 
 /**
@@ -194,13 +213,14 @@ const ROWS: readonly Row[] = [
   },
   {
     cause:
-      "part replaced by a regular file with its first 4 KiB and another size (the export's id, so taken for it)",
+      "part replaced by a regular file with its first 4 KiB (the export's id) and another size",
     fileName: "part-same-head",
     folder: (b) => dir(`${b}/part-same-head`),
     during: ({ part }) => {
       const head = NodeFS.readFileSync(part).subarray(0, 4096);
       replace(part, (p) => NodeFS.writeFileSync(p, head));
     },
+    theirs: ["part-same-head.har.part"],
     expect: failed("file-replaced"),
   },
   {
@@ -215,7 +235,6 @@ const ROWS: readonly Row[] = [
         NodeFS.closeSync(fd);
       }
     },
-    leaves: ["part-overwritten.har.part"],
     expect: failed("file-replaced"),
   },
   {
@@ -230,12 +249,61 @@ const ROWS: readonly Row[] = [
     cause: "part replaced by a FIFO (never opened)",
     fileName: "part-fifo",
     folder: (b) => dir(`${b}/part-fifo`),
-    during: ({ part }) =>
-      replace(part, (p) => {
-        const made = NodeChildProcess.spawnSync("mkfifo", ["-m", "600", p], { encoding: "utf8" });
-        if (made.status !== 0) throw new Error(`mkfifo: ${made.stderr}`);
-      }),
+    during: ({ part }) => replace(part, mkfifo),
     theirs: ["part-fifo.har.part"],
+    expect: failed("file-replaced"),
+  },
+  {
+    cause: "a FIFO takes the part's name while the rename waits (put back, never opened)",
+    fileName: "held-fifo",
+    folder: (b) => dir(`${b}/held-fifo`),
+    hold: { act: ({ part }) => replace(part, mkfifo), withinMs: PROMPTLY_MS },
+    theirs: ["held-fifo.har.part"],
+    expect: failed("file-replaced"),
+  },
+  {
+    cause: "cancel while the rename waits, a FIFO at the part's name",
+    fileName: "held-cancel",
+    folder: (b) => dir(`${b}/held-cancel`),
+    hold: { act: ({ part }) => replace(part, mkfifo), cancel: true, withinMs: PROMPTLY_MS },
+    theirs: ["held-cancel.har.part"],
+    expect: cancelled,
+  },
+  {
+    cause: "the rename still waiting at the step limit (the late rename cleaned up)",
+    fileName: "held-late",
+    folder: (b) => dir(`${b}/held-late`),
+    hold: { act: () => undefined, keep: true, withinMs: STEP_MS + PROMPTLY_MS },
+    expect: failed("timed-out"),
+  },
+  {
+    cause: "folder replaced by a link to the profile while the rename waits",
+    fileName: "held-folder-link",
+    folder: (b) => dir(`${b}/held-folder-link`),
+    hold: {
+      act: ({ base, folder, profile }) => {
+        NodeFS.renameSync(folder, `${base}/held-folder-moved`);
+        NodeFS.symlinkSync(profile, folder);
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    expect: failed("folder-refused"),
+  },
+  {
+    cause: "folder deleted while the rename waits",
+    fileName: "held-folder-gone",
+    folder: (b) => dir(`${b}/held-folder-gone`),
+    hold: {
+      act: ({ folder }) => NodeFS.rmSync(folder, { recursive: true, force: true }),
+      withinMs: PROMPTLY_MS,
+    },
+    expect: failed("folder-missing"),
+  },
+  {
+    cause: "part deleted while the rename waits",
+    fileName: "held-part-gone",
+    folder: (b) => dir(`${b}/held-part-gone`),
+    hold: { act: ({ part }) => NodeFS.rmSync(part), withinMs: PROMPTLY_MS },
     expect: failed("file-replaced"),
   },
   {
@@ -251,13 +319,22 @@ const ROWS: readonly Row[] = [
  * nested namespace, so file permissions apply to it as they do to the user. Every step execs, so the process the
  * harness started and stops is the browser itself.
  */
-const launcher = (binary: string, mountAt: string | null, options: string | null): string => {
+const launcher = (
+  binary: string,
+  mountAt: string | null,
+  options: string | null,
+  hold: { readonly library: string; readonly dir: string } | null,
+): string => {
   const mountStep =
     mountAt === null || options === null
       ? ":"
       : `mount -t tmpfs -o ${options} one-click-har-row ${JSON.stringify(mountAt)}`;
+  const preload =
+    hold === null
+      ? ""
+      : `export LD_PRELOAD=${JSON.stringify(hold.library)} OCH_HOLD_DIR=${JSON.stringify(hold.dir)}\n`;
   return `#!/bin/sh
-exec unshare --user --map-root-user --mount -- /bin/sh -c '${mountStep} && exec unshare --user --map-user=${String(process.getuid?.())} --map-group=${String(process.getgid?.())} -- "$@"' sh ${JSON.stringify(binary)} "$@"
+${preload}exec unshare --user --map-root-user --mount -- /bin/sh -c '${mountStep} && exec unshare --user --map-user=${String(process.getuid?.())} --map-group=${String(process.getgid?.())} -- "$@"' sh ${JSON.stringify(binary)} "$@"
 `;
 };
 
@@ -276,6 +353,20 @@ const sha256 = (path: string): string =>
   NodeFS.existsSync(path)
     ? NodeCrypto.createHash("sha256").update(NodeFS.readFileSync(path)).digest("hex")
     : "absent";
+
+/** Every export file opens with this, the document's start and its random id. */
+const EXPORT_OPENING = '{"log":{"_harExportId"';
+
+/**
+ * Whether a file holds any of an export's bytes. The browser rewrites prefs.js itself during a long row, so prefs.js is
+ * judged by this rather than by its hash: no export byte may reach it.
+ */
+const exportBytesIn = (path: string): string =>
+  !NodeFS.existsSync(path)
+    ? "absent"
+    : NodeFS.readFileSync(path).includes(EXPORT_OPENING)
+      ? "holds export bytes"
+      : "no export bytes";
 
 /** What is at a path, never following a link there: a file by its hash, a link by its target. */
 const fingerprint = (path: string): string => {
@@ -319,11 +410,43 @@ const namespacesRefused = (): string | null => {
   return probe.status === 0 ? null : (probe.stderr || String(probe.error)).trim();
 };
 
+const HOLD_SOURCE = NodePath.join(import.meta.dirname, "..", "native", "hold-part-call.c");
+
+/** Builds hold-part-call.c into `folder`; the error text when no C compiler can. */
+const buildHold = (folder: string): string | { readonly error: string } => {
+  const library = NodePath.join(folder, "hold-part-call.so");
+  const built = NodeChildProcess.spawnSync(
+    "cc",
+    ["-shared", "-fPIC", "-O2", "-o", library, HOLD_SOURCE, "-ldl"],
+    { encoding: "utf8" },
+  );
+  return built.status === 0 ? library : { error: (built.stderr || String(built.error)).trim() };
+};
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Wakes any reader waiting on a FIFO under `root` by opening it for writing, without waiting, and closing it. */
+const wakeFifoReaders = (root: string): void => {
+  for (const [path, print] of filesUnder(root, []))
+    if (print === "fifo")
+      try {
+        NodeFS.closeSync(
+          NodeFS.openSync(path, NodeFS.constants.O_WRONLY | NodeFS.constants.O_NONBLOCK),
+        );
+      } catch {
+        // No reader is waiting.
+      }
+};
+
 async function runRow(
   context: CheckContext,
   row: Row,
   extensionPath: string,
-): Promise<{ readonly problems: readonly string[]; readonly state: unknown }> {
+): Promise<{
+  readonly problems: readonly string[];
+  readonly state: unknown;
+  readonly timing: RowObservation["timing"];
+}> {
   await using server = await startFixtureServer();
   await using workspace = recordingWorkspace("export-failures");
   const base = NodePath.dirname(workspace.downloads);
@@ -335,9 +458,24 @@ async function runRow(
   });
   const binary = NodePath.join(base, "browser-in-namespace.sh");
   const mountAt = row.mount === undefined ? null : (row.mount.at?.(base) ?? folder);
-  NodeFS.writeFileSync(binary, launcher(context.binaryPath, mountAt, row.mount?.options ?? null), {
-    mode: 0o700,
-  });
+  const holdDir = row.hold === undefined ? null : dir(NodePath.join(base, "hold"));
+  const library = holdDir === null ? null : buildHold(base);
+  if (typeof library === "object" && library !== null)
+    return {
+      problems: [`no C compiler for hold-part-call.c: ${library.error}`],
+      state: null,
+      timing: null,
+    };
+  NodeFS.writeFileSync(
+    binary,
+    launcher(
+      context.binaryPath,
+      mountAt,
+      row.mount?.options ?? null,
+      holdDir === null || library === null ? null : { library, dir: holdDir },
+    ),
+    { mode: 0o700 },
+  );
   const theirs = (row.theirs ?? []).map((name) => NodePath.join(folder, name));
   /** Every file there before the export, then what the row put in place: none may change, now or at the next start. */
   const kept = filesUnder(base, [profile, workspace.dataHome]);
@@ -345,6 +483,9 @@ async function runRow(
   const prefs = `${profile}/prefs.js`;
   const place: Place = { base, folder, profile };
   let state: unknown;
+  let timing: RowObservation["timing"] = null;
+  let journal = "";
+  const holdProblems: string[] = [];
   let observation: RowObservation;
   {
     await using session = await workspace.launch({
@@ -358,7 +499,7 @@ async function runRow(
     const tab = await session.openTab(`${server.origin}${FIXTURES_PAGE_PATH}`);
     await session.evaluate(tab, "window.__harnessReady");
     const tabId = await newestPageTab(page);
-    const before = sha256(prefs);
+    const before = exportBytesIn(prefs);
     try {
       const job = await startExport(page, {
         selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
@@ -367,18 +508,29 @@ async function runRow(
         packaging: "har",
         fileName: row.fileName,
       });
-      if (row.during !== undefined) {
+      const part = `${folder}/${row.fileName}.har.part`;
+      if (row.during !== undefined || row.hold !== undefined) {
         const writing = await waitForJob(
           page,
           job.id,
           (j) => ended(j) || (j.state.kind === "writing" && j.state.bytes >= MIB),
         );
-        if (writing.state.kind === "writing")
-          row.during({ ...place, part: `${folder}/${row.fileName}.har.part` });
+        if (writing.state.kind === "writing") row.during?.({ ...place, part });
+        if (writing.state.kind === "writing" && row.hold !== undefined && holdDir !== null) {
+          const held = await holdAndAct(page, job.id, holdDir, row.hold, { ...place, part });
+          timing = held.timing;
+          state = held.state;
+          holdProblems.push(...held.problems);
+        }
       }
       for (const path of theirs) if (!kept.has(path)) kept.set(path, fingerprint(path));
-      state = (await waitForJob(page, job.id, ended)).state;
+      // A held row's export that never ended is judged as it is, so the next rows still run.
+      if (state === undefined || ended({ state } as Parameters<typeof ended>[0]))
+        state = (await waitForJob(page, job.id, ended)).state;
+      journal = await journalSettled(NodePath.join(workspace.root(), "exports.jsonl"));
     } finally {
+      if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
+      wakeFifoReaders(base);
       row.after?.(place);
     }
     const served = JSON.stringify({
@@ -392,12 +544,8 @@ async function runRow(
     >;
     const named = (path: string): readonly string[] =>
       (listed[path] ?? []).filter(
-        (name) =>
-          name.startsWith(row.fileName) &&
-          !theirs.includes(NodePath.join(folder, name)) &&
-          !(path === folder && (row.leaves ?? []).includes(name)),
+        (name) => name.startsWith(row.fileName) && !theirs.includes(NodePath.join(folder, name)),
       );
-    const journalPath = NodePath.join(workspace.root(), "exports.jsonl");
     observation = {
       expect: row.expect(row.fileName),
       state,
@@ -405,11 +553,12 @@ async function runRow(
       paths: [profile, folder, workspace.dataHome, base],
       files: [...named(folder), ...named(profile)],
       untouched: [
-        { path: "prefs.js", before, after: sha256(prefs) },
+        { path: "prefs.js", before, after: exportBytesIn(prefs) },
         ...[...kept].map(([path, was]) => ({ path, before: was, after: fingerprint(path) })),
       ],
-      journal: NodeFS.existsSync(journalPath) ? NodeFS.readFileSync(journalPath, "utf8") : "",
+      journal,
       theirs: theirsBefore,
+      timing,
     };
   }
   // The next start, which reads the journal and deletes what it can prove an unfinished export left.
@@ -431,12 +580,78 @@ async function runRow(
   const afterNextStart = judgeNextStart(
     [...kept].map(([path, was]) => ({ path, before: was, after: fingerprint(path) })),
   );
-  return { problems: [...judgeRow(observation), ...afterNextStart], state };
+  return {
+    problems: [...holdProblems, ...judgeRow(observation), ...afterNextStart],
+    state,
+    timing,
+  };
+}
+
+/** Arms the hold, waits for the export's held call, acts, and times how long the export then takes to end. */
+async function holdAndAct(
+  page: Parameters<typeof waitForJob>[0],
+  id: string,
+  holdDir: string,
+  hold: Hold,
+  at: Place & { readonly part: string },
+): Promise<{
+  readonly timing: RowObservation["timing"];
+  readonly problems: readonly string[];
+  readonly state: unknown;
+}> {
+  const reached = NodePath.join(holdDir, "at");
+  const go = (): void => NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
+  NodeFS.writeFileSync(NodePath.join(holdDir, "arm"), "");
+  const reachBy = Date.now() + 60_000;
+  while (!NodeFS.existsSync(reached)) {
+    const job = await waitForJob(page, id, () => true);
+    if (ended(job) || Date.now() > reachBy)
+      return {
+        timing: null,
+        problems: [`the held call was never reached: ${JSON.stringify(job.state)}`],
+        state: job.state,
+      };
+    await sleep(20);
+  }
+  hold.act(at);
+  if (hold.cancel === true)
+    await value(page, `browser.oneClickHar.cancelExport(${JSON.stringify(id)}).then(String)`);
+  else if (hold.keep !== true) go();
+  const from = Date.now();
+  const endBy = from + hold.withinMs + 30_000;
+  let job = await waitForJob(page, id, () => true);
+  while (!ended(job) && Date.now() < endBy) {
+    await sleep(50);
+    job = await waitForJob(page, id, () => true);
+  }
+  const timing = { tookMs: Date.now() - from, withinMs: hold.withinMs };
+  go();
+  const held = NodeFS.readFileSync(reached, "utf8").trim().split(" ")[0];
+  return {
+    timing,
+    problems: held === "rename" ? [] : [`the held call was ${String(held)}, not the rename`],
+    state: job.state,
+  };
+}
+
+/**
+ * The journal once every started line is ended, or as it is after 10 s: cleanup may finish after the job does. Read
+ * before any FIFO reader is woken, so a read stuck on one shows as an open line.
+ */
+async function journalSettled(journal: string): Promise<string> {
+  const by = Date.now() + 10_000;
+  for (;;) {
+    const text = NodeFS.existsSync(journal) ? NodeFS.readFileSync(journal, "utf8") : "";
+    const started = (text.match(/"started"/g) ?? []).length;
+    const endedLines = (text.match(/"ended"/g) ?? []).length;
+    if (started <= endedLines || Date.now() > by) return text;
+    await sleep(100);
+  }
 }
 
 /**
  * Every cause in ROWS, made to happen for real on the browser, ends as its row says: its named kind and no file, or
- * done under the name it says. No path reaches the page, prefs.js is unchanged and the row's own files are as it left
+ * done under the name it says. No path reaches the page, prefs.js holds no export byte and the row's own files are as it left
  * them. Planted: the first version's `{ kind: "other", detail }` with a path must fail the same judge.
  */
 const check: HarnessCheck = {
@@ -465,8 +680,12 @@ const check: HarnessCheck = {
       const outcome = await runRow(context, row, context.extensionPath);
       problems.push(...outcome.problems.map((p) => `${row.cause}: ${p}`));
       const state = outcome.state as { kind?: string; fileName?: string; failure?: unknown };
+      const took =
+        outcome.timing === null
+          ? ""
+          : ` (ended ${String(outcome.timing.tookMs)} ms after the row let it go)`;
       seen.push(
-        `${row.cause}: ${state.kind === "done" ? `done as ${String(state.fileName)}` : JSON.stringify(state.failure ?? state)}`,
+        `${row.cause}: ${state.kind === "done" ? `done as ${String(state.fileName)}` : JSON.stringify(state.failure ?? state)}${took}`,
       );
     }
     const planted = judgeRow({
@@ -478,8 +697,9 @@ const check: HarnessCheck = {
       untouched: [],
       journal: '{"started":"/w/out/theirs.har.part","head":"{"}\n',
       theirs: ["/w/out/theirs.har.part"],
+      timing: { tookMs: 15_020, withinMs: PROMPTLY_MS },
     });
-    if (planted.length < 5)
+    if (planted.length < 6)
       problems.push(
         `planted detail and open journal line caught only as ${JSON.stringify(planted)}`,
       );

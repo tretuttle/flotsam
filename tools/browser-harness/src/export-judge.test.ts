@@ -214,6 +214,7 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       untouched: [{ path: "/w/profile/prefs.js", before: "a", after: "a" }],
       journal: "",
       theirs: ["/w/out/theirs.har.part"],
+      timing: null,
     };
     expect(judgeRow(failed)).toEqual([]);
     const ran = '{"started":"/w/out/a.har.part","head":"{"}\n{"ended":"/w/out/a.har.part"}\n';
@@ -264,6 +265,33 @@ describe("the tab, cancel, disk-full and crash judges", () => {
         state: { kind: "write-failed", failure: { kind: "disk-full", needBytes: 9, freeBytes: 9 } },
       }),
     ).toHaveLength(1);
+  });
+
+  it("wants a held row cancelled or ended within its limit, with nothing left", () => {
+    const cancelled = {
+      expect: { kind: "cancelled" } as const,
+      state: { kind: "cancelled" },
+      served: "{}",
+      paths: [],
+      files: [],
+      untouched: [],
+      journal: "",
+      theirs: [],
+      timing: { tookMs: 400, withinMs: 5000 },
+    };
+    expect(judgeRow(cancelled)).toEqual([]);
+    expect(
+      judgeRow({
+        ...cancelled,
+        state: { kind: "writing", done: 8, total: 8, bytes: 9 },
+        files: ["a.har"],
+        timing: { tookMs: 15_020, withinMs: 5000 },
+      }),
+    ).toEqual([
+      "ended 15020 ms after the row let it go, more than 5000",
+      'ended {"kind":"writing","done":8,"total":8,"bytes":9}, expected cancelled',
+      "left behind: a.har",
+    ]);
   });
 
   it("wants every file there before the row, and every file the row made, as it was after the next start", () => {

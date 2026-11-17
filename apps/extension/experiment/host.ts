@@ -59,9 +59,12 @@ import { forbiddenRoots, platform } from "./files.ts";
 import {
   appendText,
   localFile,
+  oneShot,
+  openReadWrite,
   pathState,
   randomBytes,
   readHead,
+  readStart,
   siteOfUri,
   type Modes,
 } from "./gecko-io.ts";
@@ -147,7 +150,11 @@ const EMPTY_PREVIEW: Preview = {
 const yieldNow = (): Promise<void> =>
   new Promise((resolve) => Services.tm.dispatchToMainThread(() => resolve()));
 
-const PR_WRONLY = 0x02;
+/**
+ * How long one export file call may run before the export ends `timed-out`. A rename or a delete on a local disk takes
+ * milliseconds; this leaves room for a slow network share.
+ */
+const EXPORT_STEP_MS = 15_000;
 const PR_CREATE_FILE = 0x08;
 const PR_EXCL = 0x80;
 
@@ -167,19 +174,30 @@ const geckoExportPlatform = (modes: Modes): ExportPlatform => ({
   makeFolder: (folder) =>
     IOUtils.makeDirectory(folder, { createAncestors: true, ignoreExisting: true }),
   createExclusive: (path) => {
-    const out = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(
-      Ci.nsIFileOutputStream,
-    );
-    out.init(localFile(path), PR_WRONLY | PR_CREATE_FILE | PR_EXCL, modes.file ?? 0o644, 0);
+    const file = openReadWrite(path, PR_CREATE_FILE | PR_EXCL, modes.file ?? 0o644);
     const utf8 = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(
       Ci.nsIConverterOutputStream,
     );
-    utf8.init(out, "UTF-8");
+    utf8.init(file, "UTF-8");
+    const toEnd = (): void => file.seek(Ci.nsISeekableStream.NS_SEEK_END, 0);
     return {
       write: (text) => {
         if (!utf8.writeString(text)) throw new Error("short write");
       },
       flush: () => utf8.flush(),
+      size: () => file.size,
+      readHead: (bytes) => {
+        try {
+          return readStart(file, bytes);
+        } finally {
+          toEnd();
+        }
+      },
+      resize: (bytes) => {
+        file.seek(Ci.nsISeekableStream.NS_SEEK_SET, bytes);
+        file.setEOF();
+        toEnd();
+      },
       close: () => utf8.close(),
     };
   },
@@ -350,6 +368,7 @@ export function createGeckoHost(options: {
     const files = exportFiles(
       geckoExportPlatform(modes),
       (real) => guardFolder(real, roots, platform()).ok,
+      { stepMs: EXPORT_STEP_MS, timer: oneShot, signal: control.signal },
     );
     let written: { readonly part: Part; readonly path: string } | null = null;
     let last = { done: 0, total: 0 };
@@ -398,8 +417,8 @@ export function createGeckoHost(options: {
       };
     } catch (error) {
       if (written !== null) await written.part.discard().catch(() => undefined);
-      if (error instanceof WriteRefused) return { kind: "write-failed", failure: error.failure };
       if (control.signal.aborted) return { kind: "cancelled" };
+      if (error instanceof WriteRefused) return { kind: "write-failed", failure: error.failure };
       return { kind: "write-failed", failure: { kind: "other" } };
     }
   };

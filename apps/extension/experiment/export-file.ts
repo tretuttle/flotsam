@@ -4,6 +4,7 @@
 
 import type { WriteFailure } from "@one-click-har/export/jobs";
 import { WriteRefused, type HarSink } from "@one-click-har/export/run";
+import type { AbortSignalLike } from "@one-click-har/export/source";
 import type { ByteCount } from "@one-click-har/recording/ids";
 
 /** Text is handed to the file in batches of about this many UTF-16 code units. */
@@ -29,13 +30,12 @@ const utf8Length = (text: string): number => {
 };
 
 /**
- * Platform errors by the identifier the platform gives them: an IOUtils DOMException's `name`, or an XPCOM exception's
- * nsresult name. Never by message text, which carries paths. Each row is a cause `export-failures` makes happen for
- * real, inside a user and mount namespace, on every browser it runs; a name no cause produces has no row. A full disk
- * has none either: it is decided by free space, which a full volume reports as below what the write needed.
+ * Platform errors by the identifier the platform gives: a DOMException `name` or an nsresult name, never message text,
+ * which carries paths. Each row is a cause `export-failures` makes happen for real; a name no cause produces has no
+ * row. A full disk is decided by free space, and a folder gone or replaced by `folderProblem`, both before this table.
  */
 const FS_ERROR_KINDS: {
-  readonly [name: string]: Exclude<WriteFailure["kind"], "other" | "disk-full">;
+  readonly [name: string]: Exclude<WriteFailure["kind"], "other" | "disk-full" | "timed-out">;
 } = {
   /** A folder that must be created where this user may not write. */
   NotAllowedError: "access-denied",
@@ -52,6 +52,8 @@ const FS_ERROR_KINDS: {
   NS_ERROR_FILE_ALREADY_EXISTS: "name-taken",
   /** Something already has the finished file's name. */
   NoModificationAllowedError: "name-taken",
+  /** The rename found no part at its name, in a folder that is still the export's. */
+  NotFoundError: "file-replaced",
 };
 const errorName = (error: unknown): string | null => {
   const name =
@@ -59,32 +61,26 @@ const errorName = (error: unknown): string | null => {
   return typeof name === "string" ? name : null;
 };
 
-/** Free space below what the call needed is a full disk whatever the name. */
-const classifyFsError = (
-  error: unknown,
-  needBytes: number,
-  freeBytes: number | null,
-): WriteFailure => {
-  const full: WriteFailure = {
-    kind: "disk-full",
-    needBytes: needBytes as ByteCount,
-    freeBytes: (freeBytes ?? 0) as ByteCount,
-  };
-  if (freeBytes !== null && freeBytes < needBytes) return full;
-  const name = errorName(error);
-  const kind = name !== null && Object.hasOwn(FS_ERROR_KINDS, name) ? FS_ERROR_KINDS[name] : null;
-  return { kind: kind ?? "other" } as WriteFailure;
-};
-
 /** What is at a path, without following a link there. `size` is the size lstat gives, whatever the kind. */
 export type PathState =
   | { readonly kind: "missing" }
   | { readonly kind: "file" | "link" | "folder" | "other"; readonly size: number };
 
-/** One open file. Every byte of a part goes through the handle its exclusive create returned. */
+/**
+ * One open file, opened for reading and writing by its exclusive create. Every byte of a part goes through it, and it
+ * is how the export knows its own file: what it reads back and the size it sets are that file's, whatever is at the
+ * path.
+ */
 export interface FileHandle {
+  /** Appends at the end. */
   readonly write: (text: string) => void;
   readonly flush: () => void;
+  /** The file's length, through the handle. */
+  readonly size: () => number;
+  /** The file's first `bytes` bytes, through the handle. */
+  readonly readHead: (bytes: number) => Uint8Array;
+  /** Sets the file's length through the handle. */
+  readonly resize: (bytes: number) => void;
   readonly close: () => void;
 }
 
@@ -99,11 +95,28 @@ export interface ExportPlatform {
   readonly makeFolder: (folder: string) => Promise<void>;
   /** Fails when anything, a dangling link included, is at the path. */
   readonly createExclusive: (path: string) => FileHandle;
+  /**
+   * Up to `bytes` first bytes of what is at `path`, opened so that the open never waits, a FIFO's included, and read
+   * only when the opened file reports at least that many bytes. It follows a link, so a caller checks the kind first.
+   */
   readonly readHead: (path: string, bytes: number) => Promise<Uint8Array>;
   /** Never overwrites. */
   readonly rename: (from: string, to: string) => Promise<void>;
   readonly remove: (path: string) => Promise<void>;
   readonly freeBytes: (folder: string) => number;
+}
+
+/** What bounds an export's file calls: a call still running after `stepMs` is `timed-out`, and cancel is honored. */
+export interface ExportLimits {
+  readonly stepMs: number;
+  /** Settles `elapsed` after `ms`, unless `cancel` comes first. */
+  readonly timer: (ms: number) => { readonly elapsed: Promise<void>; readonly cancel: () => void };
+  readonly signal: AbortSignalLike;
+}
+
+/** Thrown at a step boundary once the job's cancel was asked for. Not a WriteFailure: the job ends cancelled. */
+export class ExportCancelled extends Error {
+  override readonly name = "ExportCancelled";
 }
 
 /**
@@ -119,9 +132,9 @@ export interface PartJournal {
 /** A part being written: appended through its one handle, then confirmed and renamed, or discarded. */
 export interface Part {
   readonly append: (text: string, needBytes: number) => Promise<void>;
-  /** Closes the handle, confirms the part is still this export's file, and renames it. Returns the name it got. */
+  /** Confirms the part is this export's file holding what was written, renames it, and returns the name it got. */
   readonly finish: (planned: string) => Promise<string>;
-  /** Deletes the part if it is still this export's file. */
+  /** Deletes the part if it is still this export's file. Returns at once if a timed-out rename is still running. */
   readonly discard: () => Promise<void>;
 }
 
@@ -154,26 +167,33 @@ const sameBytes = (found: Uint8Array, text: string): boolean =>
   found.length === text.length && found.every((byte, index) => byte === text.charCodeAt(index));
 
 /**
- * Whether the file at `path` is a regular file, not a link, whose first bytes are `head`. A head names one export,
- * so this is the proof that a part is that export's own. Its kind is read before any byte, so a FIFO is never opened.
+ * Whether the file at `path` is a regular file, not a link, whose first bytes are `head` (and, given `size`, of that
+ * length). A head names one export, so this is the proof, without a handle, that a file is that export's own. The
+ * kind is read before and after the read, and the read never waits on a FIFO.
  */
 export const carriesHead = async (
   io: Pick<ExportPlatform, "state" | "readHead">,
   path: string,
   head: string,
+  size?: number,
 ): Promise<boolean> => {
-  const state = io.state(path);
-  if (head.length === 0 || state.kind !== "file" || state.size < head.length) return false;
-  return sameBytes(await io.readHead(path, head.length), head);
+  const fits = (state: PathState): boolean =>
+    state.kind === "file" && (size === undefined ? state.size >= head.length : state.size === size);
+  if (head.length === 0 || !fits(io.state(path))) return false;
+  return sameBytes(await io.readHead(path, head.length), head) && fits(io.state(path));
 };
 
 /**
  * The export's only way to the file system. Every call either succeeds or throws WriteRefused with a kind from
- * FS_ERROR_KINDS. The folder is resolved to its real path once and must stay that folder; a part is created
- * exclusively, written only through its own handle, and renamed only after it is confirmed to still be that file.
- * `allowed` is the folder guard over a real path.
+ * FS_ERROR_KINDS, or `timed-out` once a call has run `stepMs`. The folder is resolved to its real path once and must
+ * stay that folder; a part is created exclusively, written only through its own handle, and renamed only after the
+ * handle shows the path still names its file. `allowed` is the folder guard over a real path.
  */
-export function exportFiles(platform: ExportPlatform, allowed: (realFolder: string) => boolean) {
+export function exportFiles(
+  platform: ExportPlatform,
+  allowed: (realFolder: string) => boolean,
+  limits: ExportLimits,
+) {
   const free = (folder: string): number | null => {
     try {
       return platform.freeBytes(folder);
@@ -184,28 +204,79 @@ export function exportFiles(platform: ExportPlatform, allowed: (realFolder: stri
   const refuse = (kind: Exclude<WriteFailure["kind"], "disk-full">): never => {
     throw new WriteRefused({ kind } as WriteFailure);
   };
-  const run = async <T>(folder: string, call: () => T | Promise<T>, needBytes = 0): Promise<T> => {
+
+  /** Why `folder` is no longer the real, unlinked folder it was resolved to, or null while it still is. */
+  const folderProblem = (folder: string): WriteFailure["kind"] | null => {
+    try {
+      const state = platform.state(folder).kind;
+      if (state === "missing") return "folder-missing";
+      if (state === "link") return "folder-refused";
+      if (state !== "folder") return "not-a-folder";
+      return platform.realPath(folder) === folder ? null : "folder-refused";
+    } catch {
+      return null;
+    }
+  };
+  const stillFolder = (folder: string): void => {
+    const problem = folderProblem(folder);
+    if (problem !== null) refuse(problem as Exclude<WriteFailure["kind"], "disk-full">);
+  };
+
+  /** Free space first, then a folder that is no longer the export's, then the error's name. */
+  const classify = (
+    error: unknown,
+    folder: string,
+    resolved: boolean,
+    needBytes: number,
+  ): WriteFailure => {
+    const freeBytes = free(folder);
+    if (freeBytes !== null && freeBytes < needBytes)
+      return {
+        kind: "disk-full",
+        needBytes: needBytes as ByteCount,
+        freeBytes: freeBytes as ByteCount,
+      };
+    const moved = resolved ? folderProblem(folder) : null;
+    if (moved !== null) return { kind: moved } as WriteFailure;
+    const name = errorName(error);
+    const kind = name !== null && Object.hasOwn(FS_ERROR_KINDS, name) ? FS_ERROR_KINDS[name] : null;
+    return { kind: kind ?? "other" } as WriteFailure;
+  };
+  const run = async <T>(
+    folder: string,
+    resolved: boolean,
+    call: () => T | Promise<T>,
+    needBytes = 0,
+  ): Promise<T> => {
     try {
       return await call();
     } catch (error) {
-      if (error instanceof WriteRefused) throw error;
-      throw new WriteRefused(classifyFsError(error, needBytes, free(folder)));
+      if (error instanceof WriteRefused || error instanceof ExportCancelled) throw error;
+      throw new WriteRefused(classify(error, folder, resolved, needBytes));
+    }
+  };
+
+  /** `op`, or `timed-out` once it has run `stepMs`; `late` then gets the call, which may still settle. */
+  const bounded = async <T>(op: Promise<T>, late?: (op: Promise<T>) => void): Promise<T> => {
+    const timer = limits.timer(limits.stepMs);
+    try {
+      return await Promise.race([
+        op,
+        timer.elapsed.then((): never => {
+          op.catch(() => undefined);
+          late?.(op);
+          return refuse("timed-out");
+        }),
+      ]);
+    } finally {
+      timer.cancel();
     }
   };
   const isTaken = (failure: unknown): boolean =>
     failure instanceof WriteRefused && failure.failure.kind === "name-taken";
 
-  /** The folder is still the real, unlinked folder it was resolved to. */
-  const stillFolder = (folder: string): void => {
-    const state = platform.state(folder).kind;
-    if (state === "missing") refuse("folder-missing");
-    if (state === "link") refuse("folder-refused");
-    if (state !== "folder") refuse("not-a-folder");
-    if (platform.realPath(folder) !== folder) refuse("folder-refused");
-  };
-
   const openFolder = async (configured: string): Promise<ExportFolder> => {
-    const folder = await run(configured, async () => {
+    const folder = await run(configured, false, async () => {
       if (platform.state(configured).kind === "link") refuse("folder-refused");
       const missing: string[] = [];
       let existing = configured;
@@ -217,11 +288,13 @@ export function exportFiles(platform: ExportPlatform, allowed: (realFolder: stri
       }
       const planned = missing.reduce(platform.join, platform.realPath(existing));
       if (!allowed(planned)) refuse("folder-refused");
-      await platform.makeFolder(planned);
+      await bounded(platform.makeFolder(planned));
       stillFolder(planned);
       if (!allowed(platform.realPath(planned))) refuse("folder-refused");
       return planned;
     });
+    const step = <T>(call: () => T | Promise<T>, needBytes = 0): Promise<T> =>
+      run(folder, true, call, needBytes);
 
     const openPart = (path: string, journal: PartJournal): Part => {
       const handle = platform.createExclusive(path);
@@ -230,86 +303,134 @@ export function exportFiles(platform: ExportPlatform, allowed: (realFolder: stri
       let head = "";
       let journaled = false;
       let open = true;
+      /** The name this export's file has now: the part's, or the finished name once a rename lands. */
+      let at = path;
+      /** A rename that timed out and may still land, which moves the file to the finished name. */
+      let late: Promise<void> | null = null;
       const close = (): void => {
         if (!open) return;
         open = false;
         handle.close();
       };
-      const confirm = async (): Promise<void> => {
-        stillFolder(folder);
-        const state = platform.state(path);
-        if (state.kind !== "file" || state.size !== written) refuse("file-replaced");
-        const found = await platform.readHead(path, head.length);
-        if (!sameBytes(found, head)) refuse("file-replaced");
+      /**
+       * `target` names the handle's file: it is a regular file of the handle's length, and its length follows a change
+       * made through the handle. A file of the same kind, size and bytes at another inode does not follow.
+       */
+      const follows = (target: string): boolean => {
+        const size = handle.size();
+        const before = platform.state(target);
+        if (before.kind !== "file" || before.size !== size) return false;
+        handle.resize(size + 1);
+        try {
+          const grown = platform.state(target);
+          return grown.kind !== "missing" && grown.size === size + 1;
+        } finally {
+          handle.resize(size);
+        }
       };
-      /** Journaled, the part must carry its whole head; before that, as much of it as reached the file. */
-      const stillOurs = async (): Promise<boolean> => {
-        if (platform.state(folder).kind !== "folder" || platform.realPath(folder) !== folder)
-          return false;
-        const state = platform.state(path);
-        if (state.kind !== "file") return false;
-        const length = Math.min(state.size, head.length);
-        if (journaled && length < head.length) return false;
-        return sameBytes(await platform.readHead(path, length), head.slice(0, length));
+      /** The handle's file holds what this export wrote: its length, and its first bytes. */
+      const holdsWritten = (): boolean =>
+        handle.size() === written && sameBytes(handle.readHead(head.length), head);
+      /**
+       * After a rename to `target`: whether what it moved is a regular file of the written length. Anything else took
+       * the part's name between the check and the rename, and goes back where it was found.
+       */
+      const landed = async (target: string): Promise<boolean> => {
+        at = target;
+        const state = platform.state(target);
+        if (state.kind === "file" && state.size === written) return true;
+        await bounded(platform.rename(target, path)).then(
+          () => {
+            at = path;
+          },
+          () => undefined,
+        );
+        return false;
+      };
+      const ended = async (): Promise<void> => {
+        if (journaled) await bounded(journal.ended(path));
+      };
+      /** Deletes the file at `at` if it is this export's: through the handle while it is open, else by its head. */
+      const cleanUp = async (): Promise<void> => {
+        let ours = false;
+        try {
+          ours = open ? follows(at) : await carriesHead(platform, at, head, written);
+        } catch {
+          ours = false;
+        }
+        try {
+          close();
+        } catch {
+          // The handle's last error is already the export's failure.
+        }
+        if (ours) {
+          try {
+            await bounded(platform.remove(at));
+          } catch {
+            // Still this export's file, and still journaled: the next start deletes it.
+            return;
+          }
+        }
+        await ended();
       };
       return {
         append: async (text, needBytes) => {
           const first = written === 0 && !journaled;
-          await run(
-            folder,
-            async () => {
-              if (first) head = asciiPrefix(text, HEAD_BYTES);
-              handle.write(text);
-              written += needBytes;
-              if (!first) return;
-              handle.flush();
-              stillFolder(folder);
-              if (!(await carriesHead(platform, path, head))) refuse("file-replaced");
-            },
-            needBytes,
-          );
+          await step(() => {
+            if (first) head = asciiPrefix(text, HEAD_BYTES);
+            handle.write(text);
+            written += needBytes;
+            if (!first) return;
+            handle.flush();
+            stillFolder(folder);
+            if (!follows(path) || !holdsWritten()) refuse("file-replaced");
+          }, needBytes);
           if (!first) return;
-          await journal.started(path, head);
           journaled = true;
+          await step(() => bounded(journal.started(path, head)));
         },
         finish: async (planned) => {
-          const name = await run(folder, async () => {
+          await step(() => {
+            handle.flush();
+            stillFolder(folder);
+            if (!follows(path) || !holdsWritten()) refuse("file-replaced");
             close();
-            await confirm();
-            for (let n = 1; n <= NAME_TRIES; n += 1) {
-              const name = numbered(planned, n);
-              const target = platform.join(folder, name);
-              const renamed = await run(folder, () => platform.rename(path, target)).then(
-                () => true,
-                (error: unknown) => {
-                  if (isTaken(error)) return false;
-                  throw error;
-                },
-              );
-              if (renamed) return name;
-            }
-            return refuse("name-taken");
           });
-          // Nothing is left at the part's path, so an end line that failed to land costs nothing.
-          if (journaled) await journal.ended(path).catch(() => undefined);
-          return name;
+          for (let n = 1; n <= NAME_TRIES; n += 1) {
+            if (limits.signal.aborted) throw new ExportCancelled();
+            const name = numbered(planned, n);
+            const target = platform.join(folder, name);
+            const renamed = await step(() =>
+              bounded(platform.rename(path, target), (op) => {
+                late = op.then(
+                  async () => {
+                    await landed(target);
+                  },
+                  () => undefined,
+                );
+              }),
+            ).then(
+              () => true,
+              (error: unknown) => {
+                if (isTaken(error)) return false;
+                throw error;
+              },
+            );
+            if (!renamed) continue;
+            if (!(await step(() => landed(target)))) refuse("file-replaced");
+            if (limits.signal.aborted) throw new ExportCancelled();
+            // Nothing is left at the part's path, so an end line that failed to land costs nothing.
+            await ended().catch(() => undefined);
+            return name;
+          }
+          return refuse("name-taken");
         },
         discard: async () => {
-          try {
-            close();
-          } catch {
-            // The handle's last error is already the export's failure.
-          }
-          const ours = await stillOurs().catch(() => false);
-          if (ours) {
-            try {
-              await platform.remove(path);
-            } catch {
-              // Still this export's file, and still journaled: the next start deletes it.
-              return;
-            }
-          }
-          if (journaled) await journal.ended(path);
+          if (late === null) return cleanUp();
+          // The rename may land at any time: clean up once it has settled, whether or not the job waits.
+          const settled = late.then(cleanUp);
+          settled.catch(() => undefined);
+          return undefined;
         },
       };
     };
@@ -321,7 +442,7 @@ export function exportFiles(platform: ExportPlatform, allowed: (realFolder: stri
           const name = numbered(planned, n);
           const final = platform.join(folder, name);
           const path = `${final}${PART_SUFFIX}`;
-          const part = await run(folder, () => {
+          const part = await step(() => {
             stillFolder(folder);
             return openPart(path, journal);
           }).catch((error: unknown) => {

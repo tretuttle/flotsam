@@ -34,7 +34,10 @@ export type ExportRun = (
   control: { readonly signal: AbortSignalLike; readonly progress: (p: RunProgress) => void },
 ) => Promise<RunOutcome>;
 
-/** Bytes written when cancel was asked and when the run stopped, so a check can see it stopped within one chunk. */
+/**
+ * Bytes written when cancel was asked and when the run stopped, so a check can see it stopped within one chunk. The
+ * job ends cancelled as soon as cancel is asked; `bytesAtStop` comes when the run itself has stopped.
+ */
 export interface CancelAudit {
   readonly bytesAtCancel: number;
   readonly bytesAtStop: number | null;
@@ -46,6 +49,8 @@ export const KEPT_JOBS = 10;
 interface Slot {
   job: ExportJob;
   readonly signal: { aborted: boolean; reason?: unknown };
+  /** Ends the job as cancelled at once, whatever the run is still doing. */
+  stop: () => void;
   started: boolean;
   bytes: number;
   audit: { bytesAtCancel: number; bytesAtStop: number | null } | null;
@@ -76,23 +81,27 @@ export function createExportJobs(ports: {
       return;
     }
     slot.started = true;
-    let outcome: RunOutcome;
-    try {
-      outcome = await ports.run(
+    const stopped = new Promise<RunOutcome>((resolve) => {
+      slot.stop = () => resolve({ kind: "cancelled" });
+    });
+    const ran = ports
+      .run(
         { id: slot.job.id, request: slot.job.request },
         {
           signal: slot.signal,
           progress: (p) => {
             slot.bytes = p.bytes;
-            set(slot, { kind: "writing", done: p.done, total: p.total, bytes: p.bytes });
+            if (!slot.signal.aborted)
+              set(slot, { kind: "writing", done: p.done, total: p.total, bytes: p.bytes });
           },
         },
-      );
-    } catch {
-      outcome = { kind: "write-failed", failure: { kind: "other" } };
-    }
-    if (slot.audit !== null) slot.audit.bytesAtStop = slot.bytes;
-    set(slot, outcome);
+      )
+      .catch((): RunOutcome => ({ kind: "write-failed", failure: { kind: "other" } }))
+      .then((outcome) => {
+        if (slot.audit !== null) slot.audit.bytesAtStop = slot.bytes;
+        return outcome;
+      });
+    set(slot, await Promise.race([ran, stopped]));
   };
 
   const find = (id: ExportId): Slot | undefined => slots.find((slot) => slot.job.id === id);
@@ -108,6 +117,7 @@ export function createExportJobs(ports: {
           state: WAITING,
         },
         signal: { aborted: false },
+        stop: () => undefined,
         started: false,
         bytes: 0,
         audit: null,
@@ -129,6 +139,7 @@ export function createExportJobs(ports: {
         slot.signal.aborted = true;
         slot.signal.reason = undefined;
         slot.audit = { bytesAtCancel: slot.bytes, bytesAtStop: null };
+        slot.stop();
       }
       return true;
     },
