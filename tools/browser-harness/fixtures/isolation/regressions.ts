@@ -2,6 +2,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
+import * as NodeZlib from "node:zlib";
 
 // Planted regressions: each must turn its paired rows or checks red. A product plant edits and packs a scratch copy of
 // the product; a harness plant edits the scratch copy of the probes and runs against the unplanted product, and must
@@ -1042,6 +1043,26 @@ export function asRequired(plant: Pick<Plant, "id" | "mustFail">, judgment: Judg
     : !judgment.ok && plant.mustFail.every((id) => failed.has(id));
 }
 
+/**
+ * A run's check-results.json, or the gzipped, unindented copy the suite keeps in its place once it judged the run;
+ * null when the run left neither. Three runs' disk evidence per check makes the indented file large.
+ */
+export function readCheckResults(runDir: string): unknown {
+  const plain = NodePath.join(runDir, "check-results.json");
+  const packed = `${plain}.gz`;
+  if (NodeFS.existsSync(plain)) return JSON.parse(NodeFS.readFileSync(plain, "utf8"));
+  if (NodeFS.existsSync(packed))
+    return JSON.parse(NodeZlib.gunzipSync(NodeFS.readFileSync(packed)).toString("utf8"));
+  return null;
+}
+
+/** Replaces a run's check-results.json with its gzipped, unindented copy. */
+function packCheckResults(runDir: string, results: unknown): void {
+  const plain = NodePath.join(runDir, "check-results.json");
+  NodeFS.writeFileSync(`${plain}.gz`, NodeZlib.gzipSync(JSON.stringify(results)));
+  NodeFS.rmSync(plain);
+}
+
 /** The isolation result recorded in a check-results.json, or null when the run left none. */
 export function recordedIsolation(
   checkResults: unknown,
@@ -1194,10 +1215,9 @@ async function main(): Promise<void> {
     );
     restoreProbes();
     NodeFS.rmSync(tmp, { recursive: true, force: true });
-    const resultsFile = NodePath.join(out, "check-results.json");
-    const recorded = NodeFS.existsSync(resultsFile)
-      ? recordedIsolation(JSON.parse(NodeFS.readFileSync(resultsFile, "utf8")))
-      : null;
+    const results = readCheckResults(out);
+    const recorded = results === null ? null : recordedIsolation(results);
+    if (results !== null) packCheckResults(out, results);
     const judgment = (recorded?.data?.["judgment"] as JudgedRun | undefined) ?? null;
     const outcome =
       judgment === null

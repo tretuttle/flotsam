@@ -13,7 +13,7 @@ import type { ExposureEvidence } from "./exposure.ts";
 import type * as IdentityModule from "./identity.ts";
 import type * as JudgeModule from "./judge.ts";
 import type { IsolationRunInput } from "./judge.ts";
-import { PLANTS, recordedIsolation } from "./regressions.ts";
+import { PLANTS, readCheckResults, recordedIsolation } from "./regressions.ts";
 import type * as TargetsModule from "./targets.ts";
 import type { ExtraCheckId } from "./probe-table.ts";
 import type { CheckOutcome, PlanInput } from "./targets.ts";
@@ -63,15 +63,16 @@ function loadRecorded(runsDirs: readonly string[]): readonly Recorded[] {
   const recorded: Recorded[] = [];
   for (const dir of runsDirs) {
     for (const name of NodeFS.readdirSync(dir).sort()) {
-      const file = NodePath.join(dir, name, "check-results.json");
-      if (!NodeFS.existsSync(file)) continue;
+      const file = NodePath.join(dir, name);
+      const results = readCheckResults(file);
+      if (results === null) continue;
       // A plant that edited one of the judges was judged by that edited judge, so it cannot be judged again here.
       const plant = PLANTS.find((p) => p.id === name);
       if (plant?.edits.some((e) => MODULES.some((m) => e.file.endsWith(`/isolation/${m}`)))) {
         process.stdout.write(`skipping ${name}: its plant edits a judge\n`);
         continue;
       }
-      const data = recordedIsolation(JSON.parse(NodeFS.readFileSync(file, "utf8")))?.data;
+      const data = recordedIsolation(results)?.data;
       if (data === null || data === undefined) throw new Error(`${file} holds no isolation data`);
       recorded.push({
         name: `${NodePath.basename(dir)}/${name}`,
