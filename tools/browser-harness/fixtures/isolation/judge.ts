@@ -1,4 +1,5 @@
 import type { ExtraCheckResult } from "./archive-oracle.ts";
+import type { Identity } from "./identity.ts";
 import {
   denialAt,
   expandExpectedRows,
@@ -28,8 +29,15 @@ export type ObservedPair = { readonly hit: Observation; readonly miss: Observati
  */
 export type Unit = string | readonly [hit: string, miss: string];
 
-/** What a privileged witness found for one target before the probes ran: present and answering, or not. */
-export type Witness = { readonly present: boolean; readonly detail: string };
+/**
+ * What a privileged witness found for one target before the probes ran: present and answering, or not, and the key
+ * of every check it ran for that target, so the target's identity can be matched against the probe's role.
+ */
+export type Witness = {
+  readonly present: boolean;
+  readonly detail: string;
+  readonly checks: readonly string[];
+};
 
 export type BrowserRowReport = {
   readonly kind: "row";
@@ -71,6 +79,8 @@ export type IsolationRunInput = {
   readonly targets: Readonly<Record<string, readonly Unit[]>>;
   /** The witness's finding for every planned target and every missing counterpart. */
   readonly witness: Readonly<Record<string, Witness>>;
+  /** What each probe's targets must be, by probe id, resolved from the product's inventory apart from the plan. */
+  readonly identity: Readonly<Record<string, Identity>>;
   readonly syntheticControls: readonly SyntheticControlResult[];
   readonly csFileInjected: boolean;
   /** The probe extension's policy, asked from the system principal, can access neither the file page nor the log. */
@@ -219,11 +229,11 @@ function judgeSingle(
 ): Judged {
   const o = readObservation(raw);
   const line = `${unit} -> ${o === null ? `malformed ${shown(raw)}` : `${o.outcome}: ${o.text}`}`;
+  const problem = witnessProblem(input, unit, "present");
+  if (problem !== null) return { verdict: "NO-RESULT", line: `${line}; ${problem}` };
   if (carriesMark(raw, input.context)) return { verdict: "READ", line };
   if (o === null) return { verdict: "NO-RESULT", line };
   if (o.target !== unit) return { verdict: "NO-RESULT", line: `${line}; acted on ${o.target}` };
-  const problem = witnessProblem(input, unit, "present");
-  if (problem !== null) return { verdict: "NO-RESULT", line: `${line}; ${problem}` };
   if (denies(denial, o, input.context)) return { verdict: "BLOCKED", line };
   if (FRAME_ANSWERED.test(o.text)) return { verdict: leakOf(spec, denial, o), line };
   if (NO_ANSWER.has(o.outcome) || o.text.length === 0) return { verdict: "NO-RESULT", line };
@@ -238,6 +248,10 @@ function judgePair(
 ): Judged {
   const pair = readPair(raw);
   const line = `${unit[0]} -> ${pair === null ? `malformed ${shown(raw)}` : `${pair.hit.outcome}: ${pair.hit.text} | ${pair.miss.outcome}: ${pair.miss.text}`}`;
+  const problem =
+    witnessProblem(input, unit[0], spec.guess === true ? "either" : "present") ??
+    witnessProblem(input, unit[1], "absent");
+  if (problem !== null) return { verdict: "NO-RESULT", line: `${line}; ${problem}` };
   if (carriesMark(raw, input.context)) return { verdict: "READ", line };
   if (pair === null) return { verdict: "NO-RESULT", line };
   if (pair.hit.target !== unit[0] || pair.miss.target !== unit[1]) {
@@ -246,10 +260,6 @@ function judgePair(
       line: `${line}; acted on ${pair.hit.target} and ${pair.miss.target}`,
     };
   }
-  const problem =
-    witnessProblem(input, unit[0], spec.guess === true ? "either" : "present") ??
-    witnessProblem(input, unit[1], "absent");
-  if (problem !== null) return { verdict: "NO-RESULT", line: `${line}; ${problem}` };
   if (pair.hit.outcome === "threw" || pair.miss.outcome === "threw") {
     return { verdict: "NO-RESULT", line };
   }
@@ -275,6 +285,34 @@ function judgeUnit(
 }
 
 const unitKey = (unit: Unit): string => (typeof unit === "string" ? unit : unit[0]);
+
+/**
+ * Why the planned units are not the probe's target as its role names it: null when the witness ran the role's own
+ * check on each unit. A pair is proven by its existing unit; whether that one held is the pair's own rule.
+ */
+function identityProblem(
+  spec: ProbeSpec,
+  planned: readonly Unit[],
+  input: IsolationRunInput,
+): string | null {
+  const identity = input.identity[spec.id];
+  if (identity === undefined) return `no identity for ${spec.id}`;
+  const ran = (unit: Unit): readonly string[] => input.witness[unitKey(unit)]?.checks ?? [];
+  const wanted = identity.kind === "list" ? identity.checks : [identity.check];
+  const proven = planned.map((unit) => wanted.filter((check) => ran(unit).includes(check)));
+  const off = planned.filter((_, i) => proven[i]?.length !== 1).map(unitKey);
+  const matched = new Set(proven.flat());
+  const fits =
+    off.length === 0 &&
+    (identity.kind === "every"
+      ? planned.length > 0
+      : identity.kind === "one"
+        ? planned.length === 1
+        : matched.size === wanted.length && planned.length === wanted.length);
+  return fits
+    ? null
+    : `planned ${shown(planned.map(unitKey))} is not the ${identity.role}${off.length > 0 ? `; not proven: ${off.join(", ")}` : ""}`;
+}
 
 function eachVerdict(
   spec: ProbeSpec,
@@ -332,6 +370,8 @@ function judgeBrowserRow(
 ): { readonly verdict: Verdict; readonly summary: string } {
   const planned = input.targets[`${spec.id}@${position}`] ?? input.targets[spec.id];
   if (planned === undefined) return { verdict: "NO-RESULT", summary: "no planned targets" };
+  const wrong = identityProblem(spec, planned, input);
+  if (wrong !== null) return { verdict: "NO-RESULT", summary: wrong };
   const denial = denialAt(spec, position);
   if (spec.shape === "each") return eachVerdict(spec, denial, raw, planned, input);
   const unit = planned.length === 1 ? planned[0] : undefined;

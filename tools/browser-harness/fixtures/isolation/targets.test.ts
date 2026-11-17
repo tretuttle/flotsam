@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  checkKey,
   combineWitness,
   missingSibling,
   planTargets,
@@ -9,6 +10,7 @@ import {
 } from "./targets.ts";
 
 const INPUT: PlanInput = {
+  marker: "M",
   file: {
     appFolder: "/d/one-click-har",
     keyFolder: "/d/one-click-har/k0",
@@ -18,7 +20,6 @@ const INPUT: PlanInput = {
     siteDir: "/d/one-click-har/k0/sites/bank.example",
   },
   inventory: [{ path: "/d/one-click-har/k0", directory: true }],
-  outsideKeyFolder: [],
   guessedKeyFolders: ["/d/one-click-har/g1"],
   redirectToLog: "http://attacker.example/redir?to=x",
   wrRedirect: "http://attacker.example/wr-redirect",
@@ -27,6 +28,8 @@ const INPUT: PlanInput = {
     base: "moz-extension://u/",
     popupPath: "action/index.html",
     popupScriptPath: "action/index.js",
+    parentScript: "experiment/parent.js",
+    schema: "experiment/schema.json",
     files: ["manifest.json"],
   },
   probe: { base: "moz-extension://p/", warMark: "W", secretMark: "S" },
@@ -38,7 +41,7 @@ const INPUT: PlanInput = {
   mozSrc: null,
   binDir: "/opt/zen",
 };
-const LOG_FILE: WitnessCheck = { kind: "file", path: INPUT.file.log };
+const LOG_FILE: WitnessCheck = { kind: "file", path: INPUT.file.log, mark: "M" };
 
 describe("planned targets", () => {
   const plan = planTargets(INPUT);
@@ -66,6 +69,40 @@ describe("planned targets", () => {
     expect(plan.checks["file:///d/one-click-har/"]).toEqual([
       { kind: "file", path: "/d/one-click-har" },
     ]);
+    expect(plan.targets["fetch-file-body"]).toEqual([
+      "file:///d/one-click-har/k0/sites/bank.example/bodies/r1.7.body",
+    ]);
+    expect(plan.checks["file:///d/one-click-har/k0/sites/bank.example/bodies/r1.7.body"]).toEqual([
+      { kind: "file", path: INPUT.file.body, mark: "M" },
+    ]);
+    expect(plan.checks["file:///dl/e.har"]).toEqual([
+      { kind: "file", path: "/dl/e.har", mark: "M" },
+    ]);
+    expect(plan.checks["file:///d/one-click-har/k0/"]).toEqual([
+      { kind: "file", path: "/d/one-click-har/k0" },
+    ]);
+  });
+
+  it("plans the parent script and schema the manifest names, and the planted log by its mark", () => {
+    const named = planTargets({
+      ...INPUT,
+      rec: { ...INPUT.rec, parentScript: "p/x.js", schema: "p/s.json" },
+    });
+    expect(named.targets["mozext-parent"]).toEqual(["moz-extension://u/p/x.js"]);
+    expect(named.targets["mozext-schema"]).toEqual(["moz-extension://u/p/s.json"]);
+    expect(named.checks["resource://och-planted/log"]).toEqual([
+      { kind: "load", url: "resource://och-planted/log", mark: "M" },
+    ]);
+  });
+
+  it("keys a check by its fields, whatever their order, and drops an absent mark", () => {
+    expect(checkKey({ kind: "file", path: "/a", mark: "M" })).toBe(
+      checkKey({ path: "/a", mark: "M", kind: "file" } as WitnessCheck),
+    );
+    expect(checkKey({ kind: "load", url: "u", mark: undefined })).toBe(
+      checkKey({ kind: "load", url: "u" }),
+    );
+    expect(checkKey({ kind: "load", url: "u" })).toBe('[["kind","load"],["url","u"]]');
   });
 
   it("plans guesses under each derived key, paired with a sibling no product writes", () => {
@@ -139,14 +176,23 @@ describe("witness", () => {
       },
     };
     const results = new Map([
-      [JSON.stringify(LOG_FILE), { ok: false, detail: "NotFoundError" }],
-      [JSON.stringify({ kind: "addon", id: "a" }), { ok: true, detail: "active" }],
+      [checkKey(LOG_FILE), { ok: false, detail: "NotFoundError" }],
+      [checkKey({ kind: "addon", id: "a" }), { ok: true, detail: "active" }],
     ]);
+    const addonA = checkKey({ kind: "addon", id: "a" });
     expect(combineWitness(plan, results)).toEqual({
-      both: { present: false, detail: "NotFoundError; active" },
-      one: { present: true, detail: "active" },
-      none: { present: false, detail: "" },
-      unrun: { present: false, detail: "no result for addon" },
+      both: {
+        present: false,
+        detail: "NotFoundError; active",
+        checks: [checkKey(LOG_FILE), addonA],
+      },
+      one: { present: true, detail: "active", checks: [addonA] },
+      none: { present: false, detail: "", checks: [] },
+      unrun: {
+        present: false,
+        detail: "no result for addon",
+        checks: [checkKey({ kind: "addon", id: "b" })],
+      },
     });
   });
 });

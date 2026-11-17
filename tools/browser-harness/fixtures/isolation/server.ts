@@ -30,6 +30,8 @@ export type IsolationServer = AsyncDisposable & {
   readonly origin: string;
   readonly reports: readonly IsolationReport[];
   readonly setPlan: (plan: Record<string, unknown>) => void;
+  /** Forgets every report and enabled position, so a second run of the same positions starts clean. */
+  readonly clear: () => void;
   readonly enable: (position: string) => void;
   readonly waitFor: <T extends IsolationReport>(
     predicate: (report: IsolationReport) => report is T,
@@ -201,6 +203,10 @@ fetch("/api/account").then((r) => r.text()).then(() => fetch("/api/done"));
     reports,
     setPlan: (next) => {
       plan = { ...next, ready: true };
+    },
+    clear: () => {
+      reports.length = 0;
+      enabled.clear();
     },
     enable: (position) => {
       enabled.add(position);

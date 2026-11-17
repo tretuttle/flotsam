@@ -25,7 +25,8 @@ import {
   type ProbeSpec,
   type Verdict,
 } from "./probe-table.ts";
-import { planTargets, type PlanInput } from "./targets.ts";
+import { identities } from "./identity.ts";
+import { checkKey, planTargets, type PlanInput } from "./targets.ts";
 import { buildStoredZip } from "./zip.ts";
 
 const cleanupDirs: string[] = [];
@@ -48,6 +49,7 @@ const CTX: JudgeContext = {
 
 const LOG = "/d/one-click-har/k0/sites/bank.example/log/r-0.jsonl";
 const PLAN_INPUT: PlanInput = {
+  marker: CTX.marker,
   file: {
     appFolder: "/d/one-click-har",
     keyFolder: "/d/one-click-har/k0",
@@ -60,7 +62,6 @@ const PLAN_INPUT: PlanInput = {
     { path: "/d/one-click-har", directory: true },
     { path: "/d/one-click-har/k0/settings.json", directory: false },
   ],
-  outsideKeyFolder: [],
   guessedKeyFolders: ["/d/one-click-har/g1", "/d/one-click-har/g2"],
   redirectToLog: "http://attacker.example/redir?to=file%3A%2F%2F%2Fd%2Flog",
   wrRedirect: "http://attacker.example/wr-redirect",
@@ -69,6 +70,8 @@ const PLAN_INPUT: PlanInput = {
     base: `moz-extension://${CTX.recUuid}/`,
     popupPath: "action/index.html",
     popupScriptPath: "action/index.js",
+    parentScript: "experiment/parent.js",
+    schema: "experiment/schema.json",
     files: ["manifest.json", "action/index.html"],
   },
   probe: {
@@ -88,6 +91,7 @@ const PLAN_INPUT: PlanInput = {
   binDir: "/opt/zen",
 };
 const PLAN = planTargets(PLAN_INPUT);
+const IDENTITY = identities(PLAN_INPUT);
 
 const spec = (id: string): ProbeSpec => PROBE_TABLE.find((s) => s.id === id)!;
 const unitsOf = (id: string): readonly Unit[] => PLAN.targets[id]!;
@@ -109,9 +113,19 @@ const GUESSES = new Set(
 const WITNESS: Readonly<Record<string, Witness>> = Object.fromEntries(
   Object.keys(PLAN.checks).map((t) => [
     t,
-    { present: !MISSES.has(t) && !GUESSES.has(t), detail: "seen" },
+    {
+      present: !MISSES.has(t) && !GUESSES.has(t),
+      detail: "seen",
+      checks: PLAN.checks[t]!.map(checkKey),
+    },
   ]),
 );
+/** What the witness found for one planned target, with the checks the plan gave it. */
+const found = (target: string, present: boolean, detail: string): Witness => ({
+  ...WITNESS[target]!,
+  present,
+  detail,
+});
 
 const at = (target: string, outcome: Outcome, text: string): Observation => ({
   outcome,
@@ -269,6 +283,7 @@ function passingInput(): IsolationRunInput {
     browserRows: PASSING_ROWS,
     targets: PLAN.targets,
     witness: WITNESS,
+    identity: IDENTITY,
     syntheticControls: [
       {
         id: "control-system-read",
@@ -308,12 +323,23 @@ function passingInput(): IsolationRunInput {
   };
 }
 
+/** The rows with one row's observation replaced. */
+function replaced(
+  rows: readonly BrowserRowReport[],
+  probe: string,
+  position: Position,
+  observed: unknown,
+): readonly BrowserRowReport[] {
+  return [
+    ...rows.filter((r) => !(r.probe === probe && r.position === position)),
+    { kind: "row", position, probe, observed },
+  ];
+}
+
 /** The input with one row's observation replaced. */
 function withRow(probe: string, position: Position, observed: unknown): IsolationRunInput {
   const input = passingInput();
-  const rows = input.browserRows.filter((r) => !(r.probe === probe && r.position === position));
-  rows.push({ kind: "row", position, probe, observed });
-  return { ...input, browserRows: rows };
+  return { ...input, browserRows: replaced(input.browserRows, probe, position, observed) };
 }
 
 /** Verdict, ok, observed text and the run's mismatches for one row: everything a person or CI reads. */
@@ -329,11 +355,11 @@ function judged(input: IsolationRunInput, id: string, position: Position) {
 }
 
 describe("isolation probe table", () => {
-  it("expands to 292 rows: 275 browser rows, 10 no-Marionette rows and 7 synthetic rows", () => {
-    expect(PROBE_TABLE).toHaveLength(66);
+  it("expands to 285 rows: 269 browser rows, 9 no-Marionette rows and 7 synthetic rows", () => {
+    expect(PROBE_TABLE).toHaveLength(65);
     const rows = expandExpectedRows(false);
-    expect(rows).toHaveLength(292);
-    expect(rows.filter((r) => r.position === "file-no-marionette")).toHaveLength(10);
+    expect(rows).toHaveLength(285);
+    expect(rows.filter((r) => r.position === "file-no-marionette")).toHaveLength(9);
     expect(rows.filter((r) => r.spec === null)).toHaveLength(7);
   });
 
@@ -464,7 +490,7 @@ describe("isolation judge", () => {
     expect(result.mismatches).toEqual([]);
     expect(result.ok).toBe(true);
     expect(result.counts).toEqual({
-      BLOCKED: 274,
+      BLOCKED: 267,
       READ: 11,
       "LEAKS-EXISTENCE": 7,
       "NO-RESULT": 0,
@@ -600,7 +626,7 @@ describe("isolation judge", () => {
     const log = only("fetch-file-log");
     const absent = {
       ...passingInput(),
-      witness: { ...WITNESS, [log]: { present: false, detail: "NotFoundError" } },
+      witness: { ...WITNESS, [log]: found(log, false, "NotFoundError") },
     };
     expect(judged(absent, "fetch-file-log", "web")).toMatchObject({
       verdict: "NO-RESULT",
@@ -610,7 +636,7 @@ describe("isolation judge", () => {
     const rest = Object.fromEntries(Object.entries(WITNESS).filter(([t]) => t !== log));
     const unchecked = { ...passingInput(), witness: rest };
     expect(judged(unchecked, "xhr-file-log", "web").observed).toBe(
-      `${log} -> error: error event, status 0, readyState 4; no witness ran for ${log}`,
+      `planned ["${log}"] is not the archive-log; not proven: ${log}`,
     );
     const onLog = expandExpectedRows(false).filter(
       (r) => r.spec !== null && unitsOf(r.id).includes(log),
@@ -622,7 +648,7 @@ describe("isolation judge", () => {
     const unit = pairUnit("img-file-oracle");
     const input = {
       ...passingInput(),
-      witness: { ...WITNESS, [unit[1]]: { present: true, detail: "file, 3 bytes" } },
+      witness: { ...WITNESS, [unit[1]]: found(unit[1], true, "file, 3 bytes") },
     };
     expect(judged(input, "img-file-oracle", "web")).toMatchObject({
       verdict: "NO-RESULT",
@@ -631,7 +657,7 @@ describe("isolation judge", () => {
     });
     const hitAbsent = {
       ...passingInput(),
-      witness: { ...WITNESS, [unit[0]]: { present: false, detail: "NotFoundError" } },
+      witness: { ...WITNESS, [unit[0]]: found(unit[0], false, "NotFoundError") },
     };
     expect(judged(hitAbsent, "img-file-oracle", "web").verdict).toBe("NO-RESULT");
   });
@@ -645,7 +671,7 @@ describe("isolation judge", () => {
           "file",
           each([pairAt(first!, LOAD_SIDE, ERROR_SIDE), pairAt(second!, ERROR_SIDE, ERROR_SIDE)]),
         ),
-        witness: { ...WITNESS, [first![0]]: { present: true, detail: "file, 900 bytes" } },
+        witness: { ...WITNESS, [first![0]]: found(first![0], true, "file, 900 bytes") },
       };
       expect(judged(input, id, "file")).toEqual({
         verdict: "LEAKS-EXISTENCE",
@@ -683,23 +709,133 @@ describe("isolation judge", () => {
     }
   });
 
+  it("refuses a plan pointed at an existing but wrong target, before reading any answer", () => {
+    // The reviewer's plants: the body probe aimed at the log, the parent-script probe at the manifest, and the
+    // probe add-on's secret probe at its web-accessible file, each target present and answering.
+    const log = only("fetch-file-log");
+    const manifest = only("mozext-manifest");
+    const war = only("planted-own-war-fetch");
+    const wrong: readonly (readonly [string, string, string])[] = [
+      ["fetch-file-body", log, "archive-body"],
+      ["mozext-parent", manifest, "packed-parent"],
+      ["own-non-war", war, "probe-secret"],
+    ];
+    for (const [id, target, role] of wrong) {
+      const input = {
+        ...withRow(id, "web", at(target, "ok", `status 200: ${CTX.marker} ${CTX.warMark}`)),
+        targets: { ...PLAN.targets, [id]: [target] },
+      };
+      expect(judged(input, id, "web")).toMatchObject({
+        verdict: "NO-RESULT",
+        ok: false,
+        observed: `planned ["${target}"] is not the ${role}; not proven: ${target}`,
+      });
+    }
+    const noIdentity = Object.fromEntries(
+      Object.entries(IDENTITY).filter(([id]) => id !== "fetch-file-log"),
+    );
+    expect(
+      judged({ ...passingInput(), identity: noIdentity }, "fetch-file-log", "web"),
+    ).toMatchObject({
+      verdict: "NO-RESULT",
+      observed: "no identity for fetch-file-log",
+    });
+  });
+
+  it("puts a failed witness before a mark: an answer about a target the witness never found is NO-RESULT", () => {
+    const secret = only("own-non-war");
+    const input = {
+      ...withRow("own-non-war", "web", at(secret, "ok", `status 200: ${CTX.secretMark}`)),
+      witness: { ...WITNESS, [secret]: found(secret, false, "loads 20 chars, without the mark") },
+    };
+    expect(judged(input, "own-non-war", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      observed: `${secret} -> ok: status 200: ${CTX.secretMark}; witness did not find ${secret} (loads 20 chars, without the mark)`,
+    });
+    const unit = pairUnit("img-file-oracle");
+    const pairInput = {
+      ...withRow(
+        "img-file-oracle",
+        "web",
+        pairAt(unit, { outcome: "load", text: CTX.marker }, ERROR_SIDE),
+      ),
+      witness: { ...WITNESS, [unit[0]]: found(unit[0], false, "NotFoundError") },
+    };
+    expect(judged(pairInput, "img-file-oracle", "web").verdict).toBe("NO-RESULT");
+    const unwitnessedMiss = Object.fromEntries(
+      Object.entries(WITNESS).filter(([t]) => t !== unit[1]),
+    );
+    expect(
+      judged({ ...passingInput(), witness: unwitnessedMiss }, "img-file-oracle", "web").observed,
+    ).toBe(`${unit[0]} -> error: error | error: error; no witness ran for ${unit[1]}`);
+  });
+
+  it("holds a list role to exactly its targets, one each, and an every role to each unit", () => {
+    const [first, second] = unitsOf("inventory-read") as readonly string[];
+    const lists: readonly (readonly [readonly Unit[], string])[] = [
+      [[first!], `planned ["${first!}"] is not the inventory`],
+      [
+        [first!, second!, "file:///x"],
+        `planned ["${first!}","${second!}","file:///x"] is not the inventory; not proven: file:///x`,
+      ],
+      [[first!, first!], `planned ["${first!}","${first!}"] is not the inventory`],
+    ];
+    for (const [units, summary] of lists) {
+      const input = { ...passingInput(), targets: { ...PLAN.targets, "inventory-read": units } };
+      expect(judged(input, "inventory-read", "web")).toMatchObject({
+        verdict: "NO-RESULT",
+        observed: summary,
+      });
+    }
+    const walks = unitsOf("resource-traversal") as readonly string[];
+    const offRoute = {
+      ...passingInput(),
+      targets: { ...PLAN.targets, "resource-traversal": [...walks, "resource://gre/x"] },
+    };
+    expect(judged(offRoute, "resource-traversal", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      observed: `planned ${JSON.stringify([...walks, "resource://gre/x"]).slice(0, 200)} is not the archive-log; not proven: resource://gre/x`,
+    });
+    expect(
+      judged(
+        { ...passingInput(), targets: { ...PLAN.targets, "resource-traversal": [] } },
+        "resource-traversal",
+        "web",
+      ).observed,
+    ).toBe("planned [] is not the archive-log");
+  });
+
   it("judges an each-probe with nothing planned as BLOCKED only when it reports nothing", () => {
-    expect(judged(passingInput(), "inventory-exists", "file")).toMatchObject({
+    const noSrcInput = { ...PLAN_INPUT, mozSrc: null };
+    const noSrc = {
+      ...passingInput(),
+      targets: planTargets(noSrcInput).targets,
+      identity: identities(noSrcInput),
+    };
+    const nothing = {
+      ...noSrc,
+      browserRows: replaced(noSrc.browserRows, "moz-src-root", "web", each([])),
+    };
+    expect(judged(nothing, "moz-src-root", "web")).toMatchObject({
       verdict: "BLOCKED",
       ok: true,
       observed: "0 results for 0 planned targets",
     });
-    const extra = withRow(
-      "inventory-exists",
-      "file",
-      each([pairAt(["file:///d/x", "file:///d/x-och-missing"], ERROR_SIDE, ERROR_SIDE)]),
-    );
-    expect(judged(extra, "inventory-exists", "file").verdict).toBe("NO-RESULT");
+    const extra = {
+      ...noSrc,
+      browserRows: replaced(
+        noSrc.browserRows,
+        "moz-src-root",
+        "web",
+        each([at("moz-src:///x", "fetch error, link error", NETWORK)]),
+      ),
+    };
+    expect(judged(extra, "moz-src-root", "web").verdict).toBe("NO-RESULT");
     const emptyPlan = { ...passingInput(), targets: { ...PLAN.targets, "fetch-file-log": [] } };
     expect(judged(emptyPlan, "fetch-file-log", "web")).toMatchObject({
       verdict: "NO-RESULT",
       ok: false,
-      observed: "planned [], expected one single unit",
+      observed: "planned [] is not the archive-log",
     });
     const noXhr = Object.fromEntries(
       Object.entries(PLAN.targets).filter(([id]) => id !== "xhr-file-log"),
@@ -708,30 +844,6 @@ describe("isolation judge", () => {
       verdict: "NO-RESULT",
       ok: false,
       observed: "no planned targets",
-    });
-  });
-
-  it("probes paths written outside the key folder, and fails one whose existence a page can tell", () => {
-    const outside = planTargets({
-      ...PLAN_INPUT,
-      outsideKeyFolder: [{ path: "/p/one-click-har-sites.txt", directory: false }],
-    }).targets["inventory-exists"]!;
-    expect(outside).toEqual([
-      ["file:///p/one-click-har-sites.txt", "file:///p/one-click-har-sites.txt-och-missing"],
-    ]);
-    const unit = outside[0] as readonly [string, string];
-    const input = {
-      ...withRow("inventory-exists", "file", each([pairAt(unit, LOAD_SIDE, ERROR_SIDE)])),
-      targets: { ...PLAN.targets, "inventory-exists": outside },
-      witness: {
-        ...WITNESS,
-        [unit[0]]: { present: true, detail: "file" },
-        [unit[1]]: { present: false, detail: "NotFoundError" },
-      },
-    };
-    expect(judged(input, "inventory-exists", "file")).toMatchObject({
-      verdict: "LEAKS-EXISTENCE",
-      ok: false,
     });
   });
 
@@ -1034,7 +1146,7 @@ describe("isolation judge", () => {
   it("runs the content-script rows in the file:// page, and drops the injection row, once a content script ran there", () => {
     const rows = expandExpectedRows(true);
     expect(rows.some((r) => r.id === "cs-file-injection")).toBe(false);
-    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(40);
+    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(39);
     const judgment = judgeIsolationRun({ ...passingInput(), csFileInjected: true });
     expect(
       judgment.rows.filter((r) => r.position === "cs-file").every((r) => r.verdict === "NO-RESULT"),
@@ -1179,19 +1291,21 @@ describe("isolation judge details", () => {
     ]);
   });
 
-  it("refuses a plan of the wrong shape for its probe", () => {
+  it("refuses a plan of the wrong shape for its probe, even on the right targets", () => {
+    const log = only("fetch-file-log");
+    const body = only("fetch-file-body");
     const shapes: readonly (readonly [string, readonly Unit[], string])[] = [
       [
         "fetch-file-log",
-        ["file:///a", "file:///b"],
-        'planned ["file:///a","file:///b"], expected one single unit',
+        [[log, "file:///b"]],
+        `planned [["${log}","file:///b"]], expected one single unit`,
       ],
+      ["img-file-oracle", [body], `planned ["${body}"], expected one pair unit`],
       [
         "fetch-file-log",
-        [["file:///a", "file:///b"]],
-        'planned [["file:///a","file:///b"]], expected one single unit',
+        ["file:///a", "file:///b"],
+        'planned ["file:///a","file:///b"] is not the archive-log; not proven: file:///a, file:///b',
       ],
-      ["img-file-oracle", ["file:///a"], 'planned ["file:///a"], expected one pair unit'],
     ];
     for (const [id, units, summary] of shapes) {
       const input = {
@@ -1204,14 +1318,17 @@ describe("isolation judge details", () => {
         observed: summary,
       });
     }
+    const [first, second] = unitsOf("inventory-read") as readonly string[];
     const pairForFetch = {
-      ...withRow("inventory-read", "web", each([{ target: "file:///a" }])),
-      targets: { ...PLAN.targets, "inventory-read": [["file:///a", "file:///b"] as const] },
+      ...withRow("inventory-read", "web", each([{ target: first }, at(second!, "error", NETWORK)])),
+      targets: {
+        ...PLAN.targets,
+        "inventory-read": [[first!, "file:///b"] as const, second!],
+      },
     };
     expect(judged(pairForFetch, "inventory-read", "web")).toMatchObject({
       verdict: "NO-RESULT",
-      observed:
-        "1 results for 1 planned targets; NO-RESULT file:///a -> a pair planned for a rejected probe",
+      observed: `2 results for 2 planned targets; NO-RESULT ${first!} -> a pair planned for a rejected probe`,
     });
   });
 

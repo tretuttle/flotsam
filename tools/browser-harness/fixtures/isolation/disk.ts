@@ -1,10 +1,10 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
-// The isolation check's disk rule: snapshot the throwaway workspace (the browser's HOME, its profile, the data
-// home and Downloads) before the browser starts and after it quits, with lstat so a link is seen as a link and never
-// followed. Every new or changed path must be one the browser owns, one the harness wrote, the key file, or inside
-// the random key folder or an export in Downloads. Anything else is the product writing where it should not.
+// The isolation check's disk rule. The same workspace and actions run twice, with the product and with an inert
+// stand-in under its id, each read with lstat (links never followed). What the product run wrote beyond the control
+// run is the product's: it must be the key file, in the key folder or an export, at mode 600 (folders 700), with one
+// link. A hard link anywhere fails.
 
 export type DiskKind = "file" | "directory" | "symlink" | "other";
 
@@ -13,6 +13,8 @@ export type DiskEntry = {
   readonly size: number;
   readonly mtimeMs: number;
   readonly mode: number;
+  /** How many names the inode has; a file with more than one shares its bytes with another path. */
+  readonly nlink: number;
   /** A symlink's target text, as stored; never resolved. */
   readonly link: string | null;
 };
@@ -52,6 +54,7 @@ export function snapshotTree(root: string): DiskSnapshot {
         size: kind === "directory" ? 0 : stat.size,
         mtimeMs: stat.mtimeMs,
         mode: stat.mode & 0o7777,
+        nlink: stat.nlink,
         link: kind === "symlink" ? NodeFS.readlinkSync(full) : null,
       };
       if (kind === "directory") walk(full);
@@ -62,8 +65,8 @@ export function snapshotTree(root: string): DiskSnapshot {
 }
 
 /**
- * New paths, and paths whose kind, size, mode, link target or modification time changed. A directory that already
- * existed is never "changed": its own time moves whenever a child is added, and the child is reported itself.
+ * New paths, and paths whose kind, size, mode, link count, link target or modification time changed. A directory
+ * that already existed is never "changed": its own time moves whenever a child is added, and the child is reported.
  */
 export function diffSnapshots(before: DiskSnapshot, after: DiskSnapshot): readonly DiskChange[] {
   return Object.entries(after).flatMap(([path, entry]): DiskChange[] => {
@@ -74,6 +77,7 @@ export function diffSnapshots(before: DiskSnapshot, after: DiskSnapshot): readon
       old.kind === entry.kind &&
       old.size === entry.size &&
       old.mode === entry.mode &&
+      old.nlink === entry.nlink &&
       old.link === entry.link &&
       old.mtimeMs === entry.mtimeMs;
     return same ? [] : [{ path, change: "changed", entry }];
@@ -81,158 +85,136 @@ export function diffSnapshots(before: DiskSnapshot, after: DiskSnapshot): readon
 }
 
 /**
- * One allowed kind of write: where (relative to the workspace) and what kind of entry. `product` marks the product's
- * own writes, which the probes must fail to read; the rest are the browser's or the harness's.
+ * Text that differs between the two runs only because each made its own: every add-on's moz-extension uuid and the
+ * workspace folder. Each is replaced by its role, so the same browser write in both runs reads the same.
  */
-export type DiskRule = {
-  readonly path: RegExp;
-  readonly kinds: readonly DiskKind[];
-  readonly product?: true;
+export type RunNames = readonly (readonly [text: string, role: string])[];
+
+/** One run's changes: what it wrote by plan time and by the end, and its own run names. */
+export type RunChanges = {
+  readonly plan: readonly DiskChange[];
+  readonly final: readonly DiskChange[];
+  readonly names: RunNames;
 };
 
-const FILE: readonly DiskKind[] = ["file"];
-const DIR: readonly DiskKind[] = ["directory"];
-const TREE: readonly DiskKind[] = ["file", "directory"];
-const VENDORS = "(zen|mozilla)";
+const withRoles = (text: string, names: RunNames): string =>
+  names.reduce((out, [from, role]) => out.replaceAll(from, role), text);
 
-// Gecko's own profile entries, each one written in a recorded baseline or regression run of Zen Twilight 1.25t,
-// Firefox Developer Edition 161.0 or Zen 1.24.2b. A browser that writes a name not listed here fails the check,
-// and the name is added with the run that showed it.
-const PROFILE_FILES = [
-  "prefs\\.js",
-  "times\\.json",
-  "compatibility\\.ini",
-  "extensions\\.json",
-  "addons\\.json",
-  "addonStartup\\.json\\.lz4",
-  "extension-preferences\\.json",
-  "xulstore\\.json",
-  "containers\\.json",
-  "handlers\\.json",
-  "search\\.json\\.mozlz4",
-  "sessionstore\\.jsonlz4",
-  "sessionCheckpoints\\.json",
-  "Telemetry\\.ShutdownTime\\.txt",
-  "SiteSecurityServiceState\\.bin",
-  "cert9\\.db",
-  "key4\\.db",
-  "pkcs11\\.txt",
-  "logins\\.db",
-  "broadcast-listeners\\.json",
-  "breach-alerts\\.db",
-  "\\.parentlock",
-  "\\.startup-incomplete",
-  "activity-stream\\.[a-z_]+\\.json",
-  "zen-[a-z-]+\\.json(lz4)?",
-  // A database with the companion files SQLite keeps beside it while the browser runs.
-  "(places|favicons|cookies|permissions|content-prefs|formhistory|storage|bounce-tracking-protection|protections|domain_to_categories)\\.sqlite(-wal|-shm|-journal)?",
-  // Gecko names one database after a hash; its name changes per run.
-  "[0-9a-f]{8}\\.sqlite(-wal|-shm|-journal)?",
-].join("|");
-
-const PROFILE_DIRS = [
-  "bookmarkbackups",
-  "cache2",
-  "chrome",
-  "crashes",
-  "datareporting",
-  "extension-store",
-  "minidumps",
-  "safebrowsing",
-  "saved-telemetry-pings",
-  "security_state",
-  "sessionstore-backups",
-  "settings",
-  "startupCache",
-  "storage",
-  "thumbnails",
-  "zen-sessions-backup",
-].join("|");
+/** Where, what kind, what mode and what a link points to: what must match for a write to be the control run's too. */
+const signature = (change: DiskChange, names: RunNames): string =>
+  JSON.stringify([
+    withRoles(change.path, names),
+    change.entry.kind,
+    change.entry.mode,
+    change.entry.link === null ? null : withRoles(change.entry.link, names),
+  ]);
 
 /**
- * The fixed part of the allowed set. The key folder, the key file and the harness's own files are added per run by
- * `diskRules`, because their names are only known then.
+ * Every write the product run made, by plan time or by the end, that the control run did not make at the same place
+ * with the same kind, mode and link target. A file that came and went before the end is still seen at plan time.
  */
-const BASE_RULES: readonly DiskRule[] = [
-  // Files and folders Gecko keeps in every profile, and what it puts in those folders.
-  { path: new RegExp(`^profile/(${PROFILE_FILES})$`, "u"), kinds: FILE },
-  { path: new RegExp(`^profile/(${PROFILE_DIRS})(/.*)?$`, "u"), kinds: TREE },
-  // Gecko's profile lock on Linux, a symlink naming the host and pid, while the browser runs.
-  { path: /^profile\/lock$/u, kinds: ["symlink"] },
-  // Marionette, which the harness drives, writes its port while the browser runs.
-  { path: /^profile\/MarionetteActivePort$/u, kinds: FILE },
-  // The launcher writes the harness prefs and installs the recorder and the probe add-ons.
-  { path: /^profile\/user\.js$/u, kinds: FILE },
-  { path: /^profile\/extensions(\/[^/]+\.xpi)?$/u, kinds: TREE },
-  // The browser's XDG folders under its HOME: folders only, never files.
-  { path: /^home\/(\.cache|\.config)$/u, kinds: DIR },
-  { path: new RegExp(`^home/(\\.cache|\\.config)/${VENDORS}(/.*)?$`, "u"), kinds: DIR },
-  // The crash reporter's own client id and pending pings.
-  { path: new RegExp(`^home/\\.config/${VENDORS}/[a-z]+/Crash Reports(/.*)?$`, "u"), kinds: TREE },
-  // fontconfig's cache, and its links between cache versions.
-  { path: /^home\/\.cache\/fontconfig(\/CACHEDIR\.TAG)?$/u, kinds: TREE },
-  {
-    path: /^home\/\.cache\/fontconfig\/[0-9a-f]{32}-[a-z0-9]+\.cache-\d+$/u,
-    kinds: ["file", "symlink"],
-  },
-  // The app folder that holds the key folder, and an export in the export folder.
-  { path: /^data\/one-click-har$/u, kinds: DIR, product: true },
-  { path: /^downloads\/[^/]+\.har$/u, kinds: FILE, product: true },
-];
+export function beyondControl(product: RunChanges, control: RunChanges): readonly DiskChange[] {
+  const made = new Set([...control.plan, ...control.final].map((c) => signature(c, control.names)));
+  const seen = new Set<string>();
+  return [...product.final, ...product.plan].filter((change) => {
+    const key = signature(change, product.names);
+    if (made.has(key) || seen.has(change.path)) return false;
+    seen.add(change.path);
+    return true;
+  });
+}
+
+/** The product's own places, known only once the run has read its key. */
+export type ProductArea = { readonly archiveKey: string; readonly keyFileName: string };
+
+type Place = { readonly path: RegExp; readonly kind: "file" | "directory" };
 
 const escape = (text: string): string => text.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 
-/** The allowed set for one run: the fixed rules, the key folder and key file, and the files the harness wrote. */
-export function diskRules(options: {
-  readonly archiveKey: string;
-  readonly keyFileName: string;
-  readonly harnessFiles: readonly string[];
-}): readonly DiskRule[] {
+/** The app folder, the random key folder and everything in it, the key file in the profile, and an export. */
+function placesOf(area: ProductArea): readonly Place[] {
+  const keyFolder = `data/one-click-har/${escape(area.archiveKey)}`;
   return [
-    ...BASE_RULES,
-    {
-      path: new RegExp(`^data/one-click-har/${escape(options.archiveKey)}(/.*)?$`, "u"),
-      kinds: TREE,
-      product: true,
-    },
-    {
-      path: new RegExp(`^profile/${escape(options.keyFileName)}$`, "u"),
-      kinds: FILE,
-      product: true,
-    },
-    ...options.harnessFiles.map((file): DiskRule => ({
-      path: new RegExp(`^${escape(file)}$`, "u"),
-      kinds: FILE,
-    })),
+    { path: /^data\/one-click-har$/u, kind: "directory" },
+    { path: new RegExp(`^${keyFolder}(/.+)?$`, "u"), kind: "directory" },
+    { path: new RegExp(`^${keyFolder}/.+$`, "u"), kind: "file" },
+    { path: new RegExp(`^profile/${escape(area.keyFileName)}$`, "u"), kind: "file" },
+    { path: /^downloads\/[^/]+\.har$/u, kind: "file" },
   ];
 }
 
-const ruleFor = (
-  rules: readonly DiskRule[],
-  change: Pick<DiskChange, "path" | "entry">,
-): DiskRule | undefined =>
-  rules.find((rule) => rule.kinds.includes(change.entry.kind) && rule.path.test(change.path));
+/** The only modes a product write may have: readable by the user's own account and nobody else. */
+export const PRODUCT_MODES = { file: 0o600, directory: 0o700 } as const;
 
-/** Every change no rule allows, as `<new|changed> <kind> <path>`, with a link's target. */
-export function unallowedWrites(
-  changes: readonly DiskChange[],
-  rules: readonly DiskRule[],
+/** Every path the product may write: in one of its places, of that place's kind. */
+export const inProductArea = (
+  change: Pick<DiskChange, "path" | "entry">,
+  area: ProductArea,
+): boolean => placesOf(area).some((p) => p.kind === change.entry.kind && p.path.test(change.path));
+
+const describe = (c: DiskChange): string =>
+  `${c.change} ${c.entry.kind} ${c.path}${c.entry.link === null ? "" : ` -> ${c.entry.link}`}`;
+
+/**
+ * Every product write that is not in the product's places at its exact mode with a single link, as one line each.
+ * Empty when the product wrote only its key file, its key folder and exports, each private to the user.
+ */
+export function productWriteProblems(
+  writes: readonly DiskChange[],
+  area: ProductArea,
 ): readonly string[] {
-  return changes
-    .filter((change) => ruleFor(rules, change) === undefined)
-    .map(
-      (c) =>
-        `${c.change} ${c.entry.kind} ${c.path}${c.entry.link === null ? "" : ` -> ${c.entry.link}`}`,
-    );
+  return writes.flatMap((c): string[] => {
+    if (!inProductArea(c, area))
+      return [`${describe(c)}: outside the key folder, the key file and the export folder`];
+    const kind = c.entry.kind as keyof typeof PRODUCT_MODES;
+    return [
+      ...(c.entry.mode === PRODUCT_MODES[kind]
+        ? []
+        : [
+            `${describe(c)}: mode ${c.entry.mode.toString(8)}, not ${PRODUCT_MODES[kind].toString(8)}`,
+          ]),
+      ...(kind === "file" && c.entry.nlink !== 1
+        ? [`${describe(c)}: ${String(c.entry.nlink)} links`]
+        : []),
+    ];
+  });
 }
 
-/** Paths the product wrote, by the rules: the inventory every probe position must fail to read. */
-export function productWrites(
-  changes: readonly DiskChange[],
-  rules: readonly DiskRule[],
-): readonly DiskChange[] {
-  return changes.filter((change) => {
-    const rule = ruleFor(rules, change);
-    return rule === undefined || rule.product === true;
-  });
+/**
+ * Every file or link whose inode has another name: a second path to the same bytes. The workspace starts empty but
+ * for the add-ons the harness installs, so every path that could have one is among a run's changes.
+ */
+export function hardLinks(changes: readonly DiskChange[]): readonly string[] {
+  return changes
+    .filter((c) => c.entry.kind !== "directory" && c.entry.nlink > 1)
+    .map((c) => `${c.path} has ${String(c.entry.nlink)} links`);
+}
+
+/** What the disk rule reads: both runs, the product's places, and the paths the plan's inventory probed. */
+export type DiskEvidence = {
+  readonly product: RunChanges;
+  readonly control: RunChanges;
+  readonly area: ProductArea;
+  /** Workspace-relative paths of the plan's inventory, each a probe target. */
+  readonly probed: readonly string[];
+};
+
+/**
+ * Everything wrong on disk: a product write outside its places, at another mode or with another link; a hard link
+ * anywhere; and a key file or export the product wrote after the plan, which no probe could target. Writes in the
+ * key folder after the plan are the archive oracle's to cover.
+ */
+export function diskProblems(evidence: DiskEvidence): readonly string[] {
+  const written = beyondControl(evidence.product, evidence.control);
+  const probed = new Set(evidence.probed);
+  return [
+    ...productWriteProblems(written, evidence.area),
+    ...hardLinks(evidence.product.final),
+    ...written
+      .filter(
+        (c) =>
+          inProductArea(c, evidence.area) && !c.path.startsWith("data/") && !probed.has(c.path),
+      )
+      .map((c) => `${describe(c)}: written after the plan, so never probed`),
+  ];
 }

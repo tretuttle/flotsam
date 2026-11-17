@@ -318,7 +318,6 @@ export const PROBES_JS = `"use strict";
     "fetch-file-dir": fetchOne("fetch-file-dir"),
     "fetch-file-export": fetchOne("fetch-file-export"),
     "inventory-read": (p) => fetchEach(units(p, "inventory-read")),
-    "inventory-exists": (p) => oracleEach(["script", "link"], units(p, "inventory-exists")),
     "content-fetch-file-log": (p) => viaFetch(one(p, "content-fetch-file-log"), (typeof content !== "undefined" && content.fetch) ? content.fetch.bind(content) : null),
     "xhr-file-log": (p) => viaXhr(one(p, "xhr-file-log")),
     "iframe-file-log": frameOne("iframe-file-log"),

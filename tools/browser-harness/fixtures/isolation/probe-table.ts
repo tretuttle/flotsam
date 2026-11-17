@@ -63,6 +63,42 @@ export type Denial =
 /** What a well-formed answer that is not the denial means. */
 export type LeakKind = "READ" | "LEAKS-EXISTENCE";
 
+/**
+ * What a probe's planned targets must be, named so that a witness can prove it apart from the plan: a file by its
+ * path in the product's inventory and the marker it holds, a packed file by the path the product's manifest names,
+ * an add-on, a tab, a service or a fact by what the check established. See identity.ts.
+ */
+export type TargetRole =
+  | "archive-log"
+  | "archive-body"
+  | "export"
+  | "app-folder"
+  | "inventory"
+  | "guessed-log"
+  | "guessed-site"
+  | "resource-names"
+  | "chrome-packages"
+  | "moz-src"
+  | "planted-log"
+  | "packed-files"
+  | "packed-manifest"
+  | "packed-parent"
+  | "packed-schema"
+  | "packed-popup"
+  | "packed-popup-script"
+  | "probe-war-text"
+  | "probe-war-script"
+  | "probe-secret"
+  | "recorder-api"
+  | "recorder-addon"
+  | "recorder-tab"
+  | "downloads"
+  | "clipboard"
+  | "notifications"
+  | "recorder-storage"
+  | "recorder-idb"
+  | "bank-traffic";
+
 /** How a row's result is shaped: one answer, an existing/missing pair, or one answer per planned target. */
 export type Shape = "single" | "pair" | "each";
 
@@ -94,6 +130,7 @@ type ProbeBase = {
   readonly what: string;
   readonly positions: readonly BrowserProbePosition[];
   readonly shape: Shape;
+  readonly target: TargetRole;
   readonly expectAt?: Readonly<Partial<Record<Position, ExpectedOutcome>>>;
   /**
    * The planned targets are guesses (paths under derived archive keys) that exist only when the product made its
@@ -181,7 +218,6 @@ export const NO_MARIONETTE_PROBE_IDS: readonly string[] = [
   "script-site-oracle",
   "script-root-oracle",
   "inventory-read",
-  "inventory-exists",
 ];
 
 /**
@@ -194,6 +230,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(file:///<archive>/sites/<site>/log/<run>-0.jsonl)",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -202,6 +239,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(file:///<archive>/sites/<site>/bodies/<id>.body)",
     positions: ALL,
     shape: "single",
+    target: "archive-body",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -210,6 +248,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(file:///<appFolder>/) directory listing",
     positions: ALL,
     shape: "single",
+    target: "app-folder",
     deny: FETCH_DENIED,
     leak: "LEAKS-EXISTENCE",
   },
@@ -218,6 +257,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(file:///<Downloads>/<site>-<date>.har)",
     positions: ALL,
     shape: "single",
+    target: "export",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -226,22 +266,16 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch of every file and directory the product wrote by the plan (disk diff of the workspace)",
     positions: ALL,
     shape: "each",
+    target: "inventory",
     deny: FETCH_DENIED,
     leak: "READ",
-  },
-  {
-    id: "inventory-exists",
-    what: "<script> and <link> load/error of every path the product wrote outside the random key folder vs a missing sibling",
-    positions: ALL,
-    shape: "each",
-    deny: SAME,
-    leak: "LEAKS-EXISTENCE",
   },
   {
     id: "content-fetch-file-log",
     what: "content.fetch (page context) of the archive log",
     positions: ["cs-web", "cs-file"],
     shape: "single",
+    target: "archive-log",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -250,6 +284,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "XMLHttpRequest GET of the archive log",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: XHR_DENIED,
     leak: "READ",
   },
@@ -258,6 +293,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe src> of the archive log, then read contentDocument",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FRAME_WITHHELD,
     leak: "READ",
   },
@@ -266,6 +302,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe src> of the archive root directory listing, then read it",
     positions: ALL,
     shape: "single",
+    target: "app-folder",
     deny: FRAME_WITHHELD,
     leak: "LEAKS-EXISTENCE",
   },
@@ -274,6 +311,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe src> of the exported HAR, then read it",
     positions: ALL,
     shape: "single",
+    target: "export",
     deny: FRAME_WITHHELD,
     leak: "READ",
   },
@@ -282,6 +320,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<img> load/error: recorded site body file vs a missing path",
     positions: ALL,
     shape: "pair",
+    target: "archive-body",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
   },
@@ -290,6 +329,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<script> load/error: the log under every guessed archive key (profile, user, host derivations) vs a missing path",
     positions: ALL,
     shape: "each",
+    target: "guessed-log",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
     guess: true,
@@ -299,6 +339,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<link rel=stylesheet> load/error: the log under every guessed archive key vs a missing path",
     positions: ALL,
     shape: "each",
+    target: "guessed-log",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
     guess: true,
@@ -308,6 +349,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe> load/error: the site directory under every guessed archive key vs an unrecorded site",
     positions: ALL,
     shape: "each",
+    target: "guessed-site",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
     guess: true,
@@ -317,6 +359,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<script> load/error: top-level one-click-har folder vs a missing sibling",
     positions: ALL,
     shape: "pair",
+    target: "app-folder",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
     expectAt: {
@@ -329,6 +372,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<script> load/error: the site directory under every guessed archive key vs an unrecorded site",
     positions: ALL,
     shape: "each",
+    target: "guessed-site",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
     guess: true,
@@ -338,6 +382,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(view-source:file:///<archive log>)",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -346,6 +391,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe src=view-source:file:///<archive log>>",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FRAME_WITHHELD,
     leak: "READ",
   },
@@ -354,6 +400,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(jar:file:///<archive log>!/)",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -362,6 +409,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe src=jar:file:///<archive log>!/>",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FRAME_WITHHELD,
     leak: "READ",
   },
@@ -370,6 +418,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch of an http URL that 302-redirects to the archive log",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -378,6 +427,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe> of an http URL that 302-redirects to the archive log",
     positions: ALL,
     shape: "single",
+    target: "archive-log",
     deny: FRAME_WITHHELD,
     leak: "READ",
   },
@@ -386,6 +436,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "window.open(file:///<archive log>), then read the window",
     positions: DOC,
     shape: "single",
+    target: "archive-log",
     deny: { kind: "rejected", error: /^Error: Access to '.*' from script denied$/u },
     // The popup blocker refuses an open with no user gesture from a file:// page before any origin check runs.
     denyAt: { file: { kind: "rejected", error: /^window\.open returned null$/u } },
@@ -396,6 +447,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe> of a URL the test extension blocking webRequest redirects to the archive log",
     positions: ["web", "file"],
     shape: "single",
+    target: "archive-log",
     deny: FRAME_WITHHELD,
     leak: "READ",
   },
@@ -404,6 +456,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.create({url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
+    target: "archive-log",
     deny: ILLEGAL_URL,
     leak: "LEAKS-EXISTENCE",
   },
@@ -412,6 +465,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.create({url: file:///<appFolder>/})",
     positions: TABS,
     shape: "single",
+    target: "app-folder",
     deny: ILLEGAL_URL,
     leak: "LEAKS-EXISTENCE",
   },
@@ -420,6 +474,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.update(<an http tab>, {url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
+    target: "archive-log",
     deny: ILLEGAL_URL,
     leak: "LEAKS-EXISTENCE",
   },
@@ -428,6 +483,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.update(<an http tab>, {url: <http URL that 302-redirects to the log>})",
     positions: TABS,
     shape: "single",
+    target: "archive-log",
     deny: {
       kind: "answered",
       outcome: "ok",
@@ -440,6 +496,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "windows.create({url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
+    target: "archive-log",
     deny: ILLEGAL_URL,
     leak: "LEAKS-EXISTENCE",
   },
@@ -448,6 +505,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "downloads.download({url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
+    target: "archive-log",
     deny: {
       kind: "rejected",
       error: /Access denied for URL file:\/\/\/.* for downloads\.download\./u,
@@ -459,6 +517,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.create({url: view-source:file:///<archive log>})",
     positions: TABS,
     shape: "single",
+    target: "archive-log",
     deny: ILLEGAL_URL,
     leak: "LEAKS-EXISTENCE",
   },
@@ -467,6 +526,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.create of a URL the test extension blocking webRequest redirects to the archive log",
     positions: ["ext-bg"],
     shape: "single",
+    target: "archive-log",
     deny: {
       kind: "answered",
       outcome: "ok",
@@ -481,6 +541,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch and <link> load of resource://<name>/ for every substitution found in omni.ja and the packed product",
     positions: ALL,
     shape: "each",
+    target: "resource-names",
     deny: UNREACHABLE,
   },
   {
@@ -488,6 +549,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "resource://<substitution>/ with encoded ../ to the archive log: fetch and <link> load",
     positions: ALL,
     shape: "each",
+    target: "archive-log",
     deny: UNREACHABLE,
   },
   {
@@ -495,6 +557,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "planted: resource://och-planted/ (mapped by the harness to the archive with ALLOW_CONTENT_ACCESS): <link> load of the log vs a missing path",
     positions: ["web", "file"],
     shape: "pair",
+    target: "planted-log",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
     expectAt: {
@@ -507,6 +570,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch and <link> load of chrome://<package>/content/ for every package found in omni.ja and the packed product",
     positions: ALL,
     shape: "each",
+    target: "chrome-packages",
     deny: UNREACHABLE,
   },
   {
@@ -514,6 +578,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "chrome://global/content/ with encoded ../ to the archive log: fetch and <link> load",
     positions: ALL,
     shape: "each",
+    target: "archive-log",
     deny: UNREACHABLE,
   },
   {
@@ -521,6 +586,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch and <link> load of moz-src:/// paths, and moz-src with encoded ../ to the archive log",
     positions: ALL,
     shape: "each",
+    target: "moz-src",
     deny: UNREACHABLE,
   },
 
@@ -530,6 +596,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(moz-extension://<recorder uuid>/<path>) for every file in the installed XPI",
     positions: ALL,
     shape: "each",
+    target: "packed-files",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -538,6 +605,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(moz-extension://<recorder uuid>/manifest.json)",
     positions: ALL,
     shape: "single",
+    target: "packed-manifest",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -546,6 +614,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(moz-extension://<recorder uuid>/experiment/parent.js)",
     positions: ALL,
     shape: "single",
+    target: "packed-parent",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -554,6 +623,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(moz-extension://<recorder uuid>/experiment/schema.json)",
     positions: ALL,
     shape: "single",
+    target: "packed-schema",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -562,6 +632,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch(moz-extension://<recorder uuid>/<popup page>)",
     positions: ALL,
     shape: "single",
+    target: "packed-popup",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -570,6 +641,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<script src> load/error: recorder popup script vs the same path under a random uuid",
     positions: ALL,
     shape: "pair",
+    target: "packed-popup-script",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
   },
@@ -578,6 +650,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "fetch error text: recorder uuid vs random uuid (medians reported, not judged)",
     positions: ["web", "ext-bg"],
     shape: "pair",
+    target: "packed-manifest",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
   },
@@ -586,6 +659,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "<iframe> of the recorder popup page, then postMessage to it and listen for any reply",
     positions: ["web", "file", "ext-page", "cs-web"],
     shape: "single",
+    target: "packed-popup",
     // Only a load that failed counts: a recorder page that loads, even cross-origin and silent, is reachable.
     deny: {
       kind: "answered",
@@ -599,6 +673,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "planted: fetch the test extension own web_accessible_resources file",
     positions: ["web", "file"],
     shape: "single",
+    target: "probe-war-text",
     deny: FETCH_DENIED,
     leak: "READ",
     expectAt: {
@@ -611,6 +686,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "planted: <script src> of the test extension own web-accessible war.js, then read window.OCH_WAR",
     positions: ["web", "file"],
     shape: "single",
+    target: "probe-war-script",
     deny: { kind: "answered", outcome: "error", text: /window\.OCH_WAR = undefined$/u },
     leak: "READ",
     expectAt: {
@@ -623,6 +699,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "control: fetch the test extension file that is not web accessible (holds a planted mark)",
     positions: ["web", "file"],
     shape: "single",
+    target: "probe-secret",
     deny: FETCH_DENIED,
     leak: "READ",
   },
@@ -633,6 +710,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "typeof browser.oneClickHar, typeof the page's own oneClickHar, and page globals a fresh frame lacks",
     positions: ALL,
     shape: "single",
+    target: "recorder-api",
     deny: {
       kind: "answered",
       outcome: "ok",
@@ -645,6 +723,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "browser.oneClickHar.getRecordingStatus()",
     positions: ALL,
     shape: "single",
+    target: "recorder-api",
     deny: {
       kind: "rejected",
       error:
@@ -657,6 +736,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "runtime.sendMessage(<recorder id>, {op: getRecordingStatus})",
     positions: EXTAPI,
     shape: "single",
+    target: "recorder-addon",
     deny: { kind: "rejected", error: NO_RECEIVER },
     leak: "READ",
   },
@@ -665,6 +745,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "runtime.sendMessage error: recorder id vs an id that is not installed",
     positions: EXTAPI,
     shape: "pair",
+    target: "recorder-addon",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
   },
@@ -673,6 +754,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "runtime.connect(<recorder id>) and postMessage",
     positions: EXTAPI,
     shape: "single",
+    target: "recorder-addon",
     deny: {
       kind: "answered",
       outcome: "disconnected",
@@ -685,6 +767,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.query({}) for a tab showing the recorder page",
     positions: TABS,
     shape: "single",
+    target: "recorder-tab",
     deny: { kind: "answered-without-recorder" },
     leak: "LEAKS-EXISTENCE",
     expectAt: { "ext-bg": EXCEPTION_TABS, "ext-page": EXCEPTION_TABS },
@@ -694,6 +777,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "tabs.executeScript into the tab showing the recorder popup page",
     positions: TABS,
     shape: "single",
+    target: "recorder-tab",
     deny: {
       kind: "answered",
       outcome: "done",
@@ -706,6 +790,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "scripting.executeScript into the tab showing the recorder popup page",
     positions: TABS,
     shape: "single",
+    target: "recorder-tab",
     deny: {
       kind: "answered",
       outcome: "done",
@@ -718,6 +803,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "management.getAll()",
     positions: TABS,
     shape: "single",
+    target: "recorder-addon",
     deny: { kind: "answered-without-recorder" },
     leak: "LEAKS-EXISTENCE",
     expectAt: { "ext-bg": EXCEPTION_MANAGEMENT, "ext-page": EXCEPTION_MANAGEMENT },
@@ -729,6 +815,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "downloads.search({}) after recording",
     positions: TABS,
     shape: "single",
+    target: "downloads",
     deny: { kind: "answered", outcome: "ok", text: /^no download items$/u },
     leak: "LEAKS-EXISTENCE",
   },
@@ -737,6 +824,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "navigator.clipboard.readText() after recording",
     positions: ["ext-page"],
     shape: "single",
+    target: "clipboard",
     deny: { kind: "answered", outcome: "ok", text: /^clipboard text: $/u },
     leak: "READ",
   },
@@ -745,6 +833,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "notifications.getAll() after recording",
     positions: ["ext-bg"],
     shape: "single",
+    target: "notifications",
     deny: { kind: "answered", outcome: "ok", text: /^\{\}$/u },
     leak: "LEAKS-EXISTENCE",
   },
@@ -753,6 +842,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "storage.local.get(null) in the test extension: its own planted value, never the recorder's",
     positions: TABS,
     shape: "single",
+    target: "recorder-storage",
     deny: { kind: "own-value-only" },
   },
   {
@@ -760,6 +850,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "indexedDB in the test extension: its own planted value, and open('och-recorder') never shows the recorder's",
     positions: TABS,
     shape: "single",
+    target: "recorder-idb",
     deny: { kind: "own-value-only" },
   },
 
@@ -769,6 +860,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "baseline: devtools.network.getHAR() on the inspected bank tab after reload",
     positions: ["ext-devtools"],
     shape: "single",
+    target: "bank-traffic",
     deny: { kind: "never" },
     leak: "READ",
     expectAt: { "ext-devtools": { kind: "READ", control: "baseline-live-traffic" } },
@@ -778,6 +870,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     what: "baseline: webRequest.onBeforeSendHeaders and filterResponseData on live bank traffic",
     positions: ["ext-bg"],
     shape: "single",
+    target: "bank-traffic",
     deny: { kind: "never" },
     leak: "READ",
     expectAt: { "ext-bg": { kind: "READ", control: "baseline-live-traffic" } },

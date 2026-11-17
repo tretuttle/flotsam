@@ -26,17 +26,25 @@ import {
   type KeySources,
 } from "../fixtures/isolation/archive-oracle.ts";
 import {
+  beyondControl,
   diffSnapshots,
-  diskRules,
-  productWrites,
+  diskProblems,
+  inProductArea,
   snapshotTree,
-  unallowedWrites,
+  type DiskEvidence,
+  type DiskSnapshot,
+  type ProductArea,
+  type RunChanges,
+  type RunNames,
 } from "../fixtures/isolation/disk.ts";
 import {
   exposureProblems,
   schemaContexts,
   type ExposureEvidence,
+  type PageSurface,
+  type RuntimeSurface,
 } from "../fixtures/isolation/exposure.ts";
+import { identities } from "../fixtures/isolation/identity.ts";
 import {
   judgeIsolationRun,
   type BrowserRowReport,
@@ -45,6 +53,7 @@ import {
   type Witness,
 } from "../fixtures/isolation/judge.ts";
 import {
+  checkKey,
   combineWitness,
   fileHref,
   planTargets,
@@ -53,6 +62,7 @@ import {
   type PlanInput,
   type TargetPlan,
 } from "../fixtures/isolation/targets.ts";
+import { buildStoredZip } from "../fixtures/isolation/zip.ts";
 import {
   buildOtherExperimentXpi,
   buildProbeExtensionXpi,
@@ -83,6 +93,10 @@ const proxyPrefs = (port: number): readonly Pref[] => [
   { name: "network.connectivity-service.enabled", value: false },
   { name: "network.captive-portal-service.enabled", value: false },
   { name: "browser.chrome.site_icons", value: false },
+  // No telemetry upload, so the browser keeps no pending pings under random names that differ between the runs.
+  { name: "datareporting.healthreport.uploadEnabled", value: false },
+  { name: "datareporting.policy.dataSubmissionEnabled", value: false },
+  { name: "datareporting.usage.uploadEnabled", value: false },
 ];
 
 type AddonInfo = {
@@ -116,6 +130,8 @@ type PackedExposure = {
   readonly schemaTexts: Readonly<Record<string, string>>;
   readonly externalListeners: readonly string[];
   readonly declaredPages: readonly string[];
+  /** Every page the recorder packs (each .html file) or declares, as a moz-extension URL. */
+  readonly pageUrls: readonly string[];
   readonly files: readonly string[];
   readonly literals: readonly string[];
   readonly registrations: readonly string[];
@@ -202,6 +218,7 @@ const CHROME_EXPOSURE_SCRIPT = `
       schemaTexts,
       externalListeners,
       declaredPages,
+      pageUrls: [...new Set([...declaredPages, ...files.filter((f) => /\\.x?html?$/i.test(f)).map((f) => policy.getURL(f))])].sort(),
       files: files.sort(),
       literals: [...literals].sort(),
       registrations,
@@ -247,18 +264,37 @@ const CHROME_PAGES_SCRIPT = `
   })().catch((e) => done([{ href: "", error: String(e) }]));
 `;
 
-/** Posts a message to the page itself and collects anything else that arrives in 500 ms. */
+/**
+ * Posts a message to the page itself and collects anything else that arrives in 500 ms, then removes its listener so
+ * the page reads the same when it is read again at the end of the run.
+ */
 const PAGE_ECHO_EXPRESSION = `new Promise((resolve) => {
   const token = "och-echo-" + Math.random();
   const got = [];
-  window.addEventListener("message", (e) => {
+  const listener = (e) => {
     let d;
     try { d = JSON.stringify(e.data); } catch (x) { d = String(e.data); }
     if (!String(d).includes(token)) got.push(String(d).slice(0, 300));
-  });
+  };
+  window.addEventListener("message", listener);
   window.postMessage({ och: token }, "*");
-  setTimeout(() => resolve(got.length ? got.join(" | ") : "none"), 500);
+  setTimeout(() => {
+    window.removeEventListener("message", listener);
+    resolve(got.length ? got.join(" | ") : "none");
+  }, 500);
 })`;
+
+/** The random id the profiles datastore names its database after, once it has made one. */
+const CHROME_STORE_ID_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  done(Services.prefs.getStringPref("toolkit.profiles.storeID", ""));
+`;
+
+const CHROME_TAB_SHOWS_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const url = arguments[0];
+  done([...Services.wm.getEnumerator("navigator:browser")].some((w) => w.gBrowser.tabs.some((t) => t.linkedBrowser.currentURI.spec === url)));
+`;
 
 /** Runs every system-principal witness check; the harness runs redirects and facts itself. */
 const CHROME_WITNESS_SCRIPT = `
@@ -286,8 +322,10 @@ const CHROME_WITNESS_SCRIPT = `
           try {
             const st = await IOUtils.stat(c.path);
             if (st.type === "directory") { const kids = await IOUtils.getChildren(c.path); return { ok: true, detail: "directory with " + kids.length + " entries" }; }
-            const bytes = await IOUtils.read(c.path, { maxBytes: 64 });
-            return { ok: bytes.length > 0, detail: st.type + ", " + st.size + " bytes" };
+            const bytes = await IOUtils.read(c.path, c.mark ? {} : { maxBytes: 64 });
+            if (!c.mark) return { ok: bytes.length > 0, detail: st.type + ", " + st.size + " bytes" };
+            const marked = new TextDecoder("utf-8", { fatal: false }).decode(bytes).includes(c.mark);
+            return { ok: marked, detail: st.type + ", " + st.size + " bytes, " + (marked ? "holds the mark" : "without the mark") };
           } catch (e) { return { ok: false, detail: e.name || String(e) }; }
         }
         case "load": {
@@ -526,7 +564,7 @@ async function runWitness(
   const unique = new Map(
     Object.values(plan.checks)
       .flat()
-      .map((c) => [JSON.stringify(c), c] as const),
+      .map((c) => [checkKey(c), c] as const),
   );
   const chromeChecks = Object.fromEntries(
     [...unique].filter(([, c]) => c.kind !== "redirect" && c.kind !== "fact"),
@@ -620,8 +658,8 @@ async function runNoMarionetteLaunch(options: {
   readonly extraPrefs: readonly Pref[];
   readonly server: Awaited<ReturnType<typeof startIsolationServer>>;
   readonly signal: AbortSignal;
-}): Promise<string | null> {
-  await using _session = await launchBrowser({
+}): Promise<{ readonly problem: string | null; readonly pid: number }> {
+  await using session = await launchBrowser({
     binaryPath: options.binaryPath,
     extensionPath: null,
     display: options.display,
@@ -639,13 +677,327 @@ async function runNoMarionetteLaunch(options: {
       r.kind === "position-done" && r.position === options.position,
     POSITION_TIMEOUT_MS,
   );
-  return done === null ? `${options.position}: timed out waiting for page completion` : null;
+  return {
+    problem: done === null ? `${options.position}: timed out waiting for page completion` : null,
+    pid: session.spawnedPid,
+  };
+}
+
+/** The probe add-on and the other experiment, installed the same way, byte for byte, in both runs. */
+function installProbeAddons(profileDir: string, probeXpi: Buffer): void {
+  const dir = NodePath.join(profileDir, "extensions");
+  NodeFS.mkdirSync(dir, { recursive: true });
+  NodeFS.writeFileSync(NodePath.join(dir, `${PROBE_EXTENSION_ID}.xpi`), probeXpi);
+  NodeFS.writeFileSync(NodePath.join(dir, `${OTHER_EXPERIMENT_ID}.xpi`), buildOtherExperimentXpi());
+}
+
+/**
+ * The control run's recorder: the product's id, name, version and pages, with no script, no experiment API and no
+ * permission. Each page the product packs is an empty document, so the control opens the same pages.
+ */
+function buildStandInXpi(manifest: Record<string, unknown>, pageFiles: readonly string[]): Buffer {
+  const action = (manifest["action"] ?? {}) as Record<string, unknown>;
+  const standIn = {
+    manifest_version: manifest["manifest_version"],
+    name: "One-Click HAR control stand-in",
+    version: manifest["version"],
+    browser_specific_settings: manifest["browser_specific_settings"],
+    action: { default_popup: action["default_popup"] },
+    ...(manifest["options_ui"] === undefined ? {} : { options_ui: manifest["options_ui"] }),
+  };
+  return buildStoredZip([
+    { name: "manifest.json", data: Buffer.from(JSON.stringify(standIn, null, 2)) },
+    ...pageFiles.map((name) => ({
+      name,
+      data: Buffer.from('<!doctype html><meta charset="utf-8"><title>stand-in</title>'),
+    })),
+  ]);
+}
+
+type PageRead = {
+  readonly href: string;
+  readonly windowListeners?: readonly string[];
+  readonly frames?: number;
+  readonly error?: string;
+};
+
+/**
+ * Reads every recorder page as it shows: its listeners and frames from the system principal, then whether anything
+ * answers a message the page posts to itself. One page at a time; each but the popup is closed after, and the popup,
+ * which the probes need, is opened again if a new Marionette tab replaced it, as some builds do.
+ */
+async function readPages(
+  session: BrowserSession,
+  recorderId: string,
+  urls: readonly string[],
+  popup: { readonly url: string; readonly tab: string },
+): Promise<{ readonly pages: readonly PageSurface[]; readonly popupTab: string }> {
+  const pages: PageSurface[] = [];
+  for (const url of urls) {
+    const tab = url === popup.url ? popup.tab : await session.openTab(url);
+    // Listeners are read before the echo, which adds one of its own while it waits.
+    const read = (await session.evaluateChrome(CHROME_PAGES_SCRIPT, [
+      recorderId,
+    ])) as readonly PageRead[];
+    const echo = await session
+      .evaluate(tab, PAGE_ECHO_EXPRESSION)
+      .catch((e: unknown) => `could not post: ${String(e)}`);
+    const page = read.find((r) => r.href === url);
+    if (page !== undefined && page.error === undefined) {
+      pages.push({
+        href: page.href,
+        windowListeners: page.windowListeners ?? [],
+        frames: page.frames ?? 0,
+        echo: echo === "none" ? null : echo,
+      });
+    }
+    if (url !== popup.url) await session.closeTab(tab);
+  }
+  const popupShows = (await session.evaluateChrome(CHROME_TAB_SHOWS_SCRIPT, [popup.url])) === true;
+  return { pages, popupTab: popupShows ? popup.tab : await session.openTab(popup.url) };
+}
+
+/** Every resource:// substitution and chrome package the enumeration found, as comparable lines. */
+const schemeLines = (
+  enumerated: EnumeratedSchemes,
+): Pick<RuntimeSurface, "substitutions" | "chromePackages"> => ({
+  substitutions: enumerated.subs.map((s) => `resource://${s.name}/ -> ${s.resolved}`),
+  chromePackages: enumerated.chrome.map((c) => `chrome://${c.pkg}/ -> ${c.target}`),
+});
+
+/**
+ * Runs every probe position in order, then the devtools one. Returns what went wrong, and whether the probe add-on's
+ * policy, asked from the system principal, can access neither the file page nor the archive log.
+ */
+async function runPositions(
+  context: CheckContext,
+  session: BrowserSession,
+  server: Awaited<ReturnType<typeof startIsolationServer>>,
+  options: {
+    readonly savedPageUrl: string;
+    readonly probeBase: string;
+    readonly logUrl: string;
+    readonly site: string;
+  },
+): Promise<{ readonly problems: readonly string[]; readonly canAccessFileObserved: boolean }> {
+  const problems: string[] = [];
+  let canAccessFileObserved = false;
+  await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, ["http://attacker.example/probe.html"]);
+  for (const pos of ["web", "cs-web", "file", "cs-file", "ext-bg", "ext-page"] as const) {
+    if (pos === "file") {
+      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [options.savedPageUrl]);
+    } else if (pos === "ext-page") {
+      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [`${options.probeBase}page.html`]);
+    }
+    context.log(`isolation: position ${pos}`);
+    server.enable(pos);
+    if (pos === "cs-file") {
+      const canAccess = (await session.evaluateChrome(CHROME_CAN_ACCESS_FILE_SCRIPT, [
+        PROBE_EXTENSION_ID,
+        options.savedPageUrl,
+        options.logUrl,
+      ])) as { readonly savedPage: boolean; readonly archiveLog: boolean } | null;
+      canAccessFileObserved =
+        canAccess !== null && canAccess.savedPage === false && canAccess.archiveLog === false;
+      const hello = await server.waitFor(
+        (r): r is Extract<IsolationReport, { kind: "cs-hello" }> =>
+          r.kind === "cs-hello" && r.href.startsWith("file:"),
+        1500,
+      );
+      if (hello === null) continue;
+    }
+    const done = await server.waitFor(
+      (r): r is Extract<IsolationReport, { kind: "position-done" }> =>
+        r.kind === "position-done" && r.position === pos,
+      POSITION_TIMEOUT_MS,
+    );
+    if (done === null) {
+      const posRows = server.reports.filter(
+        (r): r is Extract<IsolationReport, { kind: "row" }> =>
+          r.kind === "row" && r.position === pos,
+      );
+      context.log(
+        `isolation: ${pos} timed out after ${String(posRows.length)} rows; last=${posRows.at(-1)?.probe ?? "none"}`,
+      );
+      problems.push(`position ${pos} timed out`);
+    }
+  }
+
+  context.log("isolation: opening devtools");
+  const dvOpen = (await session.evaluateChrome(CHROME_OPEN_DEVTOOLS_SCRIPT, [
+    `http://${options.site}/`,
+  ])) as string;
+  if (dvOpen !== "open") problems.push(`failed to open devtools: ${dvOpen}`);
+  server.enable("ext-devtools");
+  const dvDone = await server.waitFor(
+    (r): r is Extract<IsolationReport, { kind: "position-done" }> =>
+      r.kind === "position-done" && r.position === "ext-devtools",
+    POSITION_TIMEOUT_MS,
+  );
+  if (dvDone === null) problems.push("position ext-devtools timed out");
+  return { problems, canAccessFileObserved };
+}
+
+/** The add-on uuids and the workspace folder of one run, each replaced by its role when two runs are compared. */
+/**
+ * Names the browser chose for this run alone: the profiles datastore's random store id, and the pid of every browser
+ * the run launched, which the profile lock names while a browser holds it.
+ */
+const browserNames = (storeId: string, pids: readonly number[]): RunNames => [
+  ...(storeId === "" ? [] : [[storeId, "{profiles-store-id}"] as const]),
+  ...pids.map((pid) => [`:+${String(pid)}`, ":+{browser-pid}"] as const),
+];
+
+function runNames(
+  base: string,
+  addons: Readonly<Record<string, AddonInfo | null>>,
+  recorderId: string,
+): RunNames {
+  const roles: Readonly<Record<string, string>> = {
+    [recorderId]: "{recorder-uuid}",
+    [PROBE_EXTENSION_ID]: "{probe-uuid}",
+    [OTHER_EXPERIMENT_ID]: "{other-experiment-uuid}",
+  };
+  return [
+    [base, "{workspace}"],
+    ...Object.entries(roles).flatMap(([id, role]): (readonly [string, string])[] => {
+      const uuid = addons[id]?.uuid;
+      return uuid === null || uuid === undefined ? [] : [[uuid, role]];
+    }),
+  ];
+}
+
+/** Everything the control run repeats from the product run, with the product's own paths where a probe needs one. */
+type ControlPlan = {
+  readonly recorderId: string;
+  readonly standInXpi: Buffer;
+  readonly probeXpi: Buffer;
+  readonly popupPath: string;
+  readonly pageFiles: readonly string[];
+  readonly site: string;
+  readonly storeMark: string;
+  readonly logPath: string;
+  readonly logUrl: string;
+  readonly plantRoot: string;
+  readonly exportName: string;
+  readonly exportText: string;
+  readonly savedPageName: string;
+  readonly savedPageHtml: string;
+  readonly serverPlan: Record<string, unknown> & { readonly file: Record<string, unknown> };
+  readonly extraPrefs: readonly Pref[];
+  readonly noMarionettePrefs: readonly Pref[];
+};
+
+/**
+ * The same throwaway HOME, profile, data home and Downloads, the same probe add-ons and the same actions as the
+ * product run, with an inert stand-in under the recorder's id in place of the product. What this run writes is what
+ * the browser and the harness write; the product run's writes beyond it are the product's.
+ */
+async function controlRun(
+  context: CheckContext,
+  server: Awaited<ReturnType<typeof startIsolationServer>>,
+  plan: ControlPlan,
+): Promise<RunChanges> {
+  await using workspace = recordingWorkspace("isolation-control", { ownHome: true });
+  installProbeAddons(workspace.profileDir, plan.probeXpi);
+  const standInDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-stand-in-"));
+  try {
+    const standInPath = NodePath.join(standInDir, "stand-in.xpi");
+    NodeFS.writeFileSync(standInPath, plan.standInXpi);
+    const before = snapshotTree(workspace.base);
+    let planSnapshot: DiskSnapshot = {};
+    let names: RunNames = [];
+    let storeId = "";
+    const pids: number[] = [];
+    const savedPagePath = NodePath.join(workspace.downloads, plan.savedPageName);
+    const savedPageUrl = fileHref(savedPagePath);
+    {
+      await using session = await workspace.launch({
+        binaryPath: context.binaryPath,
+        extensionPath: standInPath,
+        display: context.display,
+        protocol: "marionette",
+        launchMode: "real-defaults",
+        signal: context.signal,
+        extraPrefs: plan.extraPrefs,
+      });
+      const info = (await session.evaluateChrome(CHROME_INFO_SCRIPT, [
+        [plan.recorderId, PROBE_EXTENSION_ID, OTHER_EXPERIMENT_ID],
+      ])) as ChromeBootstrapInfo & { readonly error?: string };
+      if (info.error !== undefined) throw new Error(`control bootstrap failed: ${info.error}`);
+      names = runNames(workspace.base, info.addons, plan.recorderId);
+      const probeUuid = info.addons[PROBE_EXTENSION_ID]?.uuid;
+      if (probeUuid === null || probeUuid === undefined)
+        throw new Error("control: probe extension has no uuid");
+
+      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [`http://${plan.site}/`]);
+      await server.waitFor(
+        (r): r is Extract<IsolationReport, { kind: "bank-done" }> => r.kind === "bank-done",
+        STEP_TIMEOUT_MS,
+      );
+      const popupUrl = await waitForActiveExtensionUrl(session, plan.recorderId, plan.popupPath);
+      let popupTab = await session.openTab(popupUrl);
+      planSnapshot = snapshotTree(workspace.base);
+      storeId = String(await session.evaluateChrome(CHROME_STORE_ID_SCRIPT));
+      pids.push(session.browserPid, session.spawnedPid);
+
+      NodeFS.writeFileSync(NodePath.join(workspace.downloads, plan.exportName), plan.exportText, {
+        mode: 0o600,
+      });
+      await session.evaluateChrome(CHROME_OTHER_EXP_SCRIPT, [plan.logPath]);
+      await session.evaluateChrome(CHROME_PLANT_STORAGE_SCRIPT, [plan.recorderId, plan.storeMark]);
+      await session.evaluate(popupTab, recorderIdbPlant(plan.storeMark));
+      const pageUrls = plan.pageFiles.map(
+        (f) => `moz-extension://${info.addons[plan.recorderId]?.uuid ?? ""}/${f}`,
+      );
+      ({ popupTab } = await readPages(session, plan.recorderId, pageUrls, {
+        url: popupUrl,
+        tab: popupTab,
+      }));
+      await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [plan.plantRoot]);
+      NodeFS.writeFileSync(savedPagePath, plan.savedPageHtml, "utf8");
+      server.setPlan({
+        ...plan.serverPlan,
+        file: { ...plan.serverPlan.file, savedPage: savedPageUrl },
+      });
+
+      context.log("isolation: control run positions");
+      await runPositions(context, session, server, {
+        savedPageUrl,
+        probeBase: `moz-extension://${probeUuid}/`,
+        logUrl: plan.logUrl,
+        site: plan.site,
+      });
+      await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [""]);
+      await readPages(session, plan.recorderId, pageUrls, { url: popupUrl, tab: popupTab });
+      await session.quit();
+    }
+    const last = await runNoMarionetteLaunch({
+      position: "file-no-marionette",
+      binaryPath: context.binaryPath,
+      display: context.display,
+      profileDir: workspace.profileDir,
+      dataHome: workspace.dataHome,
+      home: workspace.home,
+      url: `${savedPageUrl}?pos=file-no-marionette`,
+      extraPrefs: plan.noMarionettePrefs,
+      server,
+      signal: context.signal,
+    });
+    return {
+      plan: diffSnapshots(before, planSnapshot),
+      final: diffSnapshots(before, snapshotTree(workspace.base)),
+      names: [...names, ...browserNames(storeId, [...pids, last.pid])],
+    };
+  } finally {
+    NodeFS.rmSync(standInDir, { recursive: true, force: true });
+  }
 }
 
 const check: HarnessCheck = {
   name: "isolation",
   description:
-    "isolation probes across web, file, and other-extension principals against the packed XPI, with targets from the written archive",
+    "isolation probes across web, file, and other-extension principals against the packed XPI, with targets from the written archive, and a control run without the product",
   run: async (context: CheckContext): Promise<CheckResult> => {
     const started = Date.now();
     if (context.extensionPath === null) {
@@ -675,16 +1027,13 @@ const check: HarnessCheck = {
     const secondKey = await secondProfileKey(context, recorderId, proxyPrefs(server.port));
 
     await using workspace = recordingWorkspace("isolation", { ownHome: true });
-    const extensionsDir = NodePath.join(workspace.profileDir, "extensions");
-    NodeFS.mkdirSync(extensionsDir, { recursive: true });
-    NodeFS.writeFileSync(
-      NodePath.join(extensionsDir, `${PROBE_EXTENSION_ID}.xpi`),
-      buildProbeExtensionXpi({ serverOrigin: server.origin, warMark, secretMark, ownMark }),
-    );
-    NodeFS.writeFileSync(
-      NodePath.join(extensionsDir, `${OTHER_EXPERIMENT_ID}.xpi`),
-      buildOtherExperimentXpi(),
-    );
+    const probeXpi = buildProbeExtensionXpi({
+      serverOrigin: server.origin,
+      warMark,
+      secretMark,
+      ownMark,
+    });
+    installProbeAddons(workspace.profileDir, probeXpi);
     const diskBefore = snapshotTree(workspace.base);
 
     const extraChecks: ExtraCheckResult[] = [];
@@ -708,11 +1057,15 @@ const check: HarnessCheck = {
     let witnessResults: ReadonlyMap<string, CheckOutcome> = new Map();
     let recUuid = "";
     let savedPageUrl = "";
-    let archiveKey = "";
     let plannedEntries: ReturnType<typeof workspace.entries> = [];
     let keyEvidence: KeyEvidence | null = null;
-    let diskRuleInput: Parameters<typeof diskRules>[0] | null = null;
+    let area: ProductArea | null = null;
+    let planSnapshot: DiskSnapshot = {};
+    let names: RunNames = [];
+    let storeId = "";
+    const pids: number[] = [];
     let exposureEvidence: ExposureEvidence | null = null;
+    let controlPlan: ControlPlan | null = null;
     const noMarionetteExtraPrefs = [...HARNESS_PREFS, ...proxyPrefs(server.port)];
     const exportName = `${site}-2026-11-16.har`;
     const savedPageName = "saved-page.html";
@@ -732,6 +1085,7 @@ const check: HarnessCheck = {
         [recorderId, PROBE_EXTENSION_ID, OTHER_EXPERIMENT_ID],
       ])) as ChromeBootstrapInfo & { readonly error?: string };
       if (info.error !== undefined) throw new Error(`chrome bootstrap failed: ${info.error}`);
+      names = runNames(workspace.base, info.addons, recorderId);
       record(
         "strict-origin-default",
         !info.strictFileOrigin || info.strictFileOriginUserSet
@@ -775,7 +1129,7 @@ const check: HarnessCheck = {
       await callHook(session, { kind: "seal" });
 
       const popupUrl = await waitForActiveExtensionUrl(session, recorderId, popupPath);
-      const popupTab = await session.openTab(popupUrl);
+      let popupTab = await session.openTab(popupUrl);
       const statusText = await session.evaluate(
         popupTab,
         "browser.oneClickHar.getRecordingStatus().then(JSON.stringify)",
@@ -792,7 +1146,7 @@ const check: HarnessCheck = {
 
       const located = locateArchive(workspace.dataHome, workspace.profileDir);
       if (located === null) throw new Error("archive key missing after seal");
-      archiveKey = located.key;
+      const archiveKey = located.key;
       const keyFilePath = NodePath.join(workspace.profileDir, ARCHIVE_KEY_FILE);
       plannedEntries = workspace.entries();
       keyEvidence = {
@@ -808,29 +1162,18 @@ const check: HarnessCheck = {
         `${String(plannedEntries.length)} entries 700/600`,
       );
 
-      // The inventory is what the disk diff says the product wrote by now, wherever it wrote it.
-      diskRuleInput = {
-        archiveKey,
-        keyFileName: ARCHIVE_KEY_FILE,
-        harnessFiles: [`downloads/${exportName}`, `downloads/${savedPageName}`],
-      };
-      const rules = diskRules(diskRuleInput);
-      const written = productWrites(
-        diffSnapshots(diskBefore, snapshotTree(workspace.base)),
-        rules,
-      ).map((c) => ({
-        rel: c.path,
-        path: NodePath.join(workspace.base, ...c.path.split("/")),
-        directory: c.entry.kind === "directory",
-      }));
-      const keyFolderRel = `data/one-click-har/${archiveKey}`;
-      const outsideKey = written.filter(
-        (w) =>
-          w.rel !== "data/one-click-har" &&
-          w.rel !== keyFolderRel &&
-          !w.rel.startsWith(`${keyFolderRel}/`) &&
-          w.rel !== `profile/${ARCHIVE_KEY_FILE}`,
-      );
+      // The inventory is what the disk diff says the product wrote in its own places by now.
+      planSnapshot = snapshotTree(workspace.base);
+      storeId = String(await session.evaluateChrome(CHROME_STORE_ID_SCRIPT));
+      pids.push(session.browserPid, session.spawnedPid);
+      area = { archiveKey, keyFileName: ARCHIVE_KEY_FILE };
+      const productArea = area;
+      const written = diffSnapshots(diskBefore, planSnapshot)
+        .filter((c) => inProductArea(c, productArea))
+        .map((c) => ({
+          path: NodePath.join(workspace.base, ...c.path.split("/")),
+          directory: c.entry.kind === "directory",
+        }));
 
       const downloadsProblem = judgeDownloads(
         (await session.evaluateChrome(CHROME_DOWNLOAD_TARGETS_SCRIPT)) as readonly string[],
@@ -861,19 +1204,16 @@ const check: HarnessCheck = {
 
       // No export API exists yet, so the export rows read a stand-in written where an export would land.
       const exportPath = NodePath.join(workspace.downloads, exportName);
-      NodeFS.writeFileSync(
-        exportPath,
-        JSON.stringify({
-          log: {
-            version: "1.2",
-            creator: { name: "One-Click HAR", version: "0.1.0" },
-            entries: [
-              { request: { url: `http://${site}/` }, response: { content: { text: marker } } },
-            ],
-          },
-        }),
-        { mode: 0o600 },
-      );
+      const exportText = JSON.stringify({
+        log: {
+          version: "1.2",
+          creator: { name: "One-Click HAR", version: "0.1.0" },
+          entries: [
+            { request: { url: `http://${site}/` }, response: { content: { text: marker } } },
+          ],
+        },
+      });
+      NodeFS.writeFileSync(exportPath, exportText, { mode: 0o600 });
 
       const sysRead = (await session.evaluateChrome(CHROME_READ_ARCHIVE_SCRIPT, [
         { log: logPath, body: bodyPath },
@@ -930,37 +1270,43 @@ const check: HarnessCheck = {
         reads: [idbPlant],
       });
 
+      // The running surface before any probe: scheme names, web-accessible resources and every page.
+      const candidates = [
+        ...new Set([
+          ...packed.literals,
+          recorderId,
+          recUuid,
+          archiveKey,
+          "one-click-har",
+          "oneclickhar",
+        ]),
+      ];
       const enumerated = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
-        [
-          ...new Set([
-            ...packed.literals,
-            recorderId,
-            recUuid,
-            archiveKey,
-            "one-click-har",
-            "oneclickhar",
-          ]),
-        ],
+        candidates,
       ])) as EnumeratedSchemes;
-      const inside = (target: string): boolean =>
-        target.includes(workspace.profileDir) || target.includes(workspace.dataHome);
-      record(
-        "no-scheme-into-profile-or-data-home",
-        [
-          ...enumerated.subs
-            .filter((s) => inside(s.resolved))
-            .map((s) => `resource://${s.name}/ -> ${s.resolved}`),
-          ...enumerated.chrome
-            .filter((c) => inside(c.target))
-            .map((c) => `chrome://${c.pkg}/ -> ${c.target}`),
+      context.log("isolation: reading the recorder's pages before the probes");
+      const pagesAtStart = await readPages(session, recorderId, packed.pageUrls, {
+        url: popupUrl,
+        tab: popupTab,
+      });
+      popupTab = pagesAtStart.popupTab;
+      const start: RuntimeSurface = {
+        webAccessibleResources: packed.runtimeWebAccessible,
+        webAccessiblePaths: [
+          ...packed.webAccessiblePaths,
+          ...(packed.webAccessibleQuery === null
+            ? ["(the policy offers no web-accessible query)"]
+            : []),
         ],
-        `${String(enumerated.subs.length)} substitutions and ${String(enumerated.chrome.length)} packages outside`,
-      );
+        ...schemeLines(enumerated),
+        pages: pagesAtStart.pages,
+      };
 
       await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [located.root]);
 
       const savedPagePath = NodePath.join(workspace.downloads, savedPageName);
-      NodeFS.writeFileSync(savedPagePath, buildSavedPageHtml(server.origin), "utf8");
+      const savedPageHtml = buildSavedPageHtml(server.origin);
+      NodeFS.writeFileSync(savedPagePath, savedPageHtml, "utf8");
       savedPageUrl = fileHref(savedPagePath);
 
       const plantedLog = `resource://och-planted/sites/${site}/log/${NodePath.basename(logPath)}`;
@@ -973,7 +1319,14 @@ const check: HarnessCheck = {
         export: fileHref(exportPath),
         savedPage: savedPageUrl,
       };
+      const experiment = Object.values(
+        (packed.manifest["experiment_apis"] ?? {}) as Record<
+          string,
+          { readonly schema?: unknown; readonly parent?: { readonly script?: unknown } }
+        >,
+      )[0];
       planInput = {
+        marker,
         file: {
           appFolder: located.appFolder,
           keyFolder: located.root,
@@ -983,13 +1336,20 @@ const check: HarnessCheck = {
           siteDir: siteDirPath,
         },
         inventory: written,
-        outsideKeyFolder: outsideKey,
         guessedKeyFolders: keyDerivations(
           keySources(workspace.profileDir, workspace.dataHome, recorderId, recUuid),
         ).map((g) => NodePath.join(located.appFolder, g.key)),
         redirectToLog: `http://attacker.example/redir?to=${encodeURIComponent(filePlan.log)}`,
         wrRedirect,
-        rec: { id: recorderId, base: recBase, popupPath, popupScriptPath, files: packed.files },
+        rec: {
+          id: recorderId,
+          base: recBase,
+          popupPath,
+          popupScriptPath,
+          parentScript: String(experiment?.parent?.script ?? "").replace(/^\//u, ""),
+          schema: String(experiment?.schema ?? "").replace(/^\//u, ""),
+          files: packed.files,
+        },
         probe: { base: probeBase, warMark, secretMark },
         randomUuid: NodeCrypto.randomUUID(),
         randomId: `not-installed-${NodeCrypto.randomBytes(4).toString("hex")}@test`,
@@ -1029,7 +1389,7 @@ const check: HarnessCheck = {
         server.port,
       ));
 
-      server.setPlan({
+      const serverPlan = {
         browser: context.binaryPath,
         server: server.origin,
         file: filePlan,
@@ -1038,95 +1398,68 @@ const check: HarnessCheck = {
         wrRedirect,
         targets: targetPlan.targets,
         noMarionetteProbes: NO_MARIONETTE_PROBE_IDS,
-      });
+      };
+      server.setPlan(serverPlan);
 
       context.log("isolation: opening web probe tab");
-      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, ["http://attacker.example/probe.html"]);
-      let fileTabOpened = false;
-      let extPageOpened = false;
+      const positions = await runPositions(context, session, server, {
+        savedPageUrl,
+        probeBase,
+        logUrl: filePlan.log,
+        site,
+      });
+      positionProblems.push(...positions.problems);
+      canAccessFileObserved = positions.canAccessFileObserved;
 
-      for (const pos of ["web", "cs-web", "file", "cs-file", "ext-bg", "ext-page"] as const) {
-        if (pos === "file" && !fileTabOpened) {
-          await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [savedPageUrl]);
-          fileTabOpened = true;
-        } else if (pos === "ext-page" && !extPageOpened) {
-          await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [`${probeBase}page.html`]);
-          extPageOpened = true;
-        }
-        context.log(`isolation: position ${pos}`);
-        server.enable(pos);
-        if (pos === "cs-file") {
-          const canAccess = (await session.evaluateChrome(CHROME_CAN_ACCESS_FILE_SCRIPT, [
-            PROBE_EXTENSION_ID,
-            savedPageUrl,
-            filePlan.log,
-          ])) as { readonly savedPage: boolean; readonly archiveLog: boolean } | null;
-          canAccessFileObserved =
-            canAccess !== null && canAccess.savedPage === false && canAccess.archiveLog === false;
-          const hello = await server.waitFor(
-            (r): r is Extract<IsolationReport, { kind: "cs-hello" }> =>
-              r.kind === "cs-hello" && r.href.startsWith("file:"),
-            1500,
-          );
-          if (hello === null) continue;
-        }
-        const done = await server.waitFor(
-          (r): r is Extract<IsolationReport, { kind: "position-done" }> =>
-            r.kind === "position-done" && r.position === pos,
-          POSITION_TIMEOUT_MS,
-        );
-        if (done === null) {
-          const posRows = server.reports.filter(
-            (r): r is Extract<IsolationReport, { kind: "row" }> =>
-              r.kind === "row" && r.position === pos,
-          );
-          context.log(
-            `isolation: ${pos} timed out after ${String(posRows.length)} rows; last=${posRows.at(-1)?.probe ?? "none"}`,
-          );
-          positionProblems.push(`position ${pos} timed out`);
-        }
-      }
-
-      context.log("isolation: opening devtools");
-      const dvOpen = (await session.evaluateChrome(CHROME_OPEN_DEVTOOLS_SCRIPT, [
-        `http://${site}/`,
-      ])) as string;
-      if (dvOpen !== "open") positionProblems.push(`failed to open devtools: ${dvOpen}`);
-      server.enable("ext-devtools");
-      const dvDone = await server.waitFor(
-        (r): r is Extract<IsolationReport, { kind: "position-done" }> =>
-          r.kind === "position-done" && r.position === "ext-devtools",
-        POSITION_TIMEOUT_MS,
+      const stillPlanted = (await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [
+        "",
+      ])) as boolean;
+      record(
+        "planted-resource-removed",
+        stillPlanted ? ["resource://och-planted/ remained"] : [],
+        "removed",
       );
-      if (dvDone === null) positionProblems.push("position ext-devtools timed out");
 
-      // Every page the recorder declares, open at once: what listens on each, what each frames, and what answers.
-      context.log("isolation: reading the recorder's pages");
-      // One page at a time, read while it shows: a new Marionette tab can replace an earlier one in some builds.
-      // Listeners are read before the echo, which adds one of its own.
-      const pagesRead: {
-        readonly href: string;
-        readonly windowListeners?: readonly string[];
-        readonly frames?: number;
-        readonly error?: string;
-        readonly echo: string;
-      }[] = [];
-      for (const page of packed.declaredPages) {
-        const tab = page === popupUrl ? popupTab : await session.openTab(page);
-        const read = (await session.evaluateChrome(CHROME_PAGES_SCRIPT, [recorderId])) as readonly {
-          readonly href: string;
-          readonly windowListeners?: readonly string[];
-          readonly frames?: number;
-          readonly error?: string;
-        }[];
-        const echo = await session
-          .evaluate(tab, PAGE_ECHO_EXPRESSION)
-          .catch((e: unknown) => `could not post: ${String(e)}`);
-        pagesRead.push(...read.filter((r) => r.href === page).map((r) => ({ ...r, echo })));
-      }
+      // The same surface after every probe ran, with the harness's own planted name gone again.
+      context.log("isolation: reading the recorder's surface after the probes");
+      const enumeratedAtEnd = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
+        candidates,
+      ])) as EnumeratedSchemes;
       const atEnd = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
         recorderId,
       ])) as PackedExposure & { readonly error?: string };
+      if (atEnd.error !== undefined) throw new Error(`exposure read failed: ${atEnd.error}`);
+      const pagesAtEnd = await readPages(session, recorderId, packed.pageUrls, {
+        url: popupUrl,
+        tab: popupTab,
+      });
+      const end: RuntimeSurface = {
+        webAccessibleResources: atEnd.runtimeWebAccessible,
+        webAccessiblePaths: [
+          ...atEnd.webAccessiblePaths,
+          ...(atEnd.webAccessibleQuery === null
+            ? ["(the policy offers no web-accessible query)"]
+            : []),
+        ],
+        ...schemeLines(enumeratedAtEnd),
+        pages: pagesAtEnd.pages,
+      };
+      const inside = (target: string): boolean =>
+        target.includes(workspace.profileDir) || target.includes(workspace.dataHome);
+      record(
+        "no-scheme-into-profile-or-data-home",
+        [
+          ...new Set(
+            [
+              ...start.substitutions,
+              ...start.chromePackages,
+              ...end.substitutions,
+              ...end.chromePackages,
+            ].filter((line) => inside(line.slice(line.indexOf(" -> ") + 4))),
+          ),
+        ],
+        `${String(enumerated.subs.length)} substitutions and ${String(enumerated.chrome.length)} packages outside, before and after the probes`,
+      );
       exposureEvidence = {
         manifestKeys: Object.keys(packed.manifest),
         experimentApis: (packed.manifest["experiment_apis"] ?? {}) as Record<string, unknown>,
@@ -1140,40 +1473,41 @@ const check: HarnessCheck = {
         contentScripts: packed.contentScripts,
         background: packed.manifest["background"] ?? null,
         declaredWebAccessible: (packed.manifest["web_accessible_resources"] ?? []) as unknown[],
-        runtimeWebAccessible: [packed.runtimeWebAccessible, atEnd.runtimeWebAccessible ?? []],
-        webAccessiblePaths: [
-          ...new Set([...packed.webAccessiblePaths, ...(atEnd.webAccessiblePaths ?? [])]),
-          ...(packed.webAccessibleQuery === null
-            ? ["(the policy offers no web-accessible query)"]
-            : []),
-        ],
         externalListeners: packed.externalListeners,
-        pages: pagesRead
-          .filter((p) => p.error === undefined)
-          .map((p) => ({
-            href: p.href,
-            windowListeners: p.windowListeners ?? [],
-            frames: p.frames ?? 0,
-            echo: p.echo === "none" ? null : p.echo,
-          })),
-        declaredPages: packed.declaredPages,
+        pageUrls: packed.pageUrls,
+        start,
+        end,
       };
 
-      const stillPlanted = (await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [
-        "",
-      ])) as boolean;
-      record(
-        "planted-resource-removed",
-        stillPlanted ? ["resource://och-planted/ remained"] : [],
-        "removed",
-      );
+      controlPlan = {
+        recorderId,
+        standInXpi: buildStandInXpi(
+          packed.manifest,
+          packed.files.filter((f) => /\.x?html?$/iu.test(f)),
+        ),
+        probeXpi,
+        popupPath,
+        pageFiles: packed.pageUrls.map((u) => u.slice(recBase.length)),
+        site,
+        storeMark,
+        logPath,
+        logUrl: filePlan.log,
+        plantRoot: located.root,
+        exportName,
+        exportText,
+        savedPageName,
+        savedPageHtml,
+        serverPlan,
+        extraPrefs: proxyPrefs(server.port),
+        noMarionettePrefs: noMarionetteExtraPrefs,
+      };
 
       context.log("isolation: quitting marionette session");
       await session.quit();
     }
 
     context.log("isolation: file-no-marionette");
-    const problem = await runNoMarionetteLaunch({
+    const last = await runNoMarionetteLaunch({
       position: "file-no-marionette",
       binaryPath: context.binaryPath,
       display: context.display,
@@ -1185,21 +1519,39 @@ const check: HarnessCheck = {
       server,
       signal: context.signal,
     });
-    if (problem !== null) positionProblems.push(problem);
+    if (last.problem !== null) positionProblems.push(last.problem);
     record("positions-completed", positionProblems, "every position reported done");
 
-    const changes = diffSnapshots(diskBefore, snapshotTree(workspace.base));
-    if (diskRuleInput === null || planInput === null) throw new Error("the run never planned");
+    const productRun: RunChanges = {
+      plan: diffSnapshots(diskBefore, planSnapshot),
+      final: diffSnapshots(diskBefore, snapshotTree(workspace.base)),
+      names: [...names, ...browserNames(storeId, [...pids, last.pid])],
+    };
+    if (area === null || planInput === null || controlPlan === null)
+      throw new Error("the run never planned");
+    const productReports = [...server.reports];
+
+    context.log("isolation: control run without the product");
+    server.clear();
+    const controlChanges = await controlRun(context, server, controlPlan);
+    const diskEvidence: DiskEvidence = {
+      product: productRun,
+      control: controlChanges,
+      area,
+      probed: planInput.inventory.map((w) =>
+        NodePath.relative(workspace.base, w.path).split(NodePath.sep).join("/"),
+      ),
+    };
     record(
       "disk-writes-allowed",
-      unallowedWrites(changes, diskRules(diskRuleInput)),
-      `${String(changes.length)} new or changed paths, each the browser's, the harness's or the product's own`,
+      diskProblems(diskEvidence),
+      `${String(beyondControl(productRun, controlChanges).length)} product writes beyond the control run's ${String(controlChanges.final.length)} changes, each in the key folder, the key file or an export, private, with one link`,
     );
     if (exposureEvidence === null) throw new Error("no exposure evidence was read");
     record(
       "exposure-allowed",
       exposureProblems(exposureEvidence),
-      `${String(exposureEvidence.pages.length)} pages and ${String(exposureEvidence.manifestKeys.length)} manifest keys, all allowed`,
+      `${String(exposureEvidence.start.pages.length)} pages and ${String(exposureEvidence.manifestKeys.length)} manifest keys, all allowed, the same before and after the probes`,
     );
 
     if (keyEvidence === null) throw new Error("no key evidence was read");
@@ -1221,15 +1573,16 @@ const check: HarnessCheck = {
         recUuid,
         webSandboxBlocksArchive: process.platform === "linux",
       },
-      browserRows: server.reports.filter((r): r is BrowserRowReport => r.kind === "row"),
+      browserRows: productReports.filter((r): r is BrowserRowReport => r.kind === "row"),
       targets: targetPlan.targets,
       witness,
+      identity: identities(planInput),
       syntheticControls,
-      csFileInjected: server.reports.some(
+      csFileInjected: productReports.some(
         (r) => r.kind === "cs-hello" && r.href.startsWith("file:"),
       ),
       canAccessFileObserved,
-      csArchiveInjectedDocs: server.reports
+      csArchiveInjectedDocs: productReports
         .filter(
           (r): r is Extract<IsolationReport, { kind: "cs-file-doc" }> =>
             r.kind === "cs-file-doc" && r.inArchive,
@@ -1251,8 +1604,7 @@ const check: HarnessCheck = {
         input,
         archiveEvidence,
         exposureEvidence,
-        diskChanges: changes,
-        diskRuleInput,
+        diskEvidence,
         planInput,
         witnessResults: [...witnessResults],
       },

@@ -7,9 +7,10 @@ import { applyMutant, generateMutants, type Mutant } from "../../mutation/operat
 import type * as OracleModule from "./archive-oracle.ts";
 import type { ArchiveEvidence, ExtraCheckResult } from "./archive-oracle.ts";
 import type * as DiskModule from "./disk.ts";
-import type { DiskChange } from "./disk.ts";
+import type { DiskEvidence } from "./disk.ts";
 import type * as ExposureModule from "./exposure.ts";
 import type { ExposureEvidence } from "./exposure.ts";
+import type * as IdentityModule from "./identity.ts";
 import type * as JudgeModule from "./judge.ts";
 import type { IsolationRunInput } from "./judge.ts";
 import { PLANTS, recordedIsolation } from "./regressions.ts";
@@ -18,7 +19,7 @@ import type { ExtraCheckId } from "./probe-table.ts";
 import type { CheckOutcome, PlanInput } from "./targets.ts";
 
 // Every operator mutant of the isolation judges (the row judge, the archive oracle, the probe table, the target plan
-// and witness, the disk rules and the exposure rules) must be killed, or be listed in equivalent-mutants.json with
+// and witness, the target identities, the disk rules and the exposure rules) must be killed, or be listed in equivalent-mutants.json with
 // its reason. A mutant is killed when it changes anything the judges print for a recorded real run: a verdict, an
 // ok, a count, a mismatch line, an extra check's detail, a disk or exposure problem. Or when a unit test fails.
 
@@ -30,6 +31,7 @@ const MODULES = [
   "archive-oracle.ts",
   "probe-table.ts",
   "targets.ts",
+  "identity.ts",
   "disk.ts",
   "exposure.ts",
 ] as const;
@@ -42,8 +44,7 @@ type Recorded = {
   readonly input: IsolationRunInput;
   readonly evidence: ArchiveEvidence;
   readonly exposure: ExposureEvidence;
-  readonly diskChanges: readonly DiskChange[];
-  readonly diskRuleInput: Parameters<typeof DiskModule.diskRules>[0];
+  readonly disk: DiskEvidence;
   readonly planInput: PlanInput;
   readonly witnessResults: readonly (readonly [string, CheckOutcome])[];
 };
@@ -52,6 +53,7 @@ type Judges = {
   readonly judge: typeof JudgeModule;
   readonly oracle: typeof OracleModule;
   readonly targets: typeof TargetsModule;
+  readonly identity: typeof IdentityModule;
   readonly disk: typeof DiskModule;
   readonly exposure: typeof ExposureModule;
 };
@@ -76,8 +78,7 @@ function loadRecorded(runsDirs: readonly string[]): readonly Recorded[] {
         input: data["input"] as IsolationRunInput,
         evidence: data["archiveEvidence"] as ArchiveEvidence,
         exposure: data["exposureEvidence"] as ExposureEvidence,
-        diskChanges: data["diskChanges"] as DiskChange[],
-        diskRuleInput: data["diskRuleInput"] as Recorded["diskRuleInput"],
+        disk: data["diskEvidence"] as DiskEvidence,
         planInput: data["planInput"] as PlanInput,
         witnessResults: data["witnessResults"] as Recorded["witnessResults"],
       });
@@ -111,12 +112,13 @@ function replay(j: Judges, run: Recorded): string {
   const witness = j.targets.combineWitness(plan, new Map(run.witnessResults));
   const archiveChecks = j.oracle.judgeArchive(run.evidence);
   const archiveIds = new Set(archiveChecks.map((c) => c.id));
-  const disk = j.disk.unallowedWrites(run.diskChanges, j.disk.diskRules(run.diskRuleInput));
+  const disk = j.disk.diskProblems(run.disk);
   const exposure = j.exposure.exposureProblems(run.exposure);
   const judgment = j.judge.judgeIsolationRun({
     ...run.input,
     targets: plan.targets,
     witness,
+    identity: j.identity.identities(run.planInput),
     // In the order the check records them; a check that holds keeps the summary the check wrote for it.
     extraChecks: [
       ...run.input.extraChecks.filter((c) => !archiveIds.has(c.id) && !REJUDGED.has(c.id)),
@@ -135,6 +137,7 @@ async function loadJudges(dir: string): Promise<Judges> {
     judge: (await load("judge.ts")) as typeof JudgeModule,
     oracle: (await load("archive-oracle.ts")) as typeof OracleModule,
     targets: (await load("targets.ts")) as typeof TargetsModule,
+    identity: (await load("identity.ts")) as typeof IdentityModule,
     disk: (await load("disk.ts")) as typeof DiskModule,
     exposure: (await load("exposure.ts")) as typeof ExposureModule,
   };

@@ -29,12 +29,43 @@ const POPUP = "apps/extension/src/popup/main.tsx";
 const SCHEMA = "apps/extension/experiment/gecko-schema.ts";
 const PROBES = "tools/browser-harness/fixtures/isolation/probe-script.ts";
 const TARGETS = "tools/browser-harness/fixtures/isolation/targets.ts";
+const ISOLATION = "tools/browser-harness/checks/isolation.ts";
 const MANIFEST_ANCHOR = '  "experiment_apis": {';
 const KEY_LINE = "const key = archiveKeyFromBytes(randomBytes(ARCHIVE_KEY_BYTES));";
 const MODES_LINE = "const modes: Modes = { dir: row.dirMode, file: row.fileMode };";
 const STEPS_LINE = "  let steps: readonly ReconcileStep[] = [];";
 const APPEND_LINE =
   "      await ensureDir(dirOf(logSegmentPath(segment.id)));\n      await appendText(segment.path, text, modes);";
+
+/** Runs `ln` from the parent process, as a product could, to give an archive file a second name. */
+const hardLink = (target: string): string => `${APPEND_LINE}
+      {
+        const ln = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        ln.initWithPath("/usr/bin/ln");
+        const proc = (Cc["@mozilla.org/process/util;1"] as unknown as {
+          createInstance(i: unknown): { init(f: unknown): void; run(b: boolean, args: string[], n: number): void };
+        }).createInstance((Ci as unknown as Record<string, unknown>).nsIProcess);
+        proc.init(ln);
+        proc.run(true, ["-f", segment.path, ${target}], 3);
+      }`;
+
+/** Runs `body` once, in the parent process, when the web probe page starts loading: after the plan is taken. */
+const onProbePage = (body: string): Edit => ({
+  file: PARENT,
+  from: STEPS_LINE,
+  to: `  {
+    const lateObs = {
+      observe(subject: unknown) {
+        const ch = (subject as { QueryInterface(i: unknown): { URI: { spec: string } } }).QueryInterface(Ci.nsIHttpChannel);
+        if (!ch.URI.spec.includes("attacker.example/probe.html")) return;
+        Services.obs.removeObserver(lateObs, "http-on-opening-request");
+${body}
+      },
+    };
+    Services.obs.addObserver(lateObs, "http-on-opening-request");
+  }
+${STEPS_LINE}`,
+});
 
 const manifestAdds = (json: string): Edit => ({
   file: MANIFEST,
@@ -170,7 +201,7 @@ ${STEPS_LINE}`,
       await appendText(segment.path, text, modes);`,
       },
     ],
-    mustFail: ["inventory-exists@file", "nothing-outside-key-folder", "disk-writes-allowed"],
+    mustFail: ["nothing-outside-key-folder", "disk-writes-allowed"],
   },
   {
     id: "resource-sub",
@@ -230,12 +261,7 @@ ${STEPS_LINE}`,
       await appendText(segment.path, text, modes);`,
       },
     ],
-    mustFail: [
-      "inventory-exists@file",
-      "nothing-outside-key-folder",
-      "key-names-the-archive",
-      "disk-writes-allowed",
-    ],
+    mustFail: ["nothing-outside-key-folder", "key-names-the-archive", "disk-writes-allowed"],
   },
 
   // Verifier round 2: product plants of new kinds.
@@ -384,7 +410,7 @@ ${STEPS_LINE}`,
       await appendText(segment.path, text, modes);`,
       },
     ],
-    mustFail: ["disk-writes-allowed", "inventory-exists@file"],
+    mustFail: ["disk-writes-allowed"],
   },
 
   // Harness plants: a probe that reports nothing, or acts on or plans a target that is not there, is NO-RESULT.
@@ -486,11 +512,219 @@ ${STEPS_LINE}`,
     edits: [
       {
         file: TARGETS,
-        from: 'plan(["mozext-parent"], [recUrl("experiment/parent.js")]);',
-        to: 'plan(["mozext-parent"], [recUrl("experiment/parent-typo.js")]);',
+        from: 'plan(["mozext-parent"], [recUrl(rec.parentScript)]);',
+        to: 'plan(["mozext-parent"], [recUrl(`${rec.parentScript}-typo`)]);',
       },
     ],
     mustFail: ["mozext-parent@web=NO-RESULT"],
+  },
+
+  // Verifier round 3: product plants of new kinds, and plants on the witness.
+  {
+    id: "connect-external-delayed",
+    what: "a background script answers runtime.onConnectExternal only after 600 ms",
+    edits: [manifestAdds('  "background": { "scripts": ["background/connect-delayed.ts"] },')],
+    files: {
+      "apps/extension/src/background/connect-delayed.ts":
+        "declare const browser: { runtime: { onConnectExternal: { addListener(f: (p: { postMessage(m: unknown): void }) => void): void } } };\n" +
+        "browser.runtime.onConnectExternal.addListener((port) => { setTimeout(() => port.postMessage({ recording: true, problems: [] }), 600); });\n" +
+        "export {};\n",
+    },
+    mustFail: ["connect-recorder@ext-bg", "exposure-allowed"],
+  },
+  {
+    id: "hardlink-in-profile",
+    what: "each log segment gets a second name, <profile>/leaked-log.jsonl, by a hard link",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: hardLink(
+          'PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "leaked-log.jsonl")',
+        ),
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "hardlink-in-profile-storage",
+    what: "each log segment gets a second name inside the browser's own storage folder, <profile>/storage/leaked-log.jsonl",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `${APPEND_LINE}
+      await makeDirectory(PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "storage"), modes);${hardLink('PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "storage", "leaked-log.jsonl")').slice(APPEND_LINE.length)}`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "resource-sub-late-literal",
+    what: "resource://one-click-har/ mapped to the key folder with content access once the probes start, after the plan",
+    edits: [
+      onProbePage(`        const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+        const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        f.initWithPath(archive.root);
+        res.setSubstitutionWithFlags("one-click-har", Services.io.newFileURI(f), Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS);`),
+    ],
+    mustFail: [
+      "no-scheme-into-profile-or-data-home",
+      "no-registration-in-packed-scripts",
+      "exposure-allowed",
+    ],
+  },
+  {
+    id: "resource-sub-late",
+    what: "the same late mapping through a method name built at run time, so no packed script names the call",
+    edits: [
+      onProbePage(`        const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler) as unknown as Record<string, (n: string, u: unknown, fl: number) => void>;
+        const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        f.initWithPath(archive.root);
+        const fn = "s" + ch.URI.spec.slice(0, 0) + "etSubstitutionWithFlags";
+        res[fn]?.("one-click-har", Services.io.newFileURI(f), Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS);`),
+    ],
+    mustFail: ["no-scheme-into-profile-or-data-home", "exposure-allowed"],
+  },
+  {
+    id: "recorder-iframe-via-redirect",
+    what: "the popup is web-accessible, and a frame load of attacker.example/redir is redirected to it",
+    edits: [
+      manifestAdds(
+        '  "web_accessible_resources": [{ "resources": ["action/*"], "matches": ["<all_urls>"], "extension_ids": ["*"] }],',
+      ),
+      {
+        file: PARENT,
+        from: STEPS_LINE,
+        to: `  {
+    const redirObs = {
+      observe(subject: unknown) {
+        const ch = (subject as { QueryInterface(i: unknown): { URI: { spec: string }; loadInfo?: { externalContentPolicyType?: number }; redirectTo(u: unknown): void } }).QueryInterface(Ci.nsIHttpChannel);
+        if (!ch.URI.spec.startsWith("http://attacker.example/redir?")) return;
+        const pol = WebExtensionPolicy.getByID("one-click-har@tretuttle.github.io");
+        if (pol && ch.loadInfo?.externalContentPolicyType === Ci.nsIContentPolicy.TYPE_SUBDOCUMENT) {
+          ch.redirectTo(Services.io.newURI(pol.getURL("action/index.html")));
+        }
+      },
+    };
+    Services.obs.addObserver(redirObs, "http-on-opening-request");
+  }
+${STEPS_LINE}`,
+      },
+    ],
+    mustFail: ["mozext-frame-recorder@web", "exposure-allowed"],
+  },
+  {
+    id: "schema-fn-allowed-contexts",
+    what: "one function of the experiment schema, getRecordingStatus, allowed in content and add-on contexts",
+    edits: [
+      {
+        file: SCHEMA,
+        from: "      parameters,\n    })),",
+        to: '      parameters,\n      ...(name === "getRecordingStatus" ? { allowedContexts: ["content", "addon"] } : {}),\n    })),',
+      },
+    ],
+    mustFail: ["exposure-allowed"],
+  },
+  {
+    id: "export-mode-0644",
+    what: "exports in Downloads written world-readable 0644, over the planned export and as a new one, after the plan",
+    edits: [
+      onProbePage(`        const { Downloads } = ChromeUtils.importESModule("resource://gre/modules/Downloads.sys.mjs");
+        void Downloads.getPreferredDownloadsDirectory().then((dlDir: string) => {
+          for (const name of ["bank.example-2026-11-16.har", "bank.example-export.har"]) {
+            const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+            f.initWithPath(PathUtils.join(dlDir, name));
+            const out = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
+            out.init(f, 0x02 | 0x08 | 0x20, 0o644, 0);
+            const body = JSON.stringify({ log: { version: "1.2", entries: [] } });
+            out.write(body, body.length);
+            out.close();
+            f.permissions = 0o644;
+          }
+        });`),
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "profile-zen-json-leak",
+    what: "recorded log lines appended to <profile>/zen-one-click-har.json, a name like the browser's own",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `${APPEND_LINE}
+      await appendText(PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "zen-one-click-har.json"), text, modes);`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "witness-typo-target",
+    what: "the plan aims fetch-file-log at the log path with -typo appended",
+    harness: true,
+    edits: [
+      {
+        file: TARGETS,
+        from: '      "fetch-file-log",\n      "xhr-file-log",',
+        to: '      "xhr-file-log",',
+      },
+      {
+        file: TARGETS,
+        from: "  const body = marked(file.body);",
+        to: '  plan(["fetch-file-log"], [fileTarget(fileHref(`${file.log}-typo`))]);\n  const body = marked(file.body);',
+      },
+    ],
+    mustFail: ["fetch-file-log@web=NO-RESULT", "fetch-file-log@file=NO-RESULT"],
+  },
+  {
+    id: "witness-wrong-file-marked",
+    what: "the plan aims own-non-war at the probe add-on's war.txt, which exists but holds the other mark",
+    harness: true,
+    edits: [
+      {
+        file: TARGETS,
+        from: 'plan(["own-non-war"], [load(`${input.probe.base}secret.txt`, input.probe.secretMark)]);',
+        to: 'plan(["own-non-war"], [load(`${input.probe.base}war.txt`, input.probe.secretMark)]);',
+      },
+    ],
+    mustFail: ["own-non-war@web=NO-RESULT", "own-non-war@file=NO-RESULT"],
+  },
+  {
+    id: "witness-wrong-file-unmarked",
+    what: "the plan aims mozext-parent at manifest.json and fetch-file-body at the log: both exist, both the wrong file",
+    harness: true,
+    edits: [
+      {
+        file: TARGETS,
+        from: '  plan(["fetch-file-body"], [body]);',
+        to: '  plan(["fetch-file-body"], [fileTarget(log)]);',
+      },
+      {
+        file: TARGETS,
+        from: '  plan(["mozext-parent"], [recUrl(rec.parentScript)]);',
+        to: '  plan(["mozext-parent"], [recUrl("manifest.json")]);',
+      },
+    ],
+    mustFail: ["mozext-parent@web=NO-RESULT", "fetch-file-body@web=NO-RESULT"],
+  },
+  {
+    id: "witness-always-succeeds",
+    what: "the witness answers ok for every check, without asking the system principal or the server",
+    harness: true,
+    edits: [
+      {
+        file: ISOLATION,
+        from: '          ? await redirectWitness(c.url, c.to, proxyPort)\n          : (chrome[key] ?? { ok: false, detail: "no answer from the system principal" }),',
+        to: '          ? { ok: true, detail: "mutated witness always ok" }\n          : { ok: true, detail: "mutated witness always ok" },',
+      },
+    ],
+    mustFail: [
+      "img-file-oracle@web=NO-RESULT",
+      "script-root-oracle@file=NO-RESULT",
+      "mozext-script-oracle@web=NO-RESULT",
+      "sendmessage-oracle@ext-bg=NO-RESULT",
+    ],
   },
 ];
 
