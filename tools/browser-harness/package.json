@@ -14,6 +14,8 @@
   "devDependencies": {
     "@one-click-har/recording": "workspace:*",
     "@types/node": "catalog:",
+    "har-to-k6": "0.13.0",
+    "har-validator": "5.1.5",
     "vite-plus": "catalog:"
   }
 }

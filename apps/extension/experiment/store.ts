@@ -142,6 +142,9 @@ export function openStore(options: {
   readonly settings: StoredSettings;
   readonly timers: Timers;
   readonly onSettings: (settings: StoredSettings) => void;
+  /** Lines now in a segment on disk, so the activity index counts exactly what an export can read. */
+  readonly onLines: (segment: LogSegmentId, exchanges: readonly SettledExchange[]) => void;
+  readonly onForgotten: (site: Site) => void;
 }): Store {
   const { run, root, modes, timers } = options;
   let settings = options.settings;
@@ -241,6 +244,7 @@ export function openStore(options: {
       await appendText(segment.path, text, modes);
       segment.bytes += text.length;
       segment.exchanges.push(...exchanges);
+      options.onLines(segment.id, exchanges);
       if (segment.bytes >= LOG_SEAL_BYTES) await seal(state);
     });
   };
@@ -365,6 +369,7 @@ export function openStore(options: {
         await writeAtomic(at([LAYOUT.settings]), JSON.stringify(next), modes);
         settings = next;
         options.onSettings(next);
+        options.onForgotten(site);
         const dir = at([LAYOUT.sitesDir, siteDirName(site)]);
         for (const [index, sub] of [LAYOUT.logDir, LAYOUT.packDir, LAYOUT.bodyDir].entries()) {
           await IOUtils.remove(PathUtils.join(dir, sub), { recursive: true, ignoreAbsent: true });

@@ -235,6 +235,7 @@ const FULL = {
     ],
     comment: "lg",
     _harExport: { redaction: { applied: true }, _note: "lx" },
+    _harExportId: "9f2c4e6a8b0d1f3a5c7e9b1d3f5a7c9e",
     _note: "lg",
   },
 };
@@ -323,6 +324,17 @@ describe("redaction always writes a valid HAR 1.2 document", () => {
     found.add("entry.cache");
     found.add("entry.timings");
     expect(rows.map((row) => row.field).filter((field) => !found.has(field))).toEqual([]);
+  });
+
+  it("keeps log._harExportId, a random id and nothing else, at every level, and counts it in no place", () => {
+    const { _harExportId: _id, ...withoutId } = FULL.log;
+    for (const level of REDACTION_LEVELS) {
+      const { document, report } = redactHar(FULL as unknown as HarDocument, { level });
+      expect(document.log._harExportId).toBe(FULL.log._harExportId);
+      expect(report).toEqual(
+        redactHar({ log: withoutId } as unknown as HarDocument, { level }).report,
+      );
+    }
   });
 
   it("removes members of a whole place only with the place itself", () => {

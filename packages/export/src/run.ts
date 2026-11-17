@@ -79,6 +79,11 @@ export interface ExportPorts {
   readonly bodies: BodyReader;
   readonly sink: HarSink;
   readonly creator: { readonly name: string; readonly version: string };
+  /**
+   * Random, and written in the document's first bytes as `log._harExportId`, so a file on disk can be proved to be
+   * this export's own before it is deleted.
+   */
+  readonly fileId: string;
   /** Wire-encoded bytes to decoded bytes, chunk by chunk (gzip, deflate, br, zstd). */
   readonly decode: (
     encoding: string,
@@ -526,7 +531,7 @@ export async function runExport(
   };
 
   await progress(0);
-  await ports.sink.write(`{"log":{"entries":[`);
+  await ports.sink.write(`{"log":{"_harExportId":${JSON.stringify(ports.fileId)},"entries":[`);
 
   for (let index = 0; index < pairs.length; index += 1) {
     throwIfAborted(ports.signal);

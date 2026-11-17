@@ -69,8 +69,8 @@ const SKETCH_MUTATIONS: readonly SourceMutation[] = [
   },
   {
     id: "seal-pack-step-back",
-    from: "  for (const path of snapshot.unfinishedExports)",
-    to: '  for (const e of snapshot.entries) if (e.name.kind === "pack" && isOld(snapshot, e.name.run)) steps.push({ kind: "seal-pack", path: e.path } as never);\n  for (const path of snapshot.unfinishedExports)',
+    from: "  for (const { path, at } of snapshot.unfinishedExports) {",
+    to: '  for (const e of snapshot.entries) if (e.name.kind === "pack" && isOld(snapshot, e.name.run)) steps.push({ kind: "seal-pack", path: e.path } as never);\n  for (const { path, at } of snapshot.unfinishedExports) {',
   },
   {
     id: "orphan-check-ignores-exclusion",
@@ -97,6 +97,18 @@ describe("the crash table", () => {
       const positions = reconcile.planReconcile(row.snapshot).map((s) => order.indexOf(s.kind));
       expect(positions).toEqual([...positions].sort((a, b) => a - b));
     }
+  });
+
+  it("row 13 when the part was replaced: leaves someone else's file, and plans nothing where nothing is", () => {
+    const row13 = CRASH_ROWS.find((row) => row.n === 13)!;
+    const path = "/home/u/Downloads/a.har.part";
+    const other = { ...row13.snapshot, unfinishedExports: [{ path, at: "other" as const }] };
+    const gone = { ...row13.snapshot, unfinishedExports: [{ path, at: "gone" as const }] };
+    expect(reconcile.planReconcile(other)).toEqual([{ kind: "leave-export-part", path }]);
+    expect(
+      reconcile.planReconcile(reconcile.applyPlan(other, [{ kind: "leave-export-part", path }])),
+    ).toEqual([]);
+    expect(reconcile.planReconcile(gone)).toEqual([]);
   });
 
   it.each(SKETCH_MUTATIONS)("planted $id fails at least one row", async (m) => {
@@ -171,8 +183,13 @@ function broken(
   for (const path of files)
     if (parseArchiveName(path.split("/"))?.kind === "body" && !named.has(path))
       return `orphan body ${path} left`;
-  if (disk.journal.size > 0 || [...disk.exports].some((p) => p.endsWith(".part")))
+  if (
+    disk.journal.size > 0 ||
+    [...disk.exports].some((p) => p.endsWith(".part") && truth.journaled.has(p))
+  )
     return "an unfinished export is left";
+  for (const path of truth.theirs)
+    if (!disk.theirs.has(path)) return `someone else's file at ${path} was deleted`;
   const gone = (path: string) =>
     truth.retained.has(path) || excluded.some((site) => path.startsWith(`${dirOf(site)}/`));
   for (const [path, lines] of truth.lines) {
@@ -201,12 +218,15 @@ function recover(planner: Planner, disk: Disk, current: RunId, r: Random): strin
       ),
       r,
     );
+    disk.journal.clear();
     return null;
   } catch (error) {
     if (!(error instanceof Crash)) throw error;
   }
   const second = planner.planReconcile(snapshotOf(disk, current));
   execute(disk, second, new Steps(Number.POSITIVE_INFINITY, null), r);
+  // As the parent does once recovery ran: every line is now acted on, so the journal is deleted.
+  disk.journal.clear();
   return misplanned(second, disk);
 }
 
@@ -222,7 +242,7 @@ function liveRun(run: Run, r: Random, actions: number, sites: readonly Site[]): 
     else if (roll < 75) run.seal(site);
     else if (roll < 79) run.touchSettings();
     else if (roll < 83 && live.length > 1) run.exclude(site, r);
-    else if (roll < 90) run.exportFile();
+    else if (roll < 90) run.exportFile(r.chance(0.3));
     else run.retain(r);
   }
   run.quit(sites);
@@ -337,7 +357,8 @@ describe("recovery after generated crashes", () => {
     GENERATED_TIMEOUT,
   );
 
-  it.each(Object.keys(reconcile.RECONCILE_STEPS))(
+  // leave-export-part changes nothing on disk; the replaced row 13 test above holds it.
+  it.each(Object.keys(reconcile.RECONCILE_STEPS).filter((kind) => kind !== "leave-export-part"))(
     "planted: without the %s rule a generated crash is left unrecovered",
     async (kind) => {
       const planner = await importMutated<Planner>("reconcile.ts", {

@@ -14,6 +14,7 @@ import {
   type ExamineTopic,
   type ExchangeFacts,
   type Header,
+  type LiveExchange,
   type NetError,
   type RequestFacts,
   type ResponseFacts,
@@ -107,6 +108,8 @@ export interface Recorder {
   setRoutes(routes: CompiledRoutes): void;
   /** Removes the observers, closes every file tee, and writes an abandoned line for each live capture. */
   stop(reason: AbandonReason): void;
+  /** Every capture still live, as an export lists it: in progress, never as complete. */
+  readonly snapshot: () => readonly { readonly site: Site | null; readonly live: LiveExchange }[];
   readonly counts: () => {
     readonly live: number;
     readonly overflow: number;
@@ -585,6 +588,16 @@ export function startRecorder(options: {
       live.clear();
       store.commitAbandoned(abandoned);
     },
+    snapshot: () =>
+      [...live.values()].map((entry) => {
+        const { capture } = entry;
+        const request =
+          capture.phase === "opened"
+            ? requestFacts(entry, capture.id, capture.startedAt)
+            : capture.facts.request;
+        const response = capture.phase === "opened" ? null : capture.facts.response;
+        return { site: entry.site, live: { request, response, phase: capture.phase } };
+      }),
     counts: () => ({ live: live.size, overflow, observerErrors, observerMs }),
   };
 }

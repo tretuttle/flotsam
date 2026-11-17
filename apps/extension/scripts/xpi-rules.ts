@@ -3,6 +3,7 @@
 // the rules judge the facts. Every rule carries the planted archive that proves it, and check-xpi.test.ts runs them.
 import * as NodeZlib from "node:zlib";
 import { CANNOT_JUDGE } from "./check-xpi.ts";
+import { FILE_WORKER } from "../experiment/contract.ts";
 import { readManifest } from "./manifest.ts";
 import { MINIFIED, minifyScript, minifyStyleAttribute, type Step } from "./minify.ts";
 import { readMarkup, type BodyKind, type Markup } from "./xpi-markup.ts";
@@ -11,10 +12,14 @@ import { lineOf, parseScript, type ScriptFacts } from "./xpi-source.ts";
 /** A body's kind, or for a file in the archive, the build step it comes from. A carried `script` is inline code. */
 export type Kind = BodyKind | "page-script" | "parent-script" | "notice" | "source-map" | "source";
 
-// build-experiment.ts writes the parent script where the manifest names it; rspack writes every other script.
-const PARENT_SCRIPT = Object.values(readManifest().experiment_apis).map(({ parent }) =>
-  parent.script.replace(/^\//, ""),
-);
+// build-experiment.ts writes the parent script where the manifest names it, and the parent's file worker; rspack writes
+// every other script.
+const PARENT_SCRIPT = [
+  ...Object.values(readManifest().experiment_apis).map(({ parent }) =>
+    parent.script.replace(/^\//, ""),
+  ),
+  FILE_WORKER,
+];
 
 /** A file in the archive, or a body carried inside one (an inline `<script>`, a `srcdoc` page). */
 export interface Unit {

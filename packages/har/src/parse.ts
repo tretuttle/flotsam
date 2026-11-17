@@ -1074,6 +1074,7 @@ export function parseHar(input: unknown): HarParseResult {
 
   const custom = pickCustomFields(rawLog, OWNED_FIELDS.log) as CustomHarFields & {
     readonly _harExport?: HarLogExtension | undefined;
+    readonly _harExportId?: string | undefined;
   };
   const log: HarLog = {
     ...custom,

@@ -11,7 +11,7 @@ The background recording runs in the experiment API's parent script: system prin
 - **The status names a `file://` page's way in.** With `security.fileuri.strict_origin_policy` false, a local page can read the archive. `getRecordingStatus` reports `file-pages-can-read-files`; the extension never changes the user's setting.
 - **Nothing is added to the Downloads list.** An extension with the `downloads` permission sees every entry's path and file name (issue 13).
 - **The folder guard covers `moz-src://`.** `moz-src:///` resolves into `omni.ja`, like the known `resource://` names; its target joins `ForbiddenRoots.substitutions`.
-- **A harness topic exists only in harness profiles.** With `extensions.oneClickHar.harness` set, the parent script listens on the observer topic `one-click-har-harness`, which only system-principal code can reach. It flushes, seals, excludes a site, parks the write chain at a named crash point, and returns the steps recovery ran. It reveals nothing system-principal code could not read from the archive already.
+- **A harness topic exists only in harness profiles.** With `extensions.oneClickHar.harness` set, the parent script listens on the observer topic `one-click-har-harness`, which only system-principal code can reach. It flushes, seals, excludes a site, parks the write chain at a named crash point or an export at a pause, and returns the steps recovery ran. The pref `extensions.oneClickHar.harness.namedParts` beside it makes exports name a part, as where no folder can be held. It reveals nothing system-principal code could not read from the archive already.
 
 ## Traps
 

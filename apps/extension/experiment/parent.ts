@@ -2,12 +2,21 @@
 // the manifest's experiment entry lists "events": ["startup"], so onStartup starts the recorder before any page
 // loads (row L1), and no API function starts or stops it.
 
+import {
+  applyActivity,
+  emptyActivity,
+  type ActivityIndex,
+} from "@one-click-har/recording/activity";
 import { parseSite, runIdAt, type EpochMs, type RunId } from "@one-click-har/recording/ids";
-import { guardFolder } from "@one-click-har/recording/layout";
+import { guardFolder, LAYOUT } from "@one-click-har/recording/layout";
 import type { ReconcileStep } from "@one-click-har/recording/reconcile";
 import { compileRoutes } from "@one-click-har/recording/routes";
 import type { StoredSettings } from "@one-click-har/recording/settings";
-import { namespace, type OneClickHarApi, type ToolboxState } from "./contract.ts";
+import { loadActivity } from "./archive-source.ts";
+import { FILE_WORKER, namespace } from "./contract.ts";
+import { toolboxOf } from "./devtools.ts";
+import { unfinishedExports } from "./export-file.ts";
+import { parseExportId } from "@one-click-har/export/jobs";
 import {
   forbiddenRoots,
   loadSettings,
@@ -17,14 +26,19 @@ import {
   type RootProblem,
 } from "./files.ts";
 import { Timers } from "./gecko-io.ts";
+import { createGeckoHost, type GeckoHost, type RecordingReads } from "./host.ts";
 import { recover } from "./maintenance.ts";
-import { createOneClickHarApi, type RecordingFacts } from "./parent-api.ts";
+import { createOneClickHarApi, type RawApi, type RecordingFacts } from "./parent-api.ts";
 import { startRecorder, type Recorder } from "./recorder.ts";
 import { HOLD_POINTS, openStore, type HoldPoint, type Store } from "./store.ts";
 
 /** Set only in a harness profile's user.js. Enables the observer topic below, which only system-principal code reaches. */
 const HARNESS_PREF = "extensions.oneClickHar.harness";
 const HARNESS_TOPIC = "one-click-har-harness";
+/** The resource root file-worker.js is served under, and its path in the package. */
+const WORKER_ROOT = "one-click-har";
+const resourceHandler = () =>
+  Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsISubstitutingProtocolHandler);
 
 interface Running {
   readonly run: RunId;
@@ -34,6 +48,7 @@ interface Running {
   readonly timers: Timers;
   readonly settingsRejected: boolean;
   readonly recovery: Promise<readonly ReconcileStep[]>;
+  readonly activity: ActivityIndex;
 }
 
 type Lifecycle =
@@ -58,6 +73,7 @@ function start(): Lifecycle {
   const { archive } = opened;
   const { settings, rejected } = loadSettings(archive.root);
   const timers = new Timers();
+  const activity = emptyActivity(run);
   let recorder: Recorder | null = null;
   const store = openStore({
     run,
@@ -66,6 +82,11 @@ function start(): Lifecycle {
     settings,
     timers,
     onSettings: (next) => recorder?.setRoutes(compile(next, archive)),
+    onLines: (segment, exchanges) => {
+      for (const exchange of exchanges)
+        applyActivity(activity, { kind: "settled", segment, exchange });
+    },
+    onForgotten: (site) => applyActivity(activity, { kind: "site-forgotten", site }),
   });
   recorder = startRecorder({
     run,
@@ -76,9 +97,19 @@ function start(): Lifecycle {
     timers,
   });
   let steps: readonly ReconcileStep[] = [];
+  const journal = PathUtils.join(archive.root, LAYOUT.exportsJournal);
   const recovery = store
     .enqueue(async () => {
-      steps = await recover(archive.root, archive.modes, run, settings.user.excludedSites);
+      const started = await IOUtils.readUTF8(journal).catch(() => "");
+      steps = await recover(
+        archive.root,
+        archive.modes,
+        run,
+        settings.user.excludedSites,
+        unfinishedExports(started),
+      );
+      await IOUtils.remove(journal, { ignoreAbsent: true });
+      await loadActivity(archive.root, activity);
     })
     .then(() => steps);
   return {
@@ -90,6 +121,7 @@ function start(): Lifecycle {
     timers,
     settingsRejected: rejected,
     recovery,
+    activity,
   };
 }
 
@@ -112,13 +144,30 @@ type HarnessRequest =
   | { readonly kind: "flush" | "seal" | "recovery" | "status" }
   | { readonly kind: "exclude"; readonly site: string }
   | { readonly kind: "arm" | "reached"; readonly point: string }
-  | { readonly kind: "guard"; readonly path: string };
+  | { readonly kind: "guard"; readonly path: string }
+  | { readonly kind: "export-audit" | "export-route"; readonly id: string }
+  | { readonly kind: "export-fault"; readonly op: string; readonly errno: string }
+  | {
+      readonly kind: "export-pause";
+      readonly point: string;
+      readonly action: "arm" | "reached" | "release";
+    };
+
+/** The worker calls a harness profile may make answer an errno, once. */
+const FAULT_OPS = new Set(["hold-folder", "create", "write", "link"]);
 
 const isHoldPoint = (value: string): value is HoldPoint =>
   (HOLD_POINTS as readonly string[]).includes(value);
 
-/** The harness's way in: flush, seal, exclude, hold the write chain at a crash point, read recovery and the guard. */
-async function answerHarness(state: Running, request: HarnessRequest): Promise<unknown> {
+/**
+ * The harness's way in: flush, seal, exclude, hold the write chain at a crash point or an export at a pause, arm an
+ * export's worker call to fail, read recovery, the guard and an export's route.
+ */
+async function answerHarness(
+  state: Running,
+  host: GeckoHost,
+  request: HarnessRequest,
+): Promise<unknown> {
   switch (request.kind) {
     case "flush":
       return state.store.flush();
@@ -151,38 +200,72 @@ async function answerHarness(state: Running, request: HarnessRequest): Promise<u
         forbidden: forbiddenRoots(),
         verdict: guardFolder(request.path, forbiddenRoots(), platform()),
       };
+    case "export-audit": {
+      const id = parseExportId(request.id);
+      if (id === null) throw new Error(`not an export id: ${request.id}`);
+      return host.jobs.audit(id);
+    }
+    case "export-route": {
+      const id = parseExportId(request.id);
+      if (id === null) throw new Error(`not an export id: ${request.id}`);
+      return host.jobs.route(id);
+    }
+    case "export-fault": {
+      if (!FAULT_OPS.has(request.op)) throw new Error(`not a worker call: ${request.op}`);
+      if (!/^E[A-Z]{2,15}$/u.test(request.errno)) throw new Error(`not an errno: ${request.errno}`);
+      host.faults.arm(request.op, request.errno);
+      return null;
+    }
+    case "export-pause": {
+      const point = request.point;
+      if (point !== "before-link" && point !== "after-link")
+        throw new Error(`not an export pause: ${point}`);
+      return host.pauses[request.action](point) ?? null;
+    }
   }
 }
 
-const nativeTab = (context: ExtensionContext, tabId: number): NativeTab | undefined => {
-  try {
-    return context.extension.tabManager.get(tabId).nativeTab;
-  } catch {
-    return undefined;
-  }
-};
+/** The archive as the host reads it, or null while the recording is not running. */
+const recordingReads = (state: Lifecycle): RecordingReads | null =>
+  state.kind !== "running"
+    ? null
+    : {
+        run: state.run,
+        root: state.archive.root,
+        modes: state.archive.modes,
+        activity: state.activity,
+        settings: state.store.settings,
+        settle: async () => {
+          // A file body's line joins a batch only after its rename, which runs on the chain; the second flush writes it.
+          await state.store.flush();
+          await state.store.flush();
+        },
+        live: () => state.recorder.snapshot(),
+        recovered: state.recovery,
+      };
 
-const toolboxState = (context: ExtensionContext, tabId: number): ToolboxState => {
-  const tab = nativeTab(context, tabId);
-  if (tab === undefined) return { open: false, reason: "no-such-tab" };
-  // Loading the DevTools client framework is expensive. Until DevTools starts, no toolbox can exist.
-  const { DevToolsShim } = ChromeUtils.importESModule(
-    "chrome://devtools-startup/content/DevToolsShim.sys.mjs",
+const refusal = (message: string): Error => {
+  const { ExtensionUtils } = ChromeUtils.importESModule(
+    "resource://gre/modules/ExtensionUtils.sys.mjs",
   );
-  if (!DevToolsShim.isInitialized()) return { open: false, reason: "devtools-not-started" };
-  const devtoolsLoader = ChromeUtils.importESModule(
-    "resource://devtools/shared/loader/Loader.sys.mjs",
-  );
-  const { gDevTools } = devtoolsLoader.require("resource://devtools/client/framework/devtools.js");
-  const toolbox = gDevTools.getToolboxForTab(tab);
-  return toolbox === undefined
-    ? { open: false, reason: "no-toolbox-for-tab" }
-    : { open: true, host: toolbox.hostType };
+  return new ExtensionUtils.ExtensionError(message);
 };
 
 class OneClickHarParent extends ExtensionAPI {
   #state: Lifecycle = { kind: "stopped" };
   #harness: Observer | null = null;
+  #host: GeckoHost | null = null;
+
+  /** One host per add-on, so an export started from the popup keeps running after the popup closes. */
+  get #shared(): GeckoHost {
+    this.#host ??= createGeckoHost({
+      reads: () => recordingReads(this.#state),
+      creator: { name: this.extension.manifest.name, version: this.extension.version },
+      extension: this.extension,
+      workerUrl: this.#workerUrl(),
+    });
+    return this.#host;
+  }
 
   override onStartup(): void {
     if (this.#state.kind !== "stopped") return;
@@ -197,7 +280,7 @@ class OneClickHarParent extends ExtensionAPI {
         const state = this.#state;
         const answer =
           state.kind === "running"
-            ? answerHarness(state, holder.request)
+            ? answerHarness(state, this.#shared, holder.request)
             : Promise.resolve({ unavailable: state.kind === "unavailable" ? state.problem : null });
         answer.then(
           (result) => holder.done({ ok: true, result }),
@@ -208,9 +291,29 @@ class OneClickHarParent extends ExtensionAPI {
     Services.obs.addObserver(this.#harness, HARNESS_TOPIC);
   }
 
+  /**
+   * file-worker.js under a resource URL, the only kind a ChromeWorker starts from. Only system-principal code loads
+   * it: the substitution grants no content access.
+   */
+  #workerUrl(): string | null {
+    try {
+      resourceHandler().setSubstitution(WORKER_ROOT, this.extension.rootURI);
+      return `resource://${WORKER_ROOT}/${FILE_WORKER}`;
+    } catch {
+      return null;
+    }
+  }
+
   override onShutdown(isAppShutdown: boolean): void {
+    try {
+      if (this.#host !== null) resourceHandler().setSubstitution(WORKER_ROOT, null);
+    } catch {
+      // Nothing was registered.
+    }
     if (this.#harness !== null) Services.obs.removeObserver(this.#harness, HARNESS_TOPIC);
     this.#harness = null;
+    for (const job of this.#host?.jobs.list() ?? [])
+      if (job.state.kind === "writing") this.#host?.jobs.cancel(job.id);
     const state = this.#state;
     this.#state = { kind: "stopped" };
     if (state.kind !== "running") return;
@@ -247,17 +350,29 @@ class OneClickHarParent extends ExtensionAPI {
     };
   }
 
-  override getAPI(context: ExtensionContext): Record<string, OneClickHarApi> {
+  override getAPI(_context: ExtensionContext): Record<string, RawApi> {
+    const host = this.#shared;
     return {
-      [namespace]: createOneClickHarApi({
-        identity: () => ({
-          name: Services.appinfo.name,
-          version: Services.appinfo.version,
-          buildId: Services.appinfo.appBuildID,
-        }),
-        toolbox: (tabId) => toolboxState(context, tabId),
-        recording: () => this.#facts(),
-      }),
+      [namespace]: createOneClickHarApi(
+        {
+          identity: () => ({
+            name: Services.appinfo.name,
+            version: Services.appinfo.version,
+            buildId: Services.appinfo.appBuildID,
+          }),
+          toolbox: (tabId) => {
+            const found = host.lookup(tabId);
+            return found.kind === "tab"
+              ? toolboxOf(found.tab)
+              : { open: false, reason: "no-such-tab" };
+          },
+          recording: () => this.#facts(),
+          popup: host.popup,
+          preview: host.preview,
+          exports: host.exports,
+        },
+        refusal,
+      ),
     };
   }
 }

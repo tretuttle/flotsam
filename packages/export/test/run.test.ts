@@ -12,7 +12,7 @@ import { summarizeHar } from "@one-click-har/har/summarize";
 import { afterAll, describe, expect, it } from "vite-plus/test";
 import type { RedactionChoice } from "../src/redaction.ts";
 import { BODY_WINDOW_BYTES } from "../src/run.ts";
-import { runFake, sha256, utf8, writtenBytes, type FakeRow } from "./fake-ports.ts";
+import { FAKE_FILE_ID, runFake, sha256, utf8, writtenBytes, type FakeRow } from "./fake-ports.ts";
 import type { HeapRun } from "./heap-runner.ts";
 import { importMutated } from "./mutate.ts";
 
@@ -176,6 +176,15 @@ describe("runExport over fake ports", () => {
       }
     });
   }
+
+  it("writes the export's file id first, alone, as log._harExportId, and the file still validates", async () => {
+    const writes: string[] = [];
+    const result = await runFake({ rows: MIXED, onWrite: (text) => writes.push(text) });
+    expect(writes[0]).toBe(`{"log":{"_harExportId":"${FAKE_FILE_ID}","entries":[`);
+    const doc = JSON.parse(result.text) as HarDocument & { log: { _harExportId?: unknown } };
+    expect(doc.log._harExportId).toBe(FAKE_FILE_ID);
+    await expect(HarValidator.har(doc)).resolves.toBe(doc);
+  });
 
   it("cancel at every await point rejects with AbortError and reads no chunk after the abort", async () => {
     const complete = await runFake({ rows: MIXED });

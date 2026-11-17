@@ -1,6 +1,7 @@
 // Native helpers more than one experiment file needs. Nothing here reads a body into script.
 
 import { parseSite, type Site } from "@one-click-har/recording/ids";
+import type { PathState } from "./export-file.ts";
 
 /** POSIX modes the archive uses on Linux and macOS (rows P2). Windows ignores them and keeps the inherited ACL. */
 export interface Modes {
@@ -170,3 +171,89 @@ export const randomBytes = (length: number): Uint8Array =>
       .getService(Ci.nsIRandomGenerator)
       .generateRandomBytes(length),
   );
+
+/** What is at a path, without following a link there. */
+export const pathState = (path: string): PathState => {
+  const file = localFile(path);
+  try {
+    if (file.isSymlink()) return { kind: "link", size: file.fileSizeOfLink };
+  } catch {
+    return { kind: "missing" };
+  }
+  if (!file.exists()) return { kind: "missing" };
+  const kind = file.isDirectory() ? "folder" : file.isFile() ? "file" : "other";
+  return { kind, size: file.fileSize };
+};
+
+const PR_RDWR = 0x04;
+
+/** Opens for reading and writing: an open that never waits, since a FIFO opened both ways has its own writer. */
+export const openReadWrite = (
+  path: string,
+  flags: number,
+  mode: number,
+  behavior = 0,
+): FileRandomAccessStream => {
+  const stream = Cc["@mozilla.org/network/file-random-access-stream;1"].createInstance(
+    Ci.nsIFileRandomAccessStream,
+  );
+  stream.init(localFile(path), PR_RDWR | flags, mode, behavior);
+  for (const iface of [
+    Ci.nsIInputStream,
+    Ci.nsIOutputStream,
+    Ci.nsISeekableStream,
+    Ci.nsIFileMetadata,
+  ])
+    stream.QueryInterface(iface);
+  return stream;
+};
+
+/** Up to `bytes` bytes through `stream`, from `offset`; fewer only at its end. */
+export const readAt = (
+  stream: FileRandomAccessStream,
+  offset: number,
+  bytes: number,
+): Uint8Array => {
+  stream.seek(Ci.nsISeekableStream.NS_SEEK_SET, offset);
+  const reader = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
+  reader.setInputStream(stream);
+  const buffer = new ArrayBuffer(Math.max(0, Math.min(bytes, stream.size - offset)));
+  return new Uint8Array(buffer, 0, reader.readArrayBuffer(buffer.byteLength, buffer));
+};
+
+/** A new SHA-256 over the bytes it is given, as lowercase hex. */
+export const sha256 = () => {
+  const hash = Cc["@mozilla.org/security/hash;1"].createInstance(Ci.nsICryptoHash);
+  hash.init(Ci.nsICryptoHash.SHA256);
+  return {
+    update: (bytes: Uint8Array): void => hash.update(bytes, bytes.length),
+    hex: (): string =>
+      Array.from(hash.finish(false), (byte) =>
+        byte.charCodeAt(0).toString(16).padStart(2, "0"),
+      ).join(""),
+  };
+};
+
+/**
+ * The first `bytes` bytes of what is at `path`, or fewer. The open never waits, and nothing is read from a file that
+ * reports fewer bytes than asked, which is every FIFO and device: a read there could wait for a writer.
+ */
+export const readHead = async (path: string, bytes: number): Promise<Uint8Array> => {
+  const stream = openReadWrite(path, 0, 0);
+  try {
+    return stream.size < bytes ? new Uint8Array(0) : readAt(stream, 0, bytes);
+  } finally {
+    stream.close();
+  }
+};
+
+/** A one-shot timer, cancelled once the call it bounds settles, so none is left armed after an export. */
+export const oneShot = (
+  ms: number,
+): { readonly elapsed: Promise<void>; readonly cancel: () => void } => {
+  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+  const elapsed = new Promise<void>((resolve) => {
+    timer.initWithCallback({ notify: () => resolve() }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+  });
+  return { elapsed, cancel: () => timer.cancel() };
+};

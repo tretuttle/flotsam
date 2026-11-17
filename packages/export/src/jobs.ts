@@ -70,11 +70,36 @@ export interface PopupState {
 
 export type ExportId = string & { readonly __exportId: unique symbol };
 
+/**
+ * Why an export file could not be written: a closed set of kinds and numbers. No field holds text, because a platform
+ * error's text names the export folder and the profile, and a failure crosses to extension pages.
+ */
 export type WriteFailure =
   | { readonly kind: "disk-full"; readonly needBytes: ByteCount; readonly freeBytes: ByteCount }
   | { readonly kind: "access-denied" }
+  | { readonly kind: "read-only" }
+  | { readonly kind: "not-a-folder" }
+  | { readonly kind: "folder-missing" }
+  /** The folder is a link, or resolves inside the profile, the archive or the browser's own folders. */
   | { readonly kind: "folder-refused" }
-  | { readonly kind: "other"; readonly detail: string };
+  /** Something other than the file this export created stood at its name when it finished. */
+  | { readonly kind: "file-replaced" }
+  | { readonly kind: "name-too-long" }
+  | { readonly kind: "name-taken" }
+  /** The disk or the file system reported an input/output error. */
+  | { readonly kind: "io-error" }
+  /** The bytes copied to a named part, when the link could not be made, were not the export's, by length or SHA-256. */
+  | { readonly kind: "copy-mismatch" }
+  /** A file call was still running after the export's time limit for one call. */
+  | { readonly kind: "timed-out" }
+  /** An error the table does not name. */
+  | { readonly kind: "other" };
+
+/**
+ * How the file was written: `link` names an unnamed file once, where the folder is held open (Linux); `named` writes
+ * `<name>.har.part` and renames it. Why an export took the named route stays in the parent.
+ */
+export type ExportRouteKind = "link" | "named";
 
 export type ExportState =
   | {
@@ -88,9 +113,17 @@ export type ExportState =
       readonly fileName: string;
       readonly folderLabel: string;
       readonly report: ExportReport;
+      readonly route: ExportRouteKind;
     }
   | { readonly kind: "cancelled" }
-  | { readonly kind: "write-failed"; readonly failure: WriteFailure };
+  | {
+      readonly kind: "write-failed";
+      readonly failure: WriteFailure;
+      /** Absent when the export failed before it had a file. */
+      readonly route?: ExportRouteKind;
+      /** The export named its file, then could not prove the name still holds it, so it names no file. */
+      readonly unconfirmed?: true;
+    };
 
 export interface ExportJob {
   readonly id: ExportId;

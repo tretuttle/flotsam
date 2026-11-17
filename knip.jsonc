@@ -46,7 +46,15 @@
       "entry": ["src/cli.ts", "checks/*.ts", "mutation/guard-mutation.ts"],
       "includeEntryExports": true,
       // Knip does not resolve these platform process tools.
-      "ignoreBinaries": ["taskkill.exe", "powershell.exe", "getconf", "coredumpctl", "unshare"],
+      "ignoreBinaries": [
+        "taskkill.exe",
+        "powershell.exe",
+        "getconf",
+        "coredumpctl",
+        "unshare",
+        "mkfifo",
+        "cc",
+      ],
     },
   },
 }

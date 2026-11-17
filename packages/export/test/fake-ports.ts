@@ -178,6 +178,9 @@ function baseEntry(row: FakeRow, side: SideRow): HarEntry {
   });
 }
 
+/** The fake export's random file id. */
+export const FAKE_FILE_ID = "5f0e6c1d9a8b47e2b3c4d5e6f7a8b9c0";
+
 export interface FakeEnv {
   readonly rows: readonly FakeRow[];
   readonly redaction?: RedactionChoice;
@@ -380,6 +383,7 @@ export async function runFake(env: FakeEnv): Promise<FakeResult> {
       bytesWritten: () => bytes as ByteCount,
     },
     creator: { name: "One-Click HAR", version: "0.0.0-test" },
+    fileId: FAKE_FILE_ID,
     decode: nodeDecode,
     yieldNow: async () => {
       point();

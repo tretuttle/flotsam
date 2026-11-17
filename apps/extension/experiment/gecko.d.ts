@@ -2,21 +2,33 @@
 // Only the members this parent script uses are declared.
 
 declare const tabBrand: unique symbol;
-/** A browser tab element in the parent process. Opaque here: it is only passed back to DevTools. */
+/** A browser tab element in the parent process. Passed back to DevTools, and read for its browser. */
 interface NativeTab {
   readonly [tabBrand]: true;
-}
-
-interface ExtensionContext {
-  readonly extension: {
-    readonly tabManager: {
-      /** Throws an `ExtensionError` when no tab has this ID. */
-      get(tabId: number): { readonly nativeTab: NativeTab };
-    };
+  readonly linkedBrowser: {
+    readonly browserId: number;
+    readonly currentURI: Uri | null;
+    readonly browsingContext: { readonly usePrivateBrowsing: boolean } | null;
   };
 }
 
+interface ExtensionObject {
+  readonly tabManager: {
+    /** Throws an `ExtensionError` when no tab has this ID, or for a private tab this add-on may not see. */
+    get(tabId: number): { readonly nativeTab: NativeTab };
+  };
+  readonly version: string;
+  readonly manifest: { readonly name: string };
+  /** The add-on's packaged files. */
+  readonly rootURI: Uri;
+}
+
+interface ExtensionContext {
+  readonly extension: ExtensionObject;
+}
+
 declare class ExtensionAPI {
+  readonly extension: ExtensionObject;
   /** Present only when the manifest's experiment entry lists `"events": ["startup"]`. */
   onStartup?(): void;
   /** true when the browser is closing; false for a disable, uninstall or update of this add-on. */
@@ -138,14 +150,37 @@ interface StreamListenerTee extends StreamListener {
 interface FileOutputStream extends OutputStream {
   init(file: LocalFile, ioFlags: number, perm: number, behaviorFlags: number): void;
 }
+/** One open file for reading and writing, with one position for both. Each interface is reached by QueryInterface. */
+interface FileRandomAccessStream extends InputStream, OutputStream {
+  init(file: LocalFile, ioFlags: number, perm: number, behaviorFlags: number): void;
+  QueryInterface(iface: XpcomInterface): FileRandomAccessStream;
+  /** nsISeekableStream. */
+  seek(whence: number, offset: number): void;
+  /** nsISeekableStream: the file ends at the current position, shorter or longer. */
+  setEOF(): void;
+  /** nsIFileMetadata: the open file's own length. */
+  readonly size: number;
+}
 interface LocalFile {
   readonly path: string;
   readonly fileSize: number;
+  /** The link's own size, the length of its target. */
+  readonly fileSizeOfLink: number;
   permissions: number;
   initWithPath(path: string): void;
   exists(): boolean;
   create(type: number, permissions: number): void;
   moveTo(parent: LocalFile | null, name: string): void;
+  readonly diskSpaceAvailable: number;
+  /** lstat: true for a link, dangling or not. Throws when nothing is at the path. */
+  isSymlink(): boolean;
+  isDirectory(): boolean;
+  isFile(): boolean;
+  /** Resolves every link (realpath). A path that does not exist is left as it is. */
+  normalize(): void;
+  /** Throws where the platform's file manager cannot select a file (row P4). */
+  reveal(): void;
+  launch(): void;
 }
 interface FileInputStream extends InputStream {
   init(file: LocalFile, ioFlags: number, perm: number, behaviorFlags: number): void;
@@ -179,11 +214,43 @@ interface XpcomClasses {
   "@mozilla.org/network/stream-listener-tee;1": StreamListenerTee;
   "@mozilla.org/network/file-output-stream;1": FileOutputStream;
   "@mozilla.org/network/file-input-stream;1": FileInputStream;
+  "@mozilla.org/network/file-random-access-stream;1": FileRandomAccessStream;
   "@mozilla.org/file/local;1": LocalFile;
   "@mozilla.org/io/multiplex-input-stream;1": MultiplexInputStream;
   "@mozilla.org/io/arraybuffer-input-stream;1": ArrayBufferInputStream;
   "@mozilla.org/network/async-stream-copier;1": AsyncStreamCopier;
   "@mozilla.org/timer;1": Timer;
+  "@mozilla.org/binaryinputstream;1": BinaryInputStream;
+  "@mozilla.org/intl/converter-output-stream;1": ConverterOutputStream;
+  "@mozilla.org/security/hash;1": CryptoHash;
+}
+
+interface ConverterOutputStream {
+  init(stream: OutputStream, charset: string): void;
+  /** false when not every character was written. */
+  writeString(text: string): boolean;
+  flush(): void;
+  close(): void;
+}
+
+interface CryptoHash {
+  init(algorithm: number): void;
+  update(bytes: Uint8Array, length: number): void;
+  /** The digest, as a string of byte values when `base64` is false. */
+  finish(base64: boolean): string;
+}
+
+interface BinaryInputStream {
+  setInputStream(stream: InputStream): void;
+  readArrayBuffer(count: number, buffer: ArrayBuffer): number;
+  readByteArray(count: number): number[];
+}
+
+/** What `asyncConvertData` returns: a listener that takes the coded bytes. Request arguments may be null. */
+interface StreamConverter {
+  onStartRequest(request: null): void;
+  onDataAvailable(request: null, stream: InputStream, offset: number, count: number): void;
+  onStopRequest(request: null, status: number): void;
 }
 
 declare const Cc: {
@@ -196,6 +263,14 @@ declare const Cc: {
   };
   readonly "@mozilla.org/security/random-generator;1": {
     getService(iface: XpcomInterface): { generateRandomBytes(length: number): number[] };
+  };
+  readonly "@mozilla.org/streamConverters;1": {
+    getService(iface: XpcomInterface): {
+      asyncConvertData(from: string, to: string, listener: object, context: null): StreamConverter;
+    };
+  };
+  readonly "@mozilla.org/widget/clipboardhelper;1": {
+    getService(iface: XpcomInterface): { copyString(text: string): void };
   };
 };
 
@@ -216,9 +291,20 @@ declare const Ci: {
   readonly nsIAsyncStreamCopier: XpcomInterface;
   readonly nsIEventTarget: XpcomInterface;
   readonly nsIInputStream: XpcomInterface;
-  readonly nsISeekableStream: XpcomInterface & { readonly NS_SEEK_SET: number };
+  readonly nsISeekableStream: XpcomInterface & {
+    readonly NS_SEEK_SET: number;
+    readonly NS_SEEK_END: number;
+  };
+  readonly nsIFileRandomAccessStream: XpcomInterface;
+  readonly nsIFileMetadata: XpcomInterface;
+  readonly nsIOutputStream: XpcomInterface;
   readonly nsISubstitutingProtocolHandler: XpcomInterface;
   readonly nsIRandomGenerator: XpcomInterface;
+  readonly nsIBinaryInputStream: XpcomInterface;
+  readonly nsIStreamConverterService: XpcomInterface;
+  readonly nsIClipboardHelper: XpcomInterface;
+  readonly nsIConverterOutputStream: XpcomInterface;
+  readonly nsICryptoHash: XpcomInterface & { readonly SHA256: number };
   readonly nsITimer: XpcomInterface & {
     readonly TYPE_ONE_SHOT: number;
     readonly TYPE_REPEATING_SLACK: number;
@@ -236,6 +322,8 @@ interface Observer {
 
 interface SubstitutingProtocolHandler {
   hasSubstitution(root: string): boolean;
+  /** `null` removes the substitution. */
+  setSubstitution(root: string, base: Uri | null): void;
   getSubstitution(root: string): Uri;
   resolveURI(uri: Uri): string;
 }
@@ -251,6 +339,7 @@ declare const Services: {
     readonly appBuildID: string;
     readonly OS: string;
   };
+  readonly sysinfo: { getProperty(name: "arch"): string };
   readonly obs: {
     addObserver(observer: Observer, topic: string): void;
     removeObserver(observer: Observer, topic: string): void;
@@ -263,6 +352,7 @@ declare const Services: {
     exists(name: string): boolean;
   };
   readonly dirsvc: FileDirectoryService;
+  readonly tm: { dispatchToMainThread(run: () => void): void };
   readonly eTLD: {
     getBaseDomainFromHost(host: string): string;
   };
@@ -302,6 +392,12 @@ interface GeckoModules {
     };
   };
   "resource://gre/modules/NetUtil.sys.mjs": { readonly NetUtil: NetUtilModule };
+  "resource://gre/modules/Downloads.sys.mjs": {
+    readonly Downloads: { getPreferredDownloadsDirectory(): Promise<string> };
+  };
+  "resource://gre/modules/ExtensionUtils.sys.mjs": {
+    readonly ExtensionUtils: { readonly ExtensionError: new (message: string) => Error };
+  };
   "resource://gre/modules/AsyncShutdown.sys.mjs": {
     readonly AsyncShutdown: {
       readonly profileBeforeChange: ShutdownPhase;
@@ -314,6 +410,7 @@ declare const ChromeUtils: {
   importESModule<Url extends keyof GeckoModules>(url: Url): GeckoModules[Url];
   getXPCOMErrorName(status: number): string;
   now(): number;
+  generateQI(interfaces: readonly string[]): unknown;
 };
 
 interface IOUtilsStat {
@@ -323,7 +420,10 @@ interface IOUtilsStat {
 }
 
 declare const IOUtils: {
-  read(path: string, options?: { readonly maxBytes?: number }): Promise<Uint8Array>;
+  read(
+    path: string,
+    options?: { readonly maxBytes?: number; readonly offset?: number },
+  ): Promise<Uint8Array>;
   readUTF8(path: string): Promise<string>;
   write(
     path: string,
@@ -363,5 +463,15 @@ declare const IOUtils: {
 declare const PathUtils: {
   join(...segments: string[]): string;
   filename(path: string): string;
+  parent(path: string): string | null;
   readonly profileDir: string;
 };
+
+/** A worker with js-ctypes, started only from a chrome or resource URL. */
+declare class ChromeWorker {
+  constructor(url: string);
+  onmessage: ((event: { readonly data: never }) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  postMessage(message: unknown, transfer?: readonly ArrayBuffer[]): void;
+  terminate(): void;
+}
