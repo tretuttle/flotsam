@@ -157,6 +157,8 @@ const BASE_RULES: readonly DiskRule[] = [
   // Files and folders Gecko keeps in every profile, and what it puts in those folders.
   { path: new RegExp(`^profile/(${PROFILE_FILES})$`, "u"), kinds: FILE },
   { path: new RegExp(`^profile/(${PROFILE_DIRS})(/.*)?$`, "u"), kinds: TREE },
+  // Gecko's profile lock on Linux, a symlink naming the host and pid, while the browser runs.
+  { path: /^profile\/lock$/u, kinds: ["symlink"] },
   // Marionette, which the harness drives, writes its port while the browser runs.
   { path: /^profile\/MarionetteActivePort$/u, kinds: FILE },
   // The launcher writes the harness prefs and installs the recorder and the probe add-ons.
