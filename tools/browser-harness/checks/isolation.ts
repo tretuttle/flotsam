@@ -96,6 +96,9 @@ const proxyPrefs = (port: number): readonly Pref[] => [
   { name: "datareporting.healthreport.uploadEnabled", value: false },
   { name: "datareporting.policy.dataSubmissionEnabled", value: false },
   { name: "datareporting.usage.uploadEnabled", value: false },
+  { name: "toolkit.telemetry.archive.enabled", value: false },
+  { name: "toolkit.telemetry.newProfilePing.enabled", value: false },
+  { name: "toolkit.telemetry.firstShutdownPing.enabled", value: false },
 ];
 
 type AddonInfo = {
