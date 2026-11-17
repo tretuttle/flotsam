@@ -220,43 +220,32 @@ describe("entries beyond the control runs", () => {
     expect(entriesBeyond(control, [control, control])).toEqual([]);
   });
 
-  it("judges keys a container names at random by their count, and keeps a stable container exact", () => {
+  it("passes a new entry of numbers under a key named at random, and fails any new entry holding text", () => {
     const scores = (...ids: string[]): Entries =>
       Object.fromEntries(
         ids.flatMap((id) => [
-          [`$.score_map.${id}.freq`, g({ value: "1" })],
-          [`$.score_map.${id}.ctr`, g({ value: "2" })],
+          [`$.score_map.${id}.freq`, g({ value: "#" })],
+          [`$.score_map.${id}.ctr`, g({ value: "#" })],
         ]),
       );
     const [a, b] = [scores("A1", "x"), scores("B1", "x")];
-    expect(entriesBeyond(scores("C1", "x"), [a, b])).toEqual([]);
-    expect(entriesBeyond(scores("C1", "C2", "x"), [a, b])).toEqual([
-      "$.score_map.C1.freq: in neither control run",
-      "$.score_map.C1.ctr: in neither control run",
-      "$.score_map.C2.freq: in neither control run",
-      "$.score_map.C2.ctr: in neither control run",
-    ]);
+    expect(entriesBeyond(scores("C1", "C2", "x"), [a, b])).toEqual([]);
     const stable = scores("x");
     expect(
-      entriesBeyond({ ...stable, "$.score_map.x.leak": g({ value: "9" }) }, [stable, stable]),
+      entriesBeyond({ ...stable, "$.score_map.x.leak": g({ value: "GET /log" }) }, [
+        stable,
+        stable,
+      ]),
     ).toEqual(["$.score_map.x.leak: in neither control run"]);
-    expect(entriesBeyond({ "$.other[0]": g({ value: "1" }) }, [stable, stable])).toEqual([
-      "$.other[0]: in neither control run",
-    ]);
-    const prefsA: Entries = { "pref a": g({ value: "1" }), "pref noisy1": g({ value: "1" }) };
-    const prefsB: Entries = { "pref a": g({ value: "1" }), "pref noisy2": g({ value: "1" }) };
+    // The verifier's control-write-prefs: a pref of recorded text where the two control runs' pref sets differ.
+    const prefsA: Entries = { "pref a": g({ value: "x" }), "pref idle1": g({ value: "flag" }) };
+    const prefsB: Entries = { "pref a": g({ value: "x" }), "pref idle2": g({ value: "flag" }) };
     expect(
-      entriesBeyond({ "pref a": g({ value: "1" }), "pref noisy3": g({ value: "1" }) }, [
+      entriesBeyond({ "pref a": g({ value: "x" }), "pref leaked": g({ value: "GET /log" }) }, [
         prefsA,
         prefsB,
       ]),
-    ).toEqual([]);
-    expect(
-      entriesBeyond(
-        { "pref a": g({ value: "1" }), "pref n3": g({ value: "1" }), "pref n4": g({ value: "1" }) },
-        [prefsA, prefsB],
-      ),
-    ).toEqual(["pref n3: in neither control run", "pref n4: in neither control run"]);
+    ).toEqual(["pref leaked: in neither control run"]);
   });
 
   it("counts an extra record only when it holds text", () => {

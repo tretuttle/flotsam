@@ -272,45 +272,6 @@ export function readStructured(
     : { format: "prefs", entries: prefs, unaccounted: 0, strayMarked: false };
 }
 
-/** A group's path, segment by segment: a JSON leaf by its keys and indexes, any other group as one segment. */
-const segments = (group: string): readonly string[] =>
-  group.startsWith("$") ? (group.slice(1).match(/\.[^.[]+|\[\d+\]/gu) ?? []) : [group];
-
-/** For every container path, the names of its children, across a file's groups. */
-function children(entries: Entries): Map<string, Set<string>> {
-  const out = new Map<string, Set<string>>();
-  for (const group of Object.keys(entries)) {
-    const parts = segments(group);
-    parts.forEach((part, i) => {
-      const parent = parts.slice(0, i).join("");
-      out.set(parent, (out.get(parent) ?? new Set()).add(part));
-    });
-  }
-  return out;
-}
-
-/**
- * Whether a group neither control run has is the browser's: true when the nearest container both control runs hold
- * has children that differ between them (the browser names them at random), and the product run holds no more of
- * them than either control run does.
- */
-function noisyNewGroup(
-  group: string,
-  product: Entries,
-  controls: readonly [Entries, Entries],
-): boolean {
-  const [a, b, p] = [children(controls[0]), children(controls[1]), children(product)];
-  const parts = segments(group);
-  for (let depth = parts.length - 1; depth >= 0; depth -= 1) {
-    const parent = parts.slice(0, depth).join("");
-    const [ca, cb] = [a.get(parent), b.get(parent)];
-    if (ca === undefined || cb === undefined) continue;
-    const same = ca.size === cb.size && [...ca].every((c) => cb.has(c));
-    return !same && (p.get(parent)?.size ?? 0) <= Math.max(ca.size, cb.size);
-  }
-  return false;
-}
-
 /**
  * Every record the product run holds beyond both control runs, as `<group>: <n> records` lines. A field whose values
  * differ between the two control runs is the browser's noise and is left out of the comparison; a record the product
@@ -324,11 +285,10 @@ export function entriesBeyond(
   return Object.entries(product).flatMap(([group, records]): string[] => {
     const a = first[group];
     const b = second[group];
+    // A new entry holding only numbers, flags, blobs and nulls is the browser's own bookkeeping, even under a key it
+    // names at random each run; one holding text fails, whatever else the control runs differ in.
     if (a === undefined && b === undefined)
-      // A new entry holding only numbers and flags is the browser's own bookkeeping: recorded data is text.
-      return noisyNewGroup(group, product, controls) || !records.rows.some(holdsText)
-        ? []
-        : [`${group}: in neither control run`];
+      return records.rows.some(holdsText) ? [`${group}: in neither control run`] : [];
     if (a === undefined || b === undefined) return [];
     const fields = [...new Set([...a.fields, ...b.fields, ...records.fields])].sort();
     const column = (g: Group, f: string): readonly string[] => {
