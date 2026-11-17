@@ -1024,6 +1024,43 @@ describe("isolation judge", () => {
     ).toBe("LEAKS-EXISTENCE");
   });
 
+  it("takes a cross-origin frame and a blank one as the same withheld state, but not a frame that read something", () => {
+    const pairOf = (hit: Observation, miss: Observation) => ({
+      outcome: "differs",
+      text: "",
+      pair: { hit, miss },
+    });
+    const crossOrigin = { outcome: "timeout", text: `iframe timeout${FRAME_CROSS.text.slice(4)}` };
+    const blank = { outcome: "timeout", text: `iframe timeout${FRAME_BLANK.text.slice(5)}` };
+    const caught = withRow("iframe-site-oracle", "file", {
+      outcome: "each",
+      text: "",
+      each: [{ target: TARGETS["iframe-site-oracle"]![0]!, ...pairOf(crossOrigin, blank) }],
+    });
+    expect(rowOf(caught, "iframe-site-oracle", "file").verdict).toBe("BLOCKED");
+    const read = {
+      outcome: "load",
+      text: "iframe load; contentDocument readable, text: 201: r1-0.jsonl; contentWindow.location.href: file:///d/",
+    };
+    const leaked = withRow("iframe-site-oracle", "file", {
+      outcome: "each",
+      text: "",
+      each: [{ target: TARGETS["iframe-site-oracle"]![0]!, ...pairOf(read, blank) }],
+    });
+    expect(rowOf(leaked, "iframe-site-oracle", "file").verdict).toBe("LEAKS-EXISTENCE");
+    const otherEvent = withRow("iframe-site-oracle", "file", {
+      outcome: "each",
+      text: "",
+      each: [
+        {
+          target: TARGETS["iframe-site-oracle"]![0]!,
+          ...pairOf({ ...crossOrigin, outcome: "load" }, blank),
+        },
+      ],
+    });
+    expect(rowOf(otherEvent, "iframe-site-oracle", "file").verdict).toBe("LEAKS-EXISTENCE");
+  });
+
   it("judges a per-target probe without a plan as NO-RESULT", () => {
     const { "resource-all": _dropped, ...rest } = TARGETS;
     const input = { ...passingInput(), targets: rest };

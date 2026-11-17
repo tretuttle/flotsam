@@ -91,6 +91,16 @@ const FRAME_CROSS_ORIGIN =
 const FRAME_BLANK =
   /; contentDocument readable, text: ; contentWindow\.location\.href: about:blank(;|$)/u;
 const FRAME_EVENTS = new Set(["load", "error", "timeout"]);
+const FRAME_STATES = [FRAME_CROSS_ORIGIN, FRAME_BLANK].map(
+  (state) => new RegExp(state.source.replace("(;|$)", ""), "gu"),
+);
+
+/**
+ * A frame that read nothing shows one of two states: still an empty about:blank, or navigated to a cross-origin
+ * document. Which one a timeout catches depends on load, so a pair compares the two as one state.
+ */
+const settled = (o: Observation): string =>
+  `${o.outcome}|${FRAME_STATES.reduce((text, state) => text.replace(state, "; frame withheld"), o.text)}`;
 /** Outcomes that mean the probe produced no answer to judge, or a refusal other than the declared one. */
 const NO_ANSWER = new Set(["", "threw", "no-target", "timeout", "error"]);
 
@@ -160,7 +170,7 @@ function pairVerdict(spec: ProbeSpec, pair: unknown, ctx: JudgeContext): Verdict
   if ([hit.outcome, miss.outcome].some((outcome) => outcome === "" || outcome === "threw")) {
     return "NO-RESULT";
   }
-  return hit.outcome === miss.outcome && hit.text === miss.text ? "BLOCKED" : spec.leak;
+  return settled(hit) === settled(miss) ? "BLOCKED" : spec.leak;
 }
 
 function eachVerdict(
