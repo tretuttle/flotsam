@@ -31,13 +31,7 @@ const PROBE_PERMISSIONS: readonly string[] = [
 ];
 
 const PROBE_META_JSON = JSON.stringify(
-  PROBE_TABLE.map(({ id, group, what, positions, detect }) => ({
-    id,
-    group,
-    label: what,
-    pos: positions,
-    detect,
-  })),
+  PROBE_TABLE.map(({ id, positions }) => ({ id, pos: positions })),
 );
 
 /**
@@ -107,11 +101,36 @@ export const PROBES_JS = `"use strict";
     });
   }
 
+  const pairOf = (a, b) => ({ outcome: a.outcome === b.outcome && a.text === b.text ? "same" : "differs", text: "existing path: " + a.outcome + "; " + a.text + " | missing path: " + b.outcome + "; " + b.text, pair: { hit: a, miss: b } });
+
   async function oracle(tag, hit, miss) {
-    const a = await element(tag, hit);
-    const b = await element(tag, miss);
-    const head = (s) => s.text.split(";")[0];
-    return { outcome: head(a) === head(b) ? "same" : "differs", text: "existing path: " + a.text + " | missing path: " + b.text, differs: head(a) !== head(b) };
+    const [a, b] = await Promise.all([element(tag, hit), element(tag, miss)]);
+    return pairOf(a, b);
+  }
+
+  const targetsFor = (p, id) => p.targets[id + "@" + p.position] || p.targets[id] || [];
+  const sibling = (u) => (u.endsWith("/") ? u.slice(0, -1) + "-och-missing/" : u + "-och-missing");
+
+  async function observeTags(tags, url) {
+    const got = await Promise.all(tags.map((tag) => element(tag, url)));
+    return { outcome: got.map((g) => g.outcome).join(","), text: got.map((g, i) => tags[i] + " " + g.text).join(" | ") };
+  }
+
+  async function oracleEach(tags, urls) {
+    const each = await Promise.all(urls.map(async (u) => {
+      const [hit, miss] = await Promise.all([observeTags(tags, u), observeTags(tags, sibling(u))]);
+      const r = pairOf(hit, miss);
+      return { target: u, outcome: r.outcome, text: clip(r.text, 400), pair: r.pair };
+    }));
+    return { outcome: "each", text: each.length + " targets", each };
+  }
+
+  async function fetchEach(urls) {
+    const each = await Promise.all(urls.map(async (u) => {
+      const f = await viaFetch(u);
+      return { target: u, outcome: f.outcome, text: clip(f.text, 400) };
+    }));
+    return { outcome: "each", text: each.length + " targets", each };
   }
 
   async function openTab(create) {
@@ -155,13 +174,11 @@ export const PROBES_JS = `"use strict";
   }
 
   async function reachEach(urls) {
-    const results = await Promise.all(urls.map(async (u) => {
+    const each = await Promise.all(urls.map(async (u) => {
       const [f, e] = await Promise.all([viaFetch(u), element("link", u, 1500)]);
-      const hit = f.outcome === "ok" || e.outcome === "load";
-      return { hit, line: u + " -> fetch " + (f.outcome === "ok" ? f.text.slice(0, 120) : f.text.slice(0, 80)) + "; <link> " + e.outcome };
+      return { target: u, outcome: "fetch " + f.outcome + ", link " + e.outcome, text: clip(f.text, 300) };
     }));
-    const reached = results.filter((r) => r.hit).length;
-    return { outcome: reached + " of " + urls.length + " reachable", text: results.map((r) => r.line).join("\\n") };
+    return { outcome: "each", text: each.length + " targets", each };
   }
 
   function summarizeDownloads(items) {
@@ -200,24 +217,49 @@ export const PROBES_JS = `"use strict";
       const y = await once("moz-extension://" + plan.randomUuid + "/manifest.json"); b.push(y.ms); eb = y.e;
     }
     const med = (v) => v.slice().sort((p, q) => p - q)[Math.floor(v.length / 2)].toFixed(2);
-    return { outcome: ea === eb ? "same" : "differs", differs: ea !== eb, text: "installed uuid: median " + med(a) + " ms, error \\"" + ea + "\\" | random uuid: median " + med(b) + " ms, error \\"" + eb + "\\" (15 each, alternating)" };
+    const side = (e) => ({ outcome: e === "ok" ? "ok" : "error", text: e });
+    return { outcome: ea === eb ? "same" : "differs", pair: { hit: side(ea), miss: side(eb) }, text: "installed uuid: median " + med(a) + " ms, error \\"" + ea + "\\" | random uuid: median " + med(b) + " ms, error \\"" + eb + "\\" (15 each, alternating)" };
+  }
+
+  function idbValue(name, key) {
+    return new Promise((resolve) => {
+      const open = indexedDB.open(name);
+      open.onerror = () => resolve("open error: " + errText(open.error));
+      open.onsuccess = () => {
+        const db = open.result;
+        if (!db.objectStoreNames.contains("kv")) { db.close(); resolve("no kv store"); return; }
+        const rq = db.transaction("kv").objectStore("kv").get(key);
+        rq.onsuccess = () => { db.close(); resolve("kv." + key + " = " + rq.result); };
+        rq.onerror = () => { db.close(); resolve("get error"); };
+      };
+    });
   }
 
   async function idbRead() {
     let names = "indexedDB.databases unavailable";
     try { names = JSON.stringify(await indexedDB.databases()); } catch (e) { names = errText(e); }
-    const got = await new Promise((resolve) => {
-      const open = indexedDB.open("och-recorder");
-      open.onerror = () => resolve("open error: " + errText(open.error));
-      open.onsuccess = () => {
-        const db = open.result;
-        if (!db.objectStoreNames.contains("kv")) { db.close(); resolve("database opened in this origin, no kv store (empty)"); return; }
-        const rq = db.transaction("kv").objectStore("kv").get("secret");
-        rq.onsuccess = () => resolve("kv.secret = " + rq.result);
-        rq.onerror = () => resolve("get error");
-      };
-    });
-    return { outcome: "ok", text: "databases(): " + names + "; open(\\"och-recorder\\"): " + got };
+    const own = await idbValue("och-probe-own", "own");
+    const rec = await idbValue("och-recorder", "secret");
+    return { outcome: "ok", text: "own: " + own + "; databases(): " + names + "; och-recorder: " + rec };
+  }
+
+  function apiNamespace() {
+    const b = typeof browser !== "undefined" ? typeof browser.oneClickHar : "n/a";
+    const pageWin = typeof window.wrappedJSObject !== "undefined" ? window.wrappedJSObject : window;
+    let pageOch;
+    try { pageOch = typeof pageWin.oneClickHar; } catch (e) { pageOch = errText(e); }
+    let globals = "n/a";
+    if (location.protocol !== "moz-extension:") {
+      try {
+        const f = document.createElement("iframe");
+        (document.body || document.documentElement).appendChild(f);
+        const fw = f.contentWindow.wrappedJSObject || f.contentWindow;
+        const fresh = new Set(Object.getOwnPropertyNames(fw));
+        globals = JSON.stringify(Object.getOwnPropertyNames(pageWin).filter((n) => !fresh.has(n) && !/^OCH_/.test(n) && !/^[0-9]+$/.test(n)).sort());
+        f.remove();
+      } catch (e) { globals = errText(e); }
+    }
+    return { outcome: "ok", text: "typeof browser.oneClickHar: " + b + "; typeof page oneClickHar: " + pageOch + "; page globals not in a fresh frame: " + globals };
   }
 
   const RUNNERS = {
@@ -225,17 +267,19 @@ export const PROBES_JS = `"use strict";
     "fetch-file-body": (p) => viaFetch(p.file.body),
     "fetch-file-dir": (p) => viaFetch(p.file.root),
     "fetch-file-export": (p) => viaFetch(p.file.export),
+    "inventory-read": (p) => fetchEach(targetsFor(p, "inventory-read")),
+    "inventory-exists": (p) => oracleEach(["script", "link"], targetsFor(p, "inventory-exists")),
     "content-fetch-file-log": (p) => viaFetch(p.file.log, (typeof content !== "undefined" && content.fetch) ? content.fetch.bind(content) : null),
     "xhr-file-log": (p) => viaXhr(p.file.log),
     "iframe-file-log": (p) => element("iframe", p.file.log),
     "iframe-file-root": (p) => element("iframe", p.file.root),
     "iframe-file-export": (p) => element("iframe", p.file.export),
     "img-file-oracle": (p) => oracle("img", p.file.body, p.file.missing),
-    "script-file-oracle": (p) => oracle("script", p.position === "file-mutated" ? p.file.log : p.file.guessedLog, p.file.missing),
-    "css-file-oracle": (p) => oracle("link", p.position === "file-mutated" ? p.file.log : p.file.guessedLog, p.file.missing),
-    "iframe-site-oracle": (p) => oracle("iframe", p.position === "file-mutated" ? p.file.siteDir : p.file.guessedSiteDir, p.file.missingSite),
+    "script-file-oracle": (p) => oracleEach(["script"], targetsFor(p, "script-file-oracle")),
+    "css-file-oracle": (p) => oracleEach(["link"], targetsFor(p, "css-file-oracle")),
+    "iframe-site-oracle": (p) => oracleEach(["iframe"], targetsFor(p, "iframe-site-oracle")),
     "script-root-oracle": (p) => oracle("script", p.file.root, p.file.missingRoot),
-    "script-site-oracle": (p) => oracle("script", p.position === "file-mutated" ? p.file.siteDir : p.file.guessedSiteDir, p.file.missingSite),
+    "script-site-oracle": (p) => oracleEach(["script"], targetsFor(p, "script-site-oracle")),
     "viewsource-fetch": (p) => viaFetch("view-source:" + p.file.log),
     "viewsource-iframe": (p) => element("iframe", "view-source:" + p.file.log),
     "jar-file-fetch": (p) => viaFetch("jar:" + p.file.log + "!/"),
@@ -252,12 +296,13 @@ export const PROBES_JS = `"use strict";
     "downloads-download-file": async (p) => { try { const id = await api().downloads.download({ url: p.file.log, filename: "probe-copy.jsonl", conflictAction: "uniquify" }); await sleep(1000); const [d] = await api().downloads.search({ id }); return { outcome: "ok", text: "download " + id + " state " + (d && d.state) + " error " + (d && d.error) + " file " + (d && d.filename) }; } catch (e) { return { outcome: "error", text: errText(e) }; } },
     "tabs-create-viewsource": (p) => openTab(() => api().tabs.create({ url: "view-source:" + p.file.log, active: false })),
     "wr-redirect-tab": (p) => openTab(() => api().tabs.create({ url: p.wrRedirect + "?from=tab", active: false })),
-    "resource-all": (p) => reachEach(p.resources.map((n) => "resource://" + n + "/")),
-    "resource-traversal": (p) => reachEach(p.resourceTraversal),
-    "planted-resource": async (p) => { const o = await oracle("link", p.plantedResource, p.plantedResource.replace(/[^/]+$/, "missing.jsonl")); const f = await viaFetch(p.plantedResource); return { outcome: o.outcome, differs: o.differs, text: o.text + " | fetch: " + f.text }; },
-    "chrome-all": (p) => reachEach(p.chromePkgs.map((n) => "chrome://" + n + "/content/")),
-    "chrome-traversal": (p) => reachEach(p.chromeTraversal),
-    "moz-src-root": (p) => reachEach(p.mozSrc),
+    "resource-all": (p) => reachEach(targetsFor(p, "resource-all")),
+    "resource-traversal": (p) => reachEach(targetsFor(p, "resource-traversal")),
+    "planted-resource": async (p) => { const o = await oracle("link", p.plantedResource, p.plantedResource.replace(/[^/]+$/, "missing.jsonl")); const f = await viaFetch(p.plantedResource); return { outcome: o.outcome, pair: o.pair, text: o.text + " | fetch: " + f.text }; },
+    "chrome-all": (p) => reachEach(targetsFor(p, "chrome-all")),
+    "chrome-traversal": (p) => reachEach(targetsFor(p, "chrome-traversal")),
+    "moz-src-root": (p) => reachEach(targetsFor(p, "moz-src-root")),
+    "mozext-every-file": (p) => fetchEach(targetsFor(p, "mozext-every-file")),
     "mozext-manifest": (p) => viaFetch(p.rec.base + "manifest.json"),
     "mozext-parent": (p) => viaFetch(p.rec.base + "experiment/parent.js"),
     "mozext-schema": (p) => viaFetch(p.rec.base + "experiment/schema.json"),
@@ -268,18 +313,16 @@ export const PROBES_JS = `"use strict";
     "planted-own-war-fetch": (p) => viaFetch(p.probe.base + "war.txt"),
     "planted-own-war-script": async (p) => { const r = await element("script", p.probe.base + "war.js"); return { outcome: r.outcome, text: r.text + "; window.OCH_WAR = " + (typeof window.OCH_WAR === "undefined" ? "undefined" : window.OCH_WAR) }; },
     "own-non-war": (p) => viaFetch(p.probe.base + "secret.txt"),
-    "api-namespace": async () => ({ outcome: "ok", text: "typeof browser: " + (typeof browser) + "; typeof browser.oneClickHar: " + (typeof browser !== "undefined" ? typeof browser.oneClickHar : "n/a") + "; typeof chrome: " + (typeof chrome) + "; typeof window.oneClickHar: " + (typeof window.oneClickHar) }),
+    "api-namespace": async () => apiNamespace(),
     "api-call": async () => { try { return { outcome: "ok", text: JSON.stringify(await browser.oneClickHar.getRecordingStatus()) }; } catch (e) { return { outcome: "error", text: errText(e) }; } },
     "sendmessage-recorder": (p) => sendMessageTo(p.rec.id),
-    "sendmessage-oracle": async (p) => { const a = await sendMessageTo(p.rec.id); const b = await sendMessageTo(p.randomId); return { outcome: a.text === b.text ? "same" : "differs", differs: a.text !== b.text, text: "recorder: " + a.text + " | not installed: " + b.text }; },
+    "sendmessage-oracle": async (p) => { const a = await sendMessageTo(p.rec.id); const b = await sendMessageTo(p.randomId); return { outcome: a.text === b.text ? "same" : "differs", pair: { hit: a, miss: b }, text: "recorder: " + a.text + " | not installed: " + b.text }; },
     "connect-recorder": (p) => connectTo(p.rec.id),
     "tabs-query-recorder": async () => { const t = await api().tabs.query({}); return { outcome: "ok", text: t.map((x) => x.id + " " + x.url + " " + x.title).join("\\n") }; },
     "executescript-recorder-page": async (p) => { const tabs = await recorderTabs(p); if (!tabs.length) return { outcome: "no-target", text: "tabs.query returned no tab with the recorder URL" }; const out = []; for (const t of tabs) { try { const r = await api().tabs.executeScript(t.id, { code: "document.documentElement.outerHTML" }); out.push("tab " + t.id + ": returned " + clip(JSON.stringify(r), 400)); } catch (e) { out.push("tab " + t.id + " (" + t.url + "): " + errText(e)); } } return { outcome: "done", text: out.join("\\n") }; },
     "scripting-recorder-page": async (p) => { const tabs = await recorderTabs(p); if (!tabs.length) return { outcome: "no-target", text: "no tab with the recorder URL" }; const out = []; for (const t of tabs) { try { const r = await api().scripting.executeScript({ target: { tabId: t.id }, func: () => document.documentElement.outerHTML }); out.push("tab " + t.id + ": returned " + clip(JSON.stringify(r), 400)); } catch (e) { out.push("tab " + t.id + " (" + t.url + "): " + errText(e)); } } return { outcome: "done", text: out.join("\\n") }; },
     "management-getall": async () => { const all = await api().management.getAll(); return { outcome: "ok", text: all.map((a) => a.id + " | " + a.name + " | " + a.type + " | enabled " + a.enabled + " | " + a.installType + " | permissions " + JSON.stringify(a.permissions) + " | hosts " + JSON.stringify(a.hostPermissions)).join("\\n") }; },
     "downloads-search": async () => ({ outcome: "ok", text: summarizeDownloads(await api().downloads.search({})) }),
-    "downloads-open-export": async () => { const items = await api().downloads.search({ filenameRegex: "\\\\.har$" }); if (!items.length) return { outcome: "no-target", text: "downloads.search found no .har item" }; try { await api().downloads.open(items[0].id); return { outcome: "ok", text: "downloads.open resolved for " + items[0].filename }; } catch (e) { return { outcome: "error", text: errText(e) }; } },
-    "downloads-refetch-export": async () => { const items = await api().downloads.search({ filenameRegex: "\\\\.har$" }); if (!items.length) return { outcome: "no-target", text: "no .har item" }; const f = await viaFetch(items[0].url); let d; try { const id = await api().downloads.download({ url: items[0].url, filename: "probe-copy.har", conflictAction: "uniquify" }); await sleep(1000); const [x] = await api().downloads.search({ id }); d = "state " + (x && x.state) + ", error " + (x && x.error) + ", file " + (x && x.filename); } catch (e) { d = errText(e); } return { outcome: f.outcome, text: "fetch: " + f.text + " | downloads.download: " + d }; },
     "clipboard-after-export": async () => { try { return { outcome: "ok", text: "clipboard text: " + clip(await navigator.clipboard.readText(), 1000) }; } catch (e) { return { outcome: "error", text: errText(e) }; } },
     "notifications-getall": async () => ({ outcome: "ok", text: JSON.stringify(await api().notifications.getAll()) }),
     "storage-recorder": async () => ({ outcome: "ok", text: JSON.stringify(await api().storage.local.get(null)) }),
@@ -310,7 +353,7 @@ export const PROBES_JS = `"use strict";
       } catch (e) {
         observed = { outcome: "threw", text: errText(e) };
       }
-      await report({ kind: "row", browser: plan.browser, position, probe: meta.id, observed: { outcome: observed.outcome, differs: !!observed.differs, text: clip(observed.text, 6000) } });
+      await report({ kind: "row", browser: plan.browser, position, probe: meta.id, observed: { outcome: String(observed.outcome), text: clip(observed.text, 6000), pair: observed.pair, each: observed.each } });
     }
     await report({ kind: "position-done", browser: plan.browser, position, href: String(location.href), origin: String(location.origin) });
   }
@@ -367,6 +410,7 @@ export function buildProbeExtensionXpi(options: {
   readonly serverOrigin: string;
   readonly warMark: string;
   readonly secretMark: string;
+  readonly ownMark: string;
 }): Buffer {
   const manifest = JSON.stringify(
     {
@@ -423,6 +467,17 @@ async function runPosition(pos) {
 `;
 
   const backgroundJs = `"use strict";
+const OWN_MARK = ${JSON.stringify(options.ownMark)};
+browser.storage.local.set({ own: OWN_MARK });
+{
+  const open = indexedDB.open("och-probe-own", 1);
+  open.onupgradeneeded = () => open.result.createObjectStore("kv");
+  open.onsuccess = () => {
+    const tx = open.result.transaction("kv", "readwrite");
+    tx.objectStore("kv").put(OWN_MARK, "own");
+    tx.oncomplete = () => open.result.close();
+  };
+}
 window.OCH_BASELINE = { cookieHeaders: [], responseBodies: [] };
 let livePlan = null;
 getPlan().then((p) => { livePlan = p; });

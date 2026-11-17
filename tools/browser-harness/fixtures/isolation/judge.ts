@@ -1,17 +1,28 @@
-import * as NodeCrypto from "node:crypto";
+import type { ExtraCheckResult } from "./archive-oracle.ts";
 import {
+  denialAt,
   expandExpectedRows,
+  EXTRA_CHECKS,
   PROBE_TABLE,
+  type Denial,
   type ExpectedOutcome,
+  type ExtraCheckId,
   type Position,
   type ProbeSpec,
   type Verdict,
 } from "./probe-table.ts";
 
-export type ObservedProbe = {
-  readonly outcome: string;
-  readonly differs: boolean;
-  readonly text: string;
+export type Observation = { readonly outcome: string; readonly text: string };
+export type ObservedPair = { readonly hit: Observation; readonly miss: Observation };
+export type ObservedTarget = Observation & {
+  readonly target: string;
+  readonly pair?: ObservedPair;
+};
+
+/** What a probe reported: one answer, an existing/missing pair, or one answer per planned target. */
+export type ObservedProbe = Observation & {
+  readonly pair?: ObservedPair;
+  readonly each?: readonly ObservedTarget[];
 };
 
 export type BrowserRowReport = {
@@ -21,25 +32,42 @@ export type BrowserRowReport = {
   readonly observed: ObservedProbe;
 };
 
+/** A planted or limit control: what each of its readers got back. Each read must carry a planted mark. */
 export type SyntheticControlResult = {
   readonly id: string;
   readonly position: Position;
   readonly observed: string;
-  readonly verdict: Verdict;
+  readonly reads: readonly string[];
 };
 
 export type JudgeContext = {
+  /** In the bank cookie, HTML and JSON body, so in the log, the body file and the export. */
   readonly marker: string;
+  /** In the probe extension's own web-accessible files. */
   readonly warMark: string;
+  /** In the probe extension's file that is not web accessible. */
   readonly secretMark: string;
-  readonly site: string;
-  readonly archiveKey: string;
-  readonly appFolder: string;
+  /** Planted in the recorder's storage.local and its origin's IndexedDB. */
+  readonly storeMark: string;
+  /** Planted by the probe extension in its own storage; seeing it proves a store read worked. Not a leak. */
+  readonly ownMark: string;
   readonly recId: string;
   readonly recUuid: string;
-  readonly planUrls: readonly string[];
   /** On Linux, the webIsolated content sandbox blocks local paths, so planted-resource@web is BLOCKED there. */
   readonly webSandboxBlocksArchive?: boolean;
+};
+
+export type IsolationRunInput = {
+  readonly context: JudgeContext;
+  readonly browserRows: readonly BrowserRowReport[];
+  /** Planned targets of each "each" probe, keyed `<probe>@<position>` or `<probe>` for every position. */
+  readonly targets: Readonly<Record<string, readonly string[]>>;
+  readonly syntheticControls: readonly SyntheticControlResult[];
+  readonly csFileInjected: boolean;
+  /** The probe extension's policy, asked from the system principal, can access neither the file page nor the log. */
+  readonly canAccessFileObserved: boolean;
+  readonly csArchiveInjectedDocs: readonly { readonly href: string; readonly text: string }[];
+  readonly extraChecks: readonly ExtraCheckResult[];
 };
 
 export type JudgedRow = {
@@ -56,13 +84,193 @@ export type IsolationJudgment = {
   readonly ok: boolean;
   readonly counts: Readonly<Record<Verdict, number>>;
   readonly rows: readonly JudgedRow[];
+  readonly checks: readonly ExtraCheckResult[];
   readonly mismatches: readonly string[];
 };
 
-export function isProfileDerivedKey(key: string, profileDir: string): boolean {
-  if (!/^[0-9a-f]{32}$/u.test(key)) return true;
-  const profileHash = NodeCrypto.createHash("sha256").update(profileDir).digest("hex");
-  return profileHash.startsWith(key.slice(0, 16));
+const FETCH_NETWORK_ERROR = /^TypeError: NetworkError when attempting to fetch resource\.$/u;
+const FRAME_CROSS_ORIGIN =
+  /; contentDocument null; contentWindow\.location\.href: SecurityError: Permission denied to get property "href" on cross-origin object/u;
+const FRAME_BLANK =
+  /; contentDocument readable, text: ; contentWindow\.location\.href: about:blank(;|$)/u;
+const FRAME_EVENTS = new Set(["load", "error", "timeout"]);
+/** Outcomes that mean the probe produced no answer to judge, or a refusal other than the declared one. */
+const NO_ANSWER = new Set(["", "threw", "no-target", "timeout", "error"]);
+
+const SEVERITY: readonly Verdict[] = ["READ", "LEAKS-EXISTENCE", "NO-RESULT", "BLOCKED"];
+const worst = (verdicts: readonly Verdict[]): Verdict =>
+  SEVERITY.find((v) => verdicts.includes(v)) ?? "BLOCKED";
+
+const isObservation = (value: unknown): value is Observation =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as Observation).outcome === "string" &&
+  typeof (value as Observation).text === "string";
+
+function carriesMark(value: unknown, ctx: JudgeContext): boolean {
+  const text = JSON.stringify(value) ?? "";
+  return [ctx.marker, ctx.warMark, ctx.secretMark, ctx.storeMark].some(
+    (mark) => mark.length > 0 && text.includes(mark),
+  );
+}
+
+function denies(denial: Denial, o: Observation, ctx: JudgeContext): boolean {
+  switch (denial.kind) {
+    case "rejected":
+      return o.outcome === "error" && denial.error.test(o.text);
+    case "answered":
+      return o.outcome === denial.outcome && denial.text.test(o.text);
+    case "answered-without-recorder":
+      return (
+        o.outcome === "ok" &&
+        o.text.length > 0 &&
+        !o.text.includes(ctx.recId) &&
+        !o.text.includes(ctx.recUuid)
+      );
+    case "own-value-only":
+      return o.outcome === "ok" && ctx.ownMark.length > 0 && o.text.includes(ctx.ownMark);
+    case "frame-withheld":
+      return (
+        FRAME_EVENTS.has(o.outcome) && (FRAME_CROSS_ORIGIN.test(o.text) || FRAME_BLANK.test(o.text))
+      );
+    case "unreachable":
+      return o.outcome === "fetch error, link error" && FETCH_NETWORK_ERROR.test(o.text);
+    case "indistinguishable":
+    case "never":
+      return false;
+  }
+}
+
+/** A well-formed answer that is not the denial: what it leaked, by the probe's declared leak kind. */
+function leakOf(spec: ProbeSpec, denial: Denial, o: Observation): Verdict {
+  if (denial.kind === "unreachable")
+    return o.outcome.startsWith("fetch ok") ? "READ" : "LEAKS-EXISTENCE";
+  if (denial.kind === "own-value-only") return "NO-RESULT";
+  return spec.leak;
+}
+
+function singleVerdict(spec: ProbeSpec, denial: Denial, o: unknown, ctx: JudgeContext): Verdict {
+  if (carriesMark(o, ctx)) return "READ";
+  if (!isObservation(o)) return "NO-RESULT";
+  if (denies(denial, o, ctx)) return "BLOCKED";
+  if (NO_ANSWER.has(o.outcome) || o.text.length === 0) return "NO-RESULT";
+  return leakOf(spec, denial, o);
+}
+
+function pairVerdict(spec: ProbeSpec, pair: unknown, ctx: JudgeContext): Verdict {
+  if (carriesMark(pair, ctx)) return "READ";
+  if (typeof pair !== "object" || pair === null) return "NO-RESULT";
+  const { hit, miss } = pair as Partial<ObservedPair>;
+  if (!isObservation(hit) || !isObservation(miss)) return "NO-RESULT";
+  if ([hit.outcome, miss.outcome].some((outcome) => outcome === "" || outcome === "threw")) {
+    return "NO-RESULT";
+  }
+  return hit.outcome === miss.outcome && hit.text === miss.text ? "BLOCKED" : spec.leak;
+}
+
+function eachVerdict(
+  spec: ProbeSpec,
+  denial: Denial,
+  observed: ObservedProbe,
+  planned: readonly string[] | undefined,
+  ctx: JudgeContext,
+): { readonly verdict: Verdict; readonly summary: string } {
+  if (carriesMark(observed, ctx)) return { verdict: "READ", summary: "a planted mark was read" };
+  if (planned === undefined) return { verdict: "NO-RESULT", summary: "no planned targets" };
+  if (!Array.isArray(observed.each))
+    return { verdict: "NO-RESULT", summary: "no per-target results" };
+  const judged = observed.each.map((t) => ({
+    target: t.target,
+    verdict:
+      denial.kind === "indistinguishable"
+        ? pairVerdict(spec, t.pair, ctx)
+        : singleVerdict(spec, denial, t, ctx),
+    line: `${t.target} -> ${t.pair === undefined ? `${t.outcome}: ${t.text}` : `${t.pair.hit.outcome} | ${t.pair.miss.outcome}`}`,
+  }));
+  const reported = new Set(judged.map((t) => t.target));
+  const missing = planned.filter((t) => !reported.has(t));
+  const unplanned = judged.filter((t) => !planned.includes(t.target)).map((t) => t.target);
+  const verdict = worst([
+    ...judged.map((t) => t.verdict),
+    ...(missing.length > 0 || unplanned.length > 0 ? (["NO-RESULT"] as const) : []),
+  ]);
+  const notBlocked = judged
+    .filter((t) => t.verdict !== "BLOCKED")
+    .map((t) => `${t.verdict} ${t.line}`);
+  return {
+    verdict,
+    summary: [
+      `${String(judged.length)} of ${String(planned.length)} planned targets reported`,
+      ...missing.map((t) => `missing ${t}`),
+      ...unplanned.map((t) => `unplanned ${t}`),
+      ...notBlocked,
+    ].join("; "),
+  };
+}
+
+function judgeBrowserRow(
+  spec: ProbeSpec,
+  position: Position,
+  observed: ObservedProbe,
+  input: IsolationRunInput,
+): { readonly verdict: Verdict; readonly summary: string } {
+  const denial = denialAt(spec, position);
+  const head = `${observed.outcome}: ${observed.text}`;
+  switch (spec.shape) {
+    case "single":
+      return { verdict: singleVerdict(spec, denial, observed, input.context), summary: head };
+    case "pair":
+      return { verdict: pairVerdict(spec, observed.pair, input.context), summary: head };
+    case "each":
+      return eachVerdict(
+        spec,
+        denial,
+        observed,
+        input.targets[`${spec.id}@${position}`] ?? input.targets[spec.id],
+        input.context,
+      );
+  }
+}
+
+function syntheticVerdict(
+  id: string,
+  input: IsolationRunInput,
+): { verdict: Verdict; observed: string } {
+  const { context, canAccessFileObserved } = input;
+  if (id === "cs-file-injection") {
+    if (input.csFileInjected) {
+      return {
+        verdict: "LEAKS-EXISTENCE",
+        observed: "content script injected into a file:// page",
+      };
+    }
+    return canAccessFileObserved
+      ? {
+          verdict: "BLOCKED",
+          observed: "no content script ran in any file:// document; policy denies file access",
+        }
+      : {
+          verdict: "NO-RESULT",
+          observed: "no file:// injection seen, and the policy was not observed to deny it",
+        };
+  }
+  if (id === "cs-in-archive-document") {
+    const docs = input.csArchiveInjectedDocs;
+    const observed = docs.map((d) => `${d.href}: ${d.text.slice(0, 200)}`).join("; ");
+    if (docs.some((d) => carriesMark(d.text, context))) return { verdict: "READ", observed };
+    if (docs.length > 0) return { verdict: "LEAKS-EXISTENCE", observed };
+    return canAccessFileObserved
+      ? { verdict: "BLOCKED", observed: "no content script ran in any archive or export document" }
+      : {
+          verdict: "NO-RESULT",
+          observed: "no injection seen, and the policy was not observed to deny it",
+        };
+  }
+  const control = input.syntheticControls.find((c) => c.id === id);
+  if (control === undefined) return { verdict: "NO-RESULT", observed: "no result reported" };
+  const read =
+    control.reads.length > 0 && control.reads.every((text) => carriesMark(text, context));
+  return { verdict: read ? "READ" : "BLOCKED", observed: control.observed };
 }
 
 function expectedLabel(expected: ExpectedOutcome): string {
@@ -81,7 +289,6 @@ function expectedLabel(expected: ExpectedOutcome): string {
 }
 
 function matchesExpectation(expected: ExpectedOutcome, verdict: Verdict): boolean {
-  if (verdict === "NO-RESULT") return false;
   switch (expected.kind) {
     case "BLOCKED":
       return verdict === "BLOCKED";
@@ -94,195 +301,56 @@ function matchesExpectation(expected: ExpectedOutcome, verdict: Verdict): boolea
   }
 }
 
-function scrubPlanUrls(text: string, planUrls: readonly string[]): string {
-  let out = text;
-  const ordered = [...planUrls].toSorted((a, b) => b.length - a.length);
-  for (const url of ordered) {
-    if (url.length > 0) out = out.split(url).join("<plan-url>");
-  }
-  return out;
+/** Every declared extra check must report exactly once; a missing, repeated or unknown one fails the run. */
+function judgeExtraChecks(results: readonly ExtraCheckResult[]): readonly string[] {
+  const declared = Object.keys(EXTRA_CHECKS) as ExtraCheckId[];
+  return [
+    ...declared.flatMap((id) => {
+      const runs = results.filter((r) => r.id === id);
+      if (runs.length === 0) return [`extra check ${id} did not run`];
+      if (runs.length > 1) return [`extra check ${id} ran ${String(runs.length)} times`];
+      return runs.filter((r) => !r.ok).map((r) => `${id}: ${r.detail}`);
+    }),
+    ...results
+      .filter((r) => !declared.includes(r.id))
+      .map((r) => `extra check ${String(r.id)} is not declared`),
+  ];
 }
 
-function verdictOf(spec: ProbeSpec, observed: ObservedProbe, ctx: JudgeContext): Verdict {
-  const text = observed.text;
-  const has = (needle: string): boolean => needle.length > 0 && text.includes(needle);
-
-  if (spec.detect === "planted") return has(ctx.warMark) ? "READ" : "BLOCKED";
-  if (spec.detect === "planted-absent") return has(ctx.secretMark) ? "READ" : "BLOCKED";
-  if (has(ctx.marker)) return "READ";
-
-  if (spec.detect === "api") {
-    return /typeof browser\.oneClickHar: (object|function)/u.test(text) ? "READ" : "BLOCKED";
-  }
-  if (spec.detect === "oracle") return observed.differs ? "LEAKS-EXISTENCE" : "BLOCKED";
-  if (spec.detect === "frame") return observed.outcome === "load" ? "LEAKS-EXISTENCE" : "BLOCKED";
-  if (spec.detect === "fetch-ok") return observed.outcome === "ok" ? "READ" : "BLOCKED";
-  if (spec.detect === "reach") {
-    if (/^0 of /u.test(observed.outcome)) return "BLOCKED";
-    return text.includes("-> fetch status ") ? "READ" : "LEAKS-EXISTENCE";
-  }
-  if (spec.detect === "execute-script") {
-    return text.includes(": returned ") ? "READ" : "BLOCKED";
-  }
-  if (spec.detect === "downloads") {
-    return text.includes(".har") || has(ctx.site) || has(ctx.appFolder)
-      ? "LEAKS-EXISTENCE"
-      : "BLOCKED";
-  }
-  if (spec.detect === "store") {
-    if (text.includes("kv.secret =")) return "READ";
-    if (text === "{}" || text.includes("no kv store (empty)")) return "BLOCKED";
-    return "READ";
-  }
-
-  const scrubbed = scrubPlanUrls(text, ctx.planUrls);
-  if (spec.detect === "names") {
-    if (scrubbed.includes(ctx.site) || scrubbed.includes(ctx.archiveKey)) {
-      return "LEAKS-EXISTENCE";
-    }
-    if (
-      spec.id === "tabs-create-dir" &&
-      observed.outcome === "ok" &&
-      text.includes("url file://")
-    ) {
-      return "LEAKS-EXISTENCE";
-    }
-    return "BLOCKED";
-  }
-  if (spec.detect === "addon") {
-    return scrubbed.includes(ctx.recId) || text.includes(ctx.recUuid)
-      ? "LEAKS-EXISTENCE"
-      : "BLOCKED";
-  }
-
-  if (
-    (spec.id === "tabs-create-file" ||
-      spec.id === "windows-create-file" ||
-      spec.id === "tabs-create-viewsource" ||
-      spec.id === "tabs-update-file") &&
-    observed.outcome === "ok"
-  ) {
-    return "LEAKS-EXISTENCE";
-  }
-  if (
-    (spec.id === "tabs-update-redirect" || spec.id === "wr-redirect-tab") &&
-    observed.outcome === "ok" &&
-    text.includes("url file://")
-  ) {
-    return "LEAKS-EXISTENCE";
-  }
-  return "BLOCKED";
-}
-
-export function judgeIsolationRun(input: {
-  readonly context: JudgeContext;
-  readonly browserRows: readonly BrowserRowReport[];
-  readonly syntheticControls: readonly SyntheticControlResult[];
-  readonly csFileInjected: boolean;
-  readonly canAccessFileObserved: boolean;
-  readonly csArchiveInjectedDocs: readonly { readonly href: string; readonly text: string }[];
-  readonly extraChecks?: readonly string[];
-}): IsolationJudgment {
+export function judgeIsolationRun(input: IsolationRunInput): IsolationJudgment {
   const specMap = new Map(PROBE_TABLE.map((spec) => [spec.id, spec]));
-  const rowMap = new Map<string, BrowserRowReport>();
-  for (const row of input.browserRows) {
-    rowMap.set(`${row.probe}|${row.position}`, row);
-  }
-  const controlMap = new Map(input.syntheticControls.map((c) => [`${c.id}|${c.position}`, c]));
+  const rowMap = new Map(input.browserRows.map((row) => [`${row.probe}|${row.position}`, row]));
 
-  const rows: JudgedRow[] = [];
-  for (const expectedRow of expandExpectedRows(input.csFileInjected)) {
-    const key = `${expectedRow.id}|${expectedRow.position}`;
-    if (expectedRow.id === "cs-file-injection") {
-      const verdict: Verdict = input.csFileInjected
-        ? "LEAKS-EXISTENCE"
-        : input.canAccessFileObserved
-          ? "BLOCKED"
-          : "NO-RESULT";
-      const ok = matchesExpectation(expectedRow.expected, verdict);
-      rows.push({
-        id: expectedRow.id,
-        position: expectedRow.position,
-        what: expectedRow.what,
-        expected: expectedRow.expected,
-        observed: input.csFileInjected
-          ? "content script injected into file:// page"
-          : "no content script ran in any file:// document",
-        verdict,
-        ok,
-      });
-      continue;
-    }
-
-    if (expectedRow.id === "cs-in-archive-document") {
-      const injected = input.csArchiveInjectedDocs;
-      const verdict: Verdict = injected.some((doc) => doc.text.includes(input.context.marker))
-        ? "READ"
-        : injected.length > 0
-          ? "LEAKS-EXISTENCE"
-          : "BLOCKED";
-      rows.push({
-        id: expectedRow.id,
-        position: expectedRow.position,
-        what: expectedRow.what,
-        expected: expectedRow.expected,
-        observed:
-          injected.length > 0
-            ? injected.map((d) => `${d.href}: ${d.text.slice(0, 200)}`).join("; ")
-            : "no content script ran in any archive or export document",
-        verdict,
-        ok: matchesExpectation(expectedRow.expected, verdict),
-      });
-      continue;
-    }
-
-    if (expectedRow.detect === "synthetic") {
-      const control = controlMap.get(key);
-      const verdict: Verdict = control?.verdict ?? "NO-RESULT";
-      rows.push({
-        id: expectedRow.id,
-        position: expectedRow.position,
-        what: expectedRow.what,
-        expected: expectedRow.expected,
-        observed: control?.observed ?? "no result reported",
-        verdict,
-        ok: matchesExpectation(expectedRow.expected, verdict),
-      });
-      continue;
-    }
-
-    const reported = rowMap.get(key);
-    const spec = specMap.get(expectedRow.id);
-    if (reported === undefined || spec === undefined) {
-      rows.push({
-        id: expectedRow.id,
-        position: expectedRow.position,
-        what: expectedRow.what,
-        expected: expectedRow.expected,
-        observed: "no row reported",
-        verdict: "NO-RESULT",
-        ok: false,
-      });
-      continue;
-    }
-
-    const verdict = verdictOf(spec, reported.observed, input.context);
-    const effectiveExpected: ExpectedOutcome =
+  const rows: JudgedRow[] = expandExpectedRows(input.csFileInjected).map((expectedRow) => {
+    const expected: ExpectedOutcome =
       expectedRow.id === "planted-resource" &&
       expectedRow.position === "web" &&
       input.context.webSandboxBlocksArchive === true
         ? { kind: "BLOCKED" }
         : expectedRow.expected;
-    rows.push({
+    const base = {
       id: expectedRow.id,
       position: expectedRow.position,
       what: expectedRow.what,
-      expected: effectiveExpected,
-      observed: `${reported.observed.outcome}: ${reported.observed.text}`,
-      verdict,
-      ok: matchesExpectation(effectiveExpected, verdict),
-    });
-  }
+      expected,
+    };
+    if (expectedRow.synthetic) {
+      const { verdict, observed } = syntheticVerdict(expectedRow.id, input);
+      return { ...base, observed, verdict, ok: matchesExpectation(expected, verdict) };
+    }
+    const reported = rowMap.get(`${expectedRow.id}|${expectedRow.position}`);
+    const spec = specMap.get(expectedRow.id);
+    if (reported === undefined || spec === undefined) {
+      return { ...base, observed: "no row reported", verdict: "NO-RESULT", ok: false };
+    }
+    const { verdict, summary } = judgeBrowserRow(
+      spec,
+      expectedRow.position,
+      reported.observed,
+      input,
+    );
+    return { ...base, observed: summary, verdict, ok: matchesExpectation(expected, verdict) };
+  });
 
   const counts: Record<Verdict, number> = {
     BLOCKED: 0,
@@ -293,19 +361,14 @@ export function judgeIsolationRun(input: {
   for (const row of rows) counts[row.verdict] += 1;
 
   const mismatches = [
-    ...(input.extraChecks ?? []),
+    ...judgeExtraChecks(input.extraChecks),
     ...rows
       .filter((row) => !row.ok)
       .map(
         (row) =>
-          `${row.id}@${row.position}: expected ${expectedLabel(row.expected)}, got ${row.verdict} (${row.observed.slice(0, 160)})`,
+          `${row.id}@${row.position}: expected ${expectedLabel(row.expected)}, got ${row.verdict} (${row.observed.slice(0, 240)})`,
       ),
   ];
 
-  return {
-    ok: mismatches.length === 0,
-    counts,
-    rows,
-    mismatches,
-  };
+  return { ok: mismatches.length === 0, counts, rows, checks: input.extraChecks, mismatches };
 }
