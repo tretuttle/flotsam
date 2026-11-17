@@ -8,6 +8,7 @@ import {
   contentText,
   orderFreeDigest,
   entriesBeyond,
+  entriesHoldText,
   lz4Block,
   readStructured,
   withRoles,
@@ -274,6 +275,14 @@ describe("entries beyond the control runs", () => {
     expect(entriesBeyond({ "table object_data": leaked }, [table, table])).toEqual([
       "table object_data: 1 records in neither control run",
     ]);
+  });
+
+  it("says whether a file's entries hold any text", () => {
+    expect(entriesHoldText({})).toBe(false);
+    expect(
+      entriesHoldText({ "table t": g({ a: "#", b: "blob" }), "pref x": g({ value: "flag" }) }),
+    ).toBe(false);
+    expect(entriesHoldText({ "table t": g({ a: "#" }, { a: "text" }) })).toBe(true);
   });
 
   it("leaves a new entry holding only numbers and flags to the browser, and fails one holding text", () => {

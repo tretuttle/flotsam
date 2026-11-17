@@ -78,6 +78,10 @@ const valueDigest = (text: string): string => {
 /** Whether a record holds text: recorded data is text, and a record of numbers, flags and blobs is bookkeeping. */
 const holdsText = (row: readonly string[]): boolean => row.some((cell) => !KINDS.has(cell));
 
+/** Whether any record of a file holds text: an empty database or a file of numbers and flags holds none. */
+export const entriesHoldText = (entries: Entries): boolean =>
+  Object.values(entries).some((group) => group.rows.some(holdsText));
+
 const single = (value: string): Group => ({ fields: ["value"], rows: [[valueDigest(value)]] });
 
 const SQLITE_MAGIC = "SQLite format 3\0";

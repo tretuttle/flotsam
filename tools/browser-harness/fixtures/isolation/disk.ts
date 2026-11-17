@@ -5,6 +5,7 @@ import {
   contentText,
   orderFreeDigest,
   entriesBeyond,
+  entriesHoldText,
   readStructured,
   withRoles,
   type RunNames,
@@ -216,8 +217,13 @@ function outsideProblems(
   controls: readonly [Seen | undefined, Seen | undefined],
 ): readonly string[] {
   const seen = controls.filter((s): s is Seen => s !== undefined);
+  // A readable file neither control run wrote fails when it holds text; an empty database the browser makes on
+  // demand (form history once a page with inputs loads) holds none.
+  const fresh = product.structured[c.path];
   if (seen.length === 0)
-    return [`${describe(c)}: outside the product's places, and neither control run wrote it`];
+    return fresh !== undefined && !entriesHoldText(fresh.entries)
+      ? []
+      : [`${describe(c)}: outside the product's places, and neither control run wrote it`];
   const link = (s: DiskChange, run: RunDisk): string | null =>
     s.entry.link === null ? null : withRoles(s.entry.link, run.names);
   const alike = seen.filter(

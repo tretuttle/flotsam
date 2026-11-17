@@ -289,6 +289,34 @@ describe("the product run against two control runs", () => {
     ).toEqual([]);
   });
 
+  it("lets a new readable file through only when it holds no text", () => {
+    const empty: Structured = {
+      format: "sqlite",
+      entries: {
+        "table moz_formhistory": { fields: ["id", "value"], rows: [] },
+        "table meta": { fields: ["v"], rows: [["#"]] },
+      },
+      unaccounted: 0,
+      strayMarked: false,
+    };
+    const texted: Structured = {
+      ...empty,
+      entries: { "table t": { fields: ["v"], rows: [["#"], ["abc"]] } },
+    };
+    const nobody = run([]);
+    const fresh = (s: Structured): RunDisk =>
+      run([added("profile/formhistory.sqlite")], {
+        structured: { "profile/formhistory.sqlite": s },
+      });
+    expect(diskProblems(evidence(fresh(empty), [nobody, nobody]))).toEqual([]);
+    expect(diskProblems(evidence(fresh(texted), [nobody, nobody]))).toEqual([
+      "new file profile/formhistory.sqlite: outside the product's places, and neither control run wrote it",
+    ]);
+    expect(
+      diskProblems(evidence(run([added("profile/formhistory.sqlite")]), [nobody, nobody])),
+    ).toHaveLength(1);
+  });
+
   it("judges a database's journal and write-ahead log through the database", () => {
     const db: Structured = { format: "sqlite", entries: {}, unaccounted: 0, strayMarked: false };
     const product = run(
