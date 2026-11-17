@@ -193,7 +193,16 @@ describe("oneClickHar contract", () => {
 
   it("lets a failed export carry only a fixed kind and numbers, never text", () => {
     expectTypeOf<FailureOf<typeof oneClickHarApi>["kind"]>().toEqualTypeOf<
-      "disk-full" | "access-denied" | "folder-missing" | "folder-refused" | "other"
+      | "disk-full"
+      | "access-denied"
+      | "read-only"
+      | "not-a-folder"
+      | "folder-missing"
+      | "folder-refused"
+      | "file-replaced"
+      | "name-too-long"
+      | "name-taken"
+      | "other"
     >();
     expectTypeOf<FailureText<FailureOf<typeof oneClickHarApi>>>().toEqualTypeOf<never>();
     type Planted<Failure> = {

@@ -8,7 +8,7 @@ import type { ByteCount } from "@one-click-har/recording/ids";
 
 /** Text is handed to the file in batches of about this many UTF-16 code units. */
 export const SINK_BATCH_UNITS = 1_048_576;
-export const PART_SUFFIX = ".part";
+const PART_SUFFIX = ".part";
 
 /** UTF-8 length of a JavaScript string. A lone surrogate is written as U+FFFD, three bytes. */
 const utf8Length = (text: string): number => {
@@ -30,28 +30,36 @@ const utf8Length = (text: string): number => {
 
 /**
  * Platform errors by the identifier the platform gives them: an IOUtils DOMException's `name`, or an XPCOM exception's
- * nsresult name. Never by message text, which carries paths. Free space below what the call needed is a full disk
- * whatever the name, because ENOSPC reaches IOUtils under a generic name.
+ * nsresult name. Never by message text, which carries paths. Each row is a cause `export-failures` makes happen for
+ * real, inside a user and mount namespace, on every browser it runs; a name no cause produces has no row. A full disk
+ * has none either: it is decided by free space, which a full volume reports as below what the write needed.
  */
-export const FS_ERROR_KINDS: {
-  readonly [name: string]: "access-denied" | "folder-missing" | "disk-full";
+const FS_ERROR_KINDS: {
+  readonly [name: string]: Exclude<WriteFailure["kind"], "other" | "disk-full">;
 } = {
+  /** A folder that must be created where this user may not write. */
   NotAllowedError: "access-denied",
+  /** The part, in a folder this user may not write. */
   NS_ERROR_FILE_ACCESS_DENIED: "access-denied",
-  NS_ERROR_FILE_READ_ONLY: "access-denied",
-  NS_ERROR_FILE_IS_LOCKED: "access-denied",
-  NotFoundError: "folder-missing",
-  NS_ERROR_FILE_NOT_FOUND: "folder-missing",
-  NS_ERROR_FILE_TARGET_DOES_NOT_EXIST: "folder-missing",
-  NS_ERROR_FILE_NO_DEVICE_SPACE: "disk-full",
+  /** A folder that must be created on a read-only mount. */
+  ReadOnlyError: "read-only",
+  /** The part, on a read-only mount. */
+  NS_ERROR_FILE_READ_ONLY: "read-only",
+  /** The folder is a file. */
+  InvalidAccessError: "not-a-folder",
+  NS_ERROR_FILE_NAME_TOO_LONG: "name-too-long",
+  /** Something, a dangling link included, already has the part's name. */
+  NS_ERROR_FILE_ALREADY_EXISTS: "name-taken",
+  /** Something already has the finished file's name. */
+  NoModificationAllowedError: "name-taken",
 };
-
 const errorName = (error: unknown): string | null => {
   const name =
     typeof error === "object" && error !== null ? (error as { name?: unknown }).name : null;
   return typeof name === "string" ? name : null;
 };
 
+/** Free space below what the call needed is a full disk whatever the name. */
 const classifyFsError = (
   error: unknown,
   needBytes: number,
@@ -65,55 +73,212 @@ const classifyFsError = (
   if (freeBytes !== null && freeBytes < needBytes) return full;
   const name = errorName(error);
   const kind = name !== null && Object.hasOwn(FS_ERROR_KINDS, name) ? FS_ERROR_KINDS[name] : null;
-  if (kind === "disk-full") return full;
-  return { kind: kind ?? "other" };
+  return { kind: kind ?? "other" } as WriteFailure;
 };
+
+/** What is at a path, without following a link there. */
+export type PathState =
+  | { readonly kind: "missing" | "link" | "folder" | "other" }
+  | { readonly kind: "file"; readonly size: number };
+
+/** One open file. Every byte of a part goes through the handle its exclusive create returned. */
+export interface FileHandle {
+  readonly write: (text: string) => void;
+  readonly close: () => void;
+}
 
 /** The raw file calls an export makes, as a platform offers them. Any of them may throw anything. */
 export interface ExportPlatform {
+  readonly state: (path: string) => PathState;
+  /** Every link resolved. A path that does not exist comes back as given. */
+  readonly realPath: (path: string) => string;
+  readonly parent: (path: string) => string | null;
+  readonly join: (folder: string, name: string) => string;
+  readonly filename: (path: string) => string;
   readonly makeFolder: (folder: string) => Promise<void>;
-  readonly exists: (path: string) => boolean;
-  /** Creates the file empty, with its final mode. */
-  readonly create: (path: string) => void;
-  readonly append: (path: string, text: string) => Promise<void>;
+  /** Fails when anything, a dangling link included, is at the path. */
+  readonly createExclusive: (path: string) => FileHandle;
+  readonly readHead: (path: string, bytes: number) => Promise<Uint8Array>;
+  /** Never overwrites. */
   readonly rename: (from: string, to: string) => Promise<void>;
   readonly remove: (path: string) => Promise<void>;
   readonly freeBytes: (folder: string) => number;
 }
 
-/** The export's only way to the file system. Every call throws WriteRefused with a classified failure, or succeeds. */
-export interface ExportFiles {
-  readonly makeFolder: () => Promise<void>;
-  readonly exists: (path: string) => Promise<boolean>;
-  readonly create: (path: string) => Promise<void>;
-  readonly append: (path: string, text: string, needBytes: number) => Promise<void>;
-  readonly rename: (from: string, to: string) => Promise<void>;
-  readonly remove: (path: string) => Promise<void>;
+/** A part being written: appended through its one handle, then confirmed and renamed, or discarded. */
+export interface Part {
+  readonly append: (text: string, needBytes: number) => Promise<void>;
+  /** Closes the handle, confirms the part is still this export's file, and renames it. Returns the name it got. */
+  readonly finish: (planned: string) => Promise<string>;
+  readonly discard: () => Promise<void>;
 }
 
-export function exportFiles(platform: ExportPlatform, folder: string): ExportFiles {
-  const free = (): number | null => {
+export interface ExportFolder {
+  readonly path: string;
+  /** A free name for `planned` and its part, then the part, created exclusively. */
+  /** `beforeCreate` runs with the part's path before it exists, so the journal names it before any byte. */
+  readonly createPart: (
+    planned: string,
+    beforeCreate: (path: string) => Promise<void>,
+  ) => Promise<{ readonly part: Part; readonly path: string }>;
+}
+
+const NAME_TRIES = 100;
+/** How much of the part's start is compared with what this export wrote first. */
+const HEAD_BYTES = 64;
+
+/** `name.har`, `name (2).har`, and on. */
+const numbered = (planned: string, n: number): string => {
+  const dot = planned.endsWith(".har") ? planned.length - 4 : planned.length;
+  return n === 1 ? planned : `${planned.slice(0, dot)} (${String(n)})${planned.slice(dot)}`;
+};
+
+const asciiPrefix = (text: string, max: number): string => {
+  let end = 0;
+  while (end < text.length && end < max && text.charCodeAt(end) < 0x80) end += 1;
+  return text.slice(0, end);
+};
+
+/**
+ * The export's only way to the file system. Every call either succeeds or throws WriteRefused with a kind from
+ * FS_ERROR_KINDS. The folder is resolved to its real path once and must stay that folder; a part is created
+ * exclusively, written only through its own handle, and renamed only after it is confirmed to still be that file.
+ * `allowed` is the folder guard over a real path.
+ */
+export function exportFiles(platform: ExportPlatform, allowed: (realFolder: string) => boolean) {
+  const free = (folder: string): number | null => {
     try {
       return platform.freeBytes(folder);
     } catch {
       return null;
     }
   };
-  const guard = async <T>(call: () => T | Promise<T>, needBytes = 0): Promise<T> => {
+  const refuse = (kind: Exclude<WriteFailure["kind"], "disk-full">): never => {
+    throw new WriteRefused({ kind } as WriteFailure);
+  };
+  const run = async <T>(folder: string, call: () => T | Promise<T>, needBytes = 0): Promise<T> => {
     try {
       return await call();
     } catch (error) {
-      throw new WriteRefused(classifyFsError(error, needBytes, free()));
+      if (error instanceof WriteRefused) throw error;
+      throw new WriteRefused(classifyFsError(error, needBytes, free(folder)));
     }
   };
-  return {
-    makeFolder: () => guard(() => platform.makeFolder(folder)),
-    exists: (path) => guard(() => platform.exists(path)),
-    create: (path) => guard(() => platform.create(path)),
-    append: (path, text, needBytes) => guard(() => platform.append(path, text), needBytes),
-    rename: (from, to) => guard(() => platform.rename(from, to)),
-    remove: (path) => guard(() => platform.remove(path)),
+  const isTaken = (failure: unknown): boolean =>
+    failure instanceof WriteRefused && failure.failure.kind === "name-taken";
+
+  /** The folder is still the real, unlinked folder it was resolved to. */
+  const stillFolder = (folder: string): void => {
+    const state = platform.state(folder).kind;
+    if (state === "missing") refuse("folder-missing");
+    if (state === "link") refuse("folder-refused");
+    if (state !== "folder") refuse("not-a-folder");
+    if (platform.realPath(folder) !== folder) refuse("folder-refused");
   };
+
+  const openFolder = async (configured: string): Promise<ExportFolder> => {
+    const folder = await run(configured, async () => {
+      if (platform.state(configured).kind === "link") refuse("folder-refused");
+      const missing: string[] = [];
+      let existing = configured;
+      while (platform.state(existing).kind === "missing") {
+        const up = platform.parent(existing);
+        if (up === null || up === existing) refuse("folder-missing");
+        missing.unshift(platform.filename(existing));
+        existing = up as string;
+      }
+      const planned = missing.reduce(platform.join, platform.realPath(existing));
+      if (!allowed(planned)) refuse("folder-refused");
+      await platform.makeFolder(planned);
+      stillFolder(planned);
+      if (!allowed(platform.realPath(planned))) refuse("folder-refused");
+      return planned;
+    });
+
+    const openPart = (path: string): Part => {
+      const handle = platform.createExclusive(path);
+      let written = 0;
+      let head = "";
+      let open = true;
+      const close = (): void => {
+        if (!open) return;
+        open = false;
+        handle.close();
+      };
+      const confirm = async (): Promise<void> => {
+        stillFolder(folder);
+        const state = platform.state(path);
+        if (state.kind !== "file" || state.size !== written) refuse("file-replaced");
+        const expected = Array.from(head, (c) => c.charCodeAt(0));
+        const found = Array.from(await platform.readHead(path, expected.length));
+        if (found.join() !== expected.join()) refuse("file-replaced");
+      };
+      return {
+        append: (text, needBytes) =>
+          run(
+            folder,
+            () => {
+              handle.write(text);
+              if (written === 0) head = asciiPrefix(text, HEAD_BYTES);
+              written += needBytes;
+            },
+            needBytes,
+          ),
+        finish: (planned) =>
+          run(folder, async () => {
+            close();
+            await confirm();
+            for (let n = 1; n <= NAME_TRIES; n += 1) {
+              const name = numbered(planned, n);
+              const target = platform.join(folder, name);
+              const renamed = await run(folder, () => platform.rename(path, target)).then(
+                () => true,
+                (error: unknown) => {
+                  if (isTaken(error)) return false;
+                  throw error;
+                },
+              );
+              if (renamed) return name;
+            }
+            return refuse("name-taken");
+          }),
+        discard: async () => {
+          try {
+            close();
+          } catch {
+            // The handle's last error is already the export's failure.
+          }
+          if (platform.state(folder).kind !== "folder" || platform.realPath(folder) !== folder)
+            return;
+          if (platform.state(path).kind !== "missing")
+            await platform.remove(path).catch(() => undefined);
+        },
+      };
+    };
+
+    return {
+      path: folder,
+      createPart: async (planned, beforeCreate) => {
+        for (let n = 1; n <= NAME_TRIES; n += 1) {
+          const name = numbered(planned, n);
+          const final = platform.join(folder, name);
+          const path = `${final}${PART_SUFFIX}`;
+          await beforeCreate(path);
+          const part = await run(folder, () => {
+            stillFolder(folder);
+            return openPart(path);
+          }).catch((error: unknown) => {
+            if (isTaken(error)) return null;
+            throw error;
+          });
+          if (part !== null) return { part, path };
+        }
+        return refuse("name-taken");
+      },
+    };
+  };
+
+  return { openFolder };
 }
 
 export type PartSink = HarSink & {
@@ -179,18 +344,4 @@ export const unfinishedExports = (journal: string): readonly string[] => {
     if (typeof ended === "string") open.delete(ended);
   }
   return [...open];
-};
-
-/** `name.har`, then `name (2).har` and on, the first that is free as both the file and its part. */
-export const freeFileName = async (
-  planned: string,
-  taken: (name: string) => Promise<boolean>,
-): Promise<string> => {
-  const dot = planned.endsWith(".har") ? planned.length - 4 : planned.length;
-  const stem = planned.slice(0, dot);
-  const extension = planned.slice(dot);
-  for (let n = 1; ; n += 1) {
-    const name = n === 1 ? planned : `${stem} (${String(n)})${extension}`;
-    if (!(await taken(name)) && !(await taken(`${name}${PART_SUFFIX}`))) return name;
-  }
 };

@@ -298,41 +298,6 @@ export function judgeCancel(o: CancelObservation): readonly string[] {
   return problems;
 }
 
-export type DiskFullObservation = {
-  readonly state: unknown;
-  /** The export folder, as the browser sees it, is the size-limited tmpfs. */
-  readonly tmpfs: boolean;
-  /** Everything in the export folder, as the browser sees it, after the export ended. */
-  readonly left: readonly string[];
-  readonly journal: string;
-};
-
-export function judgeDiskFull(o: DiskFullObservation): readonly string[] {
-  const problems: string[] = [];
-  if (!o.tmpfs) problems.push("the export folder was not the size-limited tmpfs");
-  const state = o.state as {
-    kind?: string;
-    failure?: { kind?: string; needBytes?: unknown; freeBytes?: unknown };
-  };
-  const failure = state.failure;
-  if (state.kind !== "write-failed" || failure?.kind !== "disk-full")
-    problems.push(`ended ${JSON.stringify(o.state)}, not write-failed with disk-full`);
-  else if (
-    typeof failure.needBytes !== "number" ||
-    typeof failure.freeBytes !== "number" ||
-    failure.needBytes <= 0 ||
-    failure.freeBytes < 0 ||
-    failure.freeBytes >= failure.needBytes
-  )
-    problems.push(`disk-full without a need above the free bytes: ${JSON.stringify(failure)}`);
-  if (o.left.length > 0) problems.push(`left behind: ${o.left.join(", ")}`);
-  const lines = o.journal.split("\n").filter((line) => line.length > 0);
-  const startedParts = lines.filter((l) => l.startsWith('{"started"')).length;
-  if (startedParts === 0 || startedParts !== lines.length - startedParts)
-    problems.push(`journal: ${JSON.stringify(lines)}`);
-  return problems;
-}
-
 export type AfterCrashObservation = {
   /** The kinds of step the next start's recovery ran. */
   readonly steps: readonly string[];
@@ -350,31 +315,60 @@ export function judgeAfterCrash(o: AfterCrashObservation): readonly string[] {
   ];
 }
 
-export type FailureObservation = {
-  readonly expect: string;
+/** How one cause must end: a named failure kind, or done under a given name. */
+export type RowOutcome =
+  | { readonly kind: "write-failed"; readonly failure: string }
+  | { readonly kind: "done"; readonly fileName: string };
+
+export type RowObservation = {
+  readonly expect: RowOutcome;
   readonly state: unknown;
-  /** Everything the API handed the page after the failure: the job, listExports and getPopup, serialized. */
+  /** Everything the API handed the page after the export: the job, listExports and getPopup, serialized. */
   readonly served: string;
   /** Folders whose paths may never reach a page: the profile, the export folder, the data home. */
   readonly paths: readonly string[];
-  /** Files left in the export folder named like this export. */
-  readonly left: readonly string[];
+  /** Files named like this export, in the export folder and the profile, after it ended. */
+  readonly files: readonly string[];
+  /** Files outside the export folder that an attack pointed at, hashed before and after. */
+  readonly untouched: readonly {
+    readonly path: string;
+    readonly before: string;
+    readonly after: string;
+  }[];
 };
 
 const FAILURE_KEYS: readonly string[] = ["kind", "needBytes", "freeBytes"];
 
-/** A failure is one named kind and numbers. No path, and no URL that holds one, reaches the page anywhere. */
-export function judgeFailure(o: FailureObservation): readonly string[] {
+/**
+ * A cause ends as its row says. A failure is a named kind and numbers, never `other`, and leaves no file; a finished
+ * export leaves exactly its file. No path or URL holding one reaches the page, and nothing outside the folder changed.
+ */
+export function judgeRow(o: RowObservation): readonly string[] {
   const problems: string[] = [];
-  const state = o.state as { kind?: string; failure?: Record<string, unknown> };
-  if (state.kind !== "write-failed" || state.failure?.["kind"] !== o.expect)
-    problems.push(`ended ${JSON.stringify(o.state)}, expected write-failed ${o.expect}`);
-  const extra = Object.keys(state.failure ?? {}).filter((key) => !FAILURE_KEYS.includes(key));
+  const state = o.state as { kind?: string; fileName?: string; failure?: Record<string, unknown> };
+  const failure = state.failure ?? {};
+  if (o.expect.kind === "write-failed") {
+    if (state.kind !== "write-failed" || failure["kind"] !== o.expect.failure)
+      problems.push(`ended ${JSON.stringify(o.state)}, expected write-failed ${o.expect.failure}`);
+    if (
+      failure["kind"] === "disk-full" &&
+      !(Number(failure["freeBytes"]) < Number(failure["needBytes"]))
+    )
+      problems.push(`disk-full without a need above the free bytes: ${JSON.stringify(failure)}`);
+    if (o.files.length > 0) problems.push(`left behind: ${o.files.join(", ")}`);
+  } else {
+    if (state.kind !== "done" || state.fileName !== o.expect.fileName)
+      problems.push(`ended ${JSON.stringify(o.state)}, expected done as ${o.expect.fileName}`);
+    if (o.files.join() !== o.expect.fileName) problems.push(`files: ${o.files.join(", ")}`);
+  }
+  const extra = Object.keys(failure).filter((key) => !FAILURE_KEYS.includes(key));
   if (extra.length > 0) problems.push(`the failure carries ${extra.join(", ")}`);
   for (const path of o.paths)
     if (o.served.includes(path)) problems.push(`a path reached the page: ${path}`);
-  for (const scheme of ["file:", "jar:"])
+  // URLs that hold a local path. The bare word "jar:" is in the redaction report's own description.
+  for (const scheme of ["file://", "jar:file:"])
     if (o.served.includes(scheme)) problems.push(`a ${scheme} URL reached the page`);
-  if (o.left.length > 0) problems.push(`left behind: ${o.left.join(", ")}`);
+  for (const file of o.untouched)
+    if (file.before !== file.after) problems.push(`${file.path} changed`);
   return problems;
 }

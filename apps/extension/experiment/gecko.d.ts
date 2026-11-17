@@ -157,6 +157,12 @@ interface LocalFile {
   create(type: number, permissions: number): void;
   moveTo(parent: LocalFile | null, name: string): void;
   readonly diskSpaceAvailable: number;
+  /** lstat: true for a link, dangling or not. Throws when nothing is at the path. */
+  isSymlink(): boolean;
+  isDirectory(): boolean;
+  isFile(): boolean;
+  /** Resolves every link (realpath). A path that does not exist is left as it is. */
+  normalize(): void;
   /** Throws where the platform's file manager cannot select a file (row P4). */
   reveal(): void;
   launch(): void;
@@ -199,6 +205,14 @@ interface XpcomClasses {
   "@mozilla.org/network/async-stream-copier;1": AsyncStreamCopier;
   "@mozilla.org/timer;1": Timer;
   "@mozilla.org/binaryinputstream;1": BinaryInputStream;
+  "@mozilla.org/intl/converter-output-stream;1": ConverterOutputStream;
+}
+
+interface ConverterOutputStream {
+  init(stream: OutputStream, charset: string): void;
+  /** false when not every character was written. */
+  writeString(text: string): boolean;
+  close(): void;
 }
 
 interface BinaryInputStream {
@@ -257,6 +271,7 @@ declare const Ci: {
   readonly nsIBinaryInputStream: XpcomInterface;
   readonly nsIStreamConverterService: XpcomInterface;
   readonly nsIClipboardHelper: XpcomInterface;
+  readonly nsIConverterOutputStream: XpcomInterface;
   readonly nsITimer: XpcomInterface & {
     readonly TYPE_ONE_SHOT: number;
     readonly TYPE_REPEATING_SLACK: number;

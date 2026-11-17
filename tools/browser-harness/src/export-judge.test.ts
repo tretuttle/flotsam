@@ -9,9 +9,8 @@ import {
   convertsWithK6,
   judgeAfterCrash,
   judgeCancel,
-  judgeDiskFull,
   judgeExport,
-  judgeFailure,
+  judgeRow,
   judgeTabCases,
   PLANTS,
   plantDataRow,
@@ -198,55 +197,57 @@ describe("the tab, cancel, disk-full and crash judges", () => {
     expect(judgeCancel({ ...ok, journal: '{"started":"/d/x.har.part"}\n' })).toHaveLength(1);
   });
 
-  it("wants disk-full with a need above the free bytes, on the tmpfs, leaving nothing", () => {
-    const ok = {
-      state: { kind: "write-failed", failure: { kind: "disk-full", needBytes: 9, freeBytes: 0 } },
-      tmpfs: true,
-      left: [],
-      journal,
-    };
-    expect(judgeDiskFull(ok)).toEqual([]);
-    expect(judgeDiskFull({ ...ok, tmpfs: false })).toHaveLength(1);
-    expect(
-      judgeDiskFull({
-        ...ok,
-        state: { kind: "write-failed", failure: { kind: "disk-full", needBytes: 9, freeBytes: 9 } },
-      }),
-    ).toHaveLength(1);
-    expect(judgeDiskFull({ ...ok, state: { kind: "done" } })).toHaveLength(1);
-  });
-
   it("wants the next start to delete the part a killed export left", () => {
     expect(judgeAfterCrash({ steps: ["delete-export-part"], left: [] })).toEqual([]);
     expect(judgeAfterCrash({ steps: [], left: ["killed.har.part"] })).toHaveLength(2);
   });
 
-  it("wants a refused export folder to give its named kind, numbers only, and no path to the page", () => {
-    const paths = ["/w/profile", "/w/downloads"];
-    const ok = {
-      expect: "access-denied",
+  it("wants each cause's named kind or file, numbers only, no path to the page, nothing outside touched", () => {
+    const paths = ["/w/profile", "/w/out"];
+    const failed = {
+      expect: { kind: "write-failed", failure: "access-denied" } as const,
       state: { kind: "write-failed", failure: { kind: "access-denied" } },
       served: '{"job":{"state":{"kind":"write-failed","failure":{"kind":"access-denied"}}}}',
       paths,
-      left: [],
+      files: [],
+      untouched: [{ path: "/w/profile/prefs.js", before: "a", after: "a" }],
     };
-    expect(judgeFailure(ok)).toEqual([]);
-    const leaked = {
-      ...ok,
-      state: {
-        kind: "write-failed",
-        failure: { kind: "other", detail: "/w/downloads/a.har.part" },
-      },
-      served: '{"detail":"NotAllowedError /w/downloads/a.har.part jar:file:///w/profile/x.xpi"}',
-    };
-    expect(judgeFailure(leaked)).toEqual([
-      'ended {"kind":"write-failed","failure":{"kind":"other","detail":"/w/downloads/a.har.part"}}, expected write-failed access-denied',
+    expect(judgeRow(failed)).toEqual([]);
+    expect(
+      judgeRow({
+        ...failed,
+        state: { kind: "write-failed", failure: { kind: "other", detail: "/w/out/a.har.part" } },
+        served: '{"detail":"NotAllowedError /w/out/a.har.part jar:file:///w/profile/x.xpi"}',
+        files: ["a.har.part"],
+        untouched: [{ path: "/w/profile/prefs.js", before: "a", after: "b" }],
+      }),
+    ).toEqual([
+      'ended {"kind":"write-failed","failure":{"kind":"other","detail":"/w/out/a.har.part"}}, expected write-failed access-denied',
+      "left behind: a.har.part",
       "the failure carries detail",
       "a path reached the page: /w/profile",
-      "a path reached the page: /w/downloads",
-      "a file: URL reached the page",
-      "a jar: URL reached the page",
+      "a path reached the page: /w/out",
+      "a file:// URL reached the page",
+      "a jar:file: URL reached the page",
+      "/w/profile/prefs.js changed",
     ]);
-    expect(judgeFailure({ ...ok, left: ["a.har.part"] })).toEqual(["left behind: a.har.part"]);
+    const done = {
+      ...failed,
+      expect: { kind: "done", fileName: "a (2).har" } as const,
+      state: { kind: "done", fileName: "a (2).har" },
+      served: "{}",
+      files: ["a (2).har"],
+    };
+    expect(judgeRow(done)).toEqual([]);
+    expect(judgeRow({ ...done, files: ["a (2).har", "a.har.part"] })).toEqual([
+      "files: a (2).har, a.har.part",
+    ]);
+    const full = { ...failed, expect: { kind: "write-failed", failure: "disk-full" } as const };
+    expect(
+      judgeRow({
+        ...full,
+        state: { kind: "write-failed", failure: { kind: "disk-full", needBytes: 9, freeBytes: 9 } },
+      }),
+    ).toHaveLength(1);
   });
 });

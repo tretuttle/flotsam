@@ -77,8 +77,16 @@ export type ExportId = string & { readonly __exportId: unique symbol };
 export type WriteFailure =
   | { readonly kind: "disk-full"; readonly needBytes: ByteCount; readonly freeBytes: ByteCount }
   | { readonly kind: "access-denied" }
+  | { readonly kind: "read-only" }
+  | { readonly kind: "not-a-folder" }
   | { readonly kind: "folder-missing" }
+  /** The folder is a link, or resolves inside the profile, the archive or the browser's own folders. */
   | { readonly kind: "folder-refused" }
+  /** Something other than the file this export created stood at its name when it finished. */
+  | { readonly kind: "file-replaced" }
+  | { readonly kind: "name-too-long" }
+  | { readonly kind: "name-taken" }
+  /** An error the table does not name. */
   | { readonly kind: "other" };
 
 export type ExportState =
