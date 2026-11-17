@@ -9,7 +9,8 @@
     "./build": "./src/build.ts",
     "./redact": "./src/redact.ts",
     "./summarize": "./src/summarize.ts",
-    "./filename": "./src/filename.ts"
+    "./filename": "./src/filename.ts",
+    "./rules": "./src/rules.ts"
   },
   "scripts": {
     "test": "vp test run --config ../../vite.config.ts --dir .",

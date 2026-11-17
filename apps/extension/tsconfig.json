@@ -6,5 +6,15 @@
     "types": ["node"]
   },
   "include": ["src", "scripts", "experiment"],
-  "exclude": ["dist", "public", "experiment/parent.ts", "experiment/gecko.d.ts"]
+  "exclude": [
+    "dist",
+    "public",
+    "experiment/parent.ts",
+    "experiment/gecko.d.ts",
+    "experiment/gecko-io.ts",
+    "experiment/files.ts",
+    "experiment/maintenance.ts",
+    "experiment/recorder.ts",
+    "experiment/store.ts"
+  ]
 }

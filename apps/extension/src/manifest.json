@@ -37,6 +37,7 @@
       "parent": {
         "scopes": ["addon_parent"],
         "script": "experiment/parent.js",
+        "events": ["startup"],
         "paths": [["oneClickHar"]]
       }
     }

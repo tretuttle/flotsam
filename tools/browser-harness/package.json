@@ -12,6 +12,7 @@
     "mutation:guard": "node mutation/guard-mutation.ts"
   },
   "devDependencies": {
+    "@one-click-har/recording": "workspace:*",
     "@types/node": "catalog:",
     "vite-plus": "catalog:"
   }

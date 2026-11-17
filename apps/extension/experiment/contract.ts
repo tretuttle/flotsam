@@ -19,8 +19,30 @@ export interface Environment {
   readonly toolbox: ToolboxState;
 }
 
+/**
+ * Why the background recording is off or at risk. No path, site or byte crosses to an extension page; the page turns
+ * each kind into plain words.
+ */
+export type RecordingProblem =
+  /** security.fileuri.strict_origin_policy is false, so a local file:// page can read the archive (issue 13). */
+  | "file-pages-can-read-files"
+  /** The archive folder is inside the profile, the browser's own folders, or a resource:// or moz-src:// target. */
+  | "archive-refused"
+  | "archive-unwritable"
+  /** settings.json did not parse; it was set aside and the defaults are in use. */
+  | "settings-unreadable"
+  | "write-failed"
+  /** More requests were in flight at once than the recorder tracks; the extra ones were not recorded. */
+  | "too-many-live-requests";
+
+export interface RecordingStatus {
+  readonly recording: boolean;
+  readonly problems: readonly RecordingProblem[];
+}
+
 export const oneClickHarApi = {
   getEnvironment: asyncFunction([integer("tabId", { minimum: 0 })], returns<Environment>()),
+  getRecordingStatus: asyncFunction([], returns<RecordingStatus>()),
 };
 
 export type OneClickHarApi = ApiFunctions<typeof oneClickHarApi>;
@@ -34,9 +56,11 @@ export const environmentKeys = {
   browser: ["name", "version", "buildId"],
   toolboxOpen: ["host", "open"],
   toolboxClosed: ["open", "reason"],
+  recordingStatus: ["problems", "recording"],
 } as const satisfies {
   result: ReadonlyArray<keyof Environment>;
   browser: ReadonlyArray<keyof Environment["browser"]>;
   toolboxOpen: ReadonlyArray<keyof Extract<ToolboxState, { open: true }>>;
   toolboxClosed: ReadonlyArray<keyof Extract<ToolboxState, { open: false }>>;
+  recordingStatus: ReadonlyArray<keyof RecordingStatus>;
 };

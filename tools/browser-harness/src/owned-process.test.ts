@@ -6,6 +6,7 @@ import {
   removeDirectoryBounded,
   signalPerformer,
   spawnOwned,
+  killOwnedTree,
   stopOwnedTree,
   taskkillArgs,
 } from "./owned-process.ts";
@@ -131,6 +132,19 @@ describe("stopping an owned tree", () => {
     expect(world.sent).toEqual([
       { rawTarget: -5000, signal: "SIGTERM", at: 0 },
       { rawTarget: 5100, signal: "SIGTERM", at: 0 },
+    ]);
+    expect([5000, 5001, 5100].map(world.running)).toEqual([false, false, false]);
+    expect([7000, 7001, 2000, 1800, 1].map(world.running)).toEqual([true, true, true, true, true]);
+  });
+
+  it("kills at a chosen point with SIGKILL to the same members at once, never SIGTERM first", async () => {
+    const world = simulateProcesses(browserTree(), {
+      survives: { 5000: "SIGTERM", 5001: "SIGTERM", 5100: "SIGTERM" },
+    });
+    await killOwnedTree(world.io, browserRoot());
+    expect(world.sent).toEqual([
+      { rawTarget: -5000, signal: "SIGKILL", at: 0 },
+      { rawTarget: 5100, signal: "SIGKILL", at: 0 },
     ]);
     expect([5000, 5001, 5100].map(world.running)).toEqual([false, false, false]);
     expect([7000, 7001, 2000, 1800, 1].map(world.running)).toEqual([true, true, true, true, true]);
@@ -338,15 +352,20 @@ describe("stopping an owned tree", () => {
       root: adoptSpawnedChild({ pid: 7000, startTime: "70000", profileDir: PROFILE }),
       refusal: /profile path .* missing from command line/,
     },
-  ])("refuses $name and never reaches the performer", async ({ root, refusal }) => {
-    const world = simulateProcesses([
-      ...browserTree(),
-      processIdentity(1900, { parentPid: 1800, pgrp: 1900, args: ["/bin/sh", "-c", "make"] }),
-      processIdentity(5500, { parentPid: 5000, pgrp: 5000, args: ["/opt/zen/zen", "-gpu"] }),
-    ]);
-    await expect(stopOwnedTree(world.io, root)).rejects.toThrow(refusal);
-    expect(world.sent).toEqual([]);
-  });
+  ])(
+    "refuses $name and never reaches the performer, for a stop and a kill",
+    async ({ root, refusal }) => {
+      for (const end of [stopOwnedTree, killOwnedTree]) {
+        const world = simulateProcesses([
+          ...browserTree(),
+          processIdentity(1900, { parentPid: 1800, pgrp: 1900, args: ["/bin/sh", "-c", "make"] }),
+          processIdentity(5500, { parentPid: 5000, pgrp: 5000, args: ["/opt/zen/zen", "-gpu"] }),
+        ]);
+        await expect(end(world.io, root)).rejects.toThrow(refusal);
+        expect(world.sent).toEqual([]);
+      }
+    },
+  );
 });
 
 describe("the performer", () => {

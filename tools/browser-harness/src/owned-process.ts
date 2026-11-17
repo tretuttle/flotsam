@@ -17,6 +17,7 @@ import {
   type ProcessTable,
   type SignalOrder,
   type StopSignal,
+  type StopState,
 } from "./signal-policy.ts";
 
 // Everything a stop needs from the system. Decisions take this data; `perform` is the only effect.
@@ -114,10 +115,14 @@ export function spawnOwned(
   };
 }
 
-export async function stopOwnedTree(io: ProcessIo, root: Ownership | null): Promise<void> {
+export async function stopOwnedTree(
+  io: ProcessIo,
+  root: Ownership | null,
+  from: StopState = START_STOP,
+): Promise<void> {
   if (root === null) return;
   const self = io.self();
-  let state = START_STOP;
+  let state = from;
   for (;;) {
     const step = nextStopStep({
       root,
@@ -145,6 +150,13 @@ export async function stopOwnedTree(io: ProcessIo, root: Ownership | null): Prom
     }
   }
 }
+
+/**
+ * A crash at a point the caller chose: the same stop, entered past its SIGTERM step, so the SIGKILL still comes from
+ * decideSignal. Only namespace tests call it.
+ */
+export const killOwnedTree = (io: ProcessIo, root: Ownership | null): Promise<void> =>
+  stopOwnedTree(io, root, { step: "terminating", since: Number.NEGATIVE_INFINITY, members: [] });
 
 export type ChildExitResult = {
   readonly code: number | null;
