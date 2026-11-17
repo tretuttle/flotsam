@@ -10,6 +10,7 @@ import {
   OUTCOMES,
   type Position,
   type ProbeSpec,
+  type Shape,
   type Verdict,
 } from "./probe-table.ts";
 
@@ -314,6 +315,15 @@ function eachVerdict(
   };
 }
 
+/** Whether a planned unit has the probe's shape. A shape not named here, or none at all, fits nothing. */
+function fitsShape(shape: Shape | undefined, unit: Unit | undefined): unit is Unit {
+  const fits: Readonly<Record<string, (u: unknown) => boolean>> = {
+    single: (u) => typeof u === "string",
+    pair: (u) => Array.isArray(u),
+  };
+  return fits[String(shape)]?.(unit) === true;
+}
+
 function judgeBrowserRow(
   spec: ProbeSpec,
   position: Position,
@@ -325,12 +335,7 @@ function judgeBrowserRow(
   const denial = denialAt(spec, position);
   if (spec.shape === "each") return eachVerdict(spec, denial, raw, planned, input);
   const unit = planned.length === 1 ? planned[0] : undefined;
-  // Each shape is named, so a spec without one fits no unit.
-  const fits =
-    spec.shape === "pair"
-      ? Array.isArray(unit)
-      : spec.shape === "single" && typeof unit === "string";
-  if (unit === undefined || !fits) {
+  if (!fitsShape(spec.shape, unit)) {
     return {
       verdict: "NO-RESULT",
       summary: `planned ${shown(planned)}, expected one ${spec.shape} unit`,
