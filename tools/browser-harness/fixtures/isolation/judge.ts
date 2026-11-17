@@ -327,7 +327,7 @@ function judgeExtraChecks(results: readonly ExtraCheckResult[]): readonly string
 }
 
 export function judgeIsolationRun(input: IsolationRunInput): IsolationJudgment {
-  const rowMap = new Map(input.browserRows.map((row) => [`${row.probe}|${row.position}`, row]));
+  const rowsAt = Map.groupBy(input.browserRows, (row) => `${row.probe}|${row.position}`);
 
   const rows: JudgedRow[] = expandExpectedRows(input.csFileInjected).map((expectedRow) => {
     const expected: ExpectedOutcome =
@@ -347,9 +347,11 @@ export function judgeIsolationRun(input: IsolationRunInput): IsolationJudgment {
       const { verdict, observed } = syntheticVerdict(expectedRow.id, expectedRow.position, input);
       return { ...base, observed, verdict, ok: matchesExpectation(expected, verdict) };
     }
-    const reported = rowMap.get(`${expectedRow.id}|${expectedRow.position}`);
-    if (reported === undefined) {
-      return { ...base, observed: "no row reported", verdict: "NO-RESULT", ok: false };
+    const reports = rowsAt.get(`${expectedRow.id}|${expectedRow.position}`) ?? [];
+    const [reported] = reports;
+    if (reported === undefined || reports.length > 1) {
+      const observed = `${String(reports.length)} rows reported, expected one`;
+      return { ...base, observed, verdict: "NO-RESULT", ok: false };
     }
     const { verdict, summary } = judgeBrowserRow(
       spec,

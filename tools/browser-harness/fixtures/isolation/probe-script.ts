@@ -71,7 +71,9 @@ export const PROBES_JS = `"use strict";
   }
 
   const keep = [];
-  function element(tag, url, ms = 1500) {
+  // A frame at a file:// page fires no event either way, so it gets a short wait; every other element settles with
+  // load or error, and its wait only has to outlast a slow machine.
+  function element(tag, url, ms = tag === "iframe" ? 1500 : 10000) {
     return new Promise((resolve) => {
       const el = document.createElement(tag);
       let done = false;
@@ -116,12 +118,19 @@ export const PROBES_JS = `"use strict";
     return { outcome: got.map((g) => g.outcome).join(","), text: got.map((g, i) => tags[i] + " " + g.text).join(" | ") };
   }
 
+  async function inBatches(items, size, fn) {
+    const out = [];
+    for (let i = 0; i < items.length; i += size) out.push(...(await Promise.all(items.slice(i, i + size).map(fn))));
+    return out;
+  }
+
+  // Eight targets at a time, so a slow machine still settles every load before its wait ends.
   async function oracleEach(tags, urls) {
-    const each = await Promise.all(urls.map(async (u) => {
+    const each = await inBatches(urls, 8, async (u) => {
       const [hit, miss] = await Promise.all([observeTags(tags, u), observeTags(tags, sibling(u))]);
       const r = pairOf(hit, miss);
       return { target: u, outcome: r.outcome, text: clip(r.text, 400), pair: r.pair };
-    }));
+    });
     return { outcome: "each", text: each.length + " targets", each };
   }
 

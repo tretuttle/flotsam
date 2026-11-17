@@ -1120,6 +1120,19 @@ describe("isolation judge", () => {
     ).toBe(true);
   });
 
+  it("judges a probe reported twice at one position as NO-RESULT, whichever report came last", () => {
+    const base = passingInput();
+    const again = {
+      kind: "row" as const,
+      position: "ext-bg" as const,
+      probe: "tabs-query-recorder",
+      observed: SINGLE_DENIALS["tabs-query-recorder"]!,
+    };
+    const input = { ...base, browserRows: [...base.browserRows, again] };
+    expect(rowOf(input, "tabs-query-recorder", "ext-bg").verdict).toBe("NO-RESULT");
+    expect(judgeIsolationRun(input).ok).toBe(false);
+  });
+
   it("does not let one control stand in for another reported at the same position", () => {
     const base = passingInput();
     const input = {

@@ -57,6 +57,9 @@ export async function startIsolationServer(options: {
 
   const note = (entry: IsolationReport): void => {
     reports.push(entry);
+    // A position runs once. The probe extension's background starts again in the later launches and would
+    // otherwise run its position a second time against a different browser state.
+    if (entry.kind === "position-done") enabled.delete(entry.position);
     for (const wake of waiters.splice(0)) wake();
   };
 
