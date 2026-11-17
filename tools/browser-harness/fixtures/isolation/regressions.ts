@@ -26,10 +26,12 @@ const STORE = "apps/extension/experiment/store.ts";
 const PARENT = "apps/extension/experiment/parent.ts";
 const MANIFEST = "apps/extension/src/manifest.json";
 const POPUP = "apps/extension/src/popup/main.tsx";
+const OPTIONS = "apps/extension/src/options/main.tsx";
 const SCHEMA = "apps/extension/experiment/gecko-schema.ts";
 const PROBES = "tools/browser-harness/fixtures/isolation/probe-script.ts";
 const TARGETS = "tools/browser-harness/fixtures/isolation/targets.ts";
 const ISOLATION = "tools/browser-harness/checks/isolation.ts";
+const IDENTITY = "tools/browser-harness/fixtures/isolation/identity.ts";
 const MANIFEST_ANCHOR = '  "experiment_apis": {';
 const KEY_LINE = "const key = archiveKeyFromBytes(randomBytes(ARCHIVE_KEY_BYTES));";
 const MODES_LINE = "const modes: Modes = { dir: row.dirMode, file: row.fileMode };";
@@ -725,6 +727,278 @@ ${STEPS_LINE}`,
       "mozext-script-oracle@web=NO-RESULT",
       "sendmessage-oracle@ext-bg=NO-RESULT",
     ],
+  },
+
+  // Verifier round 4: writes the control runs share, late page listeners, and identity aimed at the wrong file.
+  {
+    id: "control-write-prefs",
+    what: "a recorded log line saved as a pref, so it lands in prefs.js, a file every run writes",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `${APPEND_LINE}
+      Services.prefs.setStringPref("extensions.one-click-har.leaked", text.slice(0, 500));`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "control-write-storage",
+    what: "recorded log lines appended to <profile>/storage/ls-archive.sqlite, a database every run writes",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `${APPEND_LINE}
+      await appendText(PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "storage", "ls-archive.sqlite"), text, { dir: 0o755, file: 0o644 });`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "control-write-deleted",
+    what: "recorded log lines in <profile>/leaked-ephemeral.jsonl at plan time, deleted once the probes start",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `${APPEND_LINE}
+      if (state.site === "bank.example" && segment.path.endsWith("-0.jsonl")) {
+        await appendText(PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "leaked-ephemeral.jsonl"), text, modes);
+      }`,
+      },
+      onProbePage(
+        '        void IOUtils.remove(PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "leaked-ephemeral.jsonl"), { ignoreAbsent: true });',
+      ),
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "control-write-content-process",
+    what: "a frame script on bank.example copies document.cookie into the page's localStorage",
+    edits: [
+      {
+        file: PARENT,
+        from: STEPS_LINE,
+        to: `  {
+    const mm = (Services as unknown as { mm: { loadFrameScript(u: string, b: boolean): void } }).mm;
+    const fsBody = "addEventListener('DOMContentLoaded', () => { try { if (content && content.location && content.location.hostname === 'bank.example') content.localStorage.setItem('och_content_leak', content.document.cookie); } catch (e) {} });";
+    mm.loadFrameScript("data:application/javascript;charset=utf-8," + encodeURIComponent(fsBody), true);
+  }
+${STEPS_LINE}`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "sibling-key-folder-0600",
+    what: "a 0600 file in a 0700 folder named like a key, next to the real key folder",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `${APPEND_LINE}
+      {
+        const sibDir = PathUtils.join(PathUtils.parent(root), "00000000000000000000000000000000");
+        await makeDirectory(sibDir, modes);
+        await appendText(PathUtils.join(sibDir, "leaked.jsonl"), text, modes);
+      }`,
+      },
+    ],
+    mustFail: ["nothing-outside-key-folder", "key-names-the-archive", "disk-writes-allowed"],
+  },
+  {
+    id: "symlink-in-key-folder",
+    what: "a symlink in the key folder pointing at <profile>/prefs.js",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `${APPEND_LINE}
+      {
+        const targetPath = PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "prefs.js");
+        const linkPath = PathUtils.join(root, "leaked-link");
+        const ln = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        ln.initWithPath("/usr/bin/ln");
+        const proc = (Cc["@mozilla.org/process/util;1"] as unknown as {
+          createInstance(i: unknown): { init(f: unknown): void; run(b: boolean, args: string[], n: number): void };
+        }).createInstance((Ci as unknown as Record<string, unknown>).nsIProcess);
+        proc.init(ln);
+        proc.run(true, ["-sfn", targetPath, linkPath], 3);
+      }`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "export-wrong-folder",
+    what: "a 0600 export written to HOME instead of Downloads",
+    edits: [
+      onProbePage(`        const homeDir = Services.dirsvc.get("Home", Ci.nsIFile).path;
+        const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        f.initWithPath(PathUtils.join(homeDir, "bank.example-export.har"));
+        const out = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
+        out.init(f, 0x02 | 0x08 | 0x20, 0o600, 0);
+        const body = JSON.stringify({ log: { version: "1.2", entries: [] } });
+        out.write(body, body.length);
+        out.close();
+        f.permissions = 0o600;`),
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "popup-postmessage-delayed",
+    what: "the popup starts answering postMessage 1.5 s after it loads",
+    edits: [
+      {
+        file: POPUP,
+        from: "const readEnvironment = async (): Promise<Reading> => {",
+        to: `setTimeout(() => {
+  window.addEventListener("message", (event) => {
+    void browser.oneClickHar?.getRecordingStatus().then((status) => {
+      (event.source as WindowProxy | null)?.postMessage({ oneClickHar: status }, "*");
+    });
+  });
+}, 1500);
+const readEnvironment = async (): Promise<Reading> => {`,
+      },
+    ],
+    mustFail: ["exposure-allowed"],
+  },
+  {
+    id: "options-postmessage-delayed",
+    what: "the options page starts answering postMessage 1 s after it loads",
+    edits: [
+      {
+        file: OPTIONS,
+        from: "const Options = () => (",
+        to: `setTimeout(() => {
+  window.addEventListener("message", (event) => {
+    (event.source as WindowProxy | null)?.postMessage({ oneClickHarOptions: "leaked" }, "*");
+  });
+}, 1000);
+const Options = () => (`,
+      },
+    ],
+    mustFail: ["exposure-allowed"],
+  },
+  {
+    id: "message-external-late-runtime",
+    what: "the popup adds a runtime.onMessageExternal listener 1.5 s after it loads, under a name built at run time",
+    edits: [
+      {
+        file: POPUP,
+        from: "const readEnvironment = async (): Promise<Reading> => {",
+        to: `setTimeout(() => {
+  const rt = (browser as unknown as { runtime: Record<string, { addListener(fn: () => Promise<unknown>): void }> }).runtime;
+  const ev = ["onMessage", "External"].join("");
+  rt[ev]?.addListener(() => Promise.resolve({ recording: true, problems: [] }));
+}, 1500);
+const readEnvironment = async (): Promise<Reading> => {`,
+      },
+    ],
+    mustFail: ["sendmessage-recorder@ext-bg", "sendmessage-oracle@ext-bg"],
+  },
+  {
+    id: "war-geturl-runtime-late",
+    what: "the parent script makes the popup web-accessible at run time once the probes start",
+    edits: [
+      onProbePage(`        const pol = WebExtensionPolicy.getByID("one-click-har@tretuttle.github.io") as unknown as {
+          getURL(p: string): string;
+          sourceMayAccessPath?: (uri: unknown, path: string) => boolean;
+          isWebAccessiblePath?: (path: string) => boolean;
+          extension: {
+            webAccessibleResources: unknown[];
+            serialize(): unknown;
+            setSharedData(k: string, v: unknown): void;
+          };
+        } | null;
+        if (pol) {
+          const exposed = Services.io.newURI(pol.getURL("action/index.html")).filePath;
+          pol.extension.webAccessibleResources.push({
+            resources: [exposed],
+            matches: ["<all_urls>"],
+            extension_ids: ["*"],
+          });
+          pol.sourceMayAccessPath = (_uri: unknown, p: string) => p === exposed;
+          pol.isWebAccessiblePath = (p: string) => p === exposed;
+          pol.extension.setSharedData("", pol.extension.serialize());
+        }`),
+    ],
+    mustFail: ["exposure-allowed", "mozext-popup@file", "mozext-every-file@file"],
+  },
+  {
+    id: "identity-wrong-product-file",
+    what: "the plan aims mozext-popup at the parent script and fetch-file-log at the body: both exist, both marked or packed",
+    harness: true,
+    edits: [
+      {
+        file: TARGETS,
+        from: '      "fetch-file-log",\n      "xhr-file-log",',
+        to: '      "xhr-file-log",',
+      },
+      {
+        file: TARGETS,
+        from: '  plan(["fetch-file-body"], [body]);',
+        to: '  plan(["fetch-file-log"], [body]);\n  plan(["fetch-file-body"], [body]);',
+      },
+      {
+        file: TARGETS,
+        from: '  plan(["mozext-popup", "mozext-frame-recorder"], [recUrl(rec.popupPath)]);',
+        to: '  plan(["mozext-popup"], [recUrl(rec.parentScript)]);\n  plan(["mozext-frame-recorder"], [recUrl(rec.popupPath)]);',
+      },
+    ],
+    mustFail: ["fetch-file-log@web=NO-RESULT", "mozext-popup@web=NO-RESULT"],
+  },
+  {
+    id: "identity-wrong-product-file-via-want",
+    what: "view-source: and jar: probes aimed at the body while the plan still attaches the log's witness check",
+    harness: true,
+    edits: [
+      {
+        file: TARGETS,
+        from: '  plan(\n    ["viewsource-fetch", "viewsource-iframe", "tabs-create-viewsource"],\n    [want(`view-source:${log}`, logFile)],\n  );\n  plan(["jar-file-fetch", "jar-file-iframe"], [want(`jar:${log}!/`, logFile)]);',
+        to: '  plan(\n    ["viewsource-fetch", "viewsource-iframe", "tabs-create-viewsource"],\n    [want(`view-source:${body}`, logFile)],\n  );\n  plan(["jar-file-fetch", "jar-file-iframe"], [want(`jar:${body}!/`, logFile)]);',
+      },
+    ],
+    mustFail: ["viewsource-fetch@web=NO-RESULT", "jar-file-fetch@web=NO-RESULT"],
+  },
+  {
+    id: "identity-same-content-diff-path",
+    what: "fetch-file-log aimed at a byte-identical, marked copy of the log at another path",
+    harness: true,
+    edits: [
+      {
+        file: ISOLATION,
+        from: "      const exportPath = NodePath.join(workspace.downloads, exportName);",
+        to: "      NodeFS.copyFileSync(logPath, `${logPath}.copy.jsonl`);\n      NodeFS.chmodSync(`${logPath}.copy.jsonl`, 0o600);\n      const exportPath = NodePath.join(workspace.downloads, exportName);",
+      },
+      {
+        file: TARGETS,
+        from: '      "fetch-file-log",\n      "xhr-file-log",',
+        to: '      "xhr-file-log",',
+      },
+      {
+        file: TARGETS,
+        from: '  plan(["fetch-file-body"], [body]);',
+        to: '  plan(["fetch-file-log"], [marked(`${file.log}.copy.jsonl`)]);\n  plan(["fetch-file-body"], [body]);',
+      },
+    ],
+    mustFail: ["fetch-file-log@web=NO-RESULT", "fetch-file-log@file=NO-RESULT"],
+  },
+  {
+    id: "identity-mutated-accept-all",
+    what: "identity.ts gives every probe one dummy check that no witness ever runs",
+    harness: true,
+    edits: [
+      {
+        file: IDENTITY,
+        from: "  return Object.fromEntries(\n    PROBE_TABLE.map((spec) => [spec.id, identityOf(spec, targets[spec.target])]),\n  );",
+        to: '  void targets;\n  return Object.fromEntries(\n    PROBE_TABLE.map((spec) => [spec.id, { role: spec.target, kind: "every" as const, check: "accept-all", place: "accept-all" }]),\n  );',
+      },
+    ],
+    mustFail: ["fetch-file-log@web=NO-RESULT", "mozext-parent@web=NO-RESULT"],
   },
 ];
 

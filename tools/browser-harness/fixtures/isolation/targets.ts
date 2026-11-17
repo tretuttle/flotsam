@@ -195,12 +195,9 @@ export function planTargets(input: PlanInput): TargetPlan {
     ["moz-src-root"],
     mozSrc === null
       ? []
-      : [
-          load(mozSrc),
-          ...traversalUrls("moz-src:///", input.binDir, file.log).map((url) =>
-            want(url, { kind: "load", url: mozSrc }, logFile),
-          ),
-        ],
+      : traversalUrls("moz-src:///", input.binDir, file.log).map((url) =>
+          want(url, { kind: "load", url: mozSrc }, logFile),
+        ),
   );
 
   const { rec } = input;
@@ -220,7 +217,7 @@ export function planTargets(input: PlanInput): TargetPlan {
   const recorderAddon = want(`addon:${rec.id}`, { kind: "addon", id: rec.id });
   plan(
     ["api-namespace", "api-call"],
-    [want("api:oneClickHar", { kind: "fact", name: "recorder-api" })],
+    [want("fact:recorder-api", { kind: "fact", name: "recorder-api" })],
   );
   plan(["sendmessage-recorder", "connect-recorder", "management-getall"], [recorderAddon]);
   plan(
@@ -232,20 +229,23 @@ export function planTargets(input: PlanInput): TargetPlan {
     ["tabs-query-recorder", "executescript-recorder-page", "scripting-recorder-page"],
     [want(`tab:${popupUrl}`, { kind: "tab", url: popupUrl })],
   );
-  plan(["downloads-search"], [want("downloads:all", { kind: "service", name: "downloads" })]);
-  plan(["clipboard-after-export"], [want("clipboard:", { kind: "service", name: "clipboard" })]);
+  plan(["downloads-search"], [want("service:downloads", { kind: "service", name: "downloads" })]);
+  plan(
+    ["clipboard-after-export"],
+    [want("service:clipboard", { kind: "service", name: "clipboard" })],
+  );
   plan(
     ["notifications-getall"],
-    [want("notifications:", { kind: "service", name: "notifications" })],
+    [want("service:notifications", { kind: "service", name: "notifications" })],
   );
   plan(
     ["storage-recorder"],
-    [want("store:recorder-storage-local", { kind: "fact", name: "recorder-storage" })],
+    [want("fact:recorder-storage", { kind: "fact", name: "recorder-storage" })],
   );
-  plan(["idb-recorder"], [want("store:recorder-idb", { kind: "fact", name: "recorder-idb" })]);
+  plan(["idb-recorder"], [want("fact:recorder-idb", { kind: "fact", name: "recorder-idb" })]);
   plan(
     ["devtools-gethar", "baseline-webrequest"],
-    [want("traffic:http://bank.example/", { kind: "fact", name: "bank-traffic" })],
+    [want("fact:bank-traffic", { kind: "fact", name: "bank-traffic" })],
   );
   return { targets, checks };
 }

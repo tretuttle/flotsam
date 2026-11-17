@@ -81,6 +81,8 @@ export type IsolationRunInput = {
   readonly witness: Readonly<Record<string, Witness>>;
   /** What each probe's targets must be, by probe id, resolved from the product's inventory apart from the plan. */
   readonly identity: Readonly<Record<string, Identity>>;
+  /** Where each planned unit's URL leads, read from the URL alone, keyed by that URL. */
+  readonly places: Readonly<Record<string, string>>;
   readonly syntheticControls: readonly SyntheticControlResult[];
   readonly csFileInjected: boolean;
   /** The probe extension's policy, asked from the system principal, can access neither the file page nor the log. */
@@ -299,7 +301,13 @@ function identityProblem(
   if (identity === undefined) return `no identity for ${spec.id}`;
   const ran = (unit: Unit): readonly string[] => input.witness[unitKey(unit)]?.checks ?? [];
   const wanted = identity.kind === "list" ? identity.checks : [identity.check];
-  const proven = planned.map((unit) => wanted.filter((check) => ran(unit).includes(check)));
+  const places = identity.kind === "list" ? identity.places : [identity.place];
+  // A unit proves a target when its URL leads there and the witness ran that target's check on it.
+  const proven = planned.map((unit) =>
+    wanted.filter(
+      (check, i) => ran(unit).includes(check) && input.places[unitKey(unit)] === places[i],
+    ),
+  );
   const off = planned.filter((_, i) => proven[i]?.length !== 1).map(unitKey);
   const matched = new Set(proven.flat());
   // `one` is a list of one: exactly that target, once.

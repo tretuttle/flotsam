@@ -134,17 +134,17 @@ describe("planned targets", () => {
     expect(plan.checks["moz-extension://p/secret.txt"]).toEqual([
       { kind: "load", url: "moz-extension://p/secret.txt", mark: "S" },
     ]);
-    expect(plan.checks["api:oneClickHar"]).toEqual([{ kind: "fact", name: "recorder-api" }]);
-    expect(plan.checks["downloads:all"]).toEqual([{ kind: "service", name: "downloads" }]);
-    expect(plan.checks["traffic:http://bank.example/"]).toEqual([
-      { kind: "fact", name: "bank-traffic" },
-    ]);
-    expect(plan.checks["store:recorder-idb"]).toEqual([{ kind: "fact", name: "recorder-idb" }]);
-    expect(plan.checks["store:recorder-storage-local"]).toEqual([
+    expect(plan.checks["fact:recorder-api"]).toEqual([{ kind: "fact", name: "recorder-api" }]);
+    expect(plan.checks["service:downloads"]).toEqual([{ kind: "service", name: "downloads" }]);
+    expect(plan.checks["fact:bank-traffic"]).toEqual([{ kind: "fact", name: "bank-traffic" }]);
+    expect(plan.checks["fact:recorder-idb"]).toEqual([{ kind: "fact", name: "recorder-idb" }]);
+    expect(plan.checks["fact:recorder-storage"]).toEqual([
       { kind: "fact", name: "recorder-storage" },
     ]);
-    expect(plan.checks["clipboard:"]).toEqual([{ kind: "service", name: "clipboard" }]);
-    expect(plan.checks["notifications:"]).toEqual([{ kind: "service", name: "notifications" }]);
+    expect(plan.checks["service:clipboard"]).toEqual([{ kind: "service", name: "clipboard" }]);
+    expect(plan.checks["service:notifications"]).toEqual([
+      { kind: "service", name: "notifications" },
+    ]);
     expect(plan.targets["mozext-timing"]).toEqual([
       ["moz-extension://u/manifest.json", "moz-extension://r/manifest.json"],
     ]);
@@ -160,7 +160,9 @@ describe("planned targets", () => {
     const first = planTargets({ ...INPUT, mozSrc: "moz-src:///a.sys.mjs" }).checks;
     const [walk] = traversalUrls("moz-src:///", "/opt/zen", INPUT.file.log);
     expect(first[walk!]).toEqual([{ kind: "load", url: "moz-src:///a.sys.mjs" }, LOG_FILE]);
-    expect(first["moz-src:///a.sys.mjs"]).toEqual([{ kind: "load", url: "moz-src:///a.sys.mjs" }]);
+    expect(
+      planTargets({ ...INPUT, mozSrc: "moz-src:///a.sys.mjs" }).targets["moz-src-root"],
+    ).toEqual(traversalUrls("moz-src:///", "/opt/zen", INPUT.file.log));
   });
 });
 

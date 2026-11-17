@@ -25,7 +25,7 @@ import {
   type ProbeSpec,
   type Verdict,
 } from "./probe-table.ts";
-import { identities } from "./identity.ts";
+import { identities, unitPlaces } from "./identity.ts";
 import { checkKey, planTargets, type PlanInput } from "./targets.ts";
 import { buildStoredZip } from "./zip.ts";
 
@@ -63,7 +63,7 @@ const PLAN_INPUT: PlanInput = {
     { path: "/d/one-click-har/k0/settings.json", directory: false },
   ],
   guessedKeyFolders: ["/d/one-click-har/g1", "/d/one-click-har/g2"],
-  redirectToLog: "http://attacker.example/redir?to=file%3A%2F%2F%2Fd%2Flog",
+  redirectToLog: `http://attacker.example/redir?to=${encodeURIComponent(`file://${LOG}`)}`,
   wrRedirect: "http://attacker.example/wr-redirect",
   rec: {
     id: CTX.recId,
@@ -284,6 +284,7 @@ function passingInput(): IsolationRunInput {
     targets: PLAN.targets,
     witness: WITNESS,
     identity: IDENTITY,
+    places: unitPlaces(PLAN.targets, PLAN_INPUT),
     syntheticControls: [
       {
         id: "control-system-read",
@@ -745,6 +746,31 @@ describe("isolation judge", () => {
       verdict: "NO-RESULT",
       observed: "no identity for fetch-file-log",
     });
+  });
+
+  it("refuses a unit whose URL leads elsewhere, though it carries the right witness checks", () => {
+    // The reviewer's via-want plant: view-source: and jar: aimed at the body, with the log's witness checks attached.
+    const log = only("fetch-file-log");
+    const body = only("fetch-file-body");
+    for (const [id, url] of [
+      ["viewsource-fetch", `view-source:${body}`],
+      ["jar-file-fetch", `jar:${body}!/`],
+    ] as const) {
+      const targets = { ...PLAN.targets, [id]: [url] };
+      const input = {
+        ...withRow(id, "web", at(url, "error", NETWORK)),
+        targets,
+        witness: { ...WITNESS, [url]: WITNESS[log]! },
+        places: unitPlaces(targets, PLAN_INPUT),
+      };
+      expect(judged(input, id, "web")).toMatchObject({
+        verdict: "NO-RESULT",
+        ok: false,
+        observed: `planned ["${url}"] is not the archive-log; not proven: ${url}`,
+      });
+    }
+    const unplaced = { ...passingInput(), places: {} };
+    expect(judged(unplaced, "fetch-file-log", "web").verdict).toBe("NO-RESULT");
   });
 
   it("puts a failed witness before a mark: an answer about a target the witness never found is NO-RESULT", () => {

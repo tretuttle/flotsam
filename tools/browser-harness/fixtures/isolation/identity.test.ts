@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vite-plus/test";
-import { identities } from "./identity.ts";
+import { identities, placeOfCheck, placeOfUrl, unitPlaces } from "./identity.ts";
 import { PROBE_TABLE } from "./probe-table.ts";
-import { checkKey, planTargets, type PlanInput, type WitnessCheck } from "./targets.ts";
+import {
+  checkKey,
+  planTargets,
+  traversalUrls,
+  type PlanInput,
+  type WitnessCheck,
+} from "./targets.ts";
 
 const INPUT: PlanInput = {
   marker: "M",
@@ -18,7 +24,7 @@ const INPUT: PlanInput = {
     { path: "/d/one-click-har/k0", directory: true },
   ],
   guessedKeyFolders: ["/d/one-click-har/g1", "/d/one-click-har/g2"],
-  redirectToLog: "http://attacker.example/redir?to=x",
+  redirectToLog: `http://attacker.example/redir?to=${encodeURIComponent("file:///d/one-click-har/k0/sites/bank.example/log/r-0.jsonl")}`,
   wrRedirect: "http://attacker.example/wr-redirect",
   rec: {
     id: "rec@test",
@@ -44,12 +50,12 @@ describe("target identities", () => {
   const found = identities(INPUT);
 
   it("names a file by its path and the marker it holds, and a folder by its path", () => {
-    expect(found["fetch-file-log"]).toEqual({
+    expect(found["fetch-file-log"]).toMatchObject({
       role: "archive-log",
       kind: "one",
       check: key({ kind: "file", path: INPUT.file.log, mark: "M" }),
     });
-    expect(found["fetch-file-body"]).toEqual({
+    expect(found["fetch-file-body"]).toMatchObject({
       role: "archive-body",
       kind: "one",
       check: key({ kind: "file", path: INPUT.file.body, mark: "M" }),
@@ -58,12 +64,12 @@ describe("target identities", () => {
     expect(found["fetch-file-export"]).toMatchObject({
       check: key({ kind: "file", path: "/dl/e.har", mark: "M" }),
     });
-    expect(found["script-root-oracle"]).toEqual({
+    expect(found["script-root-oracle"]).toMatchObject({
       role: "app-folder",
       kind: "one",
       check: key({ kind: "file", path: "/d/one-click-har" }),
     });
-    expect(found["resource-traversal"]).toEqual({
+    expect(found["resource-traversal"]).toMatchObject({
       role: "archive-log",
       kind: "every",
       check: key({ kind: "file", path: INPUT.file.log, mark: "M" }),
@@ -71,7 +77,7 @@ describe("target identities", () => {
   });
 
   it("lists every inventory entry, guessed key and scheme name, one check each", () => {
-    expect(found["inventory-read"]).toEqual({
+    expect(found["inventory-read"]).toMatchObject({
       role: "inventory",
       kind: "list",
       checks: [
@@ -79,7 +85,7 @@ describe("target identities", () => {
         key({ kind: "file", path: "/d/one-click-har/k0" }),
       ],
     });
-    expect(found["script-file-oracle"]).toEqual({
+    expect(found["script-file-oracle"]).toMatchObject({
       role: "guessed-log",
       kind: "list",
       checks: ["g1", "g2"].map((g) =>
@@ -105,12 +111,17 @@ describe("target identities", () => {
     expect(found["moz-src-root"]).toEqual({
       role: "moz-src",
       kind: "every",
-      check: key({ kind: "load", url: "moz-src:///a.sys.mjs" }),
+      check: key({ kind: "file", path: INPUT.file.log, mark: "M" }),
+      place: `file:${INPUT.file.log}`,
     });
     expect(identities({ ...INPUT, mozSrc: null })["moz-src-root"]).toEqual({
       role: "moz-src",
       kind: "list",
       checks: [],
+      places: [],
+    });
+    expect(found["inventory-read"]).toMatchObject({
+      places: ["file:/p/one-click-har.archive-key", "file:/d/one-click-har/k0"],
     });
   });
 
@@ -187,14 +198,67 @@ describe("target identities", () => {
       const carried = units.map((u) =>
         (plan.checks[typeof u === "string" ? u : u[0]] ?? []).map(checkKey),
       );
+      const places = unitPlaces(plan.targets, INPUT);
+      const led = units.map((u) => places[typeof u === "string" ? u : u[0]]);
       if (identity.kind === "list") {
         expect(carried.map((c) => c.filter((k) => identity.checks.includes(k)))).toEqual(
           identity.checks.map((k) => [k]),
         );
+        expect(led).toEqual(identity.places);
       } else {
         expect(carried.every((c) => c.includes(identity.check))).toBe(true);
+        expect(led.every((p) => p === identity.place)).toBe(true);
         expect(units.length > 0).toBe(true);
       }
     }
+  });
+});
+
+describe("where a planned URL leads", () => {
+  const log = INPUT.file.log;
+  const at = (url: string): string => placeOfUrl(url, INPUT);
+
+  it("reads through view-source:, jar:, a redirect and the probe add-on's redirect to the file", () => {
+    expect(at(`file://${log}`)).toBe(`file:${log}`);
+    expect(at("file:///d/one-click-har/")).toBe("file:/d/one-click-har");
+    expect(at(`view-source:file://${log}`)).toBe(`file:${log}`);
+    expect(at(`jar:file://${log}!/`)).toBe(`file:${log}`);
+    expect(at(`view-source:file://${INPUT.file.body}`)).toBe(`file:${INPUT.file.body}`);
+    expect(
+      at(`http://attacker.example/redir?to=${encodeURIComponent(`file://${INPUT.file.body}`)}`),
+    ).toBe(`file:${INPUT.file.body}`);
+    expect(at("http://attacker.example/wr-redirect?from=tab")).toBe(`file:${log}`);
+    expect(at("http://attacker.example/other?from=tab")).toBe(
+      "load:http://attacker.example/other?from=tab",
+    );
+  });
+
+  it("follows a ../ walk from a scheme's base folder, in each encoding, to the file it reaches", () => {
+    for (const base of ["resource://gre/", "chrome://global/content/", "moz-src:///"]) {
+      for (const url of traversalUrls(base, INPUT.binDir, log)) expect(at(url)).toBe(`file:${log}`);
+      for (const url of traversalUrls(base, INPUT.binDir, INPUT.file.body))
+        expect(at(url)).toBe(`file:${INPUT.file.body}`);
+    }
+    expect(at("resource://gre/")).toBe("resource:gre");
+    expect(at("chrome://global/content/")).toBe("chrome:global");
+    expect(at("resource://och-planted/log")).toBe("load:resource://och-planted/log");
+    expect(at("moz-src:///a.sys.mjs")).toBe("load:moz-src:///a.sys.mjs");
+  });
+
+  it("names a packed file by its URL, and an add-on, tab, service or fact by itself", () => {
+    expect(at("moz-extension://u/manifest.json")).toBe("load:moz-extension://u/manifest.json");
+    for (const unit of [
+      "addon:rec@test",
+      "tab:moz-extension://u/a.html",
+      "service:clipboard",
+      "fact:recorder-api",
+    ])
+      expect(at(unit)).toBe(unit);
+    expect(placeOfCheck({ kind: "redirect", url: "u", to: "t" })).toBe("redirect:u");
+    expect(placeOfCheck({ kind: "chrome", pkg: "global" })).toBe("chrome:global");
+    expect(placeOfCheck({ kind: "resource", name: "gre" })).toBe("resource:gre");
+    expect(placeOfCheck({ kind: "tab", url: "x" })).toBe("tab:x");
+    expect(placeOfCheck({ kind: "service", name: "downloads" })).toBe("service:downloads");
+    expect(placeOfCheck({ kind: "addon", id: "a" })).toBe("addon:a");
   });
 });

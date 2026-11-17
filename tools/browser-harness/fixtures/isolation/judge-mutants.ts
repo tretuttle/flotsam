@@ -19,7 +19,7 @@ import type { ExtraCheckId } from "./probe-table.ts";
 import type { CheckOutcome, PlanInput } from "./targets.ts";
 
 // Every operator mutant of the isolation judges (the row judge, the archive oracle, the probe table, the target plan
-// and witness, the target identities, the disk rules and the exposure rules) must be killed, or be listed in equivalent-mutants.json with
+// and witness, the target identities, the file readers, the disk rules and the exposure rules) must be killed, or be listed in equivalent-mutants.json with
 // its reason. A mutant is killed when it changes anything the judges print for a recorded real run: a verdict, an
 // ok, a count, a mismatch line, an extra check's detail, a disk or exposure problem. Or when a unit test fails.
 
@@ -32,6 +32,7 @@ const MODULES = [
   "probe-table.ts",
   "targets.ts",
   "identity.ts",
+  "content.ts",
   "disk.ts",
   "exposure.ts",
 ] as const;
@@ -119,6 +120,7 @@ function replay(j: Judges, run: Recorded): string {
     targets: plan.targets,
     witness,
     identity: j.identity.identities(run.planInput),
+    places: j.identity.unitPlaces(plan.targets, run.planInput),
     // In the order the check records them; a check that holds keeps the summary the check wrote for it.
     extraChecks: [
       ...run.input.extraChecks.filter((c) => !archiveIds.has(c.id) && !REJUDGED.has(c.id)),
