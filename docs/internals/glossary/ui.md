@@ -1,3 +1,11 @@
 # Glossary: UI
 
 Terms introduced by the popup, history, and options pages go here.
+
+- **Popup view.** One screen of the toolbar popup, a variant of the `PopupView` union in `apps/extension/src/popup/view.ts`: `ready`, `custom`, `exporting`, `done`, `error-write`, `error-store`, `empty-tab`, `empty-private`, `no-tab` or `api-missing`. The reducer moves between them and returns API calls as commands; the store runs the commands.
+- **Ready-made export.** One of the popup's four rows (this tab, this tab recent, this site, everything recorded), built from `PRESETS` with the count and "up to" size the API's `getPopup` reports. One click on a row starts its export.
+- **Footer choices.** The two toggles under the rows, response bodies and removing secrets, which apply to every row and to Custom. They start from the export defaults in settings.
+- **Custom export.** The popup view that builds a selection from a scope, a time range, a request filter and a file name, checks it with `parseSelection`, and counts it with `preview` before the export starts.
+- **Missing-body group.** One line of the result: a count of bodies not in the file for one reason from `MISSING_REASONS` or `CUT_SHORT_REASONS`, with a link to the setting that changes it where the table names one. Bodies left out by the footer choice are listed but not counted as missing.
+- **No-tab view.** The popup on a tab it cannot use, such as Zen's empty tab (id -1). Only the rows that need no tab are offered.
+- **Blocking recording problem.** A `RecordingProblem` that means nothing is being recorded (`archive-refused`, `archive-unwritable`); it shows the `error-store` view instead of the rows. Other problems show as a warning line above the rows.
