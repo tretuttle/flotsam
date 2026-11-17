@@ -65,11 +65,16 @@ const short = (text: string): string => digest(text).slice(0, 10);
  * idle task flips) shift with when a run did what; recorded data is text, so it still shows.
  */
 const NUMBER = /^-?#(\.#)?(e[-+]?#)?$/iu;
-const KINDS = new Set(["#", "flag"]);
+/** The kinds a value is compared by when it is not text: a number, a flag, nothing, or an opaque blob. */
+const KINDS = new Set(["#", "flag", "null", "blob"]);
 const valueDigest = (text: string): string => {
   const shape = text.replaceAll(/\d+/gu, "#");
-  return NUMBER.test(shape) ? "#" : shape === "true" || shape === "false" ? "flag" : short(shape);
+  if (NUMBER.test(shape)) return "#";
+  if (shape === "true" || shape === "false") return "flag";
+  return shape === "null" ? "null" : short(shape);
 };
+/** Whether a record holds text: recorded data is text, and a record of numbers, flags and blobs is bookkeeping. */
+const holdsText = (row: readonly string[]): boolean => row.some((cell) => !KINDS.has(cell));
 
 const single = (value: string): Group => ({ fields: ["value"], rows: [[valueDigest(value)]] });
 
@@ -172,12 +177,15 @@ function sqliteRead(path: string, names: RunNames): Pick<Structured, "entries" |
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
         )
         .all() as { name: string }[];
+      // A blob (a compressed structured clone, a key) is opaque, so it is compared by its kind like a number.
       const cell = (value: unknown): string =>
         typeof value === "number" || typeof value === "bigint"
           ? "#"
           : value instanceof Uint8Array
-            ? short(withRoles(Buffer.from(value).toString("latin1"), names))
-            : valueDigest(withRoles(String(value), names));
+            ? "blob"
+            : value === null || value === undefined
+              ? "null"
+              : valueDigest(withRoles(String(value), names));
       const entries = Object.fromEntries(
         tables.map(({ name }) => {
           const quoted = `"${name.replaceAll('"', '""')}"`;
@@ -295,8 +303,7 @@ export function entriesBeyond(
     const b = second[group];
     if (a === undefined && b === undefined)
       // A new entry holding only numbers and flags is the browser's own bookkeeping: recorded data is text.
-      return noisyNewGroup(group, product, controls) ||
-        records.rows.every((row) => row.every((cell) => KINDS.has(cell)))
+      return noisyNewGroup(group, product, controls) || !records.rows.some(holdsText)
         ? []
         : [`${group}: in neither control run`];
     if (a === undefined || b === undefined) return [];
@@ -307,16 +314,18 @@ export function entriesBeyond(
     };
     const values = (g: Group, f: string): string => [...column(g, f)].sort().join(",");
     const stable = fields.filter((f) => values(a, f) === values(b, f));
-    const counts = (g: Group): Map<string, number> => {
+    // Every control record counts; of the product's, only those holding text can be the product's data.
+    const counts = (g: Group, textOnly: boolean): Map<string, number> => {
       const columns = stable.map((f) => column(g, f));
       const m = new Map<string, number>();
-      g.rows.forEach((_, r) => {
+      g.rows.forEach((row, r) => {
+        if (textOnly && !holdsText(row)) return;
         const key = columns.map((c) => c[r]).join("|");
         m.set(key, (m.get(key) ?? 0) + 1);
       });
       return m;
     };
-    const [ca, cb, cp] = [counts(a), counts(b), counts(records)];
+    const [ca, cb, cp] = [counts(a, false), counts(b, false), counts(records, true)];
     const extra = [...cp].reduce(
       (sum, [key, n]) => sum + Math.max(0, n - Math.max(ca.get(key) ?? 0, cb.get(key) ?? 0)),
       0,

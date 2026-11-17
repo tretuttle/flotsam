@@ -102,6 +102,7 @@ describe("structured files", () => {
     );
     expect(counted('{"title":"a"}')).not.toEqual(counted('{"title":"b"}'));
     expect(counted('{"n":"7"}')).not.toEqual(counted('{"n":7}'));
+    expect(counted('{"n":null}')).toEqual({ "$.n": { fields: ["value"], rows: [["null"]] } });
     const pref = (v: string) =>
       readStructured("prefs.js", Buffer.from(`user_pref("x", ${v});\n`), NAMES)?.entries;
     expect(pref("1794914675")).toEqual(pref("1794914999"));
@@ -171,7 +172,11 @@ describe("structured files", () => {
     // Read while the write-ahead log still holds pages the header does not count yet: none is stray.
     expect(live?.unaccounted).toBe(0);
     expect(live?.entries["table t"]?.fields).toEqual(["k", "v", "n"]);
-    expect(live?.entries["table t"]?.rows.map((row) => row[2])).toEqual(["#", "#"]);
+    expect(live?.entries["table t"]?.rows).toEqual([
+      [live?.entries["table t"]?.rows[0]?.[0], live?.entries["table t"]?.rows[0]?.[1], "#"],
+      [live?.entries["table t"]?.rows[1]?.[0], "blob", "#"],
+    ]);
+    expect(live?.entries["table t"]?.rows[0]?.[1]).not.toBe("blob");
     expect(live?.entries["table t"]?.rows).toHaveLength(2);
     const bytes = NodeFS.readFileSync(path);
     expect(readStructured(path, bytes, NAMES)?.unaccounted).toBe(0);
@@ -246,6 +251,24 @@ describe("entries beyond the control runs", () => {
         [prefsA, prefsB],
       ),
     ).toEqual(["pref n3: in neither control run", "pref n4: in neither control run"]);
+  });
+
+  it("counts an extra record only when it holds text", () => {
+    const table: Entries = {
+      "table object_data": g({ id: "#", key: "blob", data: "blob", files: "null" }),
+    };
+    const bookkeeping = g(
+      { id: "#", key: "blob", data: "blob", files: "null" },
+      { id: "#", key: "blob", data: "blob", files: "null" },
+    );
+    expect(entriesBeyond({ "table object_data": bookkeeping }, [table, table])).toEqual([]);
+    const leaked = g(
+      { id: "#", key: "blob", data: "blob", files: "null" },
+      { id: "#", key: "blob", data: "GET", files: "null" },
+    );
+    expect(entriesBeyond({ "table object_data": leaked }, [table, table])).toEqual([
+      "table object_data: 1 records in neither control run",
+    ]);
   });
 
   it("leaves a new entry holding only numbers and flags to the browser, and fails one holding text", () => {
