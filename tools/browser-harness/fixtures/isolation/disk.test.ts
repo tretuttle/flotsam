@@ -38,6 +38,7 @@ const file = (digest = "d0", more: Partial<DiskEntry> = {}): DiskEntry => ({
   nlink: 1,
   link: null,
   digest,
+  orderFree: `any order ${digest}`,
   marked: null,
   ...more,
 });
@@ -48,6 +49,7 @@ const dir: DiskEntry = {
   nlink: 2,
   link: null,
   digest: null,
+  orderFree: null,
   marked: null,
 };
 const link = (to: string): DiskEntry => ({
@@ -57,6 +59,7 @@ const link = (to: string): DiskEntry => ({
   nlink: 1,
   link: to,
   digest: null,
+  orderFree: null,
   marked: null,
 });
 const added = (path: string, entry: DiskEntry = file()): DiskChange => ({
@@ -217,6 +220,11 @@ describe("the product run against two control runs", () => {
     expect(diskProblems(evidence(appended, [same, same]))).toEqual([
       "new file profile/prefs.js: bytes differ from both control runs, which agree",
     ]);
+    const reordered = run([
+      added("profile/prefs.js", file("p+leak", { orderFree: "any order p" })),
+      added("profile/storage/x", file("s")),
+    ]);
+    expect(diskProblems(evidence(reordered, [same, same]))).toEqual([]);
     const noisy = run([
       added("profile/prefs.js", file("p2")),
       added("profile/storage/x", file("s")),

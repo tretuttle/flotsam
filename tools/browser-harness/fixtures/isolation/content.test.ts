@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
   contentDigest,
   contentText,
+  orderFreeDigest,
   entriesBeyond,
   lz4Block,
   readStructured,
@@ -42,6 +43,23 @@ describe("content digests", () => {
   });
 });
 
+describe("order-free digests", () => {
+  it("matches the same printable records in another order, and nothing added or changed", () => {
+    const free = (text: string): string => orderFreeDigest(Buffer.from(text, "latin1"), NAMES);
+    expect(free("\u0002glean#dirty\u0000\u0005os#Linux")).toBe(
+      free("\u0005os#Linux\u0002glean#dirty\u0000"),
+    );
+    expect(free("\u0002glean#dirty\u0000\u0005os#Linux")).not.toBe(
+      free("\u0002glean#dirty\u0000\u0005os#Linux leak"),
+    );
+    expect(free("glean#dirty")).not.toBe(free("glean#dirtx"));
+    expect(free("ab\u0000\u0000")).not.toBe(free("ab\u0000"));
+    expect(free("/w1/x path")).toBe(
+      orderFreeDigest(Buffer.from("/w2/x path"), [["/w2", "{workspace}"]]),
+    );
+  });
+});
+
 describe("structured files", () => {
   it("reads a prefs file as one group per pref, its value digested with names replaced", () => {
     const text = 'user_pref("a.b", true);\nuser_pref("c\\"d", "/w1/x");\n// comment\n';
@@ -53,6 +71,20 @@ describe("structured files", () => {
     ]);
     expect(again?.entries).toEqual(read?.entries);
     expect(readStructured("x", Buffer.from("plain text\n"), NAMES)).toBeNull();
+  });
+
+  it("compares a number by its kind alone, and text by its value", () => {
+    const counted = (text: string) => readStructured("x.json", Buffer.from(text), NAMES)?.entries;
+    expect(counted('{"docIdentifier":7,"t":1.5e3}')).toEqual(
+      counted('{"docIdentifier":12,"t":-2}'),
+    );
+    expect(counted('{"title":"a"}')).not.toEqual(counted('{"title":"b"}'));
+    expect(counted('{"n":"7"}')).not.toEqual(counted('{"n":7}'));
+    const pref = (v: string) =>
+      readStructured("prefs.js", Buffer.from(`user_pref("x", ${v});\n`), NAMES)?.entries;
+    expect(pref("1794914675")).toEqual(pref("1794914999"));
+    expect(pref('"leak"')).not.toEqual(pref('"other"'));
+    expect(pref("true")).not.toEqual(pref("false"));
   });
 
   it("reads JSON as one group per leaf path, and mozlz4 JSON through its LZ4 block", () => {
@@ -106,12 +138,13 @@ describe("structured files", () => {
     const path = NodePath.join(dir, "x.sqlite");
     const db = new NodeSqlite.DatabaseSync(path);
     db.exec(
-      "PRAGMA journal_mode=WAL; CREATE TABLE t (k TEXT, v BLOB); INSERT INTO t VALUES ('a', 'U1'), ('b', x'00');",
+      "PRAGMA journal_mode=WAL; CREATE TABLE t (k TEXT, v BLOB, n INTEGER); INSERT INTO t VALUES ('a', 'U1', 5), ('b', x'00', 6);",
     );
     const live = readStructured(path, NodeFS.readFileSync(path), NAMES);
     db.close();
     expect(live?.format).toBe("sqlite");
-    expect(live?.entries["table t"]?.fields).toEqual(["k", "v"]);
+    expect(live?.entries["table t"]?.fields).toEqual(["k", "v", "n"]);
+    expect(live?.entries["table t"]?.rows.map((row) => row[2])).toEqual(["#", "#"]);
     expect(live?.entries["table t"]?.rows).toHaveLength(2);
     const bytes = NodeFS.readFileSync(path);
     expect(readStructured(path, bytes, NAMES)?.unaccounted).toBe(0);

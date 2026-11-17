@@ -25,6 +25,17 @@ export const contentDigest = (bytes: Buffer, names: RunNames): string =>
   digest(withRoles(bytes.toString("latin1"), names));
 
 /**
+ * A file's content in any order: its length and its printable runs, sorted. Two files that hold the same records in
+ * another order (a hash map the browser serializes in random order) share it; added or changed text does not.
+ */
+export function orderFreeDigest(bytes: Buffer, names: RunNames): string {
+  const text = withRoles(bytes.toString("latin1"), names);
+  return digest(
+    `${String(text.length)}\n${(text.match(/[\x20-\x7e]{4,}/gu) ?? []).sort().join("\n")}`,
+  );
+}
+
+/**
  * A structured file's entries: groups (a table, a pref, a JSON leaf), each a list of records, each record its fields
  * as short digests. Two runs compare group by group, so an entry the product added shows up in a file both runs wrote.
  */
@@ -36,8 +47,6 @@ export type Group = {
   readonly rows: readonly (readonly string[])[];
 };
 
-const single = (value: string): Group => ({ fields: ["value"], rows: [[short(value)]] });
-
 /** What a structured file holds: its entries, and for a database the bytes its header does not account for. */
 export type Structured = {
   readonly format: "sqlite" | "prefs" | "json";
@@ -47,6 +56,15 @@ export type Structured = {
 };
 
 const short = (text: string): string => digest(text).slice(0, 10);
+
+/**
+ * A value as it is compared: text by a digest of itself, a number by its kind alone. The browser's own numbers
+ * (counters, ids, timestamps) shift with what a run did; recorded data is text, so it still shows.
+ */
+const NUMBER = /^-?\d+(\.\d+)?(e[-+]?\d+)?$/iu;
+const valueDigest = (text: string): string => (NUMBER.test(text) ? "#" : short(text));
+
+const single = (value: string): Group => ({ fields: ["value"], rows: [[valueDigest(value)]] });
 
 const SQLITE_MAGIC = "SQLite format 3\0";
 const MOZLZ4_MAGIC = "mozLz40\0";
@@ -127,11 +145,11 @@ function sqliteEntries(path: string, names: RunNames): Entries {
         )
         .all() as { name: string }[];
       const cell = (value: unknown): string =>
-        short(
-          value instanceof Uint8Array
-            ? withRoles(Buffer.from(value).toString("latin1"), names)
-            : withRoles(String(value), names),
-        );
+        typeof value === "number" || typeof value === "bigint"
+          ? "#"
+          : value instanceof Uint8Array
+            ? short(withRoles(Buffer.from(value).toString("latin1"), names))
+            : valueDigest(withRoles(String(value), names));
       return Object.fromEntries(
         tables.map(({ name }) => {
           const quoted = `"${name.replaceAll('"', '""')}"`;

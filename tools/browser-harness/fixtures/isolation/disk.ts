@@ -3,6 +3,7 @@ import * as NodePath from "node:path";
 import {
   contentDigest,
   contentText,
+  orderFreeDigest,
   entriesBeyond,
   readStructured,
   withRoles,
@@ -26,6 +27,8 @@ export type DiskEntry = {
   readonly link: string | null;
   /** A file's bytes as a digest, with the run's names replaced by their roles; null for anything else. */
   readonly digest: string | null;
+  /** The same, blind to the order the file holds its content in; null when `digest` is. */
+  readonly orderFree: string | null;
   /** Whether a file's text holds the recorded marker; null when the snapshot did not look. */
   readonly marked: boolean | null;
 };
@@ -80,6 +83,7 @@ export function snapshotTree(
         nlink: stat.nlink,
         link: kind === "symlink" ? NodeFS.readlinkSync(full) : null,
         digest: bytes === null || names === undefined ? null : contentDigest(bytes, names),
+        orderFree: bytes === null || names === undefined ? null : orderFreeDigest(bytes, names),
         marked: bytes === null || marker === undefined ? null : contentText(bytes).includes(marker),
       };
       if (kind === "directory") walk(full);
@@ -223,8 +227,10 @@ function outsideProblems(
   );
   if (alike.length === 0)
     return [`${describe(c)}: unlike what either control run left there in kind, mode or link`];
-  if (c.entry.kind !== "file" || seen.some((s) => s.change.entry.digest === c.entry.digest))
-    return [];
+  // The same bytes as either control run, or the same content in another order.
+  const sameContent = (s: Seen): boolean =>
+    s.change.entry.digest === c.entry.digest || s.change.entry.orderFree === c.entry.orderFree;
+  if (c.entry.kind !== "file" || seen.some(sameContent)) return [];
   const [first, second] = controls;
   const mine = product.structured[c.path];
   const theirs = [first, second].map((s) =>
