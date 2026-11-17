@@ -10,7 +10,6 @@ export type BrowserProbePosition =
 export type Position =
   | BrowserProbePosition
   | "file-no-marionette"
-  | "file-mutated"
   | "cs-archive"
   | "system"
   | "rec-page"
@@ -27,7 +26,6 @@ export type DecidedException =
 export type ControlReason =
   | "planted-own-war"
   | "planted-resource-substitution"
-  | "planted-strict-origin-disabled"
   | "planted-recorder-store"
   | "baseline-live-traffic"
   | "control-system-principal"
@@ -69,16 +67,58 @@ export type LeakKind = "READ" | "LEAKS-EXISTENCE";
 /** How a row's result is shaped: one answer, an existing/missing pair, or one answer per planned target. */
 export type Shape = "single" | "pair" | "each";
 
-export type ProbeSpec = {
+const LOADS = ["load", "error", "timeout"] as const;
+const REPLIES = ["ok", "error", "timeout"] as const;
+
+/**
+ * Every outcome a probe runner may report. A row whose outcome is not one of these, or that has no outcome, text or
+ * target, is malformed and can only be NO-RESULT.
+ */
+export const OUTCOMES = [
+  "ok",
+  "error",
+  "timeout",
+  "threw",
+  "no-target",
+  "done",
+  "same",
+  "differs",
+  "each",
+  "disconnected",
+  "message",
+  "load",
+  ...LOADS.flatMap((a) => LOADS.map((b) => `${a},${b}` as const)),
+  ...REPLIES.flatMap((f) => LOADS.map((l) => `fetch ${f}, link ${l}` as const)),
+] as const;
+
+export type Outcome = (typeof OUTCOMES)[number];
+
+type ProbeBase = {
   readonly id: string;
   readonly what: string;
   readonly positions: readonly BrowserProbePosition[];
   readonly shape: Shape;
-  readonly deny: Denial;
-  readonly denyAt?: Readonly<Partial<Record<Position, Denial>>>;
-  readonly leak: LeakKind;
   readonly expectAt?: Readonly<Partial<Record<Position, ExpectedOutcome>>>;
+  /**
+   * The planned targets are guesses (paths under derived archive keys) that exist only when the product made its
+   * key guessable. The witness still checks each one; a guess it finds absent has nothing to deny.
+   */
+  readonly guess?: true;
 };
+
+/** The two denials that decide the leak kind themselves: a reachable URL reads, and a store read is a control. */
+type SelfJudgedDenial = Extract<Denial, { readonly kind: "unreachable" | "own-value-only" }>;
+type LeakDenial = Exclude<Denial, SelfJudgedDenial>;
+
+export type ProbeSpec = ProbeBase &
+  (
+    | { readonly deny: SelfJudgedDenial }
+    | {
+        readonly deny: LeakDenial;
+        readonly denyAt?: Readonly<Partial<Record<Position, LeakDenial>>>;
+        readonly leak: LeakKind;
+      }
+  );
 
 export type ExpectedRow = {
   readonly id: string;
@@ -122,11 +162,6 @@ const EXCEPTION_MANAGEMENT: ExpectedOutcome = {
   kind: "LEAKS-EXISTENCE",
   exception: "addon-management-visibility",
 };
-const MUTATED_READ: ExpectedOutcome = { kind: "READ", control: "planted-strict-origin-disabled" };
-const MUTATED_EXISTS: ExpectedOutcome = {
-  kind: "LEAKS-EXISTENCE",
-  control: "planted-strict-origin-disabled",
-};
 
 const FETCH_DENIED: Denial = {
   kind: "rejected",
@@ -139,7 +174,7 @@ const FRAME_WITHHELD: Denial = { kind: "frame-withheld" };
 const SAME: Denial = { kind: "indistinguishable" };
 const UNREACHABLE: Denial = { kind: "unreachable" };
 
-/** Probes repeated in the no-Marionette and mutated-strict-origin launches. */
+/** Probes repeated in the launch without Marionette, where no remote-protocol pref is set. */
 export const NO_MARIONETTE_PROBE_IDS: readonly string[] = [
   "fetch-file-log",
   "fetch-file-body",
@@ -165,7 +200,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "single",
     deny: FETCH_DENIED,
     leak: "READ",
-    expectAt: { "file-mutated": MUTATED_READ },
   },
   {
     id: "fetch-file-body",
@@ -174,7 +208,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "single",
     deny: FETCH_DENIED,
     leak: "READ",
-    expectAt: { "file-mutated": MUTATED_READ },
   },
   {
     id: "fetch-file-dir",
@@ -183,12 +216,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "single",
     deny: FETCH_DENIED,
     leak: "LEAKS-EXISTENCE",
-    expectAt: {
-      "file-mutated": {
-        kind: "LEAKS-EXISTENCE-OR-READ",
-        control: "planted-strict-origin-disabled",
-      },
-    },
   },
   {
     id: "fetch-file-export",
@@ -197,20 +224,18 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "single",
     deny: FETCH_DENIED,
     leak: "READ",
-    expectAt: { "file-mutated": MUTATED_READ },
   },
   {
     id: "inventory-read",
-    what: "fetch of every file and directory the product wrote (app folder walk) and the key file in the profile",
+    what: "fetch of every file and directory the product wrote by the plan (disk diff of the workspace)",
     positions: ALL,
     shape: "each",
     deny: FETCH_DENIED,
     leak: "READ",
-    expectAt: { "file-mutated": MUTATED_READ },
   },
   {
     id: "inventory-exists",
-    what: "<script> and <link> load/error of every written path outside the random key folder vs a missing sibling",
+    what: "<script> and <link> load/error of every path the product wrote outside the random key folder vs a missing sibling",
     positions: ALL,
     shape: "each",
     deny: SAME,
@@ -239,7 +264,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "single",
     deny: FRAME_WITHHELD,
     leak: "READ",
-    expectAt: { "file-mutated": MUTATED_READ },
   },
   {
     id: "iframe-file-root",
@@ -272,6 +296,7 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "each",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
+    guess: true,
   },
   {
     id: "css-file-oracle",
@@ -280,15 +305,16 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "each",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
+    guess: true,
   },
   {
     id: "iframe-site-oracle",
-    what: "<iframe> load/error: the site directory under every guessed archive key (the real one when mutated) vs an unrecorded site",
+    what: "<iframe> load/error: the site directory under every guessed archive key vs an unrecorded site",
     positions: ALL,
     shape: "each",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
-    expectAt: { "file-mutated": MUTATED_EXISTS },
+    guess: true,
   },
   {
     id: "script-root-oracle",
@@ -300,17 +326,16 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     expectAt: {
       file: EXCEPTION_ROOT,
       "file-no-marionette": EXCEPTION_ROOT,
-      "file-mutated": MUTATED_EXISTS,
     },
   },
   {
     id: "script-site-oracle",
-    what: "<script> load/error: the site directory under every guessed archive key (the real one when mutated) vs an unrecorded site",
+    what: "<script> load/error: the site directory under every guessed archive key vs an unrecorded site",
     positions: ALL,
     shape: "each",
     deny: SAME,
     leak: "LEAKS-EXISTENCE",
-    expectAt: { "file-mutated": MUTATED_EXISTS },
+    guess: true,
   },
   {
     id: "viewsource-fetch",
@@ -461,7 +486,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     positions: ALL,
     shape: "each",
     deny: UNREACHABLE,
-    leak: "READ",
   },
   {
     id: "resource-traversal",
@@ -469,7 +493,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     positions: ALL,
     shape: "each",
     deny: UNREACHABLE,
-    leak: "READ",
   },
   {
     id: "planted-resource",
@@ -489,7 +512,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     positions: ALL,
     shape: "each",
     deny: UNREACHABLE,
-    leak: "READ",
   },
   {
     id: "chrome-traversal",
@@ -497,7 +519,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     positions: ALL,
     shape: "each",
     deny: UNREACHABLE,
-    leak: "READ",
   },
   {
     id: "moz-src-root",
@@ -505,7 +526,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     positions: ALL,
     shape: "each",
     deny: UNREACHABLE,
-    leak: "READ",
   },
 
   // moz-extension:// of One-Click HAR
@@ -567,10 +587,15 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-frame-recorder",
-    what: "<iframe> of the recorder popup page, then postMessage to it",
+    what: "<iframe> of the recorder popup page, then postMessage to it and listen for any reply",
     positions: ["web", "file", "ext-page", "cs-web"],
     shape: "single",
-    deny: FRAME_WITHHELD,
+    // Only a load that failed counts: a recorder page that loads, even cross-origin and silent, is reachable.
+    deny: {
+      kind: "answered",
+      outcome: "error",
+      text: /^error; contentDocument readable, text: ; contentWindow\.location\.href: about:blank; replies: none$/u,
+    },
     leak: "LEAKS-EXISTENCE",
   },
   {
@@ -733,7 +758,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     positions: TABS,
     shape: "single",
     deny: { kind: "own-value-only" },
-    leak: "READ",
   },
   {
     id: "idb-recorder",
@@ -741,7 +765,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     positions: TABS,
     shape: "single",
     deny: { kind: "own-value-only" },
-    leak: "READ",
   },
 
   // Live-traffic baselines
@@ -843,8 +866,10 @@ export const EXTRA_CHECKS = {
   "written-paths-targeted":
     "every path written by the end of the run was a probe target or lies in a targeted directory",
   "downloads-list": "the Downloads list points nowhere under the data home",
-  "exposure-declared":
-    "the recorder has no content script, background script or web-accessible resource",
+  "exposure-allowed":
+    "every surface the recorder exposes (manifest keys, experiment scopes and child, schema contexts, declared and runtime web-accessible resources, external listeners, message listeners, frames and postMessage answers on its pages) is in the allowed set",
+  "disk-writes-allowed":
+    "every new or changed path in the throwaway home, profile, data home and Downloads, links included, is the browser's, the harness's, the key file, inside the key folder, or an export",
   "no-registration-in-packed-scripts":
     "the packed scripts register no resource:// substitution or chrome package",
   "no-scheme-into-profile-or-data-home":
@@ -857,7 +882,7 @@ export const EXTRA_CHECKS = {
 export type ExtraCheckId = keyof typeof EXTRA_CHECKS;
 
 export function denialAt(spec: ProbeSpec, position: Position): Denial {
-  return spec.denyAt?.[position] ?? spec.deny;
+  return ("denyAt" in spec ? spec.denyAt?.[position] : undefined) ?? spec.deny;
 }
 
 function expectedOutcomeFor(spec: ProbeSpec, position: Position): ExpectedOutcome {
@@ -866,14 +891,14 @@ function expectedOutcomeFor(spec: ProbeSpec, position: Position): ExpectedOutcom
 
 /** Expands PROBE_TABLE, NO_MARIONETTE_PROBE_IDS and SYNTHETIC_ROWS into every expected row. */
 export function expandExpectedRows(csFileInjected: boolean): readonly ExpectedRow[] {
-  const row = (spec: ProbeSpec, position: Position, what = spec.what): ExpectedRow => ({
+  const row = (spec: ProbeSpec, position: Position): ExpectedRow => ({
     id: spec.id,
     position,
-    what,
+    what: spec.what,
     spec,
     expected: expectedOutcomeFor(spec, position),
   });
-  const secondLaunches = PROBE_TABLE.filter((spec) => NO_MARIONETTE_PROBE_IDS.includes(spec.id));
+  const noMarionette = PROBE_TABLE.filter((spec) => NO_MARIONETTE_PROBE_IDS.includes(spec.id));
   return [
     ...(csFileInjected ? [] : [CS_FILE_INJECTION_ROW]),
     ...PROBE_TABLE.flatMap((spec) =>
@@ -881,8 +906,7 @@ export function expandExpectedRows(csFileInjected: boolean): readonly ExpectedRo
         .filter((position) => csFileInjected || position !== "cs-file")
         .map((position) => row(spec, position)),
     ),
-    ...secondLaunches.map((spec) => row(spec, "file-no-marionette")),
-    ...secondLaunches.map((spec) => row(spec, "file-mutated", `planted mutation: ${spec.what}`)),
+    ...noMarionette.map((spec) => row(spec, "file-no-marionette")),
     ...SYNTHETIC_ROWS,
   ];
 }

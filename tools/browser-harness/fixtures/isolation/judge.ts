@@ -6,29 +6,36 @@ import {
   type Denial,
   type ExpectedOutcome,
   type ExtraCheckId,
+  type Outcome,
+  OUTCOMES,
   type Position,
   type ProbeSpec,
   type Verdict,
 } from "./probe-table.ts";
 
-export type Observation = { readonly outcome: string; readonly text: string };
-export type ObservedPair = { readonly hit: Observation; readonly miss: Observation };
-export type ObservedTarget = Observation & {
+/** One answer a probe got, about the exact target it acted on. Only a well-formed one is ever judged. */
+export type Observation = {
+  readonly outcome: Outcome;
+  readonly text: string;
   readonly target: string;
-  readonly pair?: ObservedPair;
 };
+export type ObservedPair = { readonly hit: Observation; readonly miss: Observation };
 
-/** What a probe reported: one answer, an existing/missing pair, or one answer per planned target. */
-export type ObservedProbe = Observation & {
-  readonly pair?: ObservedPair;
-  readonly each?: readonly ObservedTarget[];
-};
+/**
+ * What one probe acts on: a target, or an existing target and a missing one to tell apart. Every probe's units are
+ * planned before it runs, and the witness checks each of them first.
+ */
+export type Unit = string | readonly [hit: string, miss: string];
+
+/** What a privileged witness found for one target before the probes ran: present and answering, or not. */
+export type Witness = { readonly present: boolean; readonly detail: string };
 
 export type BrowserRowReport = {
   readonly kind: "row";
   readonly position: Position;
   readonly probe: string;
-  readonly observed: ObservedProbe;
+  /** As the browser sent it; parsed by the judge, so a missing or malformed field can only become NO-RESULT. */
+  readonly observed: unknown;
 };
 
 /** A planted or limit control: what each of its readers got back. Each read must carry a planted mark. */
@@ -44,6 +51,8 @@ export type JudgeContext = {
   readonly marker: string;
   /** In the probe extension's own web-accessible files. */
   readonly warMark: string;
+  /** In the probe extension's own file that is not web accessible. */
+  readonly secretMark: string;
   /** Planted in the recorder's storage.local and its origin's IndexedDB. */
   readonly storeMark: string;
   /** Planted by the probe extension in its own storage; seeing it proves a store read worked. Not a leak. */
@@ -57,8 +66,10 @@ export type JudgeContext = {
 export type IsolationRunInput = {
   readonly context: JudgeContext;
   readonly browserRows: readonly BrowserRowReport[];
-  /** Planned targets of each "each" probe, keyed `<probe>@<position>` or `<probe>` for every position. */
-  readonly targets: Readonly<Record<string, readonly string[]>>;
+  /** Planned units of every probe, keyed `<probe>@<position>` or `<probe>` for every position. */
+  readonly targets: Readonly<Record<string, readonly Unit[]>>;
+  /** The witness's finding for every planned target and every missing counterpart. */
+  readonly witness: Readonly<Record<string, Witness>>;
   readonly syntheticControls: readonly SyntheticControlResult[];
   readonly csFileInjected: boolean;
   /** The probe extension's policy, asked from the system principal, can access neither the file page nor the log. */
@@ -91,6 +102,10 @@ const FRAME_CROSS_ORIGIN =
 const FRAME_BLANK =
   /; contentDocument readable, text: ; contentWindow\.location\.href: about:blank(;|$)/u;
 const FRAME_EVENTS = new Set(["load", "error", "timeout"]);
+/** A frame probe appends what came back after it posted a message into the frame; only silence is withheld. */
+const FRAME_NO_REPLY = /; replies: none$/u;
+/** A frame that answered postMessage, whatever its load event said. */
+const FRAME_ANSWERED = /; replies: (?!none$|no window$).+$/su;
 const FRAME_STATES = [FRAME_CROSS_ORIGIN, FRAME_BLANK].map(
   (state) => new RegExp(state.source.replace("(;|$)", ""), "gu"),
 );
@@ -102,21 +117,45 @@ const FRAME_STATES = [FRAME_CROSS_ORIGIN, FRAME_BLANK].map(
 const settled = (o: Observation): string =>
   `${o.outcome}|${FRAME_STATES.reduce((text, state) => text.replace(state, "; frame withheld"), o.text)}`;
 /** Outcomes that mean the probe produced no answer to judge, or a refusal other than the declared one. */
-const NO_ANSWER = new Set(["", "threw", "no-target", "timeout", "error"]);
+const NO_ANSWER: ReadonlySet<Outcome> = new Set(["threw", "no-target", "timeout", "error"]);
+const OUTCOME_SET: ReadonlySet<string> = new Set(OUTCOMES);
 
-const SEVERITY: readonly Verdict[] = ["READ", "LEAKS-EXISTENCE", "NO-RESULT"];
-const worst = (verdicts: readonly Verdict[]): Verdict =>
-  SEVERITY.find((v) => verdicts.includes(v)) ?? "BLOCKED";
+/** The most severe verdict; anything that is not a known verdict counts as NO-RESULT, never as BLOCKED. */
+function worst(verdicts: readonly Verdict[]): Verdict {
+  for (const v of ["READ", "LEAKS-EXISTENCE", "NO-RESULT"] as const) {
+    if (verdicts.includes(v)) return v;
+  }
+  return verdicts.every((v) => v === "BLOCKED") ? "BLOCKED" : "NO-RESULT";
+}
 
-const isObservation = (value: unknown): value is Observation =>
-  typeof value === "object" &&
-  value !== null &&
-  typeof (value as Observation).outcome === "string" &&
-  typeof (value as Observation).text === "string";
+/** A browser report as an Observation, or null when any field is missing, of the wrong type, or not a known outcome. */
+export function readObservation(value: unknown): Observation | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { outcome, text, target } = value as Record<string, unknown>;
+  return typeof outcome === "string" &&
+    OUTCOME_SET.has(outcome) &&
+    typeof text === "string" &&
+    typeof target === "string"
+    ? { outcome: outcome as Outcome, text, target }
+    : null;
+}
+
+function readPair(value: unknown): ObservedPair | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { pair } = value as { readonly pair?: unknown };
+  if (typeof pair !== "object" || pair === null) return null;
+  const { hit, miss } = pair as Record<string, unknown>;
+  const read = { hit: readObservation(hit), miss: readObservation(miss) };
+  return read.hit === null || read.miss === null ? null : { hit: read.hit, miss: read.miss };
+}
+
+const shown = (value: unknown): string => (JSON.stringify(value) ?? String(value)).slice(0, 200);
 
 function carriesMark(value: unknown, ctx: JudgeContext): boolean {
   const text = JSON.stringify(value) ?? "";
-  return [ctx.marker, ctx.warMark, ctx.storeMark].some((mark) => text.includes(mark));
+  return [ctx.marker, ctx.warMark, ctx.secretMark, ctx.storeMark].some((mark) =>
+    text.includes(mark),
+  );
 }
 
 function denies(denial: Denial, o: Observation, ctx: JudgeContext): boolean {
@@ -136,7 +175,9 @@ function denies(denial: Denial, o: Observation, ctx: JudgeContext): boolean {
       return o.outcome === "ok" && o.text.includes(ctx.ownMark);
     case "frame-withheld":
       return (
-        FRAME_EVENTS.has(o.outcome) && (FRAME_CROSS_ORIGIN.test(o.text) || FRAME_BLANK.test(o.text))
+        FRAME_EVENTS.has(o.outcome) &&
+        (FRAME_CROSS_ORIGIN.test(o.text) || FRAME_BLANK.test(o.text)) &&
+        FRAME_NO_REPLY.test(o.text)
       );
     case "unreachable":
       return o.outcome === "fetch error, link error" && FETCH_NETWORK_ERROR.test(o.text);
@@ -151,63 +192,127 @@ function leakOf(spec: ProbeSpec, denial: Denial, o: Observation): Verdict {
   if (denial.kind === "unreachable")
     return o.outcome.startsWith("fetch ok") ? "READ" : "LEAKS-EXISTENCE";
   if (denial.kind === "own-value-only") return "NO-RESULT";
-  return spec.leak;
+  return "leak" in spec ? spec.leak : "NO-RESULT";
 }
 
-function singleVerdict(spec: ProbeSpec, denial: Denial, o: unknown, ctx: JudgeContext): Verdict {
-  if (carriesMark(o, ctx)) return "READ";
-  if (!isObservation(o)) return "NO-RESULT";
-  if (denies(denial, o, ctx)) return "BLOCKED";
-  if (NO_ANSWER.has(o.outcome) || o.text.length === 0) return "NO-RESULT";
-  return leakOf(spec, denial, o);
+type Judged = { readonly verdict: Verdict; readonly line: string };
+
+/** Why a target cannot carry a verdict: the witness did not find it as planned. Null when it did. */
+function witnessProblem(
+  input: IsolationRunInput,
+  target: string,
+  want: "present" | "absent" | "either",
+): string | null {
+  const found = input.witness[target];
+  if (found === undefined) return `no witness ran for ${target}`;
+  if (want === "present" && !found.present)
+    return `witness did not find ${target} (${found.detail})`;
+  if (want === "absent" && found.present)
+    return `witness found ${target}, planned as missing (${found.detail})`;
+  return null;
 }
 
-function pairVerdict(spec: ProbeSpec, pair: unknown, ctx: JudgeContext): Verdict {
-  if (carriesMark(pair, ctx)) return "READ";
-  if (typeof pair !== "object" || pair === null) return "NO-RESULT";
-  const { hit, miss } = pair as Partial<ObservedPair>;
-  if (!isObservation(hit) || !isObservation(miss)) return "NO-RESULT";
-  if ([hit.outcome, miss.outcome].some((outcome) => outcome === "" || outcome === "threw")) {
-    return "NO-RESULT";
+function judgeSingle(
+  spec: ProbeSpec,
+  denial: Denial,
+  unit: string,
+  raw: unknown,
+  input: IsolationRunInput,
+): Judged {
+  const o = readObservation(raw);
+  const line = `${unit} -> ${o === null ? `malformed ${shown(raw)}` : `${o.outcome}: ${o.text}`}`;
+  if (carriesMark(raw, input.context)) return { verdict: "READ", line };
+  if (o === null) return { verdict: "NO-RESULT", line };
+  if (o.target !== unit) return { verdict: "NO-RESULT", line: `${line}; acted on ${o.target}` };
+  const problem = witnessProblem(input, unit, "present");
+  if (problem !== null) return { verdict: "NO-RESULT", line: `${line}; ${problem}` };
+  if (denies(denial, o, input.context)) return { verdict: "BLOCKED", line };
+  if (FRAME_ANSWERED.test(o.text)) return { verdict: leakOf(spec, denial, o), line };
+  if (NO_ANSWER.has(o.outcome) || o.text.length === 0) return { verdict: "NO-RESULT", line };
+  return { verdict: leakOf(spec, denial, o), line };
+}
+
+function judgePair(
+  spec: ProbeSpec,
+  unit: readonly [string, string],
+  raw: unknown,
+  input: IsolationRunInput,
+): Judged {
+  const pair = readPair(raw);
+  const line = `${unit[0]} -> ${pair === null ? `malformed ${shown(raw)}` : `${pair.hit.outcome}: ${pair.hit.text} | ${pair.miss.outcome}: ${pair.miss.text}`}`;
+  if (carriesMark(raw, input.context)) return { verdict: "READ", line };
+  if (pair === null) return { verdict: "NO-RESULT", line };
+  if (pair.hit.target !== unit[0] || pair.miss.target !== unit[1]) {
+    return {
+      verdict: "NO-RESULT",
+      line: `${line}; acted on ${pair.hit.target} and ${pair.miss.target}`,
+    };
   }
-  return settled(hit) === settled(miss) ? "BLOCKED" : spec.leak;
+  const problem =
+    witnessProblem(input, unit[0], spec.guess === true ? "either" : "present") ??
+    witnessProblem(input, unit[1], "absent");
+  if (problem !== null) return { verdict: "NO-RESULT", line: `${line}; ${problem}` };
+  if (pair.hit.outcome === "threw" || pair.miss.outcome === "threw") {
+    return { verdict: "NO-RESULT", line };
+  }
+  if (settled(pair.hit) === settled(pair.miss)) return { verdict: "BLOCKED", line };
+  return { verdict: "leak" in spec ? spec.leak : "NO-RESULT", line };
 }
+
+function judgeUnit(
+  spec: ProbeSpec,
+  denial: Denial,
+  unit: Unit,
+  raw: unknown,
+  input: IsolationRunInput,
+): Judged {
+  if (typeof unit === "string") return judgeSingle(spec, denial, unit, raw, input);
+  if (denial.kind !== "indistinguishable") {
+    return {
+      verdict: "NO-RESULT",
+      line: `${unit[0]} -> a pair planned for a ${denial.kind} probe`,
+    };
+  }
+  return judgePair(spec, unit, raw, input);
+}
+
+const unitKey = (unit: Unit): string => (typeof unit === "string" ? unit : unit[0]);
 
 function eachVerdict(
   spec: ProbeSpec,
   denial: Denial,
-  observed: ObservedProbe,
-  planned: readonly string[] | undefined,
-  ctx: JudgeContext,
+  raw: unknown,
+  planned: readonly Unit[],
+  input: IsolationRunInput,
 ): { readonly verdict: Verdict; readonly summary: string } {
-  if (planned === undefined) return { verdict: "NO-RESULT", summary: "no planned targets" };
-  if (!Array.isArray(observed.each))
-    return { verdict: "NO-RESULT", summary: "no per-target results" };
-  const judged = observed.each.map((t) => ({
-    target: t.target,
-    verdict:
-      denial.kind === "indistinguishable"
-        ? pairVerdict(spec, t.pair, ctx)
-        : singleVerdict(spec, denial, t, ctx),
-    line: `${t.target} -> ${t.pair === undefined ? `${t.outcome}: ${t.text}` : `${t.pair.hit.outcome} | ${t.pair.miss.outcome}`}`,
-  }));
-  const reported = new Set(judged.map((t) => t.target));
-  const missing = planned.filter((t) => !reported.has(t));
-  const unplanned = judged.filter((t) => !planned.includes(t.target)).map((t) => t.target);
+  const each = (raw as { readonly each?: unknown } | null)?.each;
+  if (!Array.isArray(each)) return { verdict: "NO-RESULT", summary: "no per-target results" };
+  const targetOf = (e: unknown): string | null => {
+    const target = (e as { readonly target?: unknown } | null)?.target;
+    return typeof target === "string" ? target : null;
+  };
+  const byTarget = Map.groupBy(each, targetOf);
+  const judged = planned.map((unit) => {
+    const reports = byTarget.get(unitKey(unit)) ?? [];
+    return reports.length === 1
+      ? judgeUnit(spec, denial, unit, reports[0], input)
+      : {
+          verdict: "NO-RESULT" as const,
+          line: `${unitKey(unit)} -> ${String(reports.length)} results, expected one`,
+        };
+  });
+  const keys = new Set(planned.map(unitKey));
+  const unplanned = each.map(targetOf).filter((t) => t === null || !keys.has(t));
   const verdict = worst([
     ...judged.map((t) => t.verdict),
-    ...(missing.length > 0 || unplanned.length > 0 ? (["NO-RESULT"] as const) : []),
+    ...(unplanned.length > 0 ? (["NO-RESULT"] as const) : []),
   ]);
-  const notBlocked = judged
-    .filter((t) => t.verdict !== "BLOCKED")
-    .map((t) => `${t.verdict} ${t.line}`);
   return {
     verdict,
     summary: [
-      `${String(judged.length)} of ${String(planned.length)} planned targets reported`,
-      ...missing.map((t) => `missing ${t}`),
-      ...unplanned.map((t) => `unplanned ${t}`),
-      ...notBlocked,
+      `${String(each.length)} results for ${String(planned.length)} planned targets`,
+      ...unplanned.map((t) => `unplanned ${String(t)}`),
+      ...judged.filter((t) => t.verdict !== "BLOCKED").map((t) => `${t.verdict} ${t.line}`),
     ].join("; "),
   };
 }
@@ -215,35 +320,26 @@ function eachVerdict(
 function judgeBrowserRow(
   spec: ProbeSpec,
   position: Position,
-  observed: ObservedProbe,
+  raw: unknown,
   input: IsolationRunInput,
 ): { readonly verdict: Verdict; readonly summary: string } {
-  // Rows arrive as JSON from the browser, so a row may carry no observation at all.
-  if (typeof observed !== "object" || observed === null) {
-    return { verdict: "NO-RESULT", summary: "no observation" };
-  }
+  const planned = input.targets[`${spec.id}@${position}`] ?? input.targets[spec.id];
+  if (planned === undefined) return { verdict: "NO-RESULT", summary: "no planned targets" };
   const denial = denialAt(spec, position);
-  const head = `${observed.outcome}: ${observed.text}`;
-  switch (spec.shape) {
-    case "single":
-      return { verdict: singleVerdict(spec, denial, observed, input.context), summary: head };
-    case "pair":
-      return {
-        verdict:
-          denial.kind === "indistinguishable"
-            ? pairVerdict(spec, observed.pair, input.context)
-            : "NO-RESULT",
-        summary: head,
-      };
-    case "each":
-      return eachVerdict(
-        spec,
-        denial,
-        observed,
-        input.targets[`${spec.id}@${position}`] ?? input.targets[spec.id],
-        input.context,
-      );
+  if (spec.shape === "each") return eachVerdict(spec, denial, raw, planned, input);
+  const [unit] = planned;
+  if (
+    planned.length !== 1 ||
+    unit === undefined ||
+    (typeof unit === "string") !== (spec.shape === "single")
+  ) {
+    return {
+      verdict: "NO-RESULT",
+      summary: `planned ${shown(planned)}, expected one ${spec.shape} unit`,
+    };
   }
+  const judged = judgeUnit(spec, denial, unit, raw, input);
+  return { verdict: judged.verdict, summary: judged.line };
 }
 
 function syntheticVerdict(

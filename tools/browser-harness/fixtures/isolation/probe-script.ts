@@ -45,21 +45,28 @@ export const PROBES_JS = `"use strict";
   const errText = (e) => (e && e.name ? e.name + ": " : "") + (e && e.message !== undefined ? e.message : String(e));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const timeout = (ms, p, what) => Promise.race([p, sleep(ms).then(() => ({ outcome: "timeout", text: "no " + (what || "answer") + " within " + ms + " ms" }))]);
+  // Every answer names the exact target the probe acted on, so the judge can hold it to the planned, witnessed one.
+  const at = (target, p) => Promise.resolve(p).then((r) => ({ outcome: r.outcome, text: r.text, target }));
   const api = () => (typeof browser !== "undefined" ? browser : null);
 
-  async function viaFetch(url, f) {
+  // The planned units of a probe at this position: targets, or [existing, missing] pairs.
+  const units = (p, id) => p.targets[id + "@" + p.position] || p.targets[id] || [];
+  const one = (p, id) => units(p, id)[0];
+  const after = (unit, prefix) => (typeof unit === "string" && unit.startsWith(prefix) ? unit.slice(prefix.length) : "");
+
+  function viaFetch(url, f) {
     const doFetch = f || fetch;
-    return timeout(3000, (async () => {
+    return at(url, timeout(3000, (async () => {
       try {
         const r = await doFetch(url);
         const t = await r.text();
         return { outcome: "ok", text: "status " + r.status + ", " + t.length + " chars: " + clip(t) };
       } catch (e) { return { outcome: "error", text: errText(e) }; }
-    })(), "fetch result");
+    })(), "fetch result"));
   }
 
   function viaXhr(url) {
-    return timeout(3000, new Promise((resolve) => {
+    return at(url, timeout(3000, new Promise((resolve) => {
       try {
         const x = new XMLHttpRequest();
         x.open("GET", url);
@@ -67,17 +74,29 @@ export const PROBES_JS = `"use strict";
         x.onerror = () => resolve({ outcome: "error", text: "error event, status " + x.status + ", readyState " + x.readyState });
         x.send();
       } catch (e) { resolve({ outcome: "error", text: errText(e) }); }
-    }), "xhr event");
+    }), "xhr event"));
+  }
+
+  // Posts into a frame and collects every message that reaches this window in the next 300 ms. A framed document
+  // that answers at all is a way in, whatever it says.
+  async function replies(win) {
+    const got = [];
+    const onMessage = (e) => { if (!(e.data && e.data.och === "probe-postmessage")) got.push(clip(JSON.stringify(e.data) || String(e.data), 300)); };
+    window.addEventListener("message", onMessage);
+    try { win.postMessage({ och: "probe-postmessage" }, "*"); } catch (e) {}
+    await sleep(300);
+    window.removeEventListener("message", onMessage);
+    return got.length ? got.join(" | ") : "none";
   }
 
   const keep = [];
   // A frame at a file:// page fires no event either way, so it gets a short wait; every other element settles with
   // load or error, and its wait only has to outlast a slow machine.
   function element(tag, url, ms = tag === "iframe" ? 1500 : 10000) {
-    return new Promise((resolve) => {
+    return at(url, new Promise((resolve) => {
       const el = document.createElement(tag);
       let done = false;
-      const finish = (outcome) => {
+      const finish = async (outcome) => {
         if (done) return;
         done = true;
         let text = outcome;
@@ -87,6 +106,7 @@ export const PROBES_JS = `"use strict";
             text += d ? "; contentDocument readable, text: " + clip(d.documentElement ? d.documentElement.textContent : "", 2000) : "; contentDocument null";
           } catch (e) { text += "; contentDocument: " + errText(e); }
           try { text += "; contentWindow.location.href: " + el.contentWindow.location.href; } catch (e) { text += "; contentWindow.location.href: " + errText(e); }
+          text += "; replies: " + (el.contentWindow ? await replies(el.contentWindow) : "no window");
         }
         if (tag === "link") {
           try { text += "; cssRules: " + (el.sheet ? el.sheet.cssRules.length : "no sheet"); } catch (e) { text += "; cssRules: " + errText(e); }
@@ -100,22 +120,19 @@ export const PROBES_JS = `"use strict";
       setTimeout(() => finish("timeout"), ms);
       if (tag === "link") { el.rel = "stylesheet"; el.href = url; } else el.src = url;
       (document.body || document.documentElement).appendChild(el);
-    });
+    }));
   }
 
-  const pairOf = (a, b) => ({ outcome: a.outcome === b.outcome && a.text === b.text ? "same" : "differs", text: "existing path: " + a.outcome + "; " + a.text + " | missing path: " + b.outcome + "; " + b.text, pair: { hit: a, miss: b } });
+  const pairOf = (a, b) => ({ outcome: a.outcome === b.outcome && a.text === b.text ? "same" : "differs", text: "existing path: " + a.outcome + "; " + a.text + " | missing path: " + b.outcome + "; " + b.text, target: a.target, pair: { hit: a, miss: b } });
 
-  async function oracle(tag, hit, miss) {
-    const [a, b] = await Promise.all([element(tag, hit), element(tag, miss)]);
+  async function oracle(tag, unit) {
+    const [a, b] = await Promise.all([element(tag, unit[0]), element(tag, unit[1])]);
     return pairOf(a, b);
   }
 
-  const targetsFor = (p, id) => p.targets[id + "@" + p.position] || p.targets[id] || [];
-  const sibling = (u) => (u.endsWith("/") ? u.slice(0, -1) + "-och-missing/" : u + "-och-missing");
-
   async function observeTags(tags, url) {
     const got = await Promise.all(tags.map((tag) => element(tag, url)));
-    return { outcome: got.map((g) => g.outcome).join(","), text: got.map((g, i) => tags[i] + " " + g.text).join(" | ") };
+    return { outcome: got.map((g) => g.outcome).join(","), text: got.map((g, i) => tags[i] + " " + g.text).join(" | "), target: url };
   }
 
   async function inBatches(items, size, fn) {
@@ -125,61 +142,67 @@ export const PROBES_JS = `"use strict";
   }
 
   // Eight targets at a time, so a slow machine still settles every load before its wait ends.
-  async function oracleEach(tags, urls) {
-    const each = await inBatches(urls, 8, async (u) => {
-      const [hit, miss] = await Promise.all([observeTags(tags, u), observeTags(tags, sibling(u))]);
+  async function oracleEach(tags, pairs) {
+    const each = await inBatches(pairs, 8, async (unit) => {
+      const [hit, miss] = await Promise.all([observeTags(tags, unit[0]), observeTags(tags, unit[1])]);
       const r = pairOf(hit, miss);
-      return { target: u, outcome: r.outcome, text: clip(r.text, 400), pair: r.pair };
+      return { target: unit[0], outcome: r.outcome, text: clip(r.text, 400), pair: r.pair };
     });
-    return { outcome: "each", text: each.length + " targets", each };
+    return { outcome: "each", text: each.length + " targets", target: "", each };
   }
 
   async function fetchEach(urls) {
     const each = await Promise.all(urls.map(async (u) => {
       const f = await viaFetch(u);
-      return { target: u, outcome: f.outcome, text: clip(f.text, 400) };
+      return { target: f.target, outcome: f.outcome, text: clip(f.text, 400) };
     }));
-    return { outcome: "each", text: each.length + " targets", each };
+    return { outcome: "each", text: each.length + " targets", target: "", each };
   }
 
-  async function openTab(create) {
+  function openTab(url, create) {
     const b = api();
-    try {
-      const tab = await create();
-      await sleep(1000);
-      let after = "";
-      try { const t = await b.tabs.get(tab.id); after = "url " + t.url + ", status " + t.status + ", title " + t.title; } catch (e) { after = errText(e); }
+    return at(url, (async () => {
+      try {
+        const tab = await create(url);
+        await sleep(1000);
+        let later = "";
+        try { const t = await b.tabs.get(tab.id); later = "url " + t.url + ", status " + t.status + ", title " + t.title; } catch (e) { later = errText(e); }
+        try { await b.tabs.remove(tab.id); } catch (e) {}
+        return { outcome: "ok", text: "created; 1 s later: " + later };
+      } catch (e) { return { outcome: "error", text: errText(e) }; }
+    })());
+  }
+
+  function navigateVictim(plan, url) {
+    const b = api();
+    return at(url, (async () => {
+      const tab = await b.tabs.create({ url: plan.victimUrl, active: false });
+      await sleep(500);
+      let res;
+      try {
+        await b.tabs.update(tab.id, { url });
+        await sleep(1000);
+        const t = await b.tabs.get(tab.id);
+        res = { outcome: "ok", text: "update resolved; 1 s later: url " + t.url + ", title " + t.title };
+      } catch (e) { res = { outcome: "error", text: errText(e) }; }
       try { await b.tabs.remove(tab.id); } catch (e) {}
-      return { outcome: "ok", text: "created; 1 s later: " + after };
-    } catch (e) { return { outcome: "error", text: errText(e) }; }
+      return res;
+    })());
   }
 
-  async function navigateVictim(plan, url) {
-    const b = api();
-    const tab = await b.tabs.create({ url: plan.victimUrl, active: false });
-    await sleep(500);
-    let res;
-    try {
-      await b.tabs.update(tab.id, { url });
-      await sleep(1000);
-      const t = await b.tabs.get(tab.id);
-      res = { outcome: "ok", text: "update resolved; 1 s later: url " + t.url + ", title " + t.title };
-    } catch (e) { res = { outcome: "error", text: errText(e) }; }
-    try { await b.tabs.remove(tab.id); } catch (e) {}
-    return res;
-  }
-
-  async function windowOpen(url) {
-    try {
-      const w = window.open(url, "_blank");
-      if (!w) return { outcome: "error", text: "window.open returned null" };
-      await sleep(1000);
-      let text = "opened";
-      try { text += "; document text: " + clip(w.document.documentElement.textContent, 2000); } catch (e) { text += "; document: " + errText(e); }
-      try { text += "; location: " + w.location.href; } catch (e) { text += "; location: " + errText(e); }
-      try { w.close(); } catch (e) {}
-      return { outcome: "ok", text };
-    } catch (e) { return { outcome: "error", text: errText(e) }; }
+  function windowOpen(url) {
+    return at(url, (async () => {
+      try {
+        const w = window.open(url, "_blank");
+        if (!w) return { outcome: "error", text: "window.open returned null" };
+        await sleep(1000);
+        let text = "opened";
+        try { text += "; document text: " + clip(w.document.documentElement.textContent, 2000); } catch (e) { text += "; document: " + errText(e); }
+        try { text += "; location: " + w.location.href; } catch (e) { text += "; location: " + errText(e); }
+        try { w.close(); } catch (e) {}
+        return { outcome: "ok", text };
+      } catch (e) { return { outcome: "error", text: errText(e) }; }
+    })());
   }
 
   async function reachEach(urls) {
@@ -187,47 +210,60 @@ export const PROBES_JS = `"use strict";
       const [f, e] = await Promise.all([viaFetch(u), element("link", u, 1500)]);
       return { target: u, outcome: "fetch " + f.outcome + ", link " + e.outcome, text: clip(f.text, 300) };
     }));
-    return { outcome: "each", text: each.length + " targets", each };
+    return { outcome: "each", text: each.length + " targets", target: "", each };
   }
 
   function summarizeDownloads(items) {
     return items.map((d) => d.filename + " | url " + d.url + " | " + d.mime + " | " + d.fileSize + " bytes | exists " + d.exists + " | byExtensionId " + (d.byExtensionId || "-")).join("\\n") || "no download items";
   }
 
-  async function sendMessageTo(id) {
-    try {
-      const r = await timeout(2500, api().runtime.sendMessage(id, { op: "getRecordingStatus" }), "reply");
-      return r && r.outcome === "timeout" ? r : { outcome: "ok", text: "reply: " + JSON.stringify(r) };
-    } catch (e) { return { outcome: "error", text: errText(e) }; }
+  function sendMessageTo(id) {
+    return at("addon:" + id, (async () => {
+      try {
+        const r = await timeout(2500, api().runtime.sendMessage(id, { op: "getRecordingStatus" }), "reply");
+        return r && r.outcome === "timeout" ? r : { outcome: "ok", text: "reply: " + JSON.stringify(r) };
+      } catch (e) { return { outcome: "error", text: errText(e) }; }
+    })());
   }
 
   function connectTo(id) {
-    return timeout(2500, new Promise((resolve) => {
+    return at("addon:" + id, timeout(2500, new Promise((resolve) => {
       try {
         const port = api().runtime.connect(id);
         port.onDisconnect.addListener((p) => resolve({ outcome: "disconnected", text: "onDisconnect, error: " + (p.error ? p.error.message : "none") }));
         port.onMessage.addListener((m) => resolve({ outcome: "message", text: JSON.stringify(m) }));
         port.postMessage({ op: "getRecordingStatus" });
       } catch (e) { resolve({ outcome: "error", text: errText(e) }); }
-    }), "disconnect or message");
+    }), "disconnect or message"));
   }
 
-  async function recorderTabs(plan) {
-    const tabs = await api().tabs.query({});
-    return tabs.filter((t) => !t.url || t.url.startsWith(plan.rec.base));
+  // Runs code in every tab showing the planned page; no such tab is no-target, never a denial.
+  function injectInto(unit, inject) {
+    const url = after(unit, "tab:");
+    return at("tab:" + url, (async () => {
+      const tabs = (await api().tabs.query({})).filter((t) => t.url === url);
+      if (!tabs.length) return { outcome: "no-target", text: "tabs.query returned no tab showing " + url };
+      const out = [];
+      for (const t of tabs) {
+        try { out.push("tab " + t.id + ": returned " + clip(JSON.stringify(await inject(t.id)), 400)); } catch (e) { out.push("tab " + t.id + " (" + t.url + "): " + errText(e)); }
+      }
+      return { outcome: "done", text: out.join("\\n") };
+    })());
   }
 
-  async function timing(plan) {
-    const a = [], b = [];
+  function timing(unit) {
     const once = async (url) => { const t0 = performance.now(); let e = ""; try { await fetch(url); e = "ok"; } catch (x) { e = errText(x); } return { ms: performance.now() - t0, e }; };
-    let ea = "", eb = "";
-    for (let i = 0; i < 15; i++) {
-      const x = await once(plan.rec.base + "manifest.json"); a.push(x.ms); ea = x.e;
-      const y = await once("moz-extension://" + plan.randomUuid + "/manifest.json"); b.push(y.ms); eb = y.e;
-    }
-    const med = (v) => v.slice().sort((p, q) => p - q)[Math.floor(v.length / 2)].toFixed(2);
-    const side = (e) => ({ outcome: e === "ok" ? "ok" : "error", text: e });
-    return { outcome: ea === eb ? "same" : "differs", pair: { hit: side(ea), miss: side(eb) }, text: "installed uuid: median " + med(a) + " ms, error \\"" + ea + "\\" | random uuid: median " + med(b) + " ms, error \\"" + eb + "\\" (15 each, alternating)" };
+    return (async () => {
+      const a = [], b = [];
+      let ea = "", eb = "";
+      for (let i = 0; i < 15; i++) {
+        const x = await once(unit[0]); a.push(x.ms); ea = x.e;
+        const y = await once(unit[1]); b.push(y.ms); eb = y.e;
+      }
+      const med = (v) => v.slice().sort((p, q) => p - q)[Math.floor(v.length / 2)].toFixed(2);
+      const side = (e, target) => ({ outcome: e === "ok" ? "ok" : "error", text: e, target });
+      return { outcome: ea === eb ? "same" : "differs", target: unit[0], pair: { hit: side(ea, unit[0]), miss: side(eb, unit[1]) }, text: "installed uuid: median " + med(a) + " ms, error \\"" + ea + "\\" | random uuid: median " + med(b) + " ms, error \\"" + eb + "\\" (15 each, alternating)" };
+    })();
   }
 
   function idbValue(name, key) {
@@ -271,72 +307,77 @@ export const PROBES_JS = `"use strict";
     return { outcome: "ok", text: "typeof browser.oneClickHar: " + b + "; typeof page oneClickHar: " + pageOch + "; page globals not in a fresh frame: " + globals };
   }
 
+  // A probe that acts on no URL still names its planned unit, so a typo in the plan shows as an unwitnessed target.
+  const about = (unit, fn) => at(unit, (async () => { try { return await fn(); } catch (e) { return { outcome: "error", text: errText(e) }; } })());
+
+  const fetchOne = (id) => (p) => viaFetch(one(p, id));
+  const frameOne = (id) => (p) => element("iframe", one(p, id));
   const RUNNERS = {
-    "fetch-file-log": (p) => viaFetch(p.file.log),
-    "fetch-file-body": (p) => viaFetch(p.file.body),
-    "fetch-file-dir": (p) => viaFetch(p.file.root),
-    "fetch-file-export": (p) => viaFetch(p.file.export),
-    "inventory-read": (p) => fetchEach(targetsFor(p, "inventory-read")),
-    "inventory-exists": (p) => oracleEach(["script", "link"], targetsFor(p, "inventory-exists")),
-    "content-fetch-file-log": (p) => viaFetch(p.file.log, (typeof content !== "undefined" && content.fetch) ? content.fetch.bind(content) : null),
-    "xhr-file-log": (p) => viaXhr(p.file.log),
-    "iframe-file-log": (p) => element("iframe", p.file.log),
-    "iframe-file-root": (p) => element("iframe", p.file.root),
-    "iframe-file-export": (p) => element("iframe", p.file.export),
-    "img-file-oracle": (p) => oracle("img", p.file.body, p.file.missing),
-    "script-file-oracle": (p) => oracleEach(["script"], targetsFor(p, "script-file-oracle")),
-    "css-file-oracle": (p) => oracleEach(["link"], targetsFor(p, "css-file-oracle")),
-    "iframe-site-oracle": (p) => oracleEach(["iframe"], targetsFor(p, "iframe-site-oracle")),
-    "script-root-oracle": (p) => oracle("script", p.file.root, p.file.missingRoot),
-    "script-site-oracle": (p) => oracleEach(["script"], targetsFor(p, "script-site-oracle")),
-    "viewsource-fetch": (p) => viaFetch("view-source:" + p.file.log),
-    "viewsource-iframe": (p) => element("iframe", "view-source:" + p.file.log),
-    "jar-file-fetch": (p) => viaFetch("jar:" + p.file.log + "!/"),
-    "jar-file-iframe": (p) => element("iframe", "jar:" + p.file.log + "!/"),
-    "redirect-fetch": (p) => viaFetch(p.redirectToLog),
-    "redirect-iframe": (p) => element("iframe", p.redirectToLog),
-    "window-open-file": (p) => windowOpen(p.file.log),
-    "wr-redirect-iframe": (p) => element("iframe", p.wrRedirect + "?from=iframe"),
-    "tabs-create-file": (p) => openTab(() => api().tabs.create({ url: p.file.log, active: false })),
-    "tabs-create-dir": (p) => openTab(() => api().tabs.create({ url: p.file.root, active: false })),
-    "tabs-update-file": (p) => navigateVictim(p, p.file.log),
-    "tabs-update-redirect": (p) => navigateVictim(p, p.redirectToLog),
-    "windows-create-file": (p) => openTab(async () => { const w = await api().windows.create({ url: p.file.log }); return w.tabs[0]; }),
-    "downloads-download-file": async (p) => { try { const id = await api().downloads.download({ url: p.file.log, filename: "probe-copy.jsonl", conflictAction: "uniquify" }); await sleep(1000); const [d] = await api().downloads.search({ id }); return { outcome: "ok", text: "download " + id + " state " + (d && d.state) + " error " + (d && d.error) + " file " + (d && d.filename) }; } catch (e) { return { outcome: "error", text: errText(e) }; } },
-    "tabs-create-viewsource": (p) => openTab(() => api().tabs.create({ url: "view-source:" + p.file.log, active: false })),
-    "wr-redirect-tab": (p) => openTab(() => api().tabs.create({ url: p.wrRedirect + "?from=tab", active: false })),
-    "resource-all": (p) => reachEach(targetsFor(p, "resource-all")),
-    "resource-traversal": (p) => reachEach(targetsFor(p, "resource-traversal")),
-    "planted-resource": async (p) => { const o = await oracle("link", p.plantedResource, p.plantedResource.replace(/[^/]+$/, "missing.jsonl")); const f = await viaFetch(p.plantedResource); return { outcome: o.outcome, pair: o.pair, text: o.text + " | fetch: " + f.text }; },
-    "chrome-all": (p) => reachEach(targetsFor(p, "chrome-all")),
-    "chrome-traversal": (p) => reachEach(targetsFor(p, "chrome-traversal")),
-    "moz-src-root": (p) => reachEach(targetsFor(p, "moz-src-root")),
-    "mozext-every-file": (p) => fetchEach(targetsFor(p, "mozext-every-file")),
-    "mozext-manifest": (p) => viaFetch(p.rec.base + "manifest.json"),
-    "mozext-parent": (p) => viaFetch(p.rec.base + "experiment/parent.js"),
-    "mozext-schema": (p) => viaFetch(p.rec.base + "experiment/schema.json"),
-    "mozext-popup": (p) => viaFetch(p.rec.base + p.rec.popupPath),
-    "mozext-script-oracle": (p) => oracle("script", p.rec.base + p.rec.popupScriptPath, "moz-extension://" + p.randomUuid + "/" + p.rec.popupScriptPath),
-    "mozext-timing": (p) => timing(p),
-    "mozext-frame-recorder": async (p) => { const r = await element("iframe", p.rec.base + p.rec.popupPath); try { keep[keep.length - 1].contentWindow.postMessage("probe-postmessage", "*"); r.text += "; postMessage sent"; } catch (e) { r.text += "; postMessage: " + errText(e); } await sleep(200); return r; },
-    "planted-own-war-fetch": (p) => viaFetch(p.probe.base + "war.txt"),
-    "planted-own-war-script": async (p) => { const r = await element("script", p.probe.base + "war.js"); return { outcome: r.outcome, text: r.text + "; window.OCH_WAR = " + (typeof window.OCH_WAR === "undefined" ? "undefined" : window.OCH_WAR) }; },
-    "own-non-war": (p) => viaFetch(p.probe.base + "secret.txt"),
-    "api-namespace": async () => apiNamespace(),
-    "api-call": async () => { try { return { outcome: "ok", text: JSON.stringify(await browser.oneClickHar.getRecordingStatus()) }; } catch (e) { return { outcome: "error", text: errText(e) }; } },
-    "sendmessage-recorder": (p) => sendMessageTo(p.rec.id),
-    "sendmessage-oracle": async (p) => { const a = await sendMessageTo(p.rec.id); const b = await sendMessageTo(p.randomId); return { outcome: a.text === b.text ? "same" : "differs", pair: { hit: a, miss: b }, text: "recorder: " + a.text + " | not installed: " + b.text }; },
-    "connect-recorder": (p) => connectTo(p.rec.id),
-    "tabs-query-recorder": async () => { const t = await api().tabs.query({}); return { outcome: "ok", text: t.map((x) => x.id + " " + x.url + " " + x.title).join("\\n") }; },
-    "executescript-recorder-page": async (p) => { const tabs = await recorderTabs(p); if (!tabs.length) return { outcome: "no-target", text: "tabs.query returned no tab with the recorder URL" }; const out = []; for (const t of tabs) { try { const r = await api().tabs.executeScript(t.id, { code: "document.documentElement.outerHTML" }); out.push("tab " + t.id + ": returned " + clip(JSON.stringify(r), 400)); } catch (e) { out.push("tab " + t.id + " (" + t.url + "): " + errText(e)); } } return { outcome: "done", text: out.join("\\n") }; },
-    "scripting-recorder-page": async (p) => { const tabs = await recorderTabs(p); if (!tabs.length) return { outcome: "no-target", text: "no tab with the recorder URL" }; const out = []; for (const t of tabs) { try { const r = await api().scripting.executeScript({ target: { tabId: t.id }, func: () => document.documentElement.outerHTML }); out.push("tab " + t.id + ": returned " + clip(JSON.stringify(r), 400)); } catch (e) { out.push("tab " + t.id + " (" + t.url + "): " + errText(e)); } } return { outcome: "done", text: out.join("\\n") }; },
-    "management-getall": async () => { const all = await api().management.getAll(); return { outcome: "ok", text: all.map((a) => a.id + " | " + a.name + " | " + a.type + " | enabled " + a.enabled + " | " + a.installType + " | permissions " + JSON.stringify(a.permissions) + " | hosts " + JSON.stringify(a.hostPermissions)).join("\\n") }; },
-    "downloads-search": async () => ({ outcome: "ok", text: summarizeDownloads(await api().downloads.search({})) }),
-    "clipboard-after-export": async () => { try { return { outcome: "ok", text: "clipboard text: " + clip(await navigator.clipboard.readText(), 1000) }; } catch (e) { return { outcome: "error", text: errText(e) }; } },
-    "notifications-getall": async () => ({ outcome: "ok", text: JSON.stringify(await api().notifications.getAll()) }),
-    "storage-recorder": async () => ({ outcome: "ok", text: JSON.stringify(await api().storage.local.get(null)) }),
-    "idb-recorder": () => idbRead(),
-    "devtools-gethar": async () => {
+    "fetch-file-log": fetchOne("fetch-file-log"),
+    "fetch-file-body": fetchOne("fetch-file-body"),
+    "fetch-file-dir": fetchOne("fetch-file-dir"),
+    "fetch-file-export": fetchOne("fetch-file-export"),
+    "inventory-read": (p) => fetchEach(units(p, "inventory-read")),
+    "inventory-exists": (p) => oracleEach(["script", "link"], units(p, "inventory-exists")),
+    "content-fetch-file-log": (p) => viaFetch(one(p, "content-fetch-file-log"), (typeof content !== "undefined" && content.fetch) ? content.fetch.bind(content) : null),
+    "xhr-file-log": (p) => viaXhr(one(p, "xhr-file-log")),
+    "iframe-file-log": frameOne("iframe-file-log"),
+    "iframe-file-root": frameOne("iframe-file-root"),
+    "iframe-file-export": frameOne("iframe-file-export"),
+    "img-file-oracle": (p) => oracle("img", one(p, "img-file-oracle")),
+    "script-file-oracle": (p) => oracleEach(["script"], units(p, "script-file-oracle")),
+    "css-file-oracle": (p) => oracleEach(["link"], units(p, "css-file-oracle")),
+    "iframe-site-oracle": (p) => oracleEach(["iframe"], units(p, "iframe-site-oracle")),
+    "script-root-oracle": (p) => oracle("script", one(p, "script-root-oracle")),
+    "script-site-oracle": (p) => oracleEach(["script"], units(p, "script-site-oracle")),
+    "viewsource-fetch": fetchOne("viewsource-fetch"),
+    "viewsource-iframe": frameOne("viewsource-iframe"),
+    "jar-file-fetch": fetchOne("jar-file-fetch"),
+    "jar-file-iframe": frameOne("jar-file-iframe"),
+    "redirect-fetch": fetchOne("redirect-fetch"),
+    "redirect-iframe": frameOne("redirect-iframe"),
+    "window-open-file": (p) => windowOpen(one(p, "window-open-file")),
+    "wr-redirect-iframe": frameOne("wr-redirect-iframe"),
+    "tabs-create-file": (p) => openTab(one(p, "tabs-create-file"), (url) => api().tabs.create({ url, active: false })),
+    "tabs-create-dir": (p) => openTab(one(p, "tabs-create-dir"), (url) => api().tabs.create({ url, active: false })),
+    "tabs-update-file": (p) => navigateVictim(p, one(p, "tabs-update-file")),
+    "tabs-update-redirect": (p) => navigateVictim(p, one(p, "tabs-update-redirect")),
+    "windows-create-file": (p) => openTab(one(p, "windows-create-file"), async (url) => (await api().windows.create({ url })).tabs[0]),
+    "downloads-download-file": (p) => { const url = one(p, "downloads-download-file"); return about(url, async () => { const id = await api().downloads.download({ url, filename: "probe-copy.jsonl", conflictAction: "uniquify" }); await sleep(1000); const [d] = await api().downloads.search({ id }); return { outcome: "ok", text: "download " + id + " state " + (d && d.state) + " error " + (d && d.error) + " file " + (d && d.filename) }; }); },
+    "tabs-create-viewsource": (p) => openTab(one(p, "tabs-create-viewsource"), (url) => api().tabs.create({ url, active: false })),
+    "wr-redirect-tab": (p) => openTab(one(p, "wr-redirect-tab"), (url) => api().tabs.create({ url, active: false })),
+    "resource-all": (p) => reachEach(units(p, "resource-all")),
+    "resource-traversal": (p) => reachEach(units(p, "resource-traversal")),
+    "planted-resource": async (p) => { const unit = one(p, "planted-resource"); const o = await oracle("link", unit); const f = await viaFetch(unit[0]); return { outcome: o.outcome, target: o.target, pair: o.pair, text: o.text + " | fetch: " + f.text }; },
+    "chrome-all": (p) => reachEach(units(p, "chrome-all")),
+    "chrome-traversal": (p) => reachEach(units(p, "chrome-traversal")),
+    "moz-src-root": (p) => reachEach(units(p, "moz-src-root")),
+    "mozext-every-file": (p) => fetchEach(units(p, "mozext-every-file")),
+    "mozext-manifest": fetchOne("mozext-manifest"),
+    "mozext-parent": fetchOne("mozext-parent"),
+    "mozext-schema": fetchOne("mozext-schema"),
+    "mozext-popup": fetchOne("mozext-popup"),
+    "mozext-script-oracle": (p) => oracle("script", one(p, "mozext-script-oracle")),
+    "mozext-timing": (p) => timing(one(p, "mozext-timing")),
+    "mozext-frame-recorder": frameOne("mozext-frame-recorder"),
+    "planted-own-war-fetch": fetchOne("planted-own-war-fetch"),
+    "planted-own-war-script": async (p) => { const r = await element("script", one(p, "planted-own-war-script")); return { outcome: r.outcome, target: r.target, text: r.text + "; window.OCH_WAR = " + (typeof window.OCH_WAR === "undefined" ? "undefined" : window.OCH_WAR) }; },
+    "own-non-war": fetchOne("own-non-war"),
+    "api-namespace": (p) => about(one(p, "api-namespace"), async () => apiNamespace()),
+    "api-call": (p) => about(one(p, "api-call"), async () => ({ outcome: "ok", text: JSON.stringify(await browser.oneClickHar.getRecordingStatus()) })),
+    "sendmessage-recorder": (p) => sendMessageTo(after(one(p, "sendmessage-recorder"), "addon:")),
+    "sendmessage-oracle": async (p) => { const unit = one(p, "sendmessage-oracle"); const a = await sendMessageTo(after(unit[0], "addon:")); const b = await sendMessageTo(after(unit[1], "addon:")); return { outcome: a.text === b.text ? "same" : "differs", target: a.target, pair: { hit: a, miss: b }, text: "recorder: " + a.text + " | not installed: " + b.text }; },
+    "connect-recorder": (p) => connectTo(after(one(p, "connect-recorder"), "addon:")),
+    "tabs-query-recorder": (p) => about(one(p, "tabs-query-recorder"), async () => { const t = await api().tabs.query({}); return { outcome: "ok", text: t.map((x) => x.id + " " + x.url + " " + x.title).join("\\n") }; }),
+    "executescript-recorder-page": (p) => injectInto(one(p, "executescript-recorder-page"), (tabId) => api().tabs.executeScript(tabId, { code: "document.documentElement.outerHTML" })),
+    "scripting-recorder-page": (p) => injectInto(one(p, "scripting-recorder-page"), (tabId) => api().scripting.executeScript({ target: { tabId }, func: () => document.documentElement.outerHTML })),
+    "management-getall": (p) => about(one(p, "management-getall"), async () => { const all = await api().management.getAll(); return { outcome: "ok", text: all.map((a) => a.id + " | " + a.name + " | " + a.type + " | enabled " + a.enabled + " | " + a.installType + " | permissions " + JSON.stringify(a.permissions) + " | hosts " + JSON.stringify(a.hostPermissions)).join("\\n") }; }),
+    "downloads-search": (p) => about(one(p, "downloads-search"), async () => ({ outcome: "ok", text: summarizeDownloads(await api().downloads.search({})) })),
+    "clipboard-after-export": (p) => about(one(p, "clipboard-after-export"), async () => ({ outcome: "ok", text: "clipboard text: " + clip(await navigator.clipboard.readText(), 1000) })),
+    "notifications-getall": (p) => about(one(p, "notifications-getall"), async () => ({ outcome: "ok", text: JSON.stringify(await api().notifications.getAll()) })),
+    "storage-recorder": (p) => about(one(p, "storage-recorder"), async () => ({ outcome: "ok", text: JSON.stringify(await api().storage.local.get(null)) })),
+    "idb-recorder": (p) => about(one(p, "idb-recorder"), () => idbRead()),
+    "devtools-gethar": (p) => about(one(p, "devtools-gethar"), async () => {
       try { browser.devtools.inspectedWindow.reload({}); } catch (e) {}
       const deadline = Date.now() + 5000;
       let har = { entries: [] };
@@ -346,10 +387,12 @@ export const PROBES_JS = `"use strict";
         await sleep(100);
       }
       return { outcome: "ok", text: har.entries.length + " entries: " + clip(JSON.stringify(har.entries.map((e) => ({ url: e.request.url, cookie: (e.request.headers.find((h) => /^cookie$/i.test(h.name)) || {}).value }))), 1500) };
-    },
-    "baseline-webrequest": async () => ({ outcome: "ok", text: JSON.stringify(root.OCH_BASELINE || {}) }),
+    }),
+    "baseline-webrequest": (p) => about(one(p, "baseline-webrequest"), async () => ({ outcome: "ok", text: JSON.stringify(root.OCH_BASELINE || {}) })),
   };
 
+  // Reports exactly what each runner returned: nothing is filled in or coerced, so a missing field reaches the judge
+  // as missing and can only become NO-RESULT.
   async function runAll(position, plan, report, only, asPosition) {
     plan.position = position;
     for (const meta of META) {
@@ -358,11 +401,11 @@ export const PROBES_JS = `"use strict";
       let observed;
       try {
         const fn = RUNNERS[meta.id];
-        observed = fn ? await fn(plan) : { outcome: "threw", text: "missing runner for " + meta.id };
+        observed = fn ? await fn(plan) : { outcome: "threw", text: "missing runner for " + meta.id, target: "" };
       } catch (e) {
-        observed = { outcome: "threw", text: errText(e) };
+        observed = { outcome: "threw", text: errText(e), target: "" };
       }
-      await report({ kind: "row", browser: plan.browser, position, probe: meta.id, observed: { outcome: String(observed.outcome), text: clip(observed.text, 6000), pair: observed.pair, each: observed.each } });
+      await report({ kind: "row", browser: plan.browser, position, probe: meta.id, observed });
     }
     await report({ kind: "position-done", browser: plan.browser, position, href: String(location.href), origin: String(location.origin) });
   }
@@ -384,7 +427,7 @@ export const PAGE_RUNNER_JS = `"use strict";
     try { const g = await (await fetch(BASE + "/go?pos=" + pos)).json(); if (g.go) break; } catch (e) {}
     await pause(100);
   }
-  const second = pos === "file-no-marionette" || pos === "file-mutated";
+  const second = pos === "file-no-marionette";
   await OCH_PROBES.runAll(pos, plan, report, second ? plan.noMarionetteProbes : null, second ? "file" : pos);
 })(window.OCH_BASE, new URLSearchParams(location.search).get("pos") || window.OCH_POS);
 `;

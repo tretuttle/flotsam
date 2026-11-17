@@ -1,4 +1,3 @@
-import type { ObservedProbe } from "./judge.ts";
 import * as NodeHttp from "node:http";
 import * as NodeURL from "node:url";
 
@@ -8,7 +7,7 @@ export type IsolationReport =
       readonly browser?: string;
       readonly position: string;
       readonly probe: string;
-      readonly observed: ObservedProbe;
+      readonly observed: unknown;
     }
   | {
       readonly kind: "position-done";

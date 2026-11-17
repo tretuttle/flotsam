@@ -6,20 +6,26 @@ import { readZipEntry } from "../../src/zip.ts";
 import type { ExtraCheckResult } from "./archive-oracle.ts";
 import {
   judgeIsolationRun,
+  readObservation,
   type BrowserRowReport,
   type IsolationRunInput,
   type JudgeContext,
   type Observation,
-  type ObservedProbe,
+  type Unit,
+  type Witness,
 } from "./judge.ts";
 import {
   expandExpectedRows,
   EXTRA_CHECKS,
   PROBE_TABLE,
+  type Denial,
   type ExtraCheckId,
+  type Outcome,
   type Position,
+  type ProbeSpec,
   type Verdict,
 } from "./probe-table.ts";
+import { planTargets, type PlanInput } from "./targets.ts";
 import { buildStoredZip } from "./zip.ts";
 
 const cleanupDirs: string[] = [];
@@ -32,6 +38,7 @@ afterEach(async () => {
 const CTX: JudgeContext = {
   marker: "OCHMARK_deadbeef",
   warMark: "OCHWAR_cafebabe",
+  secretMark: "OCHSECRET_feedface",
   storeMark: "OCHSTORE_0badf00d",
   ownMark: "OCHOWN_5eed5eed",
   recId: "one-click-har@tretuttle.github.io",
@@ -39,206 +46,215 @@ const CTX: JudgeContext = {
   webSandboxBlocksArchive: true,
 };
 
-// What Gecko 160 and 161 answered in the recorded baseline runs, copied as text.
-const NETWORK: Observation = {
-  outcome: "error",
-  text: "TypeError: NetworkError when attempting to fetch resource.",
+const LOG = "/d/one-click-har/k0/sites/bank.example/log/r-0.jsonl";
+const PLAN_INPUT: PlanInput = {
+  file: {
+    appFolder: "/d/one-click-har",
+    keyFolder: "/d/one-click-har/k0",
+    log: LOG,
+    body: "/d/one-click-har/k0/sites/bank.example/bodies/r1.7.body",
+    export: "/dl/bank.example-2026-11-16.har",
+    siteDir: "/d/one-click-har/k0/sites/bank.example",
+  },
+  inventory: [
+    { path: "/d/one-click-har", directory: true },
+    { path: "/d/one-click-har/k0/settings.json", directory: false },
+  ],
+  outsideKeyFolder: [],
+  guessedKeyFolders: ["/d/one-click-har/g1", "/d/one-click-har/g2"],
+  redirectToLog: "http://attacker.example/redir?to=file%3A%2F%2F%2Fd%2Flog",
+  wrRedirect: "http://attacker.example/wr-redirect",
+  rec: {
+    id: CTX.recId,
+    base: `moz-extension://${CTX.recUuid}/`,
+    popupPath: "action/index.html",
+    popupScriptPath: "action/index.js",
+    files: ["manifest.json", "action/index.html"],
+  },
+  probe: {
+    base: "moz-extension://99999999-0000-0000-0000-000000000000/",
+    warMark: CTX.warMark,
+    secretMark: CTX.secretMark,
+  },
+  randomUuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  randomId: "not-installed-1@test",
+  plantedResource: {
+    hit: "resource://och-planted/sites/bank.example/log/r-0.jsonl",
+    miss: "resource://och-planted/sites/bank.example/log/missing.jsonl",
+  },
+  resourceNames: ["gre", "app"],
+  chromePackages: ["global"],
+  mozSrc: "moz-src:///browser/a.sys.mjs",
+  binDir: "/opt/zen",
 };
-const FRAME_CROSS: Observation = {
-  outcome: "load",
-  text: 'load; contentDocument null; contentWindow.location.href: SecurityError: Permission denied to get property "href" on cross-origin object',
-};
-const FRAME_BLANK: Observation = {
-  outcome: "error",
-  text: "error; contentDocument readable, text: ; contentWindow.location.href: about:blank",
-};
-const SAME = {
-  outcome: "same",
-  text: "existing path: error | missing path: error",
-  pair: { hit: { outcome: "error", text: "error" }, miss: { outcome: "error", text: "error" } },
-};
-const DIFFERS = {
-  outcome: "differs",
-  text: "existing path: load | missing path: error",
-  pair: { hit: { outcome: "load", text: "load" }, miss: { outcome: "error", text: "error" } },
-};
-const NO_RECEIVER = "Error: Could not establish connection. Receiving end does not exist.";
-const ILLEGAL: Observation = { outcome: "error", text: "Error: Illegal URL: file:///p/log.jsonl" };
-const REC_TAB = `3 moz-extension://${CTX.recUuid}/action/index.html One-Click HAR\n2 http://bank.example/ Bank`;
+const PLAN = planTargets(PLAN_INPUT);
 
-const SINGLE_DENIALS: Readonly<Record<string, Observation>> = {
-  "fetch-file-log": NETWORK,
-  "fetch-file-body": NETWORK,
-  "fetch-file-dir": NETWORK,
-  "fetch-file-export": NETWORK,
-  "content-fetch-file-log": NETWORK,
-  "xhr-file-log": { outcome: "error", text: "error event, status 0, readyState 4" },
-  "iframe-file-log": FRAME_BLANK,
-  "iframe-file-root": FRAME_CROSS,
-  "iframe-file-export": {
-    outcome: "timeout",
-    text: "timeout; contentDocument readable, text: ; contentWindow.location.href: about:blank",
-  },
-  "viewsource-fetch": NETWORK,
-  "viewsource-iframe": FRAME_BLANK,
-  "jar-file-fetch": NETWORK,
-  "jar-file-iframe": FRAME_BLANK,
-  "redirect-fetch": NETWORK,
-  "redirect-iframe": FRAME_CROSS,
-  "window-open-file": {
-    outcome: "error",
-    text: "Error: Access to 'file:///p/log.jsonl' from script denied",
-  },
-  "wr-redirect-iframe": FRAME_CROSS,
-  "tabs-create-file": ILLEGAL,
-  "tabs-create-dir": ILLEGAL,
-  "tabs-update-file": ILLEGAL,
-  "tabs-update-redirect": {
-    outcome: "ok",
-    text: "update resolved; 1 s later: url http://attacker.example/victim.html, title victim",
-  },
-  "windows-create-file": ILLEGAL,
-  "downloads-download-file": {
-    outcome: "error",
-    text: "Error: Type error for parameter options (Error processing url: Error: Access denied for URL file:///p/log.jsonl for downloads.download.) for downloads.download.",
-  },
-  "tabs-create-viewsource": {
-    outcome: "error",
-    text: "Error: Illegal URL: view-source:file:///p/log.jsonl",
-  },
-  "wr-redirect-tab": {
-    outcome: "ok",
-    text: "created; 1 s later: url about:blank, status complete, title attacker.example/wr-redirect?from=tab",
-  },
-  "mozext-manifest": NETWORK,
-  "mozext-parent": NETWORK,
-  "mozext-schema": NETWORK,
-  "mozext-popup": NETWORK,
-  "mozext-frame-recorder": { outcome: "error", text: `${FRAME_BLANK.text}; postMessage sent` },
-  "planted-own-war-fetch": NETWORK,
-  "planted-own-war-script": { outcome: "error", text: "error; window.OCH_WAR = undefined" },
-  "own-non-war": NETWORK,
-  "api-call": { outcome: "error", text: "ReferenceError: browser is not defined" },
-  "sendmessage-recorder": { outcome: "error", text: NO_RECEIVER },
-  "connect-recorder": {
-    outcome: "disconnected",
-    text: `onDisconnect, error: ${NO_RECEIVER.slice(7)}`,
-  },
-  "tabs-query-recorder": { outcome: "ok", text: "2 http://bank.example/ Bank" },
-  "executescript-recorder-page": {
-    outcome: "done",
-    text: `tab 3 (moz-extension://${CTX.recUuid}/action/index.html): Error: Missing host permission for the tab`,
-  },
-  "scripting-recorder-page": {
-    outcome: "done",
-    text: `tab 3 (moz-extension://${CTX.recUuid}/action/index.html): Error: Missing host permission for the tab`,
-  },
-  "management-getall": {
-    outcome: "ok",
-    text: "och-probe@test | Isolation probe extension | extension",
-  },
-  "downloads-search": { outcome: "ok", text: "no download items" },
-  "clipboard-after-export": { outcome: "ok", text: "clipboard text: " },
-  "notifications-getall": { outcome: "ok", text: "{}" },
-  "storage-recorder": { outcome: "ok", text: `{"own":"${CTX.ownMark}"}` },
-  "idb-recorder": {
-    outcome: "ok",
-    text: `own: kv.own = ${CTX.ownMark}; databases(): [{"name":"och-probe-own","version":1}]; och-recorder: no kv store`,
-  },
-};
+const spec = (id: string): ProbeSpec => PROBE_TABLE.find((s) => s.id === id)!;
+const unitsOf = (id: string): readonly Unit[] => PLAN.targets[id]!;
+const only = (id: string): string => unitsOf(id)[0] as string;
+const pairUnit = (id: string): readonly [string, string] =>
+  unitsOf(id)[0] as readonly [string, string];
 
-const apiNamespace = (position: Position): Observation => ({
-  outcome: "ok",
-  text: ["ext-bg", "ext-page", "ext-devtools"].includes(position)
-    ? "typeof browser.oneClickHar: undefined; typeof page oneClickHar: undefined; page globals not in a fresh frame: n/a"
-    : "typeof browser.oneClickHar: n/a; typeof page oneClickHar: undefined; page globals not in a fresh frame: []",
+// The witness found every planned target, found every missing counterpart absent, and found no guessed key.
+const MISSES = new Set(
+  Object.values(PLAN.targets)
+    .flat()
+    .flatMap((u) => (typeof u === "string" ? [] : [u[1]])),
+);
+const GUESSES = new Set(
+  PROBE_TABLE.filter((s) => s.guess === true).flatMap((s) =>
+    unitsOf(s.id).map((u) => (typeof u === "string" ? u : u[0])),
+  ),
+);
+const WITNESS: Readonly<Record<string, Witness>> = Object.fromEntries(
+  Object.keys(PLAN.checks).map((t) => [
+    t,
+    { present: !MISSES.has(t) && !GUESSES.has(t), detail: "seen" },
+  ]),
+);
+
+const at = (target: string, outcome: Outcome, text: string): Observation => ({
+  outcome,
+  text,
+  target,
+});
+type Side = { readonly outcome: Outcome; readonly text: string };
+const pairAt = (unit: readonly [string, string], hit: Side, miss: Side) => ({
+  outcome: hit.outcome === miss.outcome && hit.text === miss.text ? "same" : "differs",
+  text: `existing path: ${hit.outcome} | missing path: ${miss.outcome}`,
+  target: unit[0],
+  pair: { hit: at(unit[0], hit.outcome, hit.text), miss: at(unit[1], miss.outcome, miss.text) },
+});
+const each = (items: readonly unknown[]) => ({
+  outcome: "each",
+  text: "",
+  target: "",
+  each: items,
 });
 
-const TARGETS: Readonly<Record<string, readonly string[]>> = {
-  "inventory-read": ["file:///d/one-click-har/", "file:///d/one-click-har/k/settings.json"],
-  "inventory-exists": ["file:///d/one-click-har/sites/"],
-  "script-file-oracle": ["file:///d/one-click-har/g1/sites/bank.example/log/r-0.jsonl"],
-  "css-file-oracle": ["file:///d/one-click-har/g1/sites/bank.example/log/r-0.jsonl"],
-  "iframe-site-oracle": ["file:///d/one-click-har/g1/sites/bank.example/"],
-  "iframe-site-oracle@file-mutated": ["file:///d/one-click-har/k/sites/bank.example/"],
-  "script-site-oracle": ["file:///d/one-click-har/g1/sites/bank.example/"],
-  "script-site-oracle@file-mutated": ["file:///d/one-click-har/k/sites/bank.example/"],
-  "resource-all": ["resource://gre/", "resource://app/"],
-  "resource-traversal": ["resource://gre/%2e%2e/log.jsonl"],
-  "chrome-all": ["chrome://global/content/"],
-  "chrome-traversal": ["chrome://global/content/%2e%2e/log.jsonl"],
-  "moz-src-root": ["moz-src:///"],
-  "mozext-every-file": [`moz-extension://${CTX.recUuid}/manifest.json`],
+// What Gecko answered in the recorded baseline runs, copied as text.
+const NETWORK = "TypeError: NetworkError when attempting to fetch resource.";
+const BLANK =
+  "error; contentDocument readable, text: ; contentWindow.location.href: about:blank; replies: none";
+const CROSS =
+  'load; contentDocument null; contentWindow.location.href: SecurityError: Permission denied to get property "href" on cross-origin object; replies: none';
+const NO_RECEIVER = "Error: Could not establish connection. Receiving end does not exist.";
+const REC_TAB = `3 moz-extension://${CTX.recUuid}/action/index.html One-Click HAR\n2 http://bank.example/ Bank`;
+const ERROR_SIDE: Side = { outcome: "error", text: "error" };
+const LOAD_SIDE: Side = { outcome: "load", text: "load" };
+
+const DENIED: Readonly<Record<string, readonly [Outcome, string]>> = {
+  "fetch-file-log": ["error", NETWORK],
+  "fetch-file-body": ["error", NETWORK],
+  "fetch-file-dir": ["error", NETWORK],
+  "fetch-file-export": ["error", NETWORK],
+  "content-fetch-file-log": ["error", NETWORK],
+  "xhr-file-log": ["error", "error event, status 0, readyState 4"],
+  "iframe-file-log": ["error", BLANK],
+  "iframe-file-root": ["load", CROSS],
+  "iframe-file-export": ["timeout", BLANK.replace(/^error/u, "timeout")],
+  "viewsource-fetch": ["error", NETWORK],
+  "viewsource-iframe": ["error", BLANK],
+  "jar-file-fetch": ["error", NETWORK],
+  "jar-file-iframe": ["error", BLANK],
+  "redirect-fetch": ["error", NETWORK],
+  "redirect-iframe": ["timeout", CROSS.replace(/^load/u, "timeout")],
+  "window-open-file": ["error", "Error: Access to 'file:///d/log' from script denied"],
+  "wr-redirect-iframe": ["load", CROSS],
+  "tabs-create-file": ["error", "Error: Illegal URL: file:///d/log"],
+  "tabs-create-dir": ["error", "Error: Illegal URL: file:///d/"],
+  "tabs-update-file": ["error", "Error: Illegal URL: file:///d/log"],
+  "tabs-update-redirect": [
+    "ok",
+    "update resolved; 1 s later: url http://attacker.example/victim.html, title victim",
+  ],
+  "windows-create-file": ["error", "Error: Illegal URL: file:///d/log"],
+  "downloads-download-file": [
+    "error",
+    "Error: Type error (Error processing url: Error: Access denied for URL file:///d/log for downloads.download.)",
+  ],
+  "tabs-create-viewsource": ["error", "Error: Illegal URL: view-source:file:///d/log"],
+  "wr-redirect-tab": [
+    "ok",
+    "created; 1 s later: url about:blank, status complete, title attacker.example/wr-redirect?from=tab",
+  ],
+  "mozext-manifest": ["error", NETWORK],
+  "mozext-parent": ["error", NETWORK],
+  "mozext-schema": ["error", NETWORK],
+  "mozext-popup": ["error", NETWORK],
+  "mozext-frame-recorder": ["error", BLANK],
+  "own-non-war": ["error", NETWORK],
+  "api-call": ["error", "ReferenceError: browser is not defined"],
+  "sendmessage-recorder": ["error", NO_RECEIVER],
+  "connect-recorder": ["disconnected", `onDisconnect, error: ${NO_RECEIVER.slice(7)}`],
+  "executescript-recorder-page": [
+    "done",
+    `tab 3 (moz-extension://${CTX.recUuid}/action/index.html): Error: Missing host permission for the tab`,
+  ],
+  "scripting-recorder-page": [
+    "done",
+    `tab 3 (moz-extension://${CTX.recUuid}/action/index.html): Error: Missing host permission for the tab`,
+  ],
+  "downloads-search": ["ok", "no download items"],
+  "clipboard-after-export": ["ok", "clipboard text: "],
+  "notifications-getall": ["ok", "{}"],
+  "storage-recorder": ["ok", `{"own":"${CTX.ownMark}"}`],
+  "idb-recorder": [
+    "ok",
+    `own: kv.own = ${CTX.ownMark}; databases(): [{"name":"och-probe-own","version":1}]; och-recorder: no kv store`,
+  ],
 };
 
-const UNREACHABLE: Observation = { outcome: "fetch error, link error", text: NETWORK.text };
+const apiNamespace = (position: Position): string =>
+  ["ext-bg", "ext-page", "ext-devtools"].includes(position)
+    ? "typeof browser.oneClickHar: undefined; typeof page oneClickHar: undefined; page globals not in a fresh frame: n/a"
+    : "typeof browser.oneClickHar: n/a; typeof page oneClickHar: undefined; page globals not in a fresh frame: []";
 
-function deniedEach(id: string, targets: readonly string[]): ObservedProbe {
-  const spec = PROBE_TABLE.find((s) => s.id === id)!;
-  return {
-    outcome: "each",
-    text: `${String(targets.length)} targets`,
-    each: targets.map((target) =>
-      spec.deny.kind === "indistinguishable"
-        ? { target, ...SAME }
-        : { target, ...(spec.deny.kind === "unreachable" ? UNREACHABLE : NETWORK) },
-    ),
-  };
+/** The answer a probe gets when its declared denial holds, at one unit. */
+function deniedUnit(id: string, unit: Unit, position: Position): unknown {
+  if (typeof unit !== "string") return pairAt(unit, ERROR_SIDE, ERROR_SIDE);
+  if (spec(id).deny.kind === "unreachable") return at(unit, "fetch error, link error", NETWORK);
+  if (id === "api-namespace") return at(unit, "ok", apiNamespace(position));
+  if (id === "window-open-file" && position === "file")
+    return at(unit, "error", "window.open returned null");
+  const [outcome, text] = DENIED[id] ?? ["error", NETWORK];
+  return at(unit, outcome, text);
 }
 
-/** What a probe that read or saw what its expected control or exception says it must. */
-function expectedSeen(id: string, targets: readonly string[]): ObservedProbe {
-  const spec = PROBE_TABLE.find((s) => s.id === id)!;
-  if (id.startsWith("planted-own-war"))
-    return { outcome: "ok", text: `status 200: ${CTX.warMark}` };
-  if (id === "tabs-query-recorder" || id === "management-getall")
-    return { outcome: "ok", text: REC_TAB };
-  if (id === "fetch-file-dir") return { outcome: "ok", text: "status 200: 201: k 0 DIRECTORY" };
-  if (spec.shape === "each") {
-    return {
-      outcome: "each",
-      text: "",
-      each: targets.map((target) => ({ target, ...DIFFERS })),
-    };
-  }
-  if (spec.shape === "pair") return DIFFERS;
-  return { outcome: "ok", text: `status 200: ${CTX.marker}` };
+/** The answer a control or decided exception must show. */
+function seenUnit(id: string, unit: Unit): unknown {
+  if (typeof unit !== "string") return pairAt(unit, LOAD_SIDE, ERROR_SIDE);
+  if (id === "planted-own-war-fetch") return at(unit, "ok", `status 200, 20 chars: ${CTX.warMark}`);
+  if (id === "planted-own-war-script")
+    return at(unit, "load", `load; window.OCH_WAR = ${CTX.warMark}`);
+  if (id === "tabs-query-recorder" || id === "management-getall") return at(unit, "ok", REC_TAB);
+  return at(unit, "ok", `cookie ${CTX.marker}`);
 }
 
-const targetsOf = (id: string, position: Position): readonly string[] =>
-  TARGETS[`${id}@${position}`] ?? TARGETS[id] ?? [];
+function rowFor(id: string, position: Position, seen: boolean): unknown {
+  const units = unitsOf(id);
+  const one = (u: Unit): unknown => (seen ? seenUnit(id, u) : deniedUnit(id, u, position));
+  return spec(id).shape === "each" ? each(units.map(one)) : one(units[0]!);
+}
 
 function passingRows(): BrowserRowReport[] {
-  return expandExpectedRows(false)
-    .filter((row) => row.spec !== null)
-    .filter((row) => !(row.id === "planted-resource" && row.position === "web"))
-    .map((row) => {
-      const spec = PROBE_TABLE.find((s) => s.id === row.id)!;
-      const targets = targetsOf(row.id, row.position);
-      let observed: ObservedProbe;
-      if (row.expected.kind !== "BLOCKED") {
-        observed =
-          row.id === "inventory-read"
-            ? {
-                outcome: "each",
-                text: "",
-                each: targets.map((target) => ({ target, outcome: "ok", text: CTX.marker })),
-              }
-            : expectedSeen(row.id, targets);
-      } else if (row.id === "api-namespace") {
-        observed = apiNamespace(row.position);
-      } else if (spec.shape === "each") {
-        observed = deniedEach(row.id, targets);
-      } else if (spec.shape === "pair") {
-        observed = SAME;
-      } else if (row.id === "window-open-file" && row.position === "file") {
-        observed = { outcome: "error", text: "window.open returned null" };
-      } else {
-        observed = SINGLE_DENIALS[row.id]!;
-      }
-      return { kind: "row" as const, position: row.position, probe: row.id, observed };
-    })
-    .concat([{ kind: "row" as const, position: "web", probe: "planted-resource", observed: SAME }]);
+  return expandExpectedRows(false).flatMap((row) =>
+    row.spec === null
+      ? []
+      : [
+          {
+            kind: "row" as const,
+            position: row.position,
+            probe: row.id,
+            observed: rowFor(
+              row.id,
+              row.position,
+              row.expected.kind !== "BLOCKED" &&
+                !(row.id === "planted-resource" && row.position === "web"),
+            ),
+          },
+        ],
+  );
 }
 
 const passingChecks = (): ExtraCheckResult[] =>
@@ -248,7 +264,8 @@ function passingInput(): IsolationRunInput {
   return {
     context: CTX,
     browserRows: passingRows(),
-    targets: TARGETS,
+    targets: PLAN.targets,
+    witness: WITNESS,
     syntheticControls: [
       {
         id: "control-system-read",
@@ -292,27 +309,33 @@ function passingInput(): IsolationRunInput {
 function withRow(probe: string, position: Position, observed: unknown): IsolationRunInput {
   const input = passingInput();
   const rows = input.browserRows.filter((r) => !(r.probe === probe && r.position === position));
-  rows.push({ kind: "row", position, probe, observed: observed as ObservedProbe });
+  rows.push({ kind: "row", position, probe, observed });
   return { ...input, browserRows: rows };
 }
 
-const rowOf = (input: IsolationRunInput, id: string, position: Position) =>
-  judgeIsolationRun(input).rows.find((r) => r.id === id && r.position === position)!;
+/** Verdict, ok, observed text and the run's mismatches for one row: everything a person or CI reads. */
+function judged(input: IsolationRunInput, id: string, position: Position) {
+  const judgment = judgeIsolationRun(input);
+  const row = judgment.rows.find((r) => r.id === id && r.position === position)!;
+  return {
+    verdict: row.verdict,
+    ok: row.ok,
+    observed: row.observed,
+    mismatches: judgment.mismatches,
+  };
+}
 
 describe("isolation probe table", () => {
-  it("expands to 302 rows: 275 browser rows, 20 no-Marionette rows and 7 synthetic rows", () => {
+  it("expands to 292 rows: 275 browser rows, 10 no-Marionette rows and 7 synthetic rows", () => {
     expect(PROBE_TABLE).toHaveLength(66);
     const rows = expandExpectedRows(false);
-    expect(rows).toHaveLength(302);
-    expect(
-      rows.filter((r) => r.position === "file-no-marionette" || r.position === "file-mutated"),
-    ).toHaveLength(20);
+    expect(rows).toHaveLength(292);
+    expect(rows.filter((r) => r.position === "file-no-marionette")).toHaveLength(10);
     expect(rows.filter((r) => r.spec === null)).toHaveLength(7);
   });
 
-  it("names exactly three decided exceptions, at six rows, and no BLOCKED row lacks a denial", () => {
-    const rows = expandExpectedRows(false);
-    const exceptions = rows.flatMap((r) =>
+  it("names exactly three decided exceptions, at six rows", () => {
+    const exceptions = expandExpectedRows(false).flatMap((r) =>
       r.expected.kind === "LEAKS-EXISTENCE" && "exception" in r.expected
         ? [`${r.id}@${r.position}`]
         : [],
@@ -325,433 +348,621 @@ describe("isolation probe table", () => {
       "tabs-query-recorder@ext-bg",
       "tabs-query-recorder@ext-page",
     ]);
-    for (const spec of PROBE_TABLE) {
-      const blockedSomewhere = spec.positions.some(
-        (p) => (spec.expectAt?.[p] ?? { kind: "BLOCKED" }).kind === "BLOCKED",
-      );
-      if (blockedSomewhere) expect(spec.deny.kind, spec.id).not.toBe("never");
-    }
   });
 
   it("keeps tabs-only probes out of the devtools page, which has no tabs API", () => {
-    const tabsProbes = PROBE_TABLE.filter((s) => /^(tabs|windows)-/u.test(s.id));
-    expect(tabsProbes.length).toBeGreaterThan(5);
-    for (const spec of tabsProbes) expect(spec.positions, spec.id).not.toContain("ext-devtools");
+    for (const id of ["tabs-query-recorder", "management-getall", "downloads-search"]) {
+      expect(spec(id).positions).not.toContain("ext-devtools");
+    }
+  });
+
+  it("plans units for exactly the probes in the table", () => {
+    expect(Object.keys(PLAN.targets).toSorted()).toEqual(PROBE_TABLE.map((s) => s.id).toSorted());
   });
 });
 
+/** The verdict a well-formed answer other than the denial gets, written out apart from the table. */
+const LEAK: Readonly<Record<string, Verdict>> = {
+  ...Object.fromEntries(
+    [
+      "fetch-file-log",
+      "fetch-file-body",
+      "fetch-file-export",
+      "inventory-read",
+      "content-fetch-file-log",
+      "xhr-file-log",
+      "iframe-file-log",
+      "iframe-file-export",
+      "viewsource-fetch",
+      "viewsource-iframe",
+      "jar-file-fetch",
+      "jar-file-iframe",
+      "redirect-fetch",
+      "redirect-iframe",
+      "window-open-file",
+      "wr-redirect-iframe",
+      "downloads-download-file",
+      "resource-all",
+      "resource-traversal",
+      "chrome-all",
+      "chrome-traversal",
+      "moz-src-root",
+      "mozext-every-file",
+      "mozext-manifest",
+      "mozext-parent",
+      "mozext-schema",
+      "mozext-popup",
+      "own-non-war",
+      "api-namespace",
+      "api-call",
+      "sendmessage-recorder",
+      "connect-recorder",
+      "executescript-recorder-page",
+      "scripting-recorder-page",
+      "clipboard-after-export",
+    ].map((id) => [id, "READ"]),
+  ),
+  ...Object.fromEntries(
+    [
+      "fetch-file-dir",
+      "iframe-file-root",
+      "img-file-oracle",
+      "script-file-oracle",
+      "css-file-oracle",
+      "iframe-site-oracle",
+      "script-root-oracle",
+      "script-site-oracle",
+      "tabs-create-file",
+      "tabs-create-dir",
+      "tabs-update-file",
+      "tabs-update-redirect",
+      "windows-create-file",
+      "tabs-create-viewsource",
+      "wr-redirect-tab",
+      "planted-resource",
+      "mozext-script-oracle",
+      "mozext-timing",
+      "mozext-frame-recorder",
+      "sendmessage-oracle",
+      "tabs-query-recorder",
+      "management-getall",
+      "downloads-search",
+      "notifications-getall",
+    ].map((id) => [id, "LEAKS-EXISTENCE"]),
+  ),
+  // A store read that did not show the prober's own value proves nothing either way.
+  "storage-recorder": "NO-RESULT",
+  "idb-recorder": "NO-RESULT",
+};
+
+/** A well-formed answer that is not the denial and carries no planted mark. */
+function leakingUnit(denial: Denial, unit: Unit): unknown {
+  if (typeof unit !== "string") return pairAt(unit, LOAD_SIDE, ERROR_SIDE);
+  switch (denial.kind) {
+    case "unreachable":
+      return at(unit, "fetch ok, link load", "status 200, 9 chars: <listing>");
+    case "frame-withheld":
+      return at(unit, "load", "load; contentDocument readable, text: {}; replies: none");
+    case "answered":
+      return at(unit, denial.outcome === "error" ? "load" : (denial.outcome as Outcome), "x=1");
+    case "answered-without-recorder":
+      return at(unit, "ok", REC_TAB);
+    default:
+      return at(unit, "ok", "status 200, 1 chars: x");
+  }
+}
+
+const denialOf = (s: ProbeSpec, position: Position): Denial =>
+  ("denyAt" in s ? s.denyAt?.[position] : undefined) ?? s.deny;
+
 describe("isolation judge", () => {
-  it("passes a run where every probe saw its declared denial and every control read its mark", () => {
+  it("passes a run where every probe saw its declared denial on a witnessed target", () => {
     const result = judgeIsolationRun(passingInput());
     expect(result.mismatches).toEqual([]);
     expect(result.ok).toBe(true);
     expect(result.counts).toEqual({
-      BLOCKED: 275,
-      READ: 16,
-      "LEAKS-EXISTENCE": 11,
+      BLOCKED: 274,
+      READ: 11,
+      "LEAKS-EXISTENCE": 7,
       "NO-RESULT": 0,
     });
+    expect(result.rows.filter((r) => !r.ok)).toEqual([]);
   });
 
-  const noResult: readonly [string, string, Position, unknown][] = [
-    [
-      "a missing runner",
-      "xhr-file-log",
-      "web",
-      { outcome: "threw", text: "missing runner for xhr-file-log" },
-    ],
-    ["an empty result", "xhr-file-log", "web", {}],
-    [
-      "a fetch that timed out",
-      "fetch-file-log",
-      "ext-bg",
-      { outcome: "timeout", text: "no fetch result within 3000 ms" },
-    ],
-    [
-      "a probe that threw",
-      "tabs-create-file",
-      "ext-bg",
-      { outcome: "threw", text: "TypeError: b.tabs is undefined" },
-    ],
-    [
-      "no target to act on",
-      "executescript-recorder-page",
-      "ext-bg",
-      { outcome: "no-target", text: "no tab" },
-    ],
-    [
-      "a pair with one side",
-      "img-file-oracle",
-      "file",
-      { outcome: "same", text: "", pair: { hit: { outcome: "error", text: "error" } } },
-    ],
-    [
-      "a pair with no sides",
-      "mozext-script-oracle",
-      "web",
-      { outcome: "same", text: "existing path: error | missing path: error" },
-    ],
-    ["targets without results", "resource-all", "web", { outcome: "each", text: "0 targets" }],
-    [
-      "a planned target left out",
-      "resource-all",
-      "web",
-      { outcome: "each", text: "", each: [{ target: "resource://gre/", ...UNREACHABLE }] },
-    ],
-    [
-      "an unplanned target",
-      "chrome-all",
-      "web",
-      {
-        outcome: "each",
-        text: "",
-        each: [
-          { target: "chrome://global/content/", ...UNREACHABLE },
-          { target: "chrome://other/content/", ...UNREACHABLE },
-        ],
-      },
-    ],
-    [
-      "a store read that did not see its own value",
-      "storage-recorder",
-      "ext-bg",
-      { outcome: "ok", text: "{}" },
-    ],
-    [
-      "a frame event with no document report",
-      "iframe-file-log",
-      "web",
-      { outcome: "error", text: "error" },
-    ],
-    [
-      "a refusal other than the declared one",
-      "window-open-file",
-      "file",
-      { outcome: "error", text: "Error: Access to 'file:///p/log.jsonl' from script denied" },
-    ],
-  ];
-  it.each(noResult)(
-    "turns %s into NO-RESULT, and fails the run",
-    (_label, probe, position, observed) => {
-      const input = withRow(probe, position, observed);
-      expect(rowOf(input, probe, position).verdict).toBe("NO-RESULT");
-      expect(judgeIsolationRun(input).ok).toBe(false);
-    },
+  const blockedRows = expandExpectedRows(false).filter(
+    (r) =>
+      r.spec !== null &&
+      r.expected.kind === "BLOCKED" &&
+      !(r.id === "planted-resource" && r.position === "web") &&
+      unitsOf(r.id).length > 0,
   );
-
-  it("turns a missing row into NO-RESULT", () => {
-    const input = passingInput();
-    const rows = input.browserRows.filter(
-      (r) => !(r.probe === "fetch-file-log" && r.position === "web"),
-    );
-    expect(rowOf({ ...input, browserRows: rows }, "fetch-file-log", "web").verdict).toBe(
-      "NO-RESULT",
-    );
-  });
-
-  const leaks: readonly [string, string, Position, unknown, "READ" | "LEAKS-EXISTENCE"][] = [
-    [
-      "file bytes",
-      "fetch-file-log",
-      "web",
-      { outcome: "ok", text: "status 200, 12 chars: {}" },
-      "READ",
-    ],
-    [
-      "the secret marker",
-      "xhr-file-log",
-      "file",
-      { outcome: "ok", text: `status 200: ${CTX.marker}` },
-      "READ",
-    ],
-    [
-      "a page-visible window.oneClickHar",
-      "api-namespace",
-      "web",
-      {
-        outcome: "ok",
-        text: "typeof browser.oneClickHar: n/a; typeof page oneClickHar: object; page globals not in a fresh frame: []",
-      },
-      "READ",
-    ],
-    [
-      "a new page global",
-      "api-namespace",
-      "cs-web",
-      {
-        outcome: "ok",
-        text: 'typeof browser.oneClickHar: undefined; typeof page oneClickHar: undefined; page globals not in a fresh frame: ["harData"]',
-      },
-      "READ",
-    ],
-    [
-      "browser.oneClickHar in another extension",
-      "api-namespace",
-      "ext-bg",
-      {
-        outcome: "ok",
-        text: "typeof browser.oneClickHar: object; typeof page oneClickHar: undefined; page globals not in a fresh frame: n/a",
-      },
-      "READ",
-    ],
-    [
-      "a reply over runtime.connect",
-      "connect-recorder",
-      "ext-bg",
-      { outcome: "message", text: '{"recording":true,"problems":[]}' },
-      "READ",
-    ],
-    [
-      "a reply to sendMessage",
-      "sendmessage-recorder",
-      "cs-web",
-      { outcome: "ok", text: 'reply: {"recording":true}' },
-      "READ",
-    ],
-    [
-      "an undefined reply to sendMessage",
-      "sendmessage-recorder",
-      "ext-bg",
-      { outcome: "ok", text: "reply: undefined" },
-      "READ",
-    ],
-    [
-      "a recorder API answer",
-      "api-call",
-      "ext-page",
-      { outcome: "ok", text: '{"recording":true,"problems":[]}' },
-      "READ",
-    ],
-    [
-      "a Downloads item without .har",
-      "downloads-search",
-      "ext-bg",
-      { outcome: "ok", text: "bank.example-export.json | url file:///x" },
-      "LEAKS-EXISTENCE",
-    ],
-    [
-      "a notification",
-      "notifications-getall",
-      "ext-bg",
-      { outcome: "ok", text: '{"n":{"title":"bank.example"}}' },
-      "LEAKS-EXISTENCE",
-    ],
-    [
-      "the recorder's stored value",
-      "storage-recorder",
-      "ext-page",
-      { outcome: "ok", text: `{"own":"${CTX.ownMark}","och_secret":"${CTX.storeMark}"}` },
-      "READ",
-    ],
-    [
-      "a readable frame",
-      "iframe-file-root",
-      "file",
-      {
-        outcome: "load",
-        text: "load; contentDocument readable, text: 201: k DIRECTORY; contentWindow.location.href: file:///d/",
-      },
-      "LEAKS-EXISTENCE",
-    ],
-    [
-      "an opened file tab",
-      "tabs-create-file",
-      "ext-page",
-      { outcome: "ok", text: "created; 1 s later: url file:///p/log.jsonl" },
-      "LEAKS-EXISTENCE",
-    ],
-    ["a differing oracle", "img-file-oracle", "file", DIFFERS, "LEAKS-EXISTENCE"],
-    [
-      "a recorder page script result",
-      "scripting-recorder-page",
-      "ext-bg",
-      { outcome: "done", text: 'tab 3: returned ["<html>"]' },
-      "READ",
-    ],
-    [
-      "the recorder in tabs.query",
-      "tabs-query-recorder",
-      "ext-bg",
-      { outcome: "ok", text: `${REC_TAB} ${CTX.marker}` },
-      "READ",
-    ],
-  ];
-  it.each(leaks)(
-    "judges %s as a leak and fails the run",
-    (_label, probe, position, observed, verdict) => {
-      const input = withRow(probe, position, observed);
-      expect(rowOf(input, probe, position).verdict).toBe(verdict);
+  it.each(blockedRows.map((r) => [r.id, r.position] as const))(
+    "judges a leak at %s@%s as its kind, fails the row, and names it in the report",
+    (id, position) => {
+      const s = spec(id);
+      const denial = denialOf(s, position);
+      const units = unitsOf(id);
+      const observed =
+        s.shape === "each"
+          ? each(
+              units.map((u, i) => (i === 0 ? leakingUnit(denial, u) : deniedUnit(id, u, position))),
+            )
+          : leakingUnit(denial, units[0]!);
+      const result = judged(withRow(id, position, observed), id, position);
+      expect(result.verdict).toBe(LEAK[id]);
+      expect(result.ok).toBe(false);
+      expect(result.mismatches).toHaveLength(1);
       expect(
-        judgeIsolationRun(input).mismatches.some((m) => m.startsWith(`${probe}@${position}:`)),
+        result.mismatches[0]!.startsWith(`${id}@${position}: expected BLOCKED, got ${LEAK[id]!} (`),
       ).toBe(true);
     },
   );
 
-  const eachLeaks: readonly [
-    string,
-    string,
-    Position,
-    ObservedProbe,
-    "READ" | "LEAKS-EXISTENCE",
-  ][] = [
-    [
-      "a reachable resource:// name",
-      "resource-all",
-      "file",
-      {
-        outcome: "each",
-        text: "",
-        each: [
-          { target: "resource://gre/", ...UNREACHABLE },
-          {
-            target: "resource://app/",
-            outcome: "fetch ok, link load",
-            text: "status 200, 9 chars",
-          },
+  it("reads a probe that came back empty as NO-RESULT, even on a decided-exception row", () => {
+    const xhr = only("xhr-file-log");
+    expect(judged(withRow("xhr-file-log", "web", {}), "xhr-file-log", "web")).toEqual({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: `${xhr} -> malformed {}`,
+      mismatches: [`xhr-file-log@web: expected BLOCKED, got NO-RESULT (${xhr} -> malformed {})`],
+    });
+    const tabs = only("tabs-query-recorder");
+    expect(
+      judged(withRow("tabs-query-recorder", "ext-bg", {}), "tabs-query-recorder", "ext-bg"),
+    ).toEqual({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: `${tabs} -> malformed {}`,
+      mismatches: [
+        `tabs-query-recorder@ext-bg: expected LEAKS-EXISTENCE (exception: addon-tabs-visibility), got NO-RESULT (${tabs} -> malformed {})`,
+      ],
+    });
+  });
+
+  const malformed: readonly (readonly [string, unknown])[] = [
+    ["an outcome no runner reports", { outcome: "undefined", text: "undefined", target: "x" }],
+    ["no text", { outcome: "error", target: "x" }],
+    ["a text that is not a string", { outcome: "error", text: 7, target: "x" }],
+    ["no target", { outcome: "error", text: "error event, status 0, readyState 4" }],
+    ["null", null],
+    ["a string", "error"],
+  ];
+  it.each(malformed)("reads a row with %s as NO-RESULT", (_label, observed) => {
+    expect(judged(withRow("xhr-file-log", "web", observed), "xhr-file-log", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+    });
+  });
+
+  it("accepts exactly the closed outcome set", () => {
+    expect(readObservation({ outcome: "fetch ok, link load", text: "", target: "t" })).toEqual({
+      outcome: "fetch ok, link load",
+      text: "",
+      target: "t",
+    });
+    expect(readObservation({ outcome: "load,error", text: "x", target: "t" })).not.toBeNull();
+    expect(readObservation({ outcome: "fetch maybe, link load", text: "x", target: "t" })).toBe(
+      null,
+    );
+  });
+
+  it("refuses a denial against a target the probe did not plan: a typo'd path, file or add-on id", () => {
+    const xhr = only("xhr-file-log");
+    expect(
+      judged(
+        withRow("xhr-file-log", "file", at(`${xhr}-typo`, ...DENIED["xhr-file-log"]!)),
+        "xhr-file-log",
+        "file",
+      ),
+    ).toEqual({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: `${xhr} -> error: error event, status 0, readyState 4; acted on ${xhr}-typo`,
+      mismatches: [
+        `xhr-file-log@file: expected BLOCKED, got NO-RESULT (${`${xhr} -> error: error event, status 0, readyState 4; acted on ${xhr}-typo`.slice(0, 240)})`,
+      ],
+    });
+    const typoParent = `moz-extension://${CTX.recUuid}/experiment/parent-typo.js`;
+    expect(
+      judged(
+        withRow("mozext-parent", "web", at(typoParent, "error", NETWORK)),
+        "mozext-parent",
+        "web",
+      ),
+    ).toMatchObject({ verdict: "NO-RESULT", ok: false });
+    expect(
+      judged(
+        withRow(
+          "connect-recorder",
+          "ext-bg",
+          at(`addon:${CTX.recId}-typo`, ...DENIED["connect-recorder"]!),
+        ),
+        "connect-recorder",
+        "ext-bg",
+      ),
+    ).toEqual({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: `addon:${CTX.recId} -> disconnected: ${DENIED["connect-recorder"]![1]}; acted on addon:${CTX.recId}-typo`,
+      mismatches: [
+        `connect-recorder@ext-bg: expected BLOCKED, got NO-RESULT (addon:${CTX.recId} -> disconnected: ${DENIED["connect-recorder"]![1]}; acted on addon:${CTX.recId}-typo)`,
+      ],
+    });
+  });
+
+  it("refuses a denial against a target the witness did not find, or never checked", () => {
+    const log = only("fetch-file-log");
+    const absent = {
+      ...passingInput(),
+      witness: { ...WITNESS, [log]: { present: false, detail: "NotFoundError" } },
+    };
+    expect(judged(absent, "fetch-file-log", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: `${log} -> error: ${NETWORK}; witness did not find ${log} (NotFoundError)`,
+    });
+    const rest = Object.fromEntries(Object.entries(WITNESS).filter(([t]) => t !== log));
+    const unchecked = { ...passingInput(), witness: rest };
+    expect(judged(unchecked, "xhr-file-log", "web").observed).toBe(
+      `${log} -> error: error event, status 0, readyState 4; no witness ran for ${log}`,
+    );
+    const onLog = expandExpectedRows(false).filter(
+      (r) => r.spec !== null && unitsOf(r.id).includes(log),
+    );
+    expect(judgeIsolationRun(unchecked).counts["NO-RESULT"]).toBe(onLog.length);
+  });
+
+  it("refuses a pair whose missing side the witness found present", () => {
+    const unit = pairUnit("img-file-oracle");
+    const input = {
+      ...passingInput(),
+      witness: { ...WITNESS, [unit[1]]: { present: true, detail: "file, 3 bytes" } },
+    };
+    expect(judged(input, "img-file-oracle", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: `${unit[0]} -> error: error | error: error; witness found ${unit[1]}, planned as missing (file, 3 bytes)`,
+    });
+    const hitAbsent = {
+      ...passingInput(),
+      witness: { ...WITNESS, [unit[0]]: { present: false, detail: "NotFoundError" } },
+    };
+    expect(judged(hitAbsent, "img-file-oracle", "web").verdict).toBe("NO-RESULT");
+  });
+
+  it("judges a guessed key that exists and tells apart as LEAKS-EXISTENCE, in both log oracles", () => {
+    for (const id of ["script-file-oracle", "css-file-oracle"]) {
+      const [first, second] = unitsOf(id) as readonly (readonly [string, string])[];
+      const input = {
+        ...withRow(
+          id,
+          "file",
+          each([pairAt(first!, LOAD_SIDE, ERROR_SIDE), pairAt(second!, ERROR_SIDE, ERROR_SIDE)]),
+        ),
+        witness: { ...WITNESS, [first![0]]: { present: true, detail: "file, 900 bytes" } },
+      };
+      expect(judged(input, id, "file")).toEqual({
+        verdict: "LEAKS-EXISTENCE",
+        ok: false,
+        observed: `2 results for 2 planned targets; LEAKS-EXISTENCE ${first![0]} -> load: load | error: error`,
+        mismatches: [
+          `${id}@file: expected BLOCKED, got LEAKS-EXISTENCE (${`2 results for 2 planned targets; LEAKS-EXISTENCE ${first![0]} -> load: load | error: error`.slice(0, 240)})`,
         ],
-      },
-      "READ",
-    ],
-    [
-      "a resource:// name that loads as a stylesheet",
-      "resource-all",
-      "web",
-      {
-        outcome: "each",
-        text: "",
-        each: [
-          { target: "resource://gre/", ...UNREACHABLE },
-          { target: "resource://app/", outcome: "fetch error, link load", text: NETWORK.text },
-        ],
-      },
-      "LEAKS-EXISTENCE",
-    ],
-    [
-      "a readable written file",
-      "inventory-read",
-      "file",
-      {
-        outcome: "each",
-        text: "",
-        each: [
-          { target: "file:///d/one-click-har/", ...NETWORK },
-          {
-            target: "file:///d/one-click-har/k/settings.json",
-            outcome: "ok",
-            text: "status 200, 2 chars: {}",
-          },
-        ],
-      },
-      "READ",
-    ],
-    [
-      "a predictable path that exists",
+      });
+    }
+  });
+
+  it("judges per-target rows: a missing, repeated or unplanned target is NO-RESULT", () => {
+    const [gre, app] = unitsOf("resource-all") as readonly string[];
+    const deny = (u: string) => at(u, "fetch error, link error", NETWORK);
+    const cases: readonly (readonly [unknown, string])[] = [
+      [
+        each([deny(gre!)]),
+        `1 results for 2 planned targets; NO-RESULT ${app!} -> 0 results, expected one`,
+      ],
+      [
+        each([deny(gre!), deny(gre!), deny(app!)]),
+        `3 results for 2 planned targets; NO-RESULT ${gre!} -> 2 results, expected one`,
+      ],
+      [
+        each([deny(gre!), deny(app!), deny("resource://other/")]),
+        "3 results for 2 planned targets; unplanned resource://other/",
+      ],
+      [{ outcome: "each", text: "0 targets", target: "" }, "no per-target results"],
+    ];
+    for (const [observed, summary] of cases) {
+      expect(judged(withRow("resource-all", "web", observed), "resource-all", "web")).toMatchObject(
+        { verdict: "NO-RESULT", ok: false, observed: summary },
+      );
+    }
+  });
+
+  it("judges an each-probe with nothing planned as BLOCKED only when it reports nothing", () => {
+    expect(judged(passingInput(), "inventory-exists", "file")).toMatchObject({
+      verdict: "BLOCKED",
+      ok: true,
+      observed: "0 results for 0 planned targets",
+    });
+    const extra = withRow(
       "inventory-exists",
       "file",
-      {
-        outcome: "each",
-        text: "",
-        each: [{ target: "file:///d/one-click-har/sites/", ...DIFFERS }],
-      },
-      "LEAKS-EXISTENCE",
-    ],
-    [
-      "a guessed key folder that exists",
-      "script-site-oracle",
-      "file",
-      {
-        outcome: "each",
-        text: "",
-        each: [{ target: "file:///d/one-click-har/g1/sites/bank.example/", ...DIFFERS }],
-      },
-      "LEAKS-EXISTENCE",
-    ],
-    [
-      "a fetchable extension file",
-      "mozext-every-file",
-      "web",
-      {
-        outcome: "each",
-        text: "",
-        each: [
-          {
-            target: `moz-extension://${CTX.recUuid}/manifest.json`,
-            outcome: "ok",
-            text: "status 200, 99 chars",
-          },
-        ],
-      },
-      "READ",
-    ],
-  ];
-  it.each(eachLeaks)(
-    "judges %s among planned targets as a leak",
-    (_label, probe, position, observed, verdict) => {
-      const input = withRow(probe, position, observed);
-      expect(rowOf(input, probe, position).verdict).toBe(verdict);
-      expect(judgeIsolationRun(input).ok).toBe(false);
-    },
-  );
-
-  it("judges an empty plan for predictable paths as BLOCKED only when nothing was planned", () => {
-    const input = { ...passingInput(), targets: { ...TARGETS, "inventory-exists": [] } };
-    const empty = { outcome: "each", text: "0 targets", each: [] };
-    const rows = input.browserRows.map((r) =>
-      r.probe === "inventory-exists" ? { ...r, observed: empty } : r,
+      each([pairAt(["file:///d/x", "file:///d/x-och-missing"], ERROR_SIDE, ERROR_SIDE)]),
     );
-    expect(rowOf({ ...input, browserRows: rows }, "inventory-exists", "file").verdict).toBe(
-      "BLOCKED",
-    );
-    expect(
-      rowOf(withRow("inventory-exists", "file", empty), "inventory-exists", "file").verdict,
-    ).toBe("NO-RESULT");
-  });
-
-  it("fails a control that could not read its planted value", () => {
-    const input = withRow("planted-own-war-fetch", "web", NETWORK);
-    expect(rowOf(input, "planted-own-war-fetch", "web").verdict).toBe("BLOCKED");
-    expect(judgeIsolationRun(input).mismatches[0]).toContain(
-      "planted-own-war-fetch@web: expected READ",
-    );
-    const mutated = withRow("fetch-file-log", "file-mutated", NETWORK);
-    expect(judgeIsolationRun(mutated).ok).toBe(false);
-  });
-
-  it("fails a decided exception that showed nothing, so the exception row cannot go blind", () => {
-    const input = withRow("tabs-query-recorder", "ext-page", {
-      outcome: "ok",
-      text: "2 http://bank.example/ Bank",
+    expect(judged(extra, "inventory-exists", "file").verdict).toBe("NO-RESULT");
+    const emptyPlan = { ...passingInput(), targets: { ...PLAN.targets, "fetch-file-log": [] } };
+    expect(judged(emptyPlan, "fetch-file-log", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: "planned [], expected one single unit",
     });
-    expect(rowOf(input, "tabs-query-recorder", "ext-page").verdict).toBe("BLOCKED");
-    expect(judgeIsolationRun(input).ok).toBe(false);
+    const noXhr = Object.fromEntries(
+      Object.entries(PLAN.targets).filter(([id]) => id !== "xhr-file-log"),
+    );
+    expect(judged({ ...passingInput(), targets: noXhr }, "xhr-file-log", "web").observed).toBe(
+      "no planned targets",
+    );
+  });
+
+  it("probes paths written outside the key folder, and fails one whose existence a page can tell", () => {
+    const outside = planTargets({
+      ...PLAN_INPUT,
+      outsideKeyFolder: [{ path: "/p/one-click-har-sites.txt", directory: false }],
+    }).targets["inventory-exists"]!;
+    expect(outside).toEqual([
+      ["file:///p/one-click-har-sites.txt", "file:///p/one-click-har-sites.txt-och-missing"],
+    ]);
+    const unit = outside[0] as readonly [string, string];
+    const input = {
+      ...withRow("inventory-exists", "file", each([pairAt(unit, LOAD_SIDE, ERROR_SIDE)])),
+      targets: { ...PLAN.targets, "inventory-exists": outside },
+      witness: {
+        ...WITNESS,
+        [unit[0]]: { present: true, detail: "file" },
+        [unit[1]]: { present: false, detail: "NotFoundError" },
+      },
+    };
+    expect(judged(input, "inventory-exists", "file")).toMatchObject({
+      verdict: "LEAKS-EXISTENCE",
+      ok: false,
+    });
+  });
+
+  it("calls a recorder frame that loaded, or any frame that answered postMessage, a leak", () => {
+    const popup = only("mozext-frame-recorder");
+    expect(
+      judged(
+        withRow("mozext-frame-recorder", "web", at(popup, "load", CROSS)),
+        "mozext-frame-recorder",
+        "web",
+      ),
+    ).toMatchObject({ verdict: "LEAKS-EXISTENCE", ok: false });
+    const answered = BLANK.replace("replies: none", 'replies: {"oneClickHar":{"recording":true}}');
+    expect(
+      judged(
+        withRow("mozext-frame-recorder", "web", at(popup, "error", answered)),
+        "mozext-frame-recorder",
+        "web",
+      ).verdict,
+    ).toBe("LEAKS-EXISTENCE");
+    const log = only("iframe-file-log");
+    expect(
+      judged(
+        withRow("iframe-file-log", "web", at(log, "error", answered)),
+        "iframe-file-log",
+        "web",
+      ).verdict,
+    ).toBe("READ");
+    expect(
+      judged(withRow("iframe-file-log", "web", at(log, "load", CROSS)), "iframe-file-log", "web"),
+    ).toMatchObject({ verdict: "BLOCKED", ok: true });
+  });
+
+  it("takes a cross-origin frame and a blank one as one withheld state in a pair, but not a frame that read", () => {
+    const unit = pairUnit("script-root-oracle");
+    const cross: Side = { outcome: "timeout", text: CROSS.replace(/^load/u, "timeout") };
+    const blank: Side = { outcome: "timeout", text: BLANK.replace(/^error/u, "timeout") };
+    const verdictOf = (observed: unknown): Verdict =>
+      judged(withRow("script-root-oracle", "web", observed), "script-root-oracle", "web").verdict;
+    expect(verdictOf(pairAt(unit, cross, blank))).toBe("BLOCKED");
+    expect(
+      verdictOf(
+        pairAt(unit, { ...blank, text: blank.text.replace("text: ;", "text: {};") }, blank),
+      ),
+    ).toBe("LEAKS-EXISTENCE");
+    expect(
+      verdictOf(
+        pairAt(
+          unit,
+          { outcome: "error", text: "error" },
+          { outcome: "error", text: "error, but longer" },
+        ),
+      ),
+    ).toBe("LEAKS-EXISTENCE");
+    expect(verdictOf(pairAt(unit, { ...blank, outcome: "threw" }, blank))).toBe("NO-RESULT");
+    expect(verdictOf(pairAt(unit, blank, { ...blank, outcome: "threw" }))).toBe("NO-RESULT");
+    expect(verdictOf({ outcome: "same", text: "", target: unit[0] })).toBe("NO-RESULT");
+    expect(verdictOf(pairAt([unit[1], unit[0]], ERROR_SIDE, ERROR_SIDE))).toBe("NO-RESULT");
+  });
+
+  it("reads a listing that names no add-on as a denial, an empty one as no answer", () => {
+    const tabs = only("tabs-query-recorder");
+    expect(
+      judged(
+        withRow("tabs-query-recorder", "ext-bg", at(tabs, "ok", "x")),
+        "tabs-query-recorder",
+        "ext-bg",
+      ),
+    ).toMatchObject({ verdict: "BLOCKED", ok: false });
+    expect(
+      judged(
+        withRow("tabs-query-recorder", "ext-bg", at(tabs, "ok", "")),
+        "tabs-query-recorder",
+        "ext-bg",
+      ).verdict,
+    ).toBe("NO-RESULT");
+    const byUuid = `3 moz-extension://${CTX.recUuid}/x.html x`;
+    expect(
+      judged(
+        withRow("management-getall", "ext-page", at(only("management-getall"), "ok", byUuid)),
+        "management-getall",
+        "ext-page",
+      ),
+    ).toMatchObject({ verdict: "LEAKS-EXISTENCE", ok: true });
+  });
+
+  it("reads any planted mark as READ, whatever else the row says", () => {
+    for (const mark of [CTX.marker, CTX.warMark, CTX.secretMark, CTX.storeMark]) {
+      expect(
+        judged(
+          withRow("own-non-war", "web", at(only("own-non-war"), "ok", `status 200: ${mark}`)),
+          "own-non-war",
+          "web",
+        ),
+      ).toMatchObject({ verdict: "READ", ok: false });
+    }
+    expect(
+      judged(withRow("xhr-file-log", "web", { text: CTX.marker }), "xhr-file-log", "web").verdict,
+    ).toBe("READ");
+  });
+
+  it("calls a timeout, a throw, a missing tab or a refusal other than the declared one NO-RESULT", () => {
+    const cases: readonly (readonly [string, Position, unknown])[] = [
+      [
+        "fetch-file-log",
+        "ext-bg",
+        at(only("fetch-file-log"), "timeout", "no fetch result within 3000 ms"),
+      ],
+      [
+        "tabs-create-file",
+        "ext-bg",
+        { outcome: "threw", text: "TypeError: b.tabs is undefined", target: "" },
+      ],
+      [
+        "executescript-recorder-page",
+        "ext-bg",
+        at(only("executescript-recorder-page"), "no-target", "no tab"),
+      ],
+      [
+        "window-open-file",
+        "file",
+        at(only("window-open-file"), "error", DENIED["window-open-file"]![1]),
+      ],
+      ["storage-recorder", "ext-bg", at(only("storage-recorder"), "ok", "{}")],
+      ["fetch-file-log", "web", at(only("fetch-file-log"), "error", "TypeError: other")],
+    ];
+    for (const [id, position, observed] of cases) {
+      expect(judged(withRow(id, position, observed), id, position)).toMatchObject({
+        verdict: "NO-RESULT",
+        ok: false,
+      });
+    }
+  });
+
+  it("turns a missing or repeated row into NO-RESULT and fails it", () => {
+    const input = passingInput();
+    const isRow = (r: BrowserRowReport) => r.probe === "fetch-file-log" && r.position === "web";
+    const missing = { ...input, browserRows: input.browserRows.filter((r) => !isRow(r)) };
+    expect(judged(missing, "fetch-file-log", "web")).toEqual({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: "0 rows reported, expected one",
+      mismatches: [
+        "fetch-file-log@web: expected BLOCKED, got NO-RESULT (0 rows reported, expected one)",
+      ],
+    });
+    const twice = { ...input, browserRows: [...input.browserRows, input.browserRows.find(isRow)!] };
+    expect(judged(twice, "fetch-file-log", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: "2 rows reported, expected one",
+    });
+  });
+
+  it("fails a control that could not read its planted value, and a decided exception that showed nothing", () => {
+    const war = only("planted-own-war-fetch");
+    expect(
+      judged(
+        withRow("planted-own-war-fetch", "web", at(war, "error", NETWORK)),
+        "planted-own-war-fetch",
+        "web",
+      ),
+    ).toEqual({
+      verdict: "BLOCKED",
+      ok: false,
+      observed: `${war} -> error: ${NETWORK}`,
+      mismatches: [
+        `planted-own-war-fetch@web: expected READ (planted-own-war), got BLOCKED (${war} -> error: ${NETWORK})`,
+      ],
+    });
+    expect(
+      judged(
+        withRow("planted-own-war-fetch", "web", at(war, "ok", "status 200, 5 chars: wrong")),
+        "planted-own-war-fetch",
+        "web",
+      ),
+    ).toMatchObject({ verdict: "READ", ok: false });
+    expect(
+      judged(
+        withRow(
+          "tabs-query-recorder",
+          "ext-page",
+          at(only("tabs-query-recorder"), "ok", "2 http://bank.example/ Bank"),
+        ),
+        "tabs-query-recorder",
+        "ext-page",
+      ),
+    ).toMatchObject({ verdict: "BLOCKED", ok: false });
   });
 
   it("requires planted-resource@file to leak when the Linux sandbox blocks planted-resource@web", () => {
-    const input = withRow("planted-resource", "file", SAME);
-    expect(rowOf(input, "planted-resource", "web").verdict).toBe("BLOCKED");
-    expect(judgeIsolationRun(input).mismatches[0]).toContain("planted-resource@file");
+    const unit = pairUnit("planted-resource");
+    const input = withRow("planted-resource", "file", pairAt(unit, ERROR_SIDE, ERROR_SIDE));
+    expect(judged(input, "planted-resource", "web")).toMatchObject({
+      verdict: "BLOCKED",
+      ok: true,
+    });
+    expect(judgeIsolationRun(input).mismatches).toEqual([
+      `planted-resource@file: expected LEAKS-EXISTENCE or READ (planted-resource-substitution), got BLOCKED (${unit[0]} -> error: error | error: error)`,
+    ]);
     const elsewhere = { ...passingInput(), context: { ...CTX, webSandboxBlocksArchive: false } };
-    expect(judgeIsolationRun(elsewhere).mismatches[0]).toContain("planted-resource@web");
+    expect(judgeIsolationRun(elsewhere).mismatches).toEqual([
+      `planted-resource@web: expected LEAKS-EXISTENCE or READ (planted-resource-substitution), got BLOCKED (${unit[0]} -> error: error | error: error)`,
+    ]);
   });
 
   it("judges synthetic controls from their reads: a missing control is NO-RESULT, a blind one fails", () => {
     const base = passingInput();
+    const replace = (id: string, change: object) => ({
+      ...base,
+      syntheticControls: base.syntheticControls.map((c) => (c.id === id ? { ...c, ...change } : c)),
+    });
     const missing = {
       ...base,
       syntheticControls: base.syntheticControls.filter((c) => c.id !== "limit-other-experiment"),
     };
-    expect(rowOf(missing, "limit-other-experiment", "otherexp").verdict).toBe("NO-RESULT");
-    expect(judgeIsolationRun(missing).ok).toBe(false);
-    const blind = {
-      ...base,
-      syntheticControls: base.syntheticControls.map((c) =>
-        c.id === "control-system-read"
-          ? { ...c, reads: [`log ${CTX.marker}`, "error NotFoundError"] }
-          : c,
+    expect(judged(missing, "limit-other-experiment", "otherexp")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: "no result reported",
+    });
+    expect(
+      judged(
+        replace("control-system-read", { reads: [`log ${CTX.marker}`, "error NotFoundError"] }),
+        "control-system-read",
+        "system",
       ),
-    };
-    expect(rowOf(blind, "control-system-read", "system").verdict).toBe("BLOCKED");
-    expect(judgeIsolationRun(blind).ok).toBe(false);
+    ).toMatchObject({ verdict: "BLOCKED", ok: false, observed: "system" });
+    expect(
+      judged(replace("control-system-read", { reads: [] }), "control-system-read", "system")
+        .verdict,
+    ).toBe("BLOCKED");
+    expect(
+      judged(
+        replace("planted-recorder-idb", { position: "system" }),
+        "planted-recorder-idb",
+        "rec-page",
+      ).verdict,
+    ).toBe("NO-RESULT");
   });
 
   it("fails a content script that ran in an archive document, and needs the policy's denial to pass without one", () => {
@@ -760,417 +971,68 @@ describe("isolation judge", () => {
       ...base,
       csArchiveInjectedDocs: [{ href: "file:///d/one-click-har/k/x.jsonl", text: "{}" }],
     };
-    expect(rowOf(injected, "cs-in-archive-document", "cs-archive").verdict).toBe("LEAKS-EXISTENCE");
+    expect(judged(injected, "cs-in-archive-document", "cs-archive")).toMatchObject({
+      verdict: "LEAKS-EXISTENCE",
+      ok: false,
+      observed: "file:///d/one-click-har/k/x.jsonl: {}",
+    });
     const read = {
       ...base,
       csArchiveInjectedDocs: [{ href: "file:///d/x.jsonl", text: CTX.marker }],
     };
-    expect(rowOf(read, "cs-in-archive-document", "cs-archive").verdict).toBe("READ");
+    expect(judged(read, "cs-in-archive-document", "cs-archive").verdict).toBe("READ");
+    expect(judged(base, "cs-in-archive-document", "cs-archive").observed).toBe(
+      "no content script ran in any archive or export document",
+    );
+    expect(judged(base, "cs-file-injection", "cs-file").observed).toBe(
+      "no content script ran in any file:// document; policy denies file access",
+    );
     const unproven = { ...base, canAccessFileObserved: false };
-    expect(rowOf(unproven, "cs-in-archive-document", "cs-archive").verdict).toBe("NO-RESULT");
-    expect(rowOf(unproven, "cs-file-injection", "cs-file").verdict).toBe("NO-RESULT");
-    expect(judgeIsolationRun(unproven).ok).toBe(false);
+    expect(judged(unproven, "cs-in-archive-document", "cs-archive")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: "no injection seen, and the policy was not observed to deny it",
+    });
+    expect(judged(unproven, "cs-file-injection", "cs-file")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: "no file:// injection seen, and the policy was not observed to deny it",
+    });
   });
 
   it("fails when a declared extra check fails, did not run, ran twice, or is unknown", () => {
     const base = passingInput();
-    const failing = base.extraChecks.map((c) =>
-      c.id === "archive-modes" ? { ...c, ok: false, detail: "x is file mode 644" } : c,
-    );
-    expect(judgeIsolationRun({ ...base, extraChecks: failing }).mismatches).toEqual([
-      "archive-modes: x is file mode 644",
-    ]);
-    const skipped = base.extraChecks.filter((c) => c.id !== "key-differs-across-profiles");
-    expect(judgeIsolationRun({ ...base, extraChecks: skipped }).mismatches).toEqual([
-      "extra check key-differs-across-profiles did not run",
-    ]);
-    expect(judgeIsolationRun({ ...base, extraChecks: [] }).mismatches).toHaveLength(
-      Object.keys(EXTRA_CHECKS).length,
-    );
-    const twice = [
-      ...base.extraChecks,
-      { id: "downloads-list" as const, ok: true, detail: "again" },
-    ];
-    expect(judgeIsolationRun({ ...base, extraChecks: twice }).ok).toBe(false);
-    const unknown = [...base.extraChecks, { id: "made-up" as ExtraCheckId, ok: true, detail: "" }];
-    expect(judgeIsolationRun({ ...base, extraChecks: unknown }).ok).toBe(false);
+    const mismatches = (extraChecks: readonly ExtraCheckResult[]) =>
+      judgeIsolationRun({ ...base, extraChecks }).mismatches;
+    expect(
+      mismatches(
+        base.extraChecks.map((c) =>
+          c.id === "archive-modes" ? { ...c, ok: false, detail: "x is file mode 644" } : c,
+        ),
+      ),
+    ).toEqual(["archive-modes: x is file mode 644"]);
+    expect(
+      mismatches(base.extraChecks.filter((c) => c.id !== "key-differs-across-profiles")),
+    ).toEqual(["extra check key-differs-across-profiles did not run"]);
+    expect(
+      mismatches([...base.extraChecks, { id: "downloads-list", ok: true, detail: "again" }]),
+    ).toEqual(["extra check downloads-list ran 2 times"]);
+    expect(
+      mismatches([...base.extraChecks, { id: "made-up" as ExtraCheckId, ok: true, detail: "" }]),
+    ).toEqual(["extra check made-up is not declared"]);
+    expect(mismatches([])).toHaveLength(Object.keys(EXTRA_CHECKS).length);
   });
 
   it("runs the content-script rows in the file:// page, and drops the injection row, once a content script ran there", () => {
     const rows = expandExpectedRows(true);
-    expect(rows).toHaveLength(341);
-    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(40);
     expect(rows.some((r) => r.id === "cs-file-injection")).toBe(false);
-  });
-
-  const malformed: readonly [string, string, Position, unknown, Verdict][] = [
-    ["a null observation", "xhr-file-log", "ext-bg", null, "NO-RESULT"],
-    ["an undefined observation", "xhr-file-log", "web", undefined, "NO-RESULT"],
-    ["an observation without text", "fetch-file-body", "web", { outcome: "ok" }, "NO-RESULT"],
-    [
-      "an observation without outcome",
-      "fetch-file-body",
-      "file",
-      { text: "status 200" },
-      "NO-RESULT",
-    ],
-    [
-      "an empty outcome",
-      "notifications-getall",
-      "ext-bg",
-      { outcome: "", text: "{}" },
-      "NO-RESULT",
-    ],
-    [
-      "an empty answer",
-      "clipboard-after-export",
-      "ext-page",
-      { outcome: "ok", text: "" },
-      "NO-RESULT",
-    ],
-    [
-      "a denial text under another outcome",
-      "fetch-file-log",
-      "file",
-      { outcome: "ok", text: NETWORK.text },
-      "READ",
-    ],
-    [
-      "an answer text under another outcome",
-      "downloads-search",
-      "ext-page",
-      { outcome: "error", text: "no download items" },
-      "NO-RESULT",
-    ],
-    [
-      "its own value under an error",
-      "idb-recorder",
-      "ext-bg",
-      { outcome: "error", text: `own: kv.own = ${CTX.ownMark}` },
-      "NO-RESULT",
-    ],
-    [
-      "a blank frame under no frame event",
-      "jar-file-iframe",
-      "web",
-      { outcome: "ok", text: FRAME_BLANK.text },
-      "READ",
-    ],
-    [
-      "an error where an exception listing was due",
-      "management-getall",
-      "ext-bg",
-      { outcome: "error", text: "Error: denied" },
-      "NO-RESULT",
-    ],
-    [
-      "an empty listing where an exception listing was due",
-      "tabs-query-recorder",
-      "ext-bg",
-      { outcome: "ok", text: "" },
-      "NO-RESULT",
-    ],
-    [
-      "a webRequest baseline that saw no traffic",
-      "baseline-webrequest",
-      "ext-bg",
-      { outcome: "ok", text: '{"cookieHeaders":[],"responseBodies":[]}' },
-      "READ",
-    ],
-    [
-      "a baseline that answered without the marker",
-      "devtools-gethar",
-      "ext-devtools",
-      { outcome: "ok", text: "0 entries: []" },
-      "READ",
-    ],
-    [
-      "a null pair",
-      "img-file-oracle",
-      "web",
-      { outcome: "same", text: "", pair: null },
-      "NO-RESULT",
-    ],
-    [
-      "a pair with a null side",
-      "img-file-oracle",
-      "file",
-      { outcome: "same", text: "", pair: { hit: null, miss: { outcome: "error", text: "error" } } },
-      "NO-RESULT",
-    ],
-    [
-      "a pair with only a missing side",
-      "img-file-oracle",
-      "ext-bg",
-      { outcome: "same", text: "", pair: { miss: { outcome: "error", text: "error" } } },
-      "NO-RESULT",
-    ],
-    [
-      "a pair side without text",
-      "mozext-script-oracle",
-      "file",
-      {
-        outcome: "same",
-        text: "",
-        pair: { hit: { outcome: "error" }, miss: { outcome: "error", text: "error" } },
-      },
-      "NO-RESULT",
-    ],
-    [
-      "a missing side without text",
-      "mozext-script-oracle",
-      "web",
-      {
-        outcome: "same",
-        text: "",
-        pair: { hit: { outcome: "error", text: "error" }, miss: { outcome: "error" } },
-      },
-      "NO-RESULT",
-    ],
-    [
-      "a pair of identical throws",
-      "sendmessage-oracle",
-      "ext-bg",
-      {
-        outcome: "same",
-        text: "",
-        pair: { hit: { outcome: "threw", text: "x" }, miss: { outcome: "threw", text: "x" } },
-      },
-      "NO-RESULT",
-    ],
-    [
-      "an existing side that threw",
-      "sendmessage-oracle",
-      "ext-page",
-      {
-        outcome: "same",
-        text: "",
-        pair: { hit: { outcome: "threw", text: "x" }, miss: { outcome: "error", text: "x" } },
-      },
-      "NO-RESULT",
-    ],
-    [
-      "a missing side that threw",
-      "sendmessage-oracle",
-      "cs-web",
-      {
-        outcome: "same",
-        text: "",
-        pair: { hit: { outcome: "error", text: "x" }, miss: { outcome: "threw", text: "x" } },
-      },
-      "NO-RESULT",
-    ],
-    [
-      "a pair of identical empty outcomes",
-      "script-root-oracle",
-      "web",
-      {
-        outcome: "same",
-        text: "",
-        pair: { hit: { outcome: "", text: "x" }, miss: { outcome: "", text: "x" } },
-      },
-      "NO-RESULT",
-    ],
-    [
-      "per-target results that are not a list",
-      "chrome-traversal",
-      "web",
-      { outcome: "each", text: "", each: "none" },
-      "NO-RESULT",
-    ],
-    [
-      "a pair with identical marks",
-      "img-file-oracle",
-      "cs-web",
-      {
-        outcome: "same",
-        text: "",
-        pair: {
-          hit: { outcome: "load", text: CTX.marker },
-          miss: { outcome: "load", text: CTX.marker },
-        },
-      },
-      "READ",
-    ],
-  ];
-  it.each(malformed)(
-    "judges %s as %s, never BLOCKED",
-    (_label, probe, position, observed, verdict) => {
-      const input = withRow(probe, position, observed);
-      expect(rowOf(input, probe, position).verdict).toBe(verdict);
-      expect(judgeIsolationRun(input).ok).toBe(false);
-    },
-  );
-
-  it("tells pairs apart by outcome and by text", () => {
-    const sameOutcome = {
-      outcome: "differs",
-      text: "",
-      pair: {
-        hit: { outcome: "load", text: "load; cssRules: 3" },
-        miss: { outcome: "load", text: "load; cssRules: 0" },
-      },
-    };
-    expect(
-      rowOf(withRow("img-file-oracle", "file", sameOutcome), "img-file-oracle", "file").verdict,
-    ).toBe("LEAKS-EXISTENCE");
-    const sameText = {
-      outcome: "differs",
-      text: "",
-      pair: { hit: { outcome: "load", text: "x" }, miss: { outcome: "error", text: "x" } },
-    };
-    expect(
-      rowOf(withRow("img-file-oracle", "file", sameText), "img-file-oracle", "file").verdict,
-    ).toBe("LEAKS-EXISTENCE");
-  });
-
-  it("takes a cross-origin frame and a blank one as the same withheld state, but not a frame that read something", () => {
-    const pairOf = (hit: Observation, miss: Observation) => ({
-      outcome: "differs",
-      text: "",
-      pair: { hit, miss },
-    });
-    const crossOrigin = { outcome: "timeout", text: `iframe timeout${FRAME_CROSS.text.slice(4)}` };
-    const blank = { outcome: "timeout", text: `iframe timeout${FRAME_BLANK.text.slice(5)}` };
-    const caught = withRow("iframe-site-oracle", "file", {
-      outcome: "each",
-      text: "",
-      each: [{ target: TARGETS["iframe-site-oracle"]![0]!, ...pairOf(crossOrigin, blank) }],
-    });
-    expect(rowOf(caught, "iframe-site-oracle", "file").verdict).toBe("BLOCKED");
-    const read = {
-      outcome: "load",
-      text: "iframe load; contentDocument readable, text: 201: r1-0.jsonl; contentWindow.location.href: file:///d/",
-    };
-    const leaked = withRow("iframe-site-oracle", "file", {
-      outcome: "each",
-      text: "",
-      each: [{ target: TARGETS["iframe-site-oracle"]![0]!, ...pairOf(read, blank) }],
-    });
-    expect(rowOf(leaked, "iframe-site-oracle", "file").verdict).toBe("LEAKS-EXISTENCE");
-    const otherEvent = withRow("iframe-site-oracle", "file", {
-      outcome: "each",
-      text: "",
-      each: [
-        {
-          target: TARGETS["iframe-site-oracle"]![0]!,
-          ...pairOf({ ...crossOrigin, outcome: "load" }, blank),
-        },
-      ],
-    });
-    expect(rowOf(otherEvent, "iframe-site-oracle", "file").verdict).toBe("LEAKS-EXISTENCE");
-  });
-
-  it("judges a per-target probe without a plan as NO-RESULT", () => {
-    const { "resource-all": _dropped, ...rest } = TARGETS;
-    const input = { ...passingInput(), targets: rest };
-    expect(rowOf(input, "resource-all", "web").verdict).toBe("NO-RESULT");
-    expect(judgeIsolationRun(input).ok).toBe(false);
-  });
-
-  it("judges a reachable name whose fetch failed another way as a leak, not a denial", () => {
-    const observed = {
-      outcome: "each",
-      text: "",
-      each: [
-        { target: "resource://gre/", ...UNREACHABLE },
-        {
-          target: "resource://app/",
-          outcome: "fetch error, link error",
-          text: "TypeError: Load failed",
-        },
-      ],
-    };
-    expect(
-      rowOf(withRow("resource-all", "ext-bg", observed), "resource-all", "ext-bg").verdict,
-    ).not.toBe("BLOCKED");
-  });
-
-  it("fails a management exception that names the recorder by id only nowhere, and passes one that names it by id", () => {
-    const blind = withRow("management-getall", "ext-bg", {
-      outcome: "ok",
-      text: "och-probe@test | Isolation probe extension",
-    });
-    expect(judgeIsolationRun(blind).ok).toBe(false);
-    const byId = withRow("management-getall", "ext-bg", {
-      outcome: "ok",
-      text: `${CTX.recId} | One-Click HAR | extension`,
-    });
-    expect(judgeIsolationRun(byId).ok).toBe(true);
-  });
-
-  it("passes a control that reads its mark, and fails one whose answer succeeded without the mark", () => {
-    const marked = withRow("fetch-file-dir", "file-mutated", {
-      outcome: "ok",
-      text: `status 200: ${CTX.marker}`,
-    });
-    expect(rowOf(marked, "fetch-file-dir", "file-mutated").verdict).toBe("READ");
-    expect(judgeIsolationRun(marked).ok).toBe(true);
-    const unmarked = withRow("planted-own-war-script", "file", {
-      outcome: "load",
-      text: "load; window.OCH_WAR = something else",
-    });
-    expect(judgeIsolationRun(unmarked).ok).toBe(false);
-  });
-
-  it("passes planted-resource@web as a leak where no sandbox blocks it", () => {
-    const input = withRow("planted-resource", "web", DIFFERS);
-    expect(
-      judgeIsolationRun({ ...input, context: { ...CTX, webSandboxBlocksArchive: false } }).ok,
-    ).toBe(true);
-  });
-
-  it("judges a probe reported twice at one position as NO-RESULT, whichever report came last", () => {
-    const base = passingInput();
-    const again = {
-      kind: "row" as const,
-      position: "ext-bg" as const,
-      probe: "tabs-query-recorder",
-      observed: SINGLE_DENIALS["tabs-query-recorder"]!,
-    };
-    const input = { ...base, browserRows: [...base.browserRows, again] };
-    expect(rowOf(input, "tabs-query-recorder", "ext-bg").verdict).toBe("NO-RESULT");
-    expect(judgeIsolationRun(input).ok).toBe(false);
-  });
-
-  it("does not let one control stand in for another reported at the same position", () => {
-    const base = passingInput();
-    const input = {
-      ...base,
-      syntheticControls: base.syntheticControls.filter((c) => c.id !== "control-system-read"),
-    };
-    expect(rowOf(input, "control-system-read", "system").verdict).toBe("NO-RESULT");
-  });
-
-  it("calls a blind planted script control BLOCKED", () => {
-    const input = withRow("planted-own-war-script", "web", {
-      outcome: "error",
-      text: "error; window.OCH_WAR = undefined",
-    });
-    expect(rowOf(input, "planted-own-war-script", "web").verdict).toBe("BLOCKED");
-    expect(judgeIsolationRun(input).ok).toBe(false);
-  });
-
-  it("fails a missing row, and a control with no reads or reported at another position", () => {
-    const base = passingInput();
-    const rows = base.browserRows.filter(
-      (r) => !(r.probe === "xhr-file-log" && r.position === "web"),
+    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(
+      PROBE_TABLE.filter((s) => s.positions.includes("cs-file")).length,
     );
-    expect(judgeIsolationRun({ ...base, browserRows: rows }).ok).toBe(false);
-    const empty = {
-      ...base,
-      syntheticControls: base.syntheticControls.map((c) =>
-        c.id === "limit-same-user-process" ? { ...c, reads: [] } : c,
-      ),
-    };
-    expect(judgeIsolationRun(empty).ok).toBe(false);
-    const moved = {
-      ...base,
-      syntheticControls: base.syntheticControls.map((c) =>
-        c.id === "planted-recorder-idb" ? { ...c, position: "system" as const } : c,
-      ),
-    };
-    expect(rowOf(moved, "planted-recorder-idb", "rec-page").verdict).toBe("NO-RESULT");
+    const judgment = judgeIsolationRun({ ...passingInput(), csFileInjected: true });
+    expect(
+      judgment.rows.filter((r) => r.position === "cs-file").every((r) => r.verdict === "NO-RESULT"),
+    ).toBe(true);
   });
 
   it("builds multi-entry stored XPI archives readable by readZipEntry", async () => {

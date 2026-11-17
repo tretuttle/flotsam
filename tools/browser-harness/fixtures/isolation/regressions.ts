@@ -3,10 +3,9 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 
-// Planted product regressions for the isolation check. Each plant edits a scratch copy of the product, the repo's
-// own pack builds it, and the unmodified isolation check must turn the paired rows or checks red. The first nine
-// came from the verifier of PR 18 (verify/pr-18.md section 3), the last three were added with the judge rewrite.
-// The check runs from the scratch copy, so the harness judged is the one copied at the start of the run.
+// Planted regressions: each must turn its paired rows or checks red. A product plant edits and packs a scratch copy of
+// the product; a harness plant edits the scratch copy of the probes and runs against the unplanted product, and must
+// come out NO-RESULT, never BLOCKED. The check runs from the scratch copy copied at the start.
 
 /** An exact edit: `from` must occur exactly once in the file. */
 type Edit = { readonly file: string; readonly from: string; readonly to: string };
@@ -16,7 +15,9 @@ export type Plant = {
   readonly what: string;
   readonly edits: readonly Edit[];
   readonly files?: Readonly<Record<string, string>>;
-  /** Rows as `<probe>@<position>` and extra checks by id: each must fail. */
+  /** Edits the probes, not the product: applied while the check runs against the unplanted XPI. */
+  readonly harness?: true;
+  /** Rows as `<probe>@<position>`, or `<probe>@<position>=<verdict>` for an exact verdict, and extra checks by id. */
   readonly mustFail: readonly string[];
 };
 
@@ -24,6 +25,10 @@ const FILES = "apps/extension/experiment/files.ts";
 const STORE = "apps/extension/experiment/store.ts";
 const PARENT = "apps/extension/experiment/parent.ts";
 const MANIFEST = "apps/extension/src/manifest.json";
+const POPUP = "apps/extension/src/popup/main.tsx";
+const SCHEMA = "apps/extension/experiment/gecko-schema.ts";
+const PROBES = "tools/browser-harness/fixtures/isolation/probe-script.ts";
+const TARGETS = "tools/browser-harness/fixtures/isolation/targets.ts";
 const MANIFEST_ANCHOR = '  "experiment_apis": {';
 const KEY_LINE = "const key = archiveKeyFromBytes(randomBytes(ARCHIVE_KEY_BYTES));";
 const MODES_LINE = "const modes: Modes = { dir: row.dirMode, file: row.fileMode };";
@@ -94,7 +99,12 @@ export const PLANTS: readonly Plant[] = [
         '  "web_accessible_resources": [{ "resources": ["popup/*", "experiment/*"], "matches": ["<all_urls>"], "extension_ids": ["*"] }],',
       ),
     ],
-    mustFail: ["mozext-parent@web", "mozext-every-file@web", "exposure-declared"],
+    mustFail: [
+      "mozext-parent@web",
+      "mozext-every-file@web",
+      "mozext-frame-recorder@web",
+      "exposure-allowed",
+    ],
   },
   {
     id: "downloads-list",
@@ -139,7 +149,7 @@ ${STEPS_LINE}`,
         "declare function cloneInto<T>(value: T, target: object): T;\n" +
         "export {};\n",
     },
-    mustFail: ["api-namespace@web", "api-namespace@cs-web", "exposure-declared"],
+    mustFail: ["api-namespace@web", "api-namespace@cs-web", "exposure-allowed"],
   },
   {
     id: "connect-external",
@@ -151,7 +161,7 @@ ${STEPS_LINE}`,
         "browser.runtime.onConnectExternal.addListener((port) => port.postMessage({ recording: true, problems: [] }));\n" +
         "export {};\n",
     },
-    mustFail: ["connect-recorder@ext-bg", "exposure-declared"],
+    mustFail: ["connect-recorder@ext-bg", "exposure-allowed"],
   },
   {
     id: "site-dir-unkeyed",
@@ -165,7 +175,7 @@ ${STEPS_LINE}`,
       await appendText(segment.path, text, modes);`,
       },
     ],
-    mustFail: ["inventory-exists@file", "nothing-outside-key-folder"],
+    mustFail: ["inventory-exists@file", "nothing-outside-key-folder", "disk-writes-allowed"],
   },
   {
     id: "resource-sub",
@@ -211,7 +221,7 @@ ${STEPS_LINE}`,
         "browser.runtime.onMessageExternal.addListener(() => Promise.resolve({ recording: true, problems: [] }));\n" +
         "export {};\n",
     },
-    mustFail: ["sendmessage-recorder@ext-bg", "exposure-declared"],
+    mustFail: ["sendmessage-recorder@ext-bg", "exposure-allowed"],
   },
   {
     id: "site-index-outside-key",
@@ -225,12 +235,273 @@ ${STEPS_LINE}`,
       await appendText(segment.path, text, modes);`,
       },
     ],
-    mustFail: ["inventory-exists@file", "nothing-outside-key-folder", "key-names-the-archive"],
+    mustFail: [
+      "inventory-exists@file",
+      "nothing-outside-key-folder",
+      "key-names-the-archive",
+      "disk-writes-allowed",
+    ],
+  },
+
+  // Verifier round 2: product plants of new kinds.
+  {
+    id: "files-0640",
+    what: "archive files group-readable 0640",
+    edits: [
+      {
+        file: FILES,
+        from: MODES_LINE,
+        to: "const modes: Modes = { dir: row.dirMode, file: row.fileMode === null ? null : 0o640 };",
+      },
+    ],
+    mustFail: ["archive-modes"],
+  },
+  {
+    id: "key-file-0640",
+    what: "the key file in the profile is written group-readable 0640",
+    edits: [
+      {
+        file: FILES,
+        from: "writeAsciiSync(path, `${key}\\n`, { dir: null, file: 0o600 });",
+        to: "writeAsciiSync(path, `${key}\\n`, { dir: null, file: 0o640 });",
+      },
+    ],
+    mustFail: ["key-file-mode"],
+  },
+  {
+    id: "popup-postmessage",
+    what: "the recorder popup echoes the recording status to any postMessage",
+    edits: [
+      {
+        file: POPUP,
+        from: "const readEnvironment = async (): Promise<Reading> => {",
+        to: `window.addEventListener("message", (event) => {
+  void browser.oneClickHar?.getRecordingStatus().then((status) => {
+    (event.source as WindowProxy | null)?.postMessage({ oneClickHar: status }, "*");
+  });
+});
+const readEnvironment = async (): Promise<Reading> => {`,
+      },
+    ],
+    mustFail: ["exposure-allowed"],
+  },
+  {
+    id: "war-runtime",
+    what: "the parent script adds /action/* and /experiment/* to webAccessibleResources at runtime",
+    edits: [
+      {
+        file: PARENT,
+        from: STEPS_LINE,
+        to: `  {
+    const pol = WebExtensionPolicy.getByID("one-click-har@tretuttle.github.io") as unknown as {
+      extension: {
+        webAccessibleResources: unknown[];
+        serialize(): unknown;
+        setSharedData(k: string, v: unknown): void;
+      };
+    } | null;
+    if (pol) {
+      pol.extension.webAccessibleResources.push({
+        resources: ["/action/*", "/experiment/*"],
+        matches: ["<all_urls>"],
+        extension_ids: ["*"],
+      });
+      pol.extension.setSharedData("", pol.extension.serialize());
+    }
+  }
+${STEPS_LINE}`,
+      },
+    ],
+    mustFail: ["exposure-allowed", "mozext-parent@web", "mozext-every-file@web"],
+  },
+  {
+    id: "downloads-symlink",
+    what: "the parent script links Downloads/one-click-har-archive to the key folder",
+    edits: [
+      {
+        file: PARENT,
+        from: STEPS_LINE,
+        to: `  {
+    const { Downloads } = ChromeUtils.importESModule("resource://gre/modules/Downloads.sys.mjs");
+    void Downloads.getPreferredDownloadsDirectory().then((dlDir: string) => {
+      const targetPath = PathUtils.join(dlDir, "one-click-har-archive");
+      const ln = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+      ln.initWithPath("/usr/bin/ln");
+      const proc = (Cc["@mozilla.org/process/util;1"] as unknown as {
+        createInstance(i: unknown): { init(f: unknown): void; run(b: boolean, args: string[], n: number): void };
+      }).createInstance((Ci as unknown as Record<string, unknown>).nsIProcess);
+      proc.init(ln);
+      proc.run(true, ["-sfn", archive.root, targetPath], 3);
+    });
+  }
+${STEPS_LINE}`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed"],
+  },
+  {
+    id: "schema-exposed-cs",
+    what: "the experiment API adds a content_parent scope and allowedContexts content",
+    edits: [
+      {
+        file: MANIFEST,
+        from: '"scopes": ["addon_parent"],',
+        to: '"scopes": ["addon_parent", "content_parent"],',
+      },
+      {
+        file: SCHEMA,
+        from: "    namespace,\n",
+        to: '    namespace,\n    allowedContexts: ["content", "addon"],\n',
+      },
+    ],
+    mustFail: ["exposure-allowed"],
+  },
+  {
+    id: "clipboard-leak",
+    what: "the recorder copies the log path and a recorded line to the clipboard while capturing",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `      await ensureDir(dirOf(logSegmentPath(segment.id)));
+      (Cc["@mozilla.org/widget/clipboardhelper;1"] as unknown as {
+        getService(i: unknown): { copyString(s: string): void };
+      }).getService((Ci as unknown as Record<string, unknown>).nsIClipboardHelper).copyString(segment.path + "\\n" + text.slice(0, 200));
+      await appendText(segment.path, text, modes);`,
+      },
+    ],
+    mustFail: ["clipboard-after-export@ext-page"],
+  },
+  {
+    id: "profile-site-list",
+    what: "the recorder writes recorded hosts to <profile>/one-click-har-sites.txt",
+    edits: [
+      {
+        file: STORE,
+        from: APPEND_LINE,
+        to: `      await ensureDir(dirOf(logSegmentPath(segment.id)));
+      await appendText(PathUtils.join(Services.dirsvc.get("ProfD", Ci.nsIFile).path, "one-click-har-sites.txt"), state.site + "\\n", modes);
+      await appendText(segment.path, text, modes);`,
+      },
+    ],
+    mustFail: ["disk-writes-allowed", "inventory-exists@file"],
+  },
+
+  // Harness plants: a probe that reports nothing, or acts on or plans a target that is not there, is NO-RESULT.
+  {
+    id: "probe-empty-result",
+    what: "xhr-file-log's runner returns {}",
+    harness: true,
+    edits: [
+      {
+        file: PROBES,
+        from: '"xhr-file-log": (p) => viaXhr(one(p, "xhr-file-log")),',
+        to: '"xhr-file-log": async () => ({}),',
+      },
+    ],
+    mustFail: ["xhr-file-log@web=NO-RESULT", "xhr-file-log@file=NO-RESULT"],
+  },
+  {
+    id: "probe-empty-result-exception",
+    what: "tabs-query-recorder's runner, on a decided-exception row, returns {}",
+    harness: true,
+    edits: [
+      {
+        file: PROBES,
+        from: '"tabs-query-recorder": (p) => about(',
+        to: '"tabs-query-recorder": async () => ({}),\n    "unused-tabs-query": (p) => about(',
+      },
+    ],
+    mustFail: ["tabs-query-recorder@ext-bg=NO-RESULT", "tabs-query-recorder@ext-page=NO-RESULT"],
+  },
+  {
+    id: "probe-missing-runner",
+    what: "xhr-file-log has no runner",
+    harness: true,
+    edits: [
+      {
+        file: PROBES,
+        from: '    "xhr-file-log": (p) => viaXhr(one(p, "xhr-file-log")),\n',
+        to: "",
+      },
+    ],
+    mustFail: ["xhr-file-log@web=NO-RESULT"],
+  },
+  {
+    id: "probe-never-runs",
+    what: "runAll skips xhr-file-log, so it reports no row",
+    harness: true,
+    edits: [
+      {
+        file: PROBES,
+        from: "      if (only && !only.includes(meta.id)) continue;",
+        to: '      if (meta.id === "xhr-file-log") continue;\n      if (only && !only.includes(meta.id)) continue;',
+      },
+    ],
+    mustFail: ["xhr-file-log@web=NO-RESULT"],
+  },
+  {
+    id: "probe-typo-xhr-file-log",
+    what: "xhr-file-log requests the log path with a typo",
+    harness: true,
+    edits: [
+      {
+        file: PROBES,
+        from: 'viaXhr(one(p, "xhr-file-log"))',
+        to: 'viaXhr(one(p, "xhr-file-log") + "-typo")',
+      },
+    ],
+    mustFail: ["xhr-file-log@file=NO-RESULT", "xhr-file-log@web=NO-RESULT"],
+  },
+  {
+    id: "probe-typo-mozext-parent",
+    what: "mozext-parent fetches experiment/parent-typo.js",
+    harness: true,
+    edits: [
+      {
+        file: PROBES,
+        from: '"mozext-parent": fetchOne("mozext-parent"),',
+        to: '"mozext-parent": (p) => viaFetch(one(p, "mozext-parent").replace("parent.js", "parent-typo.js")),',
+      },
+    ],
+    mustFail: ["mozext-parent@web=NO-RESULT"],
+  },
+  {
+    id: "probe-typo-connect-recorder",
+    what: "connect-recorder connects to the recorder id with a typo",
+    harness: true,
+    edits: [
+      {
+        file: PROBES,
+        from: 'connectTo(after(one(p, "connect-recorder"), "addon:"))',
+        to: 'connectTo(after(one(p, "connect-recorder"), "addon:") + "-typo")',
+      },
+    ],
+    mustFail: ["connect-recorder@ext-bg=NO-RESULT"],
+  },
+  {
+    id: "plan-typo-mozext-parent",
+    what: "the plan names experiment/parent-typo.js, so the probe and the plan agree on a file that is not there",
+    harness: true,
+    edits: [
+      {
+        file: TARGETS,
+        from: 'plan(["mozext-parent"], [recUrl("experiment/parent.js")]);',
+        to: 'plan(["mozext-parent"], [recUrl("experiment/parent-typo.js")]);',
+      },
+    ],
+    mustFail: ["mozext-parent@web=NO-RESULT"],
   },
 ];
 
 /** The baseline: the unplanted product must pass. */
 const BASELINE = "baseline";
+const BASELINE_PLANT: Plant = {
+  id: BASELINE,
+  what: "the product as it is",
+  edits: [],
+  mustFail: [],
+};
 
 type JudgedRun = {
   readonly ok: boolean;
@@ -238,15 +509,18 @@ type JudgedRun = {
     readonly id: string;
     readonly position: string;
     readonly ok: boolean;
+    readonly verdict: string;
   }[];
   readonly checks: readonly { readonly id: string; readonly ok: boolean }[];
   readonly mismatches: readonly string[];
 };
 
-/** The failed rows (`<probe>@<position>`) and extra checks (`<id>`) of one judgment. */
+/** The failed rows (as `<probe>@<position>` and `<probe>@<position>=<verdict>`) and extra checks of one judgment. */
 export function failedIds(judgment: JudgedRun): ReadonlySet<string> {
   return new Set([
-    ...judgment.rows.filter((r) => !r.ok).map((r) => `${r.id}@${r.position}`),
+    ...judgment.rows.flatMap((r) =>
+      r.ok ? [] : [`${r.id}@${r.position}`, `${r.id}@${r.position}=${r.verdict}`],
+    ),
     ...judgment.checks.filter((c) => !c.ok).map((c) => c.id),
     ...judgment.mismatches.filter((m) => m.startsWith("extra check ")),
   ]);
@@ -339,10 +613,7 @@ async function main(): Promise<void> {
   const work = NodePath.resolve(values.work);
   const scratch = NodePath.join(work, "product");
   const only = values.only?.split(",") ?? null;
-  const selected = [
-    { id: BASELINE, what: "the product as it is", edits: [], mustFail: [] } satisfies Plant,
-    ...PLANTS,
-  ].filter((p) => only === null || only.includes(p.id));
+  const selected = [BASELINE_PLANT, ...PLANTS].filter((p) => only === null || only.includes(p.id));
 
   if (values["skip-pack"] !== true) {
     NodeFS.rmSync(scratch, { recursive: true, force: true });
@@ -354,7 +625,10 @@ async function main(): Promise<void> {
         return rel[0] !== ".git" && !(rel[0] === "apps" && rel[2] === "dist");
       },
     });
-    for (const plant of selected) {
+    const packed = selected.some((p) => p.harness === true)
+      ? [...new Set([BASELINE_PLANT, ...selected.filter((p) => p.harness !== true)])]
+      : selected;
+    for (const plant of packed) {
       const restore = applyPlant(scratch, plant);
       try {
         process.stdout.write(`pack ${plant.id}\n`);
@@ -386,6 +660,7 @@ async function main(): Promise<void> {
     NodeFS.rmSync(out, { recursive: true, force: true });
     NodeFS.mkdirSync(tmp, { recursive: true });
     process.stdout.write(`check ${plant.id}\n`);
+    const restoreProbes = plant.harness === true ? applyPlant(scratch, plant) : () => undefined;
     NodeChildProcess.spawnSync(
       "unshare",
       [
@@ -401,7 +676,7 @@ async function main(): Promise<void> {
         "--binary",
         values.binary,
         "--extension",
-        NodePath.join(work, "xpi", `${plant.id}.xpi`),
+        NodePath.join(work, "xpi", `${plant.harness === true ? BASELINE : plant.id}.xpi`),
         "--check",
         "isolation",
         "--out-dir",
@@ -409,6 +684,7 @@ async function main(): Promise<void> {
       ],
       { cwd: scratch, env: { ...process.env, TMPDIR: tmp }, stdio: "ignore" },
     );
+    restoreProbes();
     NodeFS.rmSync(tmp, { recursive: true, force: true });
     const resultsFile = NodePath.join(out, "check-results.json");
     const recorded = NodeFS.existsSync(resultsFile)

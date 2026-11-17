@@ -204,3 +204,90 @@ describe("written paths", () => {
     ]);
   });
 });
+
+describe("archive check details", () => {
+  const KEY = "0123456789abcdef0123456789abcdef";
+  const SECOND = "fedcba9876543210fedcba9876543210";
+
+  it("prints what held when every rule holds", () => {
+    expect(judgeArchive(evidence(KEY, SECOND))).toEqual([
+      { id: "key-file-format", ok: true, detail: `key file text "${KEY}\\n"` },
+      { id: "key-file-mode", ok: true, detail: "key file mode 600" },
+      {
+        id: "key-names-the-archive",
+        ok: true,
+        detail: `app folder holds ["${KEY}"], key file names ${KEY}`,
+      },
+      { id: "key-differs-across-profiles", ok: true, detail: `first ${KEY}, second ${SECOND}` },
+      {
+        id: "key-not-derived",
+        ok: true,
+        detail: `checked against ${String(keyDerivations(sources("/home/trent/.mozilla/abc.default")).length)} derivations per profile`,
+      },
+      { id: "nothing-outside-key-folder", ok: true, detail: "only the key folder" },
+      {
+        id: "written-paths-targeted",
+        ok: true,
+        detail: "9 planned entries cover 9 final entries",
+      },
+    ]);
+  });
+
+  it("prints the offending value of every rule that fails", () => {
+    const derived = sha("sha256", "/home/trent/.mozilla/abc.default").slice(0, 32);
+    const late = [
+      ...archive(derived),
+      { path: "recent-sites.txt", kind: "file" as const },
+      { path: "sites", kind: "directory" as const },
+    ];
+    const failing = judgeArchive(
+      evidence(derived, derived, {
+        keyFileMode: 0o644,
+        appFolderNames: [derived, "recent-sites.txt"],
+        final: late,
+      }),
+    );
+    expect(failing.filter((c) => !c.ok)).toEqual([
+      { id: "key-file-mode", ok: false, detail: "key file mode 644" },
+      {
+        id: "key-names-the-archive",
+        ok: false,
+        detail: `app folder holds ["${derived}","recent-sites.txt"], key file names ${derived}`,
+      },
+      {
+        id: "key-differs-across-profiles",
+        ok: false,
+        detail: `first ${derived}, second ${derived}`,
+      },
+      { id: "key-not-derived", ok: false, detail: "key equals sha256(profileDir)" },
+      {
+        id: "nothing-outside-key-folder",
+        ok: false,
+        detail: "outside the key folder: recent-sites.txt, sites",
+      },
+      {
+        id: "written-paths-targeted",
+        ok: false,
+        detail: "written but never probed: recent-sites.txt, sites",
+      },
+    ]);
+    const second = sha("md5", "xyz.default");
+    expect(
+      judgeArchive(evidence(randomKeyFixed, second)).find((c) => c.id === "key-not-derived"),
+    ).toEqual({ id: "key-not-derived", ok: false, detail: "key equals md5(profileDir name)" });
+    expect(
+      judgeArchive(evidence(KEY, null)).find((c) => c.id === "key-differs-across-profiles"),
+    ).toEqual({
+      id: "key-differs-across-profiles",
+      ok: false,
+      detail: "no second key: no key file after 20000 ms",
+    });
+    expect(
+      judgeArchive(evidence(KEY, SECOND, { keyFileMode: 0o640 })).find(
+        (c) => c.id === "key-file-mode",
+      )?.detail,
+    ).toBe("key file mode 640");
+  });
+});
+
+const randomKeyFixed = "00112233445566778899aabbccddeeff";

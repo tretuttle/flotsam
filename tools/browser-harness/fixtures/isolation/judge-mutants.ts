@@ -4,30 +4,56 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 import { applyMutant, generateMutants, type Mutant } from "../../mutation/operators.ts";
+import type * as OracleModule from "./archive-oracle.ts";
 import type { ArchiveEvidence, ExtraCheckResult } from "./archive-oracle.ts";
+import type * as DiskModule from "./disk.ts";
+import type { DiskChange } from "./disk.ts";
+import type * as ExposureModule from "./exposure.ts";
+import type { ExposureEvidence } from "./exposure.ts";
+import type * as JudgeModule from "./judge.ts";
 import type { IsolationRunInput } from "./judge.ts";
-import { asRequired, PLANTS, recordedIsolation } from "./regressions.ts";
+import { recordedIsolation } from "./regressions.ts";
+import type * as TargetsModule from "./targets.ts";
+import type { ExtraCheckId } from "./probe-table.ts";
+import type { CheckOutcome, PlanInput } from "./targets.ts";
 
-// Every operator mutant of the isolation judge, its archive oracle and its probe table must be killed, or be listed
-// in equivalent-mutants.json with its reason. A mutant is killed when it changes the verdict of a recorded real run
-// (the baseline goes red, or a planted regression stops turning its paired rows red), or when a unit test fails.
+// Every operator mutant of the isolation judges (the row judge, the archive oracle, the probe table, the target plan
+// and witness, the disk rules and the exposure rules) must be killed, or be listed in equivalent-mutants.json with
+// its reason. A mutant is killed when it changes anything the judges print for a recorded real run: a verdict, an
+// ok, a count, a mismatch line, an extra check's detail, a disk or exposure problem. Or when a unit test fails.
 
 const HERE = import.meta.dirname;
 const PACKAGE_DIR = NodePath.resolve(HERE, "..", "..");
 const REPO_ROOT = NodePath.resolve(PACKAGE_DIR, "..", "..");
-const MODULES = ["judge.ts", "archive-oracle.ts", "probe-table.ts"] as const;
+const MODULES = [
+  "judge.ts",
+  "archive-oracle.ts",
+  "probe-table.ts",
+  "targets.ts",
+  "disk.ts",
+  "exposure.ts",
+] as const;
 const EQUIVALENT_FILE = NodePath.join(HERE, "equivalent-mutants.json");
 
 type Recorded = {
   readonly name: string;
-  readonly mustFail: readonly string[];
+  /** What the check printed when it ran; the unmutated judges must reproduce it exactly. */
+  readonly judgment: unknown;
   readonly input: IsolationRunInput;
   readonly evidence: ArchiveEvidence;
+  readonly exposure: ExposureEvidence;
+  readonly diskChanges: readonly DiskChange[];
+  readonly diskRuleInput: Parameters<typeof DiskModule.diskRules>[0];
+  readonly planInput: PlanInput;
+  readonly witnessResults: readonly (readonly [string, CheckOutcome])[];
 };
 
-type Judge = {
-  readonly judgeIsolationRun: (input: IsolationRunInput) => Parameters<typeof asRequired>[1];
-  readonly judgeArchive: (evidence: ArchiveEvidence) => readonly ExtraCheckResult[];
+type Judges = {
+  readonly judge: typeof JudgeModule;
+  readonly oracle: typeof OracleModule;
+  readonly targets: typeof TargetsModule;
+  readonly disk: typeof DiskModule;
+  readonly exposure: typeof ExposureModule;
 };
 
 function loadRecorded(runsDirs: readonly string[]): readonly Recorded[] {
@@ -38,41 +64,74 @@ function loadRecorded(runsDirs: readonly string[]): readonly Recorded[] {
       if (!NodeFS.existsSync(file)) continue;
       const data = recordedIsolation(JSON.parse(NodeFS.readFileSync(file, "utf8")))?.data;
       if (data === null || data === undefined) throw new Error(`${file} holds no isolation data`);
-      const plant = PLANTS.find((p) => p.id === name);
-      if (plant === undefined && !name.startsWith("baseline"))
-        throw new Error(`${name} is neither a plant nor a baseline`);
       recorded.push({
         name: `${NodePath.basename(dir)}/${name}`,
-        mustFail: plant?.mustFail ?? [],
+        judgment: data["judgment"],
         input: data["input"] as IsolationRunInput,
         evidence: data["archiveEvidence"] as ArchiveEvidence,
+        exposure: data["exposureEvidence"] as ExposureEvidence,
+        diskChanges: data["diskChanges"] as DiskChange[],
+        diskRuleInput: data["diskRuleInput"] as Recorded["diskRuleInput"],
+        planInput: data["planInput"] as PlanInput,
+        witnessResults: data["witnessResults"] as Recorded["witnessResults"],
       });
     }
   }
   return recorded;
 }
 
-/** Re-judges a recorded run as the check would: archive rules from the evidence, the rest from the input. */
-function replay(judge: Judge, run: Recorded, archiveIds: ReadonlySet<string>): boolean {
-  const extraChecks = [
-    ...run.input.extraChecks.filter((c) => !archiveIds.has(c.id)),
-    ...judge.judgeArchive(run.evidence),
-  ];
-  return asRequired(
-    { id: run.name, mustFail: run.mustFail },
-    judge.judgeIsolationRun({ ...run.input, extraChecks }),
-  );
+const REJUDGED = new Set(["disk-writes-allowed", "exposure-allowed"]);
+
+const rejudged = (
+  run: Recorded,
+  id: ExtraCheckId,
+  problems: readonly string[],
+): ExtraCheckResult => ({
+  id,
+  ok: problems.length === 0,
+  detail:
+    problems.length === 0
+      ? (run.input.extraChecks.find((c) => c.id === id)?.detail ?? "")
+      : problems.join("; "),
+});
+
+/**
+ * Judges a recorded run again from what it recorded: the plan and witness from the plan input and the witness's
+ * per-check results, the archive, disk and exposure rules from their evidence, and the rows from the browser's
+ * reports. The result is everything a person reads, as JSON.
+ */
+function replay(j: Judges, run: Recorded): string {
+  const plan = j.targets.planTargets(run.planInput);
+  const witness = j.targets.combineWitness(plan, new Map(run.witnessResults));
+  const archiveChecks = j.oracle.judgeArchive(run.evidence);
+  const archiveIds = new Set(archiveChecks.map((c) => c.id));
+  const disk = j.disk.unallowedWrites(run.diskChanges, j.disk.diskRules(run.diskRuleInput));
+  const exposure = j.exposure.exposureProblems(run.exposure);
+  const judgment = j.judge.judgeIsolationRun({
+    ...run.input,
+    targets: plan.targets,
+    witness,
+    // In the order the check records them; a check that holds keeps the summary the check wrote for it.
+    extraChecks: [
+      ...run.input.extraChecks.filter((c) => !archiveIds.has(c.id) && !REJUDGED.has(c.id)),
+      rejudged(run, "disk-writes-allowed", disk),
+      rejudged(run, "exposure-allowed", exposure),
+      ...archiveChecks,
+    ],
+  });
+  return JSON.stringify({ judgment, disk, exposure });
 }
 
-async function loadJudge(dir: string): Promise<Judge> {
-  const judge = (await import(NodeURL.pathToFileURL(NodePath.join(dir, "judge.ts")).href)) as Pick<
-    Judge,
-    "judgeIsolationRun"
-  >;
-  const oracle = (await import(
-    NodeURL.pathToFileURL(NodePath.join(dir, "archive-oracle.ts")).href
-  )) as Pick<Judge, "judgeArchive">;
-  return { judgeIsolationRun: judge.judgeIsolationRun, judgeArchive: oracle.judgeArchive };
+async function loadJudges(dir: string): Promise<Judges> {
+  const load = (name: string): Promise<unknown> =>
+    import(NodeURL.pathToFileURL(NodePath.join(dir, name)).href);
+  return {
+    judge: (await load("judge.ts")) as typeof JudgeModule,
+    oracle: (await load("archive-oracle.ts")) as typeof OracleModule,
+    targets: (await load("targets.ts")) as typeof TargetsModule,
+    disk: (await load("disk.ts")) as typeof DiskModule,
+    exposure: (await load("exposure.ts")) as typeof ExposureModule,
+  };
 }
 
 function writeModules(dir: string, mutant: Mutant | null): void {
@@ -144,16 +203,17 @@ async function main(): Promise<void> {
 
   const original = NodePath.join(work, "original");
   writeModules(original, null);
-  const judge = await loadJudge(original);
-  const archiveIds = new Set(
-    recorded.flatMap((r) => judge.judgeArchive(r.evidence).map((c) => c.id)),
+  const judges = await loadJudges(original);
+  const expected = new Map(recorded.map((run) => [run.name, replay(judges, run)]));
+  const wrong = recorded.filter(
+    (run) =>
+      JSON.stringify((JSON.parse(expected.get(run.name)!) as { judgment: unknown }).judgment) !==
+      JSON.stringify(run.judgment),
   );
-  const wrong = recorded.filter((run) => !replay(judge, run, archiveIds));
   if (wrong.length > 0)
     throw new Error(
-      `the unmutated judge does not reproduce: ${wrong.map((r) => r.name).join(", ")}`,
+      `the unmutated judges do not reproduce: ${wrong.map((r) => r.name).join(", ")}`,
     );
-  if (!recorded.some((r) => r.mustFail.length === 0)) throw new Error("no baseline run to replay");
 
   const mutants = MODULES.flatMap((file) =>
     generateMutants({ file, names: "all" }, NodeFS.readFileSync(NodePath.join(HERE, file), "utf8")),
@@ -169,8 +229,8 @@ async function main(): Promise<void> {
     writeModules(dir, mutant);
     let killed: boolean;
     try {
-      const mutated = await loadJudge(dir);
-      killed = recorded.some((run) => !replay(mutated, run, archiveIds));
+      const mutated = await loadJudges(dir);
+      killed = recorded.some((run) => replay(mutated, run) !== expected.get(run.name));
     } catch {
       killed = true;
     }

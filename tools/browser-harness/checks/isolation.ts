@@ -1,5 +1,6 @@
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
@@ -19,18 +20,39 @@ import { callHook, HARNESS_PREFS, recordingWorkspace } from "../src/recording-se
 import {
   judgeArchive,
   keyDerivations,
-  outsideKeyFolder,
   type ArchiveEvidence,
   type ExtraCheckResult,
   type KeyEvidence,
   type KeySources,
 } from "../fixtures/isolation/archive-oracle.ts";
 import {
+  diffSnapshots,
+  diskRules,
+  productWrites,
+  snapshotTree,
+  unallowedWrites,
+} from "../fixtures/isolation/disk.ts";
+import {
+  exposureProblems,
+  schemaContexts,
+  type ExposureEvidence,
+} from "../fixtures/isolation/exposure.ts";
+import {
   judgeIsolationRun,
   type BrowserRowReport,
   type IsolationRunInput,
   type SyntheticControlResult,
+  type Witness,
 } from "../fixtures/isolation/judge.ts";
+import {
+  combineWitness,
+  fileHref,
+  planTargets,
+  type CheckOutcome,
+  type Fact,
+  type PlanInput,
+  type TargetPlan,
+} from "../fixtures/isolation/targets.ts";
 import {
   buildOtherExperimentXpi,
   buildProbeExtensionXpi,
@@ -80,13 +102,20 @@ type ChromeBootstrapInfo = {
 type EnumeratedSchemes = {
   readonly subs: readonly { readonly name: string; readonly resolved: string }[];
   readonly chrome: readonly { readonly pkg: string; readonly target: string }[];
+  /** moz-src:/// URLs named in omni.ja; the first one is the witness that the scheme serves files. */
+  readonly mozSrc: readonly string[];
 };
 
 /** What the recorder exposes, read from its policy and its installed XPI by the system principal. */
-type Exposure = {
+type PackedExposure = {
+  readonly manifest: Record<string, unknown>;
   readonly contentScripts: readonly unknown[];
-  readonly background: unknown;
-  readonly webAccessible: readonly unknown[];
+  readonly runtimeWebAccessible: readonly unknown[];
+  readonly webAccessibleQuery: string | null;
+  readonly webAccessiblePaths: readonly string[];
+  readonly schemaTexts: Readonly<Record<string, string>>;
+  readonly externalListeners: readonly string[];
+  readonly declaredPages: readonly string[];
   readonly files: readonly string[];
   readonly literals: readonly string[];
   readonly registrations: readonly string[];
@@ -128,34 +157,162 @@ const CHROME_EXPOSURE_SCRIPT = `
   (async () => {
     const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
     const policy = WebExtensionPolicy.getByID(id);
-    const manifest = policy.extension.manifest;
-    const jar = Services.io.newURI(policy.extension.rootURI.spec).QueryInterface(Ci.nsIJARURI);
+    const ext = policy.extension;
+    const jar = Services.io.newURI(ext.rootURI.spec).QueryInterface(Ci.nsIJARURI);
     const zr = Cc["@mozilla.org/libjar/zip-reader;1"].createInstance(Ci.nsIZipReader);
     zr.open(jar.JARFile.QueryInterface(Ci.nsIFileURL).file);
+    const read = (name) => { const s = zr.getInputStream(name); const t = NetUtil.readInputStreamToString(s, s.available(), { charset: "UTF-8" }); s.close(); return t; };
     const files = [];
     const literals = new Set();
     const registrations = [];
+    const externalListeners = [];
     const it = zr.findEntries(null);
     while (it.hasMore()) {
       const name = it.getNext();
       if (name.endsWith("/")) continue;
       files.push(name);
       if (!/\\.(m?js|json|html)$/.test(name)) continue;
-      const s = zr.getInputStream(name);
-      const text = NetUtil.readInputStreamToString(s, s.available());
-      s.close();
+      const text = read(name);
       for (const m of text.matchAll(/["'\`]([A-Za-z0-9][A-Za-z0-9._-]{0,62})["'\`]/g)) literals.add(m[1].toLowerCase());
       for (const m of text.matchAll(/(setSubstitution(?:WithFlags)?|registerChrome|addSubstitution)/g)) registrations.push(name + ": " + m[1]);
+      for (const m of text.matchAll(/\\b(onMessageExternal|onConnectExternal|externally_connectable)\\b/g)) externalListeners.push(name + ": " + m[1]);
+    }
+    const manifest = JSON.parse(read("manifest.json"));
+    const schemaTexts = {};
+    for (const api of Object.values(manifest.experiment_apis ?? {})) {
+      if (api && typeof api.schema === "string") { try { schemaTexts[api.schema] = read(api.schema.replace(/^\\//, "")); } catch (e) { schemaTexts[api.schema] = "unreadable: " + e; } }
     }
     zr.close();
+    const src = Services.io.newURI("http://attacker.example/");
+    const webAccessibleQuery = typeof policy.sourceMayAccessPath === "function" ? "sourceMayAccessPath" : typeof policy.isWebAccessiblePath === "function" ? "isWebAccessiblePath" : null;
+    const accessible = (path) => webAccessibleQuery === "sourceMayAccessPath" ? policy.sourceMayAccessPath(src, path) : webAccessibleQuery === "isWebAccessiblePath" ? policy.isWebAccessiblePath(path) : false;
+    const pageKeys = [["action", "default_popup"], ["browser_action", "default_popup"], ["page_action", "default_popup"], ["options_ui", "page"], ["sidebar_action", "default_panel"]];
+    const declaredPages = [
+      ...pageKeys.map(([k, f]) => manifest[k] && manifest[k][f]),
+      manifest.options_page, manifest.devtools_page, manifest.background && manifest.background.page,
+      ...Object.values(manifest.chrome_url_overrides ?? {}),
+    ].filter((p) => typeof p === "string").map((p) => policy.getURL(p.replace(/^\\//, "")));
+    const shape = (v) => (v && typeof v === "object" && "glob" in v ? v.glob : v && typeof v === "object" && "patterns" in v ? v.patterns.map((x) => x.pattern) : v);
     done({
+      manifest,
       contentScripts: policy.contentScripts.map((cs) => ({ matches: cs.matches.patterns.map((m) => m.pattern), js: cs.jsPaths })),
-      background: manifest.background ?? null,
-      webAccessible: manifest.web_accessible_resources ?? [],
+      runtimeWebAccessible: JSON.parse(JSON.stringify(ext.webAccessibleResources ?? [], (k, v) => shape(v))),
+      webAccessibleQuery,
+      webAccessiblePaths: files.filter((f) => accessible("/" + f)),
+      schemaTexts,
+      externalListeners,
+      declaredPages,
       files: files.sort(),
       literals: [...literals].sort(),
       registrations,
     });
+  })().catch((e) => done({ error: String(e) }));
+`;
+
+/** Listener types on each recorder page's window and its frame count, read by a frame script in the page's process. */
+const CHROME_PAGES_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const id = arguments[0];
+  (async () => {
+    const policy = WebExtensionPolicy.getByID(id);
+    // A page shows up as a view only once it calls an extension API, so tabs are read as well as views.
+    const browsers = new Set([...policy.extension.views].map((v) => v.xulBrowser).filter(Boolean));
+    for (const win of Services.wm.getEnumerator("navigator:browser")) {
+      for (const tab of win.gBrowser.tabs) {
+        const uri = tab.linkedBrowser.currentURI;
+        if (uri.schemeIs("moz-extension") && uri.host === policy.mozExtensionHostname) browsers.add(tab.linkedBrowser);
+      }
+    }
+    const pages = [];
+    for (const browser of browsers) {
+      if (!browser.messageManager) { pages.push({ href: browser.currentURI.spec, error: "no message manager" }); continue; }
+      pages.push(await new Promise((resolve) => {
+        const name = "och-exposure-" + Math.random().toString(36).slice(2);
+        const mm = browser.messageManager;
+        const timer = setTimeout(() => resolve({ href: browser.currentURI.spec, error: "no answer from the page process" }), 5000);
+        const listener = (m) => { clearTimeout(timer); mm.removeMessageListener(name, listener); resolve(m.data); };
+        mm.addMessageListener(name, listener);
+        const body = function (name) {
+          const els = Components.classes["@mozilla.org/eventlistenerservice;1"].getService(Components.interfaces.nsIEventListenerService);
+          sendAsyncMessage(name, {
+            href: content.location.href,
+            windowListeners: els.getListenerInfoFor(content).map((l) => l.type + (l.capturing ? ":capture" : "")),
+            frames: content.frames.length + content.document.querySelectorAll("iframe, frame, object, embed").length,
+          });
+        };
+        mm.loadFrameScript("data:application/javascript;charset=utf-8," + encodeURIComponent("(" + body.toString() + ")(" + JSON.stringify(name) + ")"), false);
+      }));
+    }
+    done(pages);
+  })().catch((e) => done([{ href: "", error: String(e) }]));
+`;
+
+/** Posts a message to the page itself and collects anything else that arrives in 500 ms. */
+const PAGE_ECHO_EXPRESSION = `new Promise((resolve) => {
+  const token = "och-echo-" + Math.random();
+  const got = [];
+  window.addEventListener("message", (e) => {
+    let d;
+    try { d = JSON.stringify(e.data); } catch (x) { d = String(e.data); }
+    if (!String(d).includes(token)) got.push(String(d).slice(0, 300));
+  });
+  window.postMessage({ och: token }, "*");
+  setTimeout(() => resolve(got.length ? got.join(" | ") : "none"), 500);
+})`;
+
+/** Runs every system-principal witness check; the harness runs redirects and facts itself. */
+const CHROME_WITNESS_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const checks = arguments[0];
+  (async () => {
+    const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
+    const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+    const reg = Cc["@mozilla.org/chrome/chrome-registry;1"].getService(Ci.nsIChromeRegistry);
+    const load = (url) => new Promise((resolve) => {
+      try {
+        const ch = NetUtil.newChannel({ uri: url, loadUsingSystemPrincipal: true });
+        NetUtil.asyncFetch(ch, (stream, status) => {
+          if (!Components.isSuccessCode(status)) { resolve({ ok: false, detail: "load failed 0x" + (status >>> 0).toString(16), text: "" }); return; }
+          try {
+            const text = NetUtil.readInputStreamToString(stream, stream.available());
+            resolve({ ok: text.length > 0, detail: "loads " + text.length + " chars", text });
+          } catch (e) { resolve({ ok: false, detail: "read failed " + e, text: "" }); }
+        });
+      } catch (e) { resolve({ ok: false, detail: String(e), text: "" }); }
+    });
+    const run = async (c) => {
+      switch (c.kind) {
+        case "file": {
+          try {
+            const st = await IOUtils.stat(c.path);
+            if (st.type === "directory") { const kids = await IOUtils.getChildren(c.path); return { ok: true, detail: "directory with " + kids.length + " entries" }; }
+            const bytes = await IOUtils.read(c.path, { maxBytes: 64 });
+            return { ok: bytes.length > 0, detail: st.type + ", " + st.size + " bytes" };
+          } catch (e) { return { ok: false, detail: e.name || String(e) }; }
+        }
+        case "load": {
+          const l = await load(c.url);
+          if (!c.mark) return { ok: l.ok, detail: l.detail };
+          const marked = l.text.includes(c.mark);
+          return { ok: l.ok && marked, detail: l.detail + (marked ? ", holds the mark" : ", without the mark") };
+        }
+        case "resource": return res.hasSubstitution(c.name) ? { ok: true, detail: "-> " + res.resolveURI(Services.io.newURI("resource://" + c.name + "/")) } : { ok: false, detail: "no substitution" };
+        case "chrome": try { return { ok: true, detail: "-> " + reg.convertChromeURL(Services.io.newURI("chrome://" + c.pkg + "/content/")).spec }; } catch (e) { return { ok: false, detail: "not registered" }; }
+        case "addon": { const p = WebExtensionPolicy.getByID(c.id); return p && p.active ? { ok: true, detail: "active, " + p.mozExtensionHostname } : { ok: false, detail: p ? "inactive" : "not installed" }; }
+        case "tab": { const win = Services.wm.getMostRecentWindow("navigator:browser"); const tab = win.gBrowser.tabs.find((t) => t.linkedBrowser.currentURI.spec === c.url); return tab ? { ok: true, detail: "a tab shows it" } : { ok: false, detail: "no tab shows it" }; }
+        case "service": {
+          if (c.name === "downloads") { const { Downloads } = ChromeUtils.importESModule("resource://gre/modules/Downloads.sys.mjs"); const all = await (await Downloads.getList(Downloads.ALL)).getAll(); return { ok: true, detail: "list answers, " + all.length + " items" }; }
+          if (c.name === "clipboard") return Services.clipboard ? { ok: true, detail: "clipboard service" } : { ok: false, detail: "no clipboard service" };
+          return Cc["@mozilla.org/alerts-service;1"] ? { ok: true, detail: "alerts service" } : { ok: false, detail: "no alerts service" };
+        }
+        default: return { ok: false, detail: "not a system-principal check: " + c.kind };
+      }
+    };
+    const out = {};
+    for (const [key, c] of Object.entries(checks)) {
+      try { out[key] = await run(c); } catch (e) { out[key] = { ok: false, detail: "threw " + e }; }
+    }
+    done(out);
   })().catch((e) => done({ error: String(e) }));
 `;
 
@@ -168,6 +325,7 @@ const CHROME_ENUMERATE_SCRIPT = `
   const resNames = new Set(["", "gre", "app", ...candidates]);
   const pkgs = new Set(candidates);
   const jars = new Set();
+  const mozSrc = new Set();
   for (const n of ["", "gre"]) {
     const m = /^jar:(file:[^!]+)!/.exec(res.getSubstitution(n).spec);
     if (m) jars.add(m[1]);
@@ -183,6 +341,7 @@ const CHROME_ENUMERATE_SCRIPT = `
       try { const s = zr.getInputStream(name); text = NetUtil.readInputStreamToString(s, s.available()); s.close(); } catch { continue; }
       for (const m of text.matchAll(/resource:\\/\\/([a-z0-9][a-z0-9._-]*)\\//gi)) resNames.add(m[1].toLowerCase());
       for (const m of text.matchAll(/chrome:\\/\\/([a-z0-9][a-z0-9._-]*)\\/(content|skin|locale)\\//gi)) pkgs.add(m[1].toLowerCase());
+      for (const m of text.matchAll(/moz-src:\\/\\/\\/([A-Za-z0-9_\\/.-]+\\.m?js)/g)) mozSrc.add("moz-src:///" + m[1]);
       if (name.endsWith(".manifest")) {
         for (const line of text.split("\\n")) {
           const w = line.trim().split(/\\s+/);
@@ -207,7 +366,7 @@ const CHROME_ENUMERATE_SCRIPT = `
       chrome.push({ pkg, target });
     } catch {}
   }
-  done({ subs, chrome });
+  done({ subs, chrome, mozSrc: [...mozSrc].sort() });
 `;
 
 const CHROME_READ_ARCHIVE_SCRIPT = `
@@ -330,25 +489,65 @@ function findFirstFile(dir: string, suffix: string): string | null {
   return name === undefined ? null : NodePath.join(dir, name);
 }
 
-function fileHref(filePath: string): string {
-  return NodeURL.pathToFileURL(filePath).href;
+/** A redirect target's witness: the harness's own server answers the URL with a 302 to the planned file. */
+function redirectWitness(url: string, to: string, proxyPort: number): Promise<CheckOutcome> {
+  return new Promise((resolve) => {
+    const request = NodeHttp.request(
+      {
+        host: "127.0.0.1",
+        port: proxyPort,
+        path: url,
+        headers: { host: new NodeURL.URL(url).host },
+      },
+      (response) => {
+        response.resume();
+        const location = response.headers.location;
+        resolve({
+          ok: response.statusCode === 302 && location === to,
+          detail: `status ${String(response.statusCode)}, location ${String(location)}`,
+        });
+      },
+    );
+    request.on("error", (error) => resolve({ ok: false, detail: String(error) }));
+    request.end();
+  });
 }
 
-/** A written entry's file:// URL; directories end in `/` so a load asks for the listing. */
-const entryHref = (
-  appFolder: string,
-  entry: { readonly path: string; readonly kind: string },
-): string =>
-  `${fileHref(NodePath.join(appFolder, entry.path))}${entry.kind === "directory" ? "/" : ""}`;
-
-function buildTraversalUrls(base: string, baseDir: string, logPath: string): readonly string[] {
-  const segments = NodePath.relative(baseDir, logPath).split(NodePath.sep);
-  return [
-    base + segments.join("%2F"),
-    base + segments.map((s) => (s === ".." ? "%2e%2e" : s)).join("/"),
-    base + segments.map((s) => (s === ".." ? "%2e%2e" : s)).join("%2f"),
-    base + segments.join("%5C"),
-  ];
+/** Runs every planned witness check once: the system principal's in one chrome script, then the harness's own. */
+async function runWitness(
+  session: BrowserSession,
+  plan: TargetPlan,
+  facts: Readonly<Record<Fact, CheckOutcome>>,
+  proxyPort: number,
+): Promise<{
+  readonly witness: Readonly<Record<string, Witness>>;
+  readonly results: ReadonlyMap<string, CheckOutcome>;
+}> {
+  const unique = new Map(
+    Object.values(plan.checks)
+      .flat()
+      .map((c) => [JSON.stringify(c), c] as const),
+  );
+  const chromeChecks = Object.fromEntries(
+    [...unique].filter(([, c]) => c.kind !== "redirect" && c.kind !== "fact"),
+  );
+  const chrome = (await session.evaluateChrome(CHROME_WITNESS_SCRIPT, [chromeChecks])) as Record<
+    string,
+    CheckOutcome
+  > & { readonly error?: string };
+  if (typeof chrome.error === "string") throw new Error(`witness failed: ${chrome.error}`);
+  const results = new Map<string, CheckOutcome>();
+  for (const [key, c] of unique) {
+    results.set(
+      key,
+      c.kind === "fact"
+        ? facts[c.name]
+        : c.kind === "redirect"
+          ? await redirectWitness(c.url, c.to, proxyPort)
+          : (chrome[key] ?? { ok: false, detail: "no answer from the system principal" }),
+    );
+  }
+  return { witness: combineWitness(plan, results), results };
 }
 
 const keySources = (
@@ -411,11 +610,12 @@ async function secondProfileKey(
 }
 
 async function runNoMarionetteLaunch(options: {
-  readonly position: "file-no-marionette" | "file-mutated";
+  readonly position: "file-no-marionette";
   readonly binaryPath: string;
   readonly display: CheckContext["display"];
   readonly profileDir: string;
   readonly dataHome: string;
+  readonly home: string | null;
   readonly url: string;
   readonly extraPrefs: readonly Pref[];
   readonly server: Awaited<ReturnType<typeof startIsolationServer>>;
@@ -428,6 +628,7 @@ async function runNoMarionetteLaunch(options: {
     launchMode: "none",
     profileDir: options.profileDir,
     dataHome: options.dataHome,
+    ...(options.home === null ? {} : { home: options.home }),
     urls: [options.url],
     extraPrefs: options.extraPrefs,
     signal: options.signal,
@@ -473,7 +674,7 @@ const check: HarnessCheck = {
     context.log("isolation: second fresh profile for the key oracle");
     const secondKey = await secondProfileKey(context, recorderId, proxyPrefs(server.port));
 
-    await using workspace = recordingWorkspace("isolation");
+    await using workspace = recordingWorkspace("isolation", { ownHome: true });
     const extensionsDir = NodePath.join(workspace.profileDir, "extensions");
     NodeFS.mkdirSync(extensionsDir, { recursive: true });
     NodeFS.writeFileSync(
@@ -484,6 +685,7 @@ const check: HarnessCheck = {
       NodePath.join(extensionsDir, `${OTHER_EXPERIMENT_ID}.xpi`),
       buildOtherExperimentXpi(),
     );
+    const diskBefore = snapshotTree(workspace.base);
 
     const extraChecks: ExtraCheckResult[] = [];
     const record = (
@@ -500,13 +702,20 @@ const check: HarnessCheck = {
     const positionProblems: string[] = [];
     const syntheticControls: SyntheticControlResult[] = [];
     let canAccessFileObserved = false;
-    let targets: Record<string, readonly string[]> = {};
+    let targetPlan: TargetPlan = { targets: {}, checks: {} };
+    let planInput: PlanInput | null = null;
+    let witness: Readonly<Record<string, Witness>> = {};
+    let witnessResults: ReadonlyMap<string, CheckOutcome> = new Map();
     let recUuid = "";
     let savedPageUrl = "";
     let archiveKey = "";
     let plannedEntries: ReturnType<typeof workspace.entries> = [];
     let keyEvidence: KeyEvidence | null = null;
+    let diskRuleInput: Parameters<typeof diskRules>[0] | null = null;
+    let exposureEvidence: ExposureEvidence | null = null;
     const noMarionetteExtraPrefs = [...HARNESS_PREFS, ...proxyPrefs(server.port)];
+    const exportName = `${site}-2026-11-16.har`;
+    const savedPageName = "saved-page.html";
 
     {
       await using session: BrowserSession = await workspace.launch({
@@ -557,23 +766,24 @@ const check: HarnessCheck = {
         (r): r is Extract<IsolationReport, { kind: "bank-done" }> => r.kind === "bank-done",
         STEP_TIMEOUT_MS,
       );
+      const bankMarked = bankDone !== null && bankDone.cookie.includes(marker);
       record(
         "bank-recorded",
-        bankDone === null || !bankDone.cookie.includes(marker)
-          ? ["bank fixture did not complete with the cookie marker"]
-          : [],
+        bankMarked ? [] : ["bank fixture did not complete with the cookie marker"],
         "bank fixture completed with the cookie marker",
       );
       await callHook(session, { kind: "seal" });
 
       const popupUrl = await waitForActiveExtensionUrl(session, recorderId, popupPath);
       const popupTab = await session.openTab(popupUrl);
-      const status = JSON.parse(
-        await session.evaluate(
-          popupTab,
-          "browser.oneClickHar.getRecordingStatus().then(JSON.stringify)",
-        ),
-      ) as { readonly recording: boolean; readonly problems: readonly string[] };
+      const statusText = await session.evaluate(
+        popupTab,
+        "browser.oneClickHar.getRecordingStatus().then(JSON.stringify)",
+      );
+      const status = JSON.parse(statusText) as {
+        readonly recording: boolean;
+        readonly problems: readonly string[];
+      };
       record(
         "recorder-status-clean",
         !status.recording || status.problems.length > 0 ? [`status ${JSON.stringify(status)}`] : [],
@@ -597,7 +807,30 @@ const check: HarnessCheck = {
         judgeArchiveModes(plannedEntries, ["jsonl", "summary.json", "pack", "body"]),
         `${String(plannedEntries.length)} entries 700/600`,
       );
-      const outside = outsideKeyFolder(plannedEntries, archiveKey);
+
+      // The inventory is what the disk diff says the product wrote by now, wherever it wrote it.
+      diskRuleInput = {
+        archiveKey,
+        keyFileName: ARCHIVE_KEY_FILE,
+        harnessFiles: [`downloads/${exportName}`, `downloads/${savedPageName}`],
+      };
+      const rules = diskRules(diskRuleInput);
+      const written = productWrites(
+        diffSnapshots(diskBefore, snapshotTree(workspace.base)),
+        rules,
+      ).map((c) => ({
+        rel: c.path,
+        path: NodePath.join(workspace.base, ...c.path.split("/")),
+        directory: c.entry.kind === "directory",
+      }));
+      const keyFolderRel = `data/one-click-har/${archiveKey}`;
+      const outsideKey = written.filter(
+        (w) =>
+          w.rel !== "data/one-click-har" &&
+          w.rel !== keyFolderRel &&
+          !w.rel.startsWith(`${keyFolderRel}/`) &&
+          w.rel !== `profile/${ARCHIVE_KEY_FILE}`,
+      );
 
       const downloadsProblem = judgeDownloads(
         (await session.evaluateChrome(CHROME_DOWNLOAD_TARGETS_SCRIPT)) as readonly string[],
@@ -609,30 +842,13 @@ const check: HarnessCheck = {
         "nothing under the data home",
       );
 
-      const exposure = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
+      const packed = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
         recorderId,
-      ])) as Exposure & {
-        readonly error?: string;
-      };
-      if (exposure.error !== undefined) throw new Error(`exposure read failed: ${exposure.error}`);
-      record(
-        "exposure-declared",
-        [
-          ...(exposure.contentScripts.length > 0
-            ? [`content scripts ${JSON.stringify(exposure.contentScripts)}`]
-            : []),
-          ...(exposure.background !== null
-            ? [`background ${JSON.stringify(exposure.background)}`]
-            : []),
-          ...(exposure.webAccessible.length > 0
-            ? [`web_accessible_resources ${JSON.stringify(exposure.webAccessible)}`]
-            : []),
-        ],
-        `no content script, background or web-accessible resource; ${String(exposure.files.length)} files`,
-      );
+      ])) as PackedExposure & { readonly error?: string };
+      if (packed.error !== undefined) throw new Error(`exposure read failed: ${packed.error}`);
       record(
         "no-registration-in-packed-scripts",
-        exposure.registrations,
+        packed.registrations,
         "no setSubstitution or registerChrome",
       );
 
@@ -644,7 +860,7 @@ const check: HarnessCheck = {
       }
 
       // No export API exists yet, so the export rows read a stand-in written where an export would land.
-      const exportPath = NodePath.join(workspace.downloads, `${site}-2026-11-16.har`);
+      const exportPath = NodePath.join(workspace.downloads, exportName);
       NodeFS.writeFileSync(
         exportPath,
         JSON.stringify({
@@ -717,7 +933,7 @@ const check: HarnessCheck = {
       const enumerated = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
         [
           ...new Set([
-            ...exposure.literals,
+            ...packed.literals,
             recorderId,
             recUuid,
             archiveKey,
@@ -743,69 +959,75 @@ const check: HarnessCheck = {
 
       await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [located.root]);
 
-      const savedPagePath = NodePath.join(workspace.downloads, "saved-page.html");
+      const savedPagePath = NodePath.join(workspace.downloads, savedPageName);
       NodeFS.writeFileSync(savedPagePath, buildSavedPageHtml(server.origin), "utf8");
       savedPageUrl = fileHref(savedPagePath);
 
-      const guesses = keyDerivations(
-        keySources(workspace.profileDir, workspace.dataHome, recorderId, recUuid),
-      );
-      const guessedSiteDirs = guesses.map(
-        (g) => `${fileHref(NodePath.join(located.appFolder, g.key, "sites", site))}/`,
-      );
-      const guessedLogs = guesses.map((g) =>
-        fileHref(
-          NodePath.join(located.appFolder, g.key, "sites", site, "log", NodePath.basename(logPath)),
-        ),
-      );
-      const siteDirHref = `${fileHref(siteDirPath)}/`;
-
+      const plantedLog = `resource://och-planted/sites/${site}/log/${NodePath.basename(logPath)}`;
+      const recBase = `moz-extension://${recUuid}/`;
+      const probeBase = `moz-extension://${probeUuid}/`;
+      const wrRedirect = "http://attacker.example/wr-redirect";
       const filePlan = {
-        root: `${fileHref(located.appFolder)}/`,
-        missingRoot: `${fileHref(`${located.appFolder}-not-installed`)}/`,
-        siteDir: siteDirHref,
+        root: fileHref(located.appFolder, true),
         log: fileHref(logPath),
-        body: fileHref(bodyPath),
-        missing: fileHref(NodePath.join(siteDirPath, "bodies", "0.0.body")),
         export: fileHref(exportPath),
         savedPage: savedPageUrl,
       };
-      const binDir = NodePath.dirname(context.binaryPath);
-      const plantedResource = `resource://och-planted/sites/${site}/log/${NodePath.basename(logPath)}`;
-      const redirectToLog = `http://attacker.example/redir?to=${encodeURIComponent(filePlan.log)}`;
-      const recBase = `moz-extension://${recUuid}/`;
-
-      targets = {
-        "inventory-read": [
-          ...plannedEntries.map((e) => entryHref(located.appFolder, e)),
-          fileHref(keyFilePath),
-        ],
-        "inventory-exists": outside.map((path) =>
-          entryHref(
-            located.appFolder,
-            plannedEntries.find((e) => e.path === path) ?? { path, kind: "file" },
-          ),
-        ),
-        "script-file-oracle": guessedLogs,
-        "css-file-oracle": guessedLogs,
-        "iframe-site-oracle": guessedSiteDirs,
-        "iframe-site-oracle@file-mutated": [siteDirHref],
-        "script-site-oracle": guessedSiteDirs,
-        "script-site-oracle@file-mutated": [siteDirHref],
-        "resource-all": enumerated.subs
+      planInput = {
+        file: {
+          appFolder: located.appFolder,
+          keyFolder: located.root,
+          log: logPath,
+          body: bodyPath,
+          export: exportPath,
+          siteDir: siteDirPath,
+        },
+        inventory: written,
+        outsideKeyFolder: outsideKey,
+        guessedKeyFolders: keyDerivations(
+          keySources(workspace.profileDir, workspace.dataHome, recorderId, recUuid),
+        ).map((g) => NodePath.join(located.appFolder, g.key)),
+        redirectToLog: `http://attacker.example/redir?to=${encodeURIComponent(filePlan.log)}`,
+        wrRedirect,
+        rec: { id: recorderId, base: recBase, popupPath, popupScriptPath, files: packed.files },
+        probe: { base: probeBase, warMark, secretMark },
+        randomUuid: NodeCrypto.randomUUID(),
+        randomId: `not-installed-${NodeCrypto.randomBytes(4).toString("hex")}@test`,
+        plantedResource: {
+          hit: plantedLog,
+          miss: plantedLog.replace(/[^/]+$/u, "missing.jsonl"),
+        },
+        resourceNames: enumerated.subs
           .map((s) => s.name)
-          .filter((n) => n.length > 0 && n !== "och-planted")
-          .map((n) => `resource://${n}/`),
-        "resource-traversal": buildTraversalUrls("resource://gre/", binDir, logPath),
-        "chrome-all": enumerated.chrome.map((c) => `chrome://${c.pkg}/content/`),
-        "chrome-traversal": buildTraversalUrls("chrome://global/content/", binDir, logPath),
-        "moz-src-root": [
-          "moz-src:///",
-          "moz-src:///browser/components/tabbrowser/Tabbrowser.sys.mjs",
-          ...buildTraversalUrls("moz-src:///", binDir, logPath),
-        ],
-        "mozext-every-file": exposure.files.map((f) => `${recBase}${f}`),
+          .filter((n) => n.length > 0 && n !== "och-planted"),
+        chromePackages: enumerated.chrome.map((c) => c.pkg),
+        mozSrc: enumerated.mozSrc[0] ?? null,
+        binDir: NodePath.dirname(context.binaryPath),
       };
+      targetPlan = planTargets(planInput);
+
+      context.log("isolation: witnessing every planned target");
+      const outcome = (ok: boolean, detail: string): CheckOutcome => ({ ok, detail });
+      ({ witness, results: witnessResults } = await runWitness(
+        session,
+        targetPlan,
+        {
+          "recorder-api": outcome(
+            typeof status.recording === "boolean",
+            `recorder page: ${statusText}`,
+          ),
+          "recorder-storage": outcome(
+            (storagePlant.read ?? "").includes(storeMark),
+            `system principal reads ${storagePlant.read ?? storagePlant.error ?? ""}`,
+          ),
+          "recorder-idb": outcome(idbPlant.includes(storeMark), `recorder page reads ${idbPlant}`),
+          "bank-traffic": outcome(
+            bankMarked,
+            bankMarked ? "bank cookie carries the marker" : "no marked bank traffic",
+          ),
+        },
+        server.port,
+      ));
 
       server.setPlan({
         browser: context.binaryPath,
@@ -813,14 +1035,8 @@ const check: HarnessCheck = {
         file: filePlan,
         webProbeUrl: "http://attacker.example/probe.html",
         victimUrl: "http://attacker.example/victim.html",
-        wrRedirect: "http://attacker.example/wr-redirect",
-        redirectToLog,
-        rec: { id: recorderId, uuid: recUuid, base: recBase, popupPath, popupScriptPath },
-        probe: { id: PROBE_EXTENSION_ID, uuid: probeUuid, base: `moz-extension://${probeUuid}/` },
-        randomUuid: NodeCrypto.randomUUID(),
-        randomId: `not-installed-${NodeCrypto.randomBytes(4).toString("hex")}@test`,
-        plantedResource,
-        targets,
+        wrRedirect,
+        targets: targetPlan.targets,
         noMarionetteProbes: NO_MARIONETTE_PROBE_IDS,
       });
 
@@ -834,9 +1050,7 @@ const check: HarnessCheck = {
           await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [savedPageUrl]);
           fileTabOpened = true;
         } else if (pos === "ext-page" && !extPageOpened) {
-          await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [
-            `moz-extension://${probeUuid}/page.html`,
-          ]);
+          await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [`${probeBase}page.html`]);
           extPageOpened = true;
         }
         context.log(`isolation: position ${pos}`);
@@ -886,6 +1100,65 @@ const check: HarnessCheck = {
       );
       if (dvDone === null) positionProblems.push("position ext-devtools timed out");
 
+      // Every page the recorder declares, open at once: what listens on each, what each frames, and what answers.
+      context.log("isolation: reading the recorder's pages");
+      const pageTabs = new Map<string, string>([[popupUrl, popupTab]]);
+      for (const page of packed.declaredPages) {
+        if (!pageTabs.has(page)) pageTabs.set(page, await session.openTab(page));
+      }
+      // Listeners first: the echo below adds one of its own.
+      const pagesRead = (await session.evaluateChrome(CHROME_PAGES_SCRIPT, [
+        recorderId,
+      ])) as readonly {
+        readonly href: string;
+        readonly windowListeners?: readonly string[];
+        readonly frames?: number;
+        readonly error?: string;
+      }[];
+      const echoes = new Map<string, string>();
+      for (const [page, tab] of pageTabs) {
+        echoes.set(
+          page,
+          await session
+            .evaluate(tab, PAGE_ECHO_EXPRESSION)
+            .catch((e: unknown) => `could not post: ${String(e)}`),
+        );
+      }
+      const atEnd = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
+        recorderId,
+      ])) as PackedExposure & { readonly error?: string };
+      exposureEvidence = {
+        manifestKeys: Object.keys(packed.manifest),
+        experimentApis: (packed.manifest["experiment_apis"] ?? {}) as Record<string, unknown>,
+        schemaContexts: Object.entries(packed.schemaTexts).flatMap(([file, text]) => {
+          try {
+            return schemaContexts(JSON.parse(text)).map((c) => `${file}: ${c}`);
+          } catch {
+            return [`${file}: unreadable schema ${text.slice(0, 100)}`];
+          }
+        }),
+        contentScripts: packed.contentScripts,
+        background: packed.manifest["background"] ?? null,
+        declaredWebAccessible: (packed.manifest["web_accessible_resources"] ?? []) as unknown[],
+        runtimeWebAccessible: [packed.runtimeWebAccessible, atEnd.runtimeWebAccessible ?? []],
+        webAccessiblePaths: [
+          ...new Set([...packed.webAccessiblePaths, ...(atEnd.webAccessiblePaths ?? [])]),
+          ...(packed.webAccessibleQuery === null
+            ? ["(the policy offers no web-accessible query)"]
+            : []),
+        ],
+        externalListeners: packed.externalListeners,
+        pages: pagesRead
+          .filter((p) => p.error === undefined)
+          .map((p) => ({
+            href: p.href,
+            windowListeners: p.windowListeners ?? [],
+            frames: p.frames ?? 0,
+            echo: (echoes.get(p.href) ?? "none") === "none" ? null : (echoes.get(p.href) ?? null),
+          })),
+        declaredPages: packed.declaredPages,
+      };
+
       const stillPlanted = (await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [
         "",
       ])) as boolean;
@@ -899,31 +1172,35 @@ const check: HarnessCheck = {
       await session.quit();
     }
 
-    for (const [position, extraPrefs] of [
-      ["file-no-marionette", noMarionetteExtraPrefs],
-      [
-        "file-mutated",
-        [
-          ...noMarionetteExtraPrefs,
-          { name: "security.fileuri.strict_origin_policy", value: false },
-        ],
-      ],
-    ] as const) {
-      context.log(`isolation: ${position}`);
-      const problem = await runNoMarionetteLaunch({
-        position,
-        binaryPath: context.binaryPath,
-        display: context.display,
-        profileDir: workspace.profileDir,
-        dataHome: workspace.dataHome,
-        url: `${savedPageUrl}?pos=${position}`,
-        extraPrefs,
-        server,
-        signal: context.signal,
-      });
-      if (problem !== null) positionProblems.push(problem);
-    }
+    context.log("isolation: file-no-marionette");
+    const problem = await runNoMarionetteLaunch({
+      position: "file-no-marionette",
+      binaryPath: context.binaryPath,
+      display: context.display,
+      profileDir: workspace.profileDir,
+      dataHome: workspace.dataHome,
+      home: workspace.home,
+      url: `${savedPageUrl}?pos=file-no-marionette`,
+      extraPrefs: noMarionetteExtraPrefs,
+      server,
+      signal: context.signal,
+    });
+    if (problem !== null) positionProblems.push(problem);
     record("positions-completed", positionProblems, "every position reported done");
+
+    const changes = diffSnapshots(diskBefore, snapshotTree(workspace.base));
+    if (diskRuleInput === null || planInput === null) throw new Error("the run never planned");
+    record(
+      "disk-writes-allowed",
+      unallowedWrites(changes, diskRules(diskRuleInput)),
+      `${String(changes.length)} new or changed paths, each the browser's, the harness's or the product's own`,
+    );
+    if (exposureEvidence === null) throw new Error("no exposure evidence was read");
+    record(
+      "exposure-allowed",
+      exposureProblems(exposureEvidence),
+      `${String(exposureEvidence.pages.length)} pages and ${String(exposureEvidence.manifestKeys.length)} manifest keys, all allowed`,
+    );
 
     if (keyEvidence === null) throw new Error("no key evidence was read");
     const archiveEvidence: ArchiveEvidence = {
@@ -937,6 +1214,7 @@ const check: HarnessCheck = {
       context: {
         marker,
         warMark,
+        secretMark,
         storeMark,
         ownMark,
         recId: recorderId,
@@ -944,7 +1222,8 @@ const check: HarnessCheck = {
         webSandboxBlocksArchive: process.platform === "linux",
       },
       browserRows: server.reports.filter((r): r is BrowserRowReport => r.kind === "row"),
-      targets,
+      targets: targetPlan.targets,
+      witness,
       syntheticControls,
       csFileInjected: server.reports.some(
         (r) => r.kind === "cs-hello" && r.href.startsWith("file:"),
@@ -966,7 +1245,17 @@ const check: HarnessCheck = {
       ok: judgment.ok,
       durationMs: Date.now() - started,
       detail: judgment.ok ? summary : `${summary}; failures: ${judgment.mismatches.join("; ")}`,
-      data: { judgment, input, archiveEvidence },
+      // Everything the pure judges read, so a recorded run can be judged again by a mutated judge.
+      data: {
+        judgment,
+        input,
+        archiveEvidence,
+        exposureEvidence,
+        diskChanges: changes,
+        diskRuleInput,
+        planInput,
+        witnessResults: [...witnessResults],
+      },
     };
   },
 };
