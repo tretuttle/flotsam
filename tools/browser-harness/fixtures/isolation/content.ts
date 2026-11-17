@@ -25,11 +25,13 @@ export const contentDigest = (bytes: Buffer, names: RunNames): string =>
   digest(withRoles(bytes.toString("latin1"), names));
 
 /**
- * A file's content in any order: its length and its printable runs, sorted. Two files that hold the same records in
- * another order (a hash map the browser serializes in random order) share it; added or changed text does not.
+ * A file's content in any order: its length and its printable runs, sorted, with every run of digits read as one
+ * number. Two files holding the same records in another order (a hash map serialized in random order), or with other
+ * timestamps, share it; added or changed text does not.
  */
 export function orderFreeDigest(bytes: Buffer, names: RunNames): string {
-  const text = withRoles(bytes.toString("latin1"), names);
+  // Digits by kind, as everywhere else: a timestamp or counter inside a record is the browser's.
+  const text = withRoles(bytes.toString("latin1"), names).replaceAll(/\d+/gu, "#");
   return digest(
     `${String(text.length)}\n${(text.match(/[\x20-\x7e]{4,}/gu) ?? []).sort().join("\n")}`,
   );
@@ -104,9 +106,29 @@ export function lz4Block(src: Buffer, size: number): Buffer {
 }
 
 /** Every leaf of a JSON value, keyed by its path. */
+/** A JSON value as it is compared: numbers by kind, keys in order, arrays as sets. Used to order array items. */
+const canonical = (value: unknown): string =>
+  typeof value === "number"
+    ? "#"
+    : Array.isArray(value)
+      ? `[${value.map(canonical).sort().join(",")}]`
+      : typeof value === "object" && value !== null
+        ? `{${Object.keys(value)
+            .sort()
+            .map((k) => `${JSON.stringify(k)}:${canonical((value as Record<string, unknown>)[k])}`)
+            .join(",")}}`
+        : JSON.stringify(value);
+
+/**
+ * Every leaf of a JSON value, keyed by its path. An array is a set: its items are taken in the order of their content,
+ * so a list the browser writes in a different order each run (its add-ons, its tabs' entries) reads the same.
+ */
 function jsonEntries(value: unknown, path = "$", out: Record<string, Group> = {}): Entries {
   if (Array.isArray(value))
-    value.forEach((item, i) => jsonEntries(item, `${path}[${String(i)}]`, out));
+    value
+      .map((item) => [canonical(item), item] as const)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .forEach(([, item], i) => jsonEntries(item, `${path}[${String(i)}]`, out));
   else if (typeof value === "object" && value !== null)
     for (const [key, item] of Object.entries(value)) jsonEntries(item, `${path}.${key}`, out);
   else out[path] = single(JSON.stringify(value));

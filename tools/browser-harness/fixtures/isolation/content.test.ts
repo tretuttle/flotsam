@@ -53,6 +53,8 @@ describe("order-free digests", () => {
       free("\u0002glean#dirty\u0000\u0005os#Linux leak"),
     );
     expect(free("glean#dirty")).not.toBe(free("glean#dirtx"));
+    expect(free("lastModified=1794914675890 id=x")).toBe(free("lastModified=1794914999123 id=x"));
+    expect(free("lastModified=17 id=x")).toBe(free("lastModified=1794914999123 id=x"));
     expect(free("ab\u0000\u0000")).not.toBe(free("ab\u0000"));
     expect(free("/w1/x path")).toBe(
       orderFreeDigest(Buffer.from("/w2/x path"), [["/w2", "{workspace}"]]),
@@ -71,6 +73,26 @@ describe("structured files", () => {
     ]);
     expect(again?.entries).toEqual(read?.entries);
     expect(readStructured("x", Buffer.from("plain text\n"), NAMES)).toBeNull();
+  });
+
+  it("reads a JSON array as a set, in the order of its items' content", () => {
+    const read = (text: string) => readStructured("x.json", Buffer.from(text), NAMES)?.entries;
+    const addons = (...ids: string[]) =>
+      JSON.stringify({
+        addons: ids.map((id, i) => ({ id, installDate: 1000 + i, tags: ["b", "a"] })),
+      });
+    expect(read(addons("z@x", "a@x", "m@x"))).toEqual(read(addons("a@x", "m@x", "z@x")));
+    expect(read(addons("z@x", "a@x"))).not.toEqual(read(addons("z@x", "a@x", "leak@x")));
+    expect(read('{"a":[{"k":"x","n":{"y":1,"x":[2,1]}}]}')).toEqual(
+      read('{"a":[{"n":{"x":[9,8],"y":3},"k":"x"}]}'),
+    );
+    expect(Object.keys(read('{"a":["b","a",true,null]}') ?? {})).toEqual([
+      "$.a[0]",
+      "$.a[1]",
+      "$.a[2]",
+      "$.a[3]",
+    ]);
+    expect(read('{"a":["b","a"]}')).toEqual(read('{"a":["a","b"]}'));
   });
 
   it("compares a number by its kind alone, and text by its value", () => {
