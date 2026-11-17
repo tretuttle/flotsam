@@ -19,6 +19,7 @@ interface ExtensionObject {
   };
   readonly version: string;
   readonly manifest: { readonly name: string };
+  readonly privateBrowsingAllowed?: boolean;
   /** The add-on's packaged files. */
   readonly rootURI: Uri;
 }
@@ -364,8 +365,116 @@ declare const Services: {
   };
 };
 
+interface DevToolsLongStringGrip {
+  readonly type: "longString";
+  readonly actor: string;
+  readonly initial: string;
+  readonly length: number;
+}
+
+interface DevToolsStackFrame {
+  readonly filename?: string;
+  readonly functionName?: string;
+  readonly lineNumber?: number;
+  readonly columnNumber?: number;
+  readonly asyncCause?: string | null;
+}
+
+interface DevToolsWsMessage {
+  readonly type: string;
+  readonly timeStamp: number;
+  readonly opCode: number;
+  readonly payload: unknown;
+}
+
+interface DevToolsResponseContentPacket {
+  readonly content?: {
+    readonly mimeType?: string;
+    readonly text?: string | DevToolsLongStringGrip;
+    readonly size?: number;
+    readonly encoding?: string;
+  };
+  readonly contentDiscarded?: boolean;
+}
+
+interface DevToolsRequestItem {
+  readonly id: string;
+  readonly resourceId?: number | string;
+  readonly url: string;
+  readonly method: string;
+  readonly startedMs: number;
+  readonly httpVersion?: string;
+  readonly status?: number | string;
+  readonly statusText?: string;
+  readonly mimeType?: string;
+  readonly contentSize?: number;
+  readonly transferredSize?: number;
+  readonly totalTime?: number;
+  readonly remoteAddress?: string;
+  readonly remotePort?: number | string;
+  readonly securityState?: string;
+  readonly priority?: number;
+  readonly fromCache?: boolean | string;
+  readonly fromServiceWorker?: boolean;
+  readonly blockedReason?: string | number | boolean | null;
+  readonly isNavigationRequest?: boolean;
+  readonly isXHR?: boolean;
+  readonly truncated?: boolean;
+  readonly cause?: {
+    readonly type?: string;
+    readonly loadingDocumentUri?: string | null;
+    readonly stacktraceAvailable?: boolean;
+  };
+  readonly stacktrace?: readonly DevToolsStackFrame[];
+  readonly responseContent?: DevToolsResponseContentPacket;
+  readonly responseContentAvailable?: boolean;
+  readonly requestPostData?: { readonly postDataDiscarded?: boolean };
+  readonly requestPostDataAvailable?: boolean;
+  readonly eventTimings?: unknown;
+}
+
+interface DevToolsClient {
+  request(packet: Record<string, unknown>): Promise<Record<string, unknown>>;
+}
+
+interface NetMonitorConnector {
+  readonly currentTarget: { readonly url: string };
+  readonly commands?: { readonly client?: DevToolsClient };
+  enableActions(enable: boolean): void;
+  requestData(actorId: string, method: string): Promise<unknown>;
+  getLongString(grip: unknown): Promise<string>;
+  getTimingMarker?(name: string): number;
+  getHarData?(): unknown;
+}
+
+interface NetMonitorApi {
+  readonly store: {
+    getState(): {
+      readonly requests: { readonly requests: readonly DevToolsRequestItem[] };
+      readonly messages?: {
+        readonly messages?: ReadonlyMap<unknown, readonly DevToolsWsMessage[]>;
+      };
+    };
+  };
+  readonly connector: NetMonitorConnector;
+}
+
 interface DevToolsToolbox {
   readonly hostType: string;
+  readonly commands?: { readonly descriptorFront?: { readonly localTab?: NativeTab } };
+  getNetMonitorAPI(): Promise<NetMonitorApi>;
+}
+
+interface HarBuilderModule {
+  readonly HarBuilder: new (options: {
+    readonly connector: NetMonitorConnector;
+    readonly id: number;
+    readonly includeResponseBodies: boolean;
+    readonly items: readonly DevToolsRequestItem[];
+    readonly supportsMultiplePages: boolean;
+  }) => {
+    build(): Promise<{ readonly log: { readonly entries: readonly Record<string, unknown>[] } }>;
+  };
 }
 
 interface ShutdownPhase {
@@ -384,12 +493,18 @@ interface NetUtilModule {
 
 interface GeckoModules {
   "chrome://devtools-startup/content/DevToolsShim.sys.mjs": {
-    readonly DevToolsShim: { isInitialized(): boolean };
+    readonly DevToolsShim: {
+      isInitialized(): boolean;
+      getToolboxes(): readonly DevToolsToolbox[];
+      on(event: "toolbox-ready", listener: (toolbox: DevToolsToolbox) => void): void;
+      off(event: "toolbox-ready", listener: (toolbox: DevToolsToolbox) => void): void;
+    };
   };
   "resource://devtools/shared/loader/Loader.sys.mjs": {
     require(id: "resource://devtools/client/framework/devtools.js"): {
       readonly gDevTools: { getToolboxForTab(tab: NativeTab): DevToolsToolbox | undefined };
     };
+    require(id: "resource://devtools/client/netmonitor/src/har/har-builder.js"): HarBuilderModule;
   };
   "resource://gre/modules/NetUtil.sys.mjs": { readonly NetUtil: NetUtilModule };
   "resource://gre/modules/Downloads.sys.mjs": {

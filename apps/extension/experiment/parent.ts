@@ -14,7 +14,7 @@ import { compileRoutes } from "@one-click-har/recording/routes";
 import type { StoredSettings } from "@one-click-har/recording/settings";
 import { loadActivity } from "./archive-source.ts";
 import { FILE_WORKER, namespace } from "./contract.ts";
-import { toolboxOf } from "./devtools.ts";
+import { primeToolboxes, toolboxOf } from "./devtools.ts";
 import { unfinishedExports } from "./export-file.ts";
 import { parseExportId } from "@one-click-har/export/jobs";
 import {
@@ -255,10 +255,13 @@ class OneClickHarParent extends ExtensionAPI {
   #state: Lifecycle = { kind: "stopped" };
   #harness: Observer | null = null;
   #host: GeckoHost | null = null;
+  #priming: { dispose(): void } | null = null;
+  readonly #run: RunId = runIdAt(Date.now() as EpochMs);
 
   /** One host per add-on, so an export started from the popup keeps running after the popup closes. */
   get #shared(): GeckoHost {
     this.#host ??= createGeckoHost({
+      run: this.#state.kind === "running" ? this.#state.run : this.#run,
       reads: () => recordingReads(this.#state),
       creator: { name: this.extension.manifest.name, version: this.extension.version },
       extension: this.extension,
@@ -270,6 +273,7 @@ class OneClickHarParent extends ExtensionAPI {
   override onStartup(): void {
     if (this.#state.kind !== "stopped") return;
     this.#state = start();
+    this.#priming = primeToolboxes();
     if (!Services.prefs.getBoolPref(HARNESS_PREF, false)) return;
     this.#harness = {
       observe: (subject) => {
@@ -305,6 +309,8 @@ class OneClickHarParent extends ExtensionAPI {
   }
 
   override onShutdown(isAppShutdown: boolean): void {
+    this.#priming?.dispose();
+    this.#priming = null;
     try {
       if (this.#host !== null) resourceHandler().setSubstitution(WORKER_ROOT, null);
     } catch {

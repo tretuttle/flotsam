@@ -18,17 +18,21 @@ import {
   type Selection,
   type SelectionContext,
 } from "@one-click-har/export/selection";
+import type { BodyReader, ExchangeSource, SourceItem } from "@one-click-har/export/source";
 import { formatHarFilename } from "@one-click-har/har/filename";
 import {
   countWindows,
+  currentRunKeys,
   firstMinuteOfTab,
   type ActivityIndex,
 } from "@one-click-har/recording/activity";
 import type { LiveExchange } from "@one-click-har/recording/exchange";
 import {
+  exchangeId,
   toMinute,
   type ByteCount,
   type EpochMs,
+  type Minute,
   type RunId,
   type Site,
   type TabId,
@@ -44,7 +48,7 @@ import {
 import type { StoredSettings } from "@one-click-har/recording/settings";
 import { archiveBodies, archiveSource, decodeContent, itemOf } from "./archive-source.ts";
 import type { PopupTabArgument, PopupView, ToolboxState } from "./contract.ts";
-import { devtoolsSource, toolboxOf } from "./devtools.ts";
+import { createDevtoolsSource, toolboxOf } from "./devtools.ts";
 import {
   createPartSink,
   exportFiles,
@@ -142,14 +146,24 @@ const localMidnight = (now: EpochMs): EpochMs => {
   return midnight.getTime() as EpochMs;
 };
 
-const EMPTY_PREVIEW: Preview = {
-  requests: 0,
-  sources: { both: 0, recordingOnly: 0, devtoolsOnly: 0 },
-  bodyBytesAtMost: 0 as ByteCount,
-  first: null,
-  gate: null,
-  inProgress: 0,
+const EMPTY_RECORDING_SOURCE: ExchangeSource = {
+  name: "recording",
+  list: async () => ({ items: [], notNetwork: {} }),
+  load: async () => {
+    throw new Error("the recording source is unavailable");
+  },
 };
+
+const EMPTY_BODY_READER: BodyReader = {
+  open: async () => ({ ok: false, reason: "source-error" }),
+};
+
+const combinedBodies = (stored: BodyReader, devtools: BodyReader): BodyReader => ({
+  open: (source, chunkBytes, signal) =>
+    source.kind === "stored"
+      ? stored.open(source, chunkBytes, signal)
+      : devtools.open(source, chunkBytes, signal),
+});
 
 const yieldNow = (): Promise<void> =>
   new Promise((resolve) => Services.tm.dispatchToMainThread(() => resolve()));
@@ -312,6 +326,7 @@ const SCOPE_NAMES = { tab: "tab", site: "site", everything: "all", sessions: "si
 let exportCounter = 0;
 
 export function createGeckoHost(options: {
+  readonly run: RunId;
   readonly reads: () => RecordingReads | null;
   readonly creator: { readonly name: string; readonly version: string };
   /** The add-on's own tab manager answers for every page. */
@@ -321,23 +336,43 @@ export function createGeckoHost(options: {
 }) {
   const pauses = exportPauses();
   const faults = exportFaults();
-  const { reads, creator } = options;
+  const { run: currentRun, reads, creator } = options;
   const finished = new Map<ExportId, string>();
 
   const lookup = (tabId: TabId): TabLookup => lookupTab(options.extension, tabId);
+  const canAccessTab = (tab: NativeTab): boolean =>
+    tab.linkedBrowser.browsingContext?.usePrivateBrowsing !== true ||
+    options.extension.privateBrowsingAllowed === true;
+  const makeDevtools = () =>
+    createDevtoolsSource({
+      run: currentRun,
+      tabOf: (tabId) => {
+        const found = lookup(tabId);
+        return found.kind === "tab" ? found.tab : null;
+      },
+      canAccessTab,
+    });
 
-  /** Tab scope resolves the tab id to this run's TabKey once, here. With no recording there is no key to match. */
-  const selectionContext = (rec: RecordingReads | null, selection: Selection): SelectionContext => {
+  /** Tab scope resolves the tab id to this run's TabKey once, here. */
+  const selectionContext = async (
+    rec: RecordingReads | null,
+    selection: Selection,
+    devtools: ReturnType<typeof makeDevtools>,
+  ): Promise<SelectionContext> => {
     const now = Date.now() as EpochMs;
     const found = selection.scope === "tab" ? lookup(selection.tabId) : null;
     const tab: TabKey | null =
-      rec !== null && found?.kind === "tab" ? { run: rec.run, browserId: found.browserId } : null;
+      found?.kind === "tab" ? { run: currentRun, browserId: found.browserId } : null;
+    const devtoolsFirst =
+      selection.scope === "tab" && selection.range.kind === "since-tab-opened"
+        ? await devtools.firstMinute(selection.tabId)
+        : null;
     return {
       now: toMinute(now),
       localMidnight: toMinute(localMidnight(now)),
       tab,
       tabFirstSeen: rec === null || tab === null ? null : firstMinuteOfTab(rec.activity, tab),
-      devtoolsFirst: null,
+      devtoolsFirst,
     };
   };
 
@@ -345,23 +380,77 @@ export function createGeckoHost(options: {
     const rec = reads();
     const gate =
       selection.scope === "tab" ? gateOf(lookup(selection.tabId), rec?.settings() ?? null) : null;
-    if (rec === null) return { ...EMPTY_PREVIEW, gate };
-    await rec.settle();
-    const resolved = resolveSelection(selection, selectionContext(rec, selection));
+    if (rec !== null) await rec.settle();
+    const devtools = makeDevtools();
+    const resolved = resolveSelection(selection, await selectionContext(rec, selection, devtools));
+    const dtListing = await devtools.source.list(resolved);
+    const dtSeenKeys = new Set<string>();
+    const dtUnique: SourceItem[] = [];
+    for (const item of dtListing.items) {
+      if (item.key === null) {
+        dtUnique.push(item);
+      } else if (!dtSeenKeys.has(item.key)) {
+        dtSeenKeys.add(item.key);
+        dtUnique.push(item);
+      }
+    }
+    let dtFirst: Minute | null = null;
+    for (const item of dtUnique) {
+      if (dtFirst === null || item.startedMinute < dtFirst) dtFirst = item.startedMinute;
+    }
+    if (rec === null) {
+      return {
+        requests: dtUnique.length,
+        sources: { both: 0, recordingOnly: 0, devtoolsOnly: dtUnique.length },
+        bodyBytesAtMost: 0 as ByteCount,
+        first: dtFirst,
+        gate,
+        inProgress: dtUnique.filter((item) => item.inProgress).length,
+      };
+    }
     const counts = countWindows(rec.activity, resolved.windows);
     const recorded = resolved.include === "fetch-and-xhr" ? counts.fetchOrXhr : counts.requests;
-    const inProgress = rec
+    const liveItems = rec
       .live()
-      .filter(({ site, live }) =>
-        inSelection(resolved, itemOf(live.request, site, true, 0)),
-      ).length;
+      .map(({ site, live }) => itemOf(live.request, site, true, 0))
+      .filter((item) => inSelection(resolved, item));
+    const tabFilter =
+      resolved.tabId === null
+        ? null
+        : (() => {
+            const found = lookup(resolved.tabId);
+            return found.kind === "tab" ? { run: rec.run, browserId: found.browserId } : null;
+          })();
+    const recKeys = new Set<string>();
+    for (const channel of currentRunKeys(rec.activity, tabFilter)) {
+      recKeys.add(exchangeId(rec.run, channel));
+    }
+    for (const item of liveItems) {
+      if (item.key !== null) recKeys.add(item.key);
+    }
+    let both = 0;
+    let devtoolsOnly = 0;
+    for (const item of dtUnique) {
+      if (item.key !== null && recKeys.has(item.key)) both += 1;
+      else devtoolsOnly += 1;
+    }
+    const totalRecording = recorded + liveItems.length;
+    const recordingOnly = Math.max(0, totalRecording - both);
+    const first =
+      counts.first === null
+        ? dtFirst
+        : dtFirst === null
+          ? counts.first
+          : counts.first < dtFirst
+            ? counts.first
+            : dtFirst;
     return {
-      requests: recorded + inProgress,
-      sources: { both: 0, recordingOnly: recorded + inProgress, devtoolsOnly: 0 },
+      requests: totalRecording + devtoolsOnly,
+      sources: { both, recordingOnly, devtoolsOnly },
       bodyBytesAtMost: counts.bodyBytesAtMost,
-      first: counts.first,
+      first,
       gate,
-      inProgress,
+      inProgress: liveItems.length,
     };
   };
 
@@ -465,33 +554,37 @@ export function createGeckoHost(options: {
       written = await folder.createPart(planned, partJournal);
       const { part } = written;
       const sink = createPartSink(part.append, (bytes) => control.progress({ ...last, bytes }));
-      const report = await runExport(
-        job.request,
-        resolveSelection(job.request.selection, selectionContext(rec, job.request.selection)),
-        {
-          recording:
-            rec === null
-              ? { ...devtoolsSource, name: "recording" }
-              : archiveSource({
-                  root: rec.root,
-                  activity: rec.activity,
-                  settle: rec.settle,
-                  live: rec.live,
-                }),
-          devtools: devtoolsSource,
-          bodies: archiveBodies(rec?.root ?? (folder.path as SafeFolder)),
-          sink,
-          creator,
-          fileId: Array.from(randomBytes(16), (b) => b.toString(16).padStart(2, "0")).join(""),
-          decode: decodeContent,
-          yieldNow,
-          onProgress: (p) => {
-            last = { done: p.done, total: p.total };
-            control.progress(p);
-          },
-          signal: control.signal,
-        },
+      const devtools = makeDevtools();
+      const resolved = resolveSelection(
+        job.request.selection,
+        await selectionContext(rec, job.request.selection, devtools),
       );
+      const report = await runExport(job.request, resolved, {
+        recording:
+          rec === null
+            ? EMPTY_RECORDING_SOURCE
+            : archiveSource({
+                root: rec.root,
+                activity: rec.activity,
+                settle: rec.settle,
+                live: rec.live,
+              }),
+        devtools: devtools.source,
+        bodies: combinedBodies(
+          rec === null ? EMPTY_BODY_READER : archiveBodies(rec.root),
+          devtools.bodies,
+        ),
+        sink,
+        creator,
+        fileId: Array.from(randomBytes(16), (b) => b.toString(16).padStart(2, "0")).join(""),
+        decode: decodeContent,
+        yieldNow,
+        onProgress: (p) => {
+          last = { done: p.done, total: p.total };
+          control.progress(p);
+        },
+        signal: control.signal,
+      });
       await sink.close();
       const name = await part.finish(planned);
       finished.set(job.id, PathUtils.join(folder.path, name));
