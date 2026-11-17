@@ -325,7 +325,12 @@ function judgeBrowserRow(
   const denial = denialAt(spec, position);
   if (spec.shape === "each") return eachVerdict(spec, denial, raw, planned, input);
   const unit = planned.length === 1 ? planned[0] : undefined;
-  if (unit === undefined || Array.isArray(unit) !== (spec.shape === "pair")) {
+  // Each shape is named, so a spec without one fits no unit.
+  const fits =
+    spec.shape === "pair"
+      ? Array.isArray(unit)
+      : spec.shape === "single" && typeof unit === "string";
+  if (unit === undefined || !fits) {
     return {
       verdict: "NO-RESULT",
       summary: `planned ${shown(planned)}, expected one ${spec.shape} unit`,

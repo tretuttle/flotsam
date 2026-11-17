@@ -698,9 +698,11 @@ describe("isolation judge", () => {
     const noXhr = Object.fromEntries(
       Object.entries(PLAN.targets).filter(([id]) => id !== "xhr-file-log"),
     );
-    expect(judged({ ...passingInput(), targets: noXhr }, "xhr-file-log", "web").observed).toBe(
-      "no planned targets",
-    );
+    expect(judged({ ...passingInput(), targets: noXhr }, "xhr-file-log", "web")).toMatchObject({
+      verdict: "NO-RESULT",
+      ok: false,
+      observed: "no planned targets",
+    });
   });
 
   it("probes paths written outside the key folder, and fails one whose existence a page can tell", () => {
@@ -1139,7 +1141,11 @@ describe("isolation judge details", () => {
       ...good,
       pair: { hit: good.pair.hit, miss: { outcome: "error", text: "error" } },
     };
-    expect(verdictAndLine(noMissTarget)[0]).toBe("NO-RESULT");
+    expect(verdictAndLine(noMissTarget)).toEqual([
+      "NO-RESULT",
+      `${unit[0]} -> malformed ${JSON.stringify(noMissTarget).slice(0, 200)}`,
+    ]);
+    expect(verdictAndLine(null)).toEqual(["NO-RESULT", `${unit[0]} -> malformed null`]);
     expect(verdictAndLine({ outcome: "same" })).toEqual([
       "NO-RESULT",
       `${unit[0]} -> malformed {"outcome":"same"}`,

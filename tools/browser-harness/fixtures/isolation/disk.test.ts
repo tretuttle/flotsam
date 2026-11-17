@@ -157,6 +157,9 @@ describe("disk rules", () => {
       added("downloads/saved-page.html.bak"),
       added("profile/prefs.js", dir),
       added("home/.cache/zen/x"),
+      added("data/zen", dir),
+      added("home/.config/zenith", dir),
+      added("profile/x/mozilla/firefox/Crash Reports/f"),
       added("stray.txt"),
     ];
     expect(unallowedWrites(writes, RULES)).toEqual([
@@ -182,6 +185,9 @@ describe("disk rules", () => {
       "new file downloads/saved-page.html.bak",
       "new directory profile/prefs.js",
       "new file home/.cache/zen/x",
+      "new directory data/zen",
+      "new directory home/.config/zenith",
+      "new file profile/x/mozilla/firefox/Crash Reports/f",
       "new file stray.txt",
     ]);
   });
