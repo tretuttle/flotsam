@@ -251,6 +251,11 @@ export const WRITE_FAILURE_COPY: {
     text: () => "A file with this name already exists in the export folder.",
     settings: null,
   },
+  "copy-mismatch": {
+    text: () =>
+      "The copy written to the folder did not match the export byte for byte, so it was not kept.",
+    settings: null,
+  },
   "io-error": {
     text: () => "The disk reported an error while the file was being written.",
     settings: null,
