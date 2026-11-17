@@ -11,6 +11,7 @@ import {
   judgeCancel,
   judgeDiskFull,
   judgeExport,
+  judgeFailure,
   judgeTabCases,
   PLANTS,
   plantDataRow,
@@ -218,5 +219,34 @@ describe("the tab, cancel, disk-full and crash judges", () => {
   it("wants the next start to delete the part a killed export left", () => {
     expect(judgeAfterCrash({ steps: ["delete-export-part"], left: [] })).toEqual([]);
     expect(judgeAfterCrash({ steps: [], left: ["killed.har.part"] })).toHaveLength(2);
+  });
+
+  it("wants a refused export folder to give its named kind, numbers only, and no path to the page", () => {
+    const paths = ["/w/profile", "/w/downloads"];
+    const ok = {
+      expect: "access-denied",
+      state: { kind: "write-failed", failure: { kind: "access-denied" } },
+      served: '{"job":{"state":{"kind":"write-failed","failure":{"kind":"access-denied"}}}}',
+      paths,
+      left: [],
+    };
+    expect(judgeFailure(ok)).toEqual([]);
+    const leaked = {
+      ...ok,
+      state: {
+        kind: "write-failed",
+        failure: { kind: "other", detail: "/w/downloads/a.har.part" },
+      },
+      served: '{"detail":"NotAllowedError /w/downloads/a.har.part jar:file:///w/profile/x.xpi"}',
+    };
+    expect(judgeFailure(leaked)).toEqual([
+      'ended {"kind":"write-failed","failure":{"kind":"other","detail":"/w/downloads/a.har.part"}}, expected write-failed access-denied',
+      "the failure carries detail",
+      "a path reached the page: /w/profile",
+      "a path reached the page: /w/downloads",
+      "a file: URL reached the page",
+      "a jar: URL reached the page",
+    ]);
+    expect(judgeFailure({ ...ok, left: ["a.har.part"] })).toEqual(["left behind: a.har.part"]);
   });
 });

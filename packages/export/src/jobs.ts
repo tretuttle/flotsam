@@ -70,11 +70,16 @@ export interface PopupState {
 
 export type ExportId = string & { readonly __exportId: unique symbol };
 
+/**
+ * Why an export file could not be written: a closed set of kinds and numbers. No field holds text, because a platform
+ * error's text names the export folder and the profile, and a failure crosses to extension pages.
+ */
 export type WriteFailure =
   | { readonly kind: "disk-full"; readonly needBytes: ByteCount; readonly freeBytes: ByteCount }
   | { readonly kind: "access-denied" }
+  | { readonly kind: "folder-missing" }
   | { readonly kind: "folder-refused" }
-  | { readonly kind: "other"; readonly detail: string };
+  | { readonly kind: "other" };
 
 export type ExportState =
   | {

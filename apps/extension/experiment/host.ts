@@ -44,7 +44,14 @@ import type { StoredSettings } from "@one-click-har/recording/settings";
 import { archiveBodies, archiveSource, decodeContent, itemOf } from "./archive-source.ts";
 import type { PopupTabArgument, PopupView, ToolboxState } from "./contract.ts";
 import { devtoolsSource, toolboxOf } from "./devtools.ts";
-import { createPartSink, freeFileName, journalLine, PART_SUFFIX } from "./export-file.ts";
+import {
+  createPartSink,
+  exportFiles,
+  freeFileName,
+  journalLine,
+  PART_SUFFIX,
+  type ExportPlatform,
+} from "./export-file.ts";
 import { createExportJobs, type ExportJobs, type RunOutcome } from "./export-jobs.ts";
 import { forbiddenRoots, platform } from "./files.ts";
 import { appendText, localFile, openOutput, siteOfUri, type Modes } from "./gecko-io.ts";
@@ -129,6 +136,20 @@ const EMPTY_PREVIEW: Preview = {
 
 const yieldNow = (): Promise<void> =>
   new Promise((resolve) => Services.tm.dispatchToMainThread(() => resolve()));
+
+/** The only raw file calls an export makes. `exportFiles` classifies whatever they throw. */
+const geckoExportPlatform = (modes: Modes): ExportPlatform => ({
+  makeFolder: (folder) =>
+    IOUtils.makeDirectory(folder, { createAncestors: true, ignoreExisting: true }),
+  exists: (path) => localFile(path).exists(),
+  create: (path) => openOutput(path, false, modes).close(),
+  append: async (path, text) => {
+    await IOUtils.writeUTF8(path, text, { mode: "append" });
+  },
+  rename: (from, to) => IOUtils.move(from, to, { noOverwrite: true }),
+  remove: (path) => IOUtils.remove(path, { ignoreAbsent: true }),
+  freeBytes: (folder) => localFile(folder).diskSpaceAvailable,
+});
 
 const SCOPE_NAMES = { tab: "tab", site: "site", everything: "all", sessions: "site" } as const;
 
@@ -254,7 +275,6 @@ export function createGeckoHost(options: {
     }
     const guarded = guardFolder(path, forbiddenRoots(), platform());
     if (!guarded.ok) return null;
-    await IOUtils.makeDirectory(guarded.folder, { createAncestors: true, ignoreExisting: true });
     return {
       folder: guarded.folder,
       label: chosen?.kind === "chosen" ? chosen.label : PathUtils.filename(guarded.folder),
@@ -274,34 +294,33 @@ export function createGeckoHost(options: {
     let target: Awaited<ReturnType<typeof exportFolder>>;
     try {
       target = await exportFolder(rec?.settings() ?? null);
-    } catch (error) {
-      return { kind: "write-failed", failure: { kind: "other", detail: String(error) } };
+    } catch {
+      return { kind: "write-failed", failure: { kind: "other" } };
     }
     if (target === null) return { kind: "write-failed", failure: { kind: "folder-refused" } };
     const { folder, label } = target;
-    const plan = jobs.job(job.id)?.fileName ?? plannedName(job.request);
-    const name = freeFileName(plan, (candidate) =>
-      localFile(PathUtils.join(folder, candidate)).exists(),
-    );
-    const final = PathUtils.join(folder, name);
-    const part = `${final}${PART_SUFFIX}`;
+    const files = exportFiles(geckoExportPlatform(modes), folder);
     const journal = rec === null ? null : PathUtils.join(rec.root, LAYOUT.exportsJournal);
-    const note = async (event: "started" | "ended"): Promise<void> => {
-      if (journal !== null) await appendText(journal, journalLine(event, part), modes);
+    const note = async (event: "started" | "ended", path: string): Promise<void> => {
+      if (journal !== null) await appendText(journal, journalLine(event, path), modes);
     };
+    let part: string | null = null;
     let last = { done: 0, total: 0 };
-    const sink = createPartSink(
-      {
-        append: async (text) => {
-          await IOUtils.writeUTF8(part, text, { mode: "append" });
-        },
-        freeBytes: async () => localFile(folder).diskSpaceAvailable,
-      },
-      (bytes) => control.progress({ ...last, bytes }),
-    );
     try {
-      await note("started");
-      openOutput(part, false, modes).close();
+      await files.makeFolder();
+      const plan = jobs.job(job.id)?.fileName ?? plannedName(job.request);
+      const name = await freeFileName(plan, (candidate) =>
+        files.exists(PathUtils.join(folder, candidate)),
+      );
+      const final = PathUtils.join(folder, name);
+      const writing = `${final}${PART_SUFFIX}`;
+      await note("started", writing);
+      part = writing;
+      await files.create(writing);
+      const sink = createPartSink(
+        (text, needBytes) => files.append(writing, text, needBytes),
+        (bytes) => control.progress({ ...last, bytes }),
+      );
       const report = await runExport(
         job.request,
         resolveSelection(job.request.selection, selectionContext(rec, job.request.selection)),
@@ -329,16 +348,19 @@ export function createGeckoHost(options: {
         },
       );
       await sink.close();
-      await IOUtils.move(part, final, { noOverwrite: true });
-      await note("ended");
+      await files.rename(writing, final);
+      part = null;
+      await note("ended", writing);
       finished.set(job.id, final);
       return { kind: "done", fileName: name, folderLabel: label, report };
     } catch (error) {
-      await IOUtils.remove(part, { ignoreAbsent: true }).catch(() => undefined);
-      await note("ended").catch(() => undefined);
+      if (part !== null) {
+        await files.remove(part).catch(() => undefined);
+        await note("ended", part).catch(() => undefined);
+      }
       if (error instanceof WriteRefused) return { kind: "write-failed", failure: error.failure };
       if (control.signal.aborted) return { kind: "cancelled" };
-      return { kind: "write-failed", failure: { kind: "other", detail: String(error) } };
+      return { kind: "write-failed", failure: { kind: "other" } };
     }
   };
 

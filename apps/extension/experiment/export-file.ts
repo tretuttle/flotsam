@@ -1,5 +1,6 @@
-// How an export reaches disk, without Gecko: the sink that batches the document into `<name>.har.part`, the one
-// place a refused write becomes a WriteFailure, and the journal that lets the next start delete a part a crash left.
+// How an export reaches disk, without Gecko: the one boundary every export file call goes through, where a platform
+// error becomes a WriteFailure, the sink that batches the document into `<name>.har.part`, and the journal that lets
+// the next start delete a part a crash left.
 
 import type { WriteFailure } from "@one-click-har/export/jobs";
 import { WriteRefused, type HarSink } from "@one-click-har/export/run";
@@ -27,38 +28,92 @@ const utf8Length = (text: string): number => {
   return bytes;
 };
 
-/** Error names Gecko's file layer gives for a refusal, first match wins. Disk space is decided from the numbers. */
-const REFUSALS: readonly { readonly pattern: RegExp; readonly failure: WriteFailure }[] = [
-  {
-    pattern: /ACCESS_DENIED|NotAllowedError|Permission denied/u,
-    failure: { kind: "access-denied" },
-  },
-  { pattern: /READ_ONLY|read-only/iu, failure: { kind: "access-denied" } },
-];
-
 /**
- * A refused write as the popup reports it. Free space below what the write needed is a full disk whatever the error
- * text says; ENOSPC surfaces under several names, and the numbers are what the user can act on.
+ * Platform errors by the identifier the platform gives them: an IOUtils DOMException's `name`, or an XPCOM exception's
+ * nsresult name. Never by message text, which carries paths. Free space below what the call needed is a full disk
+ * whatever the name, because ENOSPC reaches IOUtils under a generic name.
  */
-const classifyWriteFailure = (
-  detail: string,
+export const FS_ERROR_KINDS: {
+  readonly [name: string]: "access-denied" | "folder-missing" | "disk-full";
+} = {
+  NotAllowedError: "access-denied",
+  NS_ERROR_FILE_ACCESS_DENIED: "access-denied",
+  NS_ERROR_FILE_READ_ONLY: "access-denied",
+  NS_ERROR_FILE_IS_LOCKED: "access-denied",
+  NotFoundError: "folder-missing",
+  NS_ERROR_FILE_NOT_FOUND: "folder-missing",
+  NS_ERROR_FILE_TARGET_DOES_NOT_EXIST: "folder-missing",
+  NS_ERROR_FILE_NO_DEVICE_SPACE: "disk-full",
+};
+
+const errorName = (error: unknown): string | null => {
+  const name =
+    typeof error === "object" && error !== null ? (error as { name?: unknown }).name : null;
+  return typeof name === "string" ? name : null;
+};
+
+const classifyFsError = (
+  error: unknown,
   needBytes: number,
   freeBytes: number | null,
 ): WriteFailure => {
-  if (freeBytes !== null && freeBytes < needBytes)
-    return {
-      kind: "disk-full",
-      needBytes: needBytes as ByteCount,
-      freeBytes: freeBytes as ByteCount,
-    };
-  return REFUSALS.find((row) => row.pattern.test(detail))?.failure ?? { kind: "other", detail };
+  const full: WriteFailure = {
+    kind: "disk-full",
+    needBytes: needBytes as ByteCount,
+    freeBytes: (freeBytes ?? 0) as ByteCount,
+  };
+  if (freeBytes !== null && freeBytes < needBytes) return full;
+  const name = errorName(error);
+  const kind = name !== null && Object.hasOwn(FS_ERROR_KINDS, name) ? FS_ERROR_KINDS[name] : null;
+  if (kind === "disk-full") return full;
+  return { kind: kind ?? "other" };
 };
 
-/** What the sink needs from a file system. `append` resolves once the text is on disk or rejects with the refusal. */
-export interface PartFile {
-  readonly append: (text: string) => Promise<void>;
-  /** Free bytes on the part's volume, or null when the platform cannot say. */
-  readonly freeBytes: () => Promise<number | null>;
+/** The raw file calls an export makes, as a platform offers them. Any of them may throw anything. */
+export interface ExportPlatform {
+  readonly makeFolder: (folder: string) => Promise<void>;
+  readonly exists: (path: string) => boolean;
+  /** Creates the file empty, with its final mode. */
+  readonly create: (path: string) => void;
+  readonly append: (path: string, text: string) => Promise<void>;
+  readonly rename: (from: string, to: string) => Promise<void>;
+  readonly remove: (path: string) => Promise<void>;
+  readonly freeBytes: (folder: string) => number;
+}
+
+/** The export's only way to the file system. Every call throws WriteRefused with a classified failure, or succeeds. */
+export interface ExportFiles {
+  readonly makeFolder: () => Promise<void>;
+  readonly exists: (path: string) => Promise<boolean>;
+  readonly create: (path: string) => Promise<void>;
+  readonly append: (path: string, text: string, needBytes: number) => Promise<void>;
+  readonly rename: (from: string, to: string) => Promise<void>;
+  readonly remove: (path: string) => Promise<void>;
+}
+
+export function exportFiles(platform: ExportPlatform, folder: string): ExportFiles {
+  const free = (): number | null => {
+    try {
+      return platform.freeBytes(folder);
+    } catch {
+      return null;
+    }
+  };
+  const guard = async <T>(call: () => T | Promise<T>, needBytes = 0): Promise<T> => {
+    try {
+      return await call();
+    } catch (error) {
+      throw new WriteRefused(classifyFsError(error, needBytes, free()));
+    }
+  };
+  return {
+    makeFolder: () => guard(() => platform.makeFolder(folder)),
+    exists: (path) => guard(() => platform.exists(path)),
+    create: (path) => guard(() => platform.create(path)),
+    append: (path, text, needBytes) => guard(() => platform.append(path, text), needBytes),
+    rename: (from, to) => guard(() => platform.rename(from, to)),
+    remove: (path) => guard(() => platform.remove(path)),
+  };
 }
 
 export type PartSink = HarSink & {
@@ -67,10 +122,13 @@ export type PartSink = HarSink & {
 };
 
 /**
- * The export's sink. A refused append is the only failure that fails an export: it is thrown as WriteRefused with the
- * bytes that append needed and the volume's free bytes, and nothing after it is written.
+ * The export's sink. A refused append is the only failure that fails an export: `append` throws WriteRefused with
+ * the bytes it needed, and nothing after it is written.
  */
-export function createPartSink(file: PartFile, onBytes: (bytes: ByteCount) => void): PartSink {
+export function createPartSink(
+  append: (text: string, needBytes: number) => Promise<void>,
+  onBytes: (bytes: ByteCount) => void,
+): PartSink {
   let pending: string[] = [];
   let pendingUnits = 0;
   let pendingBytes = 0;
@@ -82,12 +140,7 @@ export function createPartSink(file: PartFile, onBytes: (bytes: ByteCount) => vo
     pending = [];
     pendingUnits = 0;
     pendingBytes = 0;
-    try {
-      await file.append(text);
-    } catch (error) {
-      const free = await file.freeBytes().catch(() => null);
-      throw new WriteRefused(classifyWriteFailure(String(error), needBytes, free));
-    }
+    await append(text, needBytes);
     written += needBytes;
     onBytes(written as ByteCount);
   };
@@ -129,12 +182,15 @@ export const unfinishedExports = (journal: string): readonly string[] => {
 };
 
 /** `name.har`, then `name (2).har` and on, the first that is free as both the file and its part. */
-export const freeFileName = (planned: string, taken: (name: string) => boolean): string => {
+export const freeFileName = async (
+  planned: string,
+  taken: (name: string) => Promise<boolean>,
+): Promise<string> => {
   const dot = planned.endsWith(".har") ? planned.length - 4 : planned.length;
   const stem = planned.slice(0, dot);
   const extension = planned.slice(dot);
   for (let n = 1; ; n += 1) {
     const name = n === 1 ? planned : `${stem} (${String(n)})${extension}`;
-    if (!taken(name) && !taken(`${name}${PART_SUFFIX}`)) return name;
+    if (!(await taken(name)) && !(await taken(`${name}${PART_SUFFIX}`))) return name;
   }
 };

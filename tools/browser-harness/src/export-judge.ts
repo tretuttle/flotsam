@@ -349,3 +349,32 @@ export function judgeAfterCrash(o: AfterCrashObservation): readonly string[] {
     ...(o.left.length === 0 ? [] : [`left after the next start: ${o.left.join(", ")}`]),
   ];
 }
+
+export type FailureObservation = {
+  readonly expect: string;
+  readonly state: unknown;
+  /** Everything the API handed the page after the failure: the job, listExports and getPopup, serialized. */
+  readonly served: string;
+  /** Folders whose paths may never reach a page: the profile, the export folder, the data home. */
+  readonly paths: readonly string[];
+  /** Files left in the export folder named like this export. */
+  readonly left: readonly string[];
+};
+
+const FAILURE_KEYS: readonly string[] = ["kind", "needBytes", "freeBytes"];
+
+/** A failure is one named kind and numbers. No path, and no URL that holds one, reaches the page anywhere. */
+export function judgeFailure(o: FailureObservation): readonly string[] {
+  const problems: string[] = [];
+  const state = o.state as { kind?: string; failure?: Record<string, unknown> };
+  if (state.kind !== "write-failed" || state.failure?.["kind"] !== o.expect)
+    problems.push(`ended ${JSON.stringify(o.state)}, expected write-failed ${o.expect}`);
+  const extra = Object.keys(state.failure ?? {}).filter((key) => !FAILURE_KEYS.includes(key));
+  if (extra.length > 0) problems.push(`the failure carries ${extra.join(", ")}`);
+  for (const path of o.paths)
+    if (o.served.includes(path)) problems.push(`a path reached the page: ${path}`);
+  for (const scheme of ["file:", "jar:"])
+    if (o.served.includes(scheme)) problems.push(`a ${scheme} URL reached the page`);
+  if (o.left.length > 0) problems.push(`left behind: ${o.left.join(", ")}`);
+  return problems;
+}

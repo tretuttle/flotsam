@@ -119,7 +119,7 @@ describe("the export slot", () => {
     expect(listed[0]?.id).toBe(`job-${String(KEPT_JOBS + 3)}`);
     expect(listed[0]?.state).toEqual({
       kind: "write-failed",
-      failure: { kind: "other", detail: "Error: boom" },
+      failure: { kind: "other" },
     });
   });
 });

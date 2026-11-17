@@ -88,8 +88,8 @@ export function createExportJobs(ports: {
           },
         },
       );
-    } catch (error) {
-      outcome = { kind: "write-failed", failure: { kind: "other", detail: String(error) } };
+    } catch {
+      outcome = { kind: "write-failed", failure: { kind: "other" } };
     }
     if (slot.audit !== null) slot.audit.bytesAtStop = slot.bytes;
     set(slot, outcome);
