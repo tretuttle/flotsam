@@ -18,6 +18,7 @@ import {
   PROBE_TABLE,
   type ExtraCheckId,
   type Position,
+  type Verdict,
 } from "./probe-table.ts";
 import { buildStoredZip } from "./zip.ts";
 
@@ -31,7 +32,6 @@ afterEach(async () => {
 const CTX: JudgeContext = {
   marker: "OCHMARK_deadbeef",
   warMark: "OCHWAR_cafebabe",
-  secretMark: "OCHSECRET_12345678",
   storeMark: "OCHSTORE_0badf00d",
   ownMark: "OCHOWN_5eed5eed",
   recId: "one-click-har@tretuttle.github.io",
@@ -210,7 +210,7 @@ const targetsOf = (id: string, position: Position): readonly string[] =>
 
 function passingRows(): BrowserRowReport[] {
   return expandExpectedRows(false)
-    .filter((row) => !row.synthetic)
+    .filter((row) => row.spec !== null)
     .filter((row) => !(row.id === "planted-resource" && row.position === "web"))
     .map((row) => {
       const spec = PROBE_TABLE.find((s) => s.id === row.id)!;
@@ -307,7 +307,7 @@ describe("isolation probe table", () => {
     expect(
       rows.filter((r) => r.position === "file-no-marionette" || r.position === "file-mutated"),
     ).toHaveLength(20);
-    expect(rows.filter((r) => r.synthetic)).toHaveLength(7);
+    expect(rows.filter((r) => r.spec === null)).toHaveLength(7);
   });
 
   it("names exactly three decided exceptions, at six rows, and no BLOCKED row lacks a denial", () => {
@@ -794,6 +794,333 @@ describe("isolation judge", () => {
     expect(judgeIsolationRun({ ...base, extraChecks: twice }).ok).toBe(false);
     const unknown = [...base.extraChecks, { id: "made-up" as ExtraCheckId, ok: true, detail: "" }];
     expect(judgeIsolationRun({ ...base, extraChecks: unknown }).ok).toBe(false);
+  });
+
+  it("runs the content-script rows in the file:// page, and drops the injection row, once a content script ran there", () => {
+    const rows = expandExpectedRows(true);
+    expect(rows).toHaveLength(341);
+    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(40);
+    expect(rows.some((r) => r.id === "cs-file-injection")).toBe(false);
+  });
+
+  const malformed: readonly [string, string, Position, unknown, Verdict][] = [
+    ["a null observation", "xhr-file-log", "ext-bg", null, "NO-RESULT"],
+    ["an undefined observation", "xhr-file-log", "web", undefined, "NO-RESULT"],
+    ["an observation without text", "fetch-file-body", "web", { outcome: "ok" }, "NO-RESULT"],
+    [
+      "an observation without outcome",
+      "fetch-file-body",
+      "file",
+      { text: "status 200" },
+      "NO-RESULT",
+    ],
+    [
+      "an empty outcome",
+      "notifications-getall",
+      "ext-bg",
+      { outcome: "", text: "{}" },
+      "NO-RESULT",
+    ],
+    [
+      "an empty answer",
+      "clipboard-after-export",
+      "ext-page",
+      { outcome: "ok", text: "" },
+      "NO-RESULT",
+    ],
+    [
+      "a denial text under another outcome",
+      "fetch-file-log",
+      "file",
+      { outcome: "ok", text: NETWORK.text },
+      "READ",
+    ],
+    [
+      "an answer text under another outcome",
+      "downloads-search",
+      "ext-page",
+      { outcome: "error", text: "no download items" },
+      "NO-RESULT",
+    ],
+    [
+      "its own value under an error",
+      "idb-recorder",
+      "ext-bg",
+      { outcome: "error", text: `own: kv.own = ${CTX.ownMark}` },
+      "NO-RESULT",
+    ],
+    [
+      "a blank frame under no frame event",
+      "jar-file-iframe",
+      "web",
+      { outcome: "ok", text: FRAME_BLANK.text },
+      "READ",
+    ],
+    [
+      "an error where an exception listing was due",
+      "management-getall",
+      "ext-bg",
+      { outcome: "error", text: "Error: denied" },
+      "NO-RESULT",
+    ],
+    [
+      "an empty listing where an exception listing was due",
+      "tabs-query-recorder",
+      "ext-bg",
+      { outcome: "ok", text: "" },
+      "NO-RESULT",
+    ],
+    [
+      "a webRequest baseline that saw no traffic",
+      "baseline-webrequest",
+      "ext-bg",
+      { outcome: "ok", text: '{"cookieHeaders":[],"responseBodies":[]}' },
+      "READ",
+    ],
+    [
+      "a baseline that answered without the marker",
+      "devtools-gethar",
+      "ext-devtools",
+      { outcome: "ok", text: "0 entries: []" },
+      "READ",
+    ],
+    [
+      "a null pair",
+      "img-file-oracle",
+      "web",
+      { outcome: "same", text: "", pair: null },
+      "NO-RESULT",
+    ],
+    [
+      "a pair with a null side",
+      "img-file-oracle",
+      "file",
+      { outcome: "same", text: "", pair: { hit: null, miss: { outcome: "error", text: "error" } } },
+      "NO-RESULT",
+    ],
+    [
+      "a pair with only a missing side",
+      "img-file-oracle",
+      "ext-bg",
+      { outcome: "same", text: "", pair: { miss: { outcome: "error", text: "error" } } },
+      "NO-RESULT",
+    ],
+    [
+      "a pair side without text",
+      "mozext-script-oracle",
+      "file",
+      {
+        outcome: "same",
+        text: "",
+        pair: { hit: { outcome: "error" }, miss: { outcome: "error", text: "error" } },
+      },
+      "NO-RESULT",
+    ],
+    [
+      "a missing side without text",
+      "mozext-script-oracle",
+      "web",
+      {
+        outcome: "same",
+        text: "",
+        pair: { hit: { outcome: "error", text: "error" }, miss: { outcome: "error" } },
+      },
+      "NO-RESULT",
+    ],
+    [
+      "a pair of identical throws",
+      "sendmessage-oracle",
+      "ext-bg",
+      {
+        outcome: "same",
+        text: "",
+        pair: { hit: { outcome: "threw", text: "x" }, miss: { outcome: "threw", text: "x" } },
+      },
+      "NO-RESULT",
+    ],
+    [
+      "an existing side that threw",
+      "sendmessage-oracle",
+      "ext-page",
+      {
+        outcome: "same",
+        text: "",
+        pair: { hit: { outcome: "threw", text: "x" }, miss: { outcome: "error", text: "x" } },
+      },
+      "NO-RESULT",
+    ],
+    [
+      "a missing side that threw",
+      "sendmessage-oracle",
+      "cs-web",
+      {
+        outcome: "same",
+        text: "",
+        pair: { hit: { outcome: "error", text: "x" }, miss: { outcome: "threw", text: "x" } },
+      },
+      "NO-RESULT",
+    ],
+    [
+      "a pair of identical empty outcomes",
+      "script-root-oracle",
+      "web",
+      {
+        outcome: "same",
+        text: "",
+        pair: { hit: { outcome: "", text: "x" }, miss: { outcome: "", text: "x" } },
+      },
+      "NO-RESULT",
+    ],
+    [
+      "per-target results that are not a list",
+      "chrome-traversal",
+      "web",
+      { outcome: "each", text: "", each: "none" },
+      "NO-RESULT",
+    ],
+    [
+      "a pair with identical marks",
+      "img-file-oracle",
+      "cs-web",
+      {
+        outcome: "same",
+        text: "",
+        pair: {
+          hit: { outcome: "load", text: CTX.marker },
+          miss: { outcome: "load", text: CTX.marker },
+        },
+      },
+      "READ",
+    ],
+  ];
+  it.each(malformed)(
+    "judges %s as %s, never BLOCKED",
+    (_label, probe, position, observed, verdict) => {
+      const input = withRow(probe, position, observed);
+      expect(rowOf(input, probe, position).verdict).toBe(verdict);
+      expect(judgeIsolationRun(input).ok).toBe(false);
+    },
+  );
+
+  it("tells pairs apart by outcome and by text", () => {
+    const sameOutcome = {
+      outcome: "differs",
+      text: "",
+      pair: {
+        hit: { outcome: "load", text: "load; cssRules: 3" },
+        miss: { outcome: "load", text: "load; cssRules: 0" },
+      },
+    };
+    expect(
+      rowOf(withRow("img-file-oracle", "file", sameOutcome), "img-file-oracle", "file").verdict,
+    ).toBe("LEAKS-EXISTENCE");
+    const sameText = {
+      outcome: "differs",
+      text: "",
+      pair: { hit: { outcome: "load", text: "x" }, miss: { outcome: "error", text: "x" } },
+    };
+    expect(
+      rowOf(withRow("img-file-oracle", "file", sameText), "img-file-oracle", "file").verdict,
+    ).toBe("LEAKS-EXISTENCE");
+  });
+
+  it("judges a per-target probe without a plan as NO-RESULT", () => {
+    const { "resource-all": _dropped, ...rest } = TARGETS;
+    const input = { ...passingInput(), targets: rest };
+    expect(rowOf(input, "resource-all", "web").verdict).toBe("NO-RESULT");
+    expect(judgeIsolationRun(input).ok).toBe(false);
+  });
+
+  it("judges a reachable name whose fetch failed another way as a leak, not a denial", () => {
+    const observed = {
+      outcome: "each",
+      text: "",
+      each: [
+        { target: "resource://gre/", ...UNREACHABLE },
+        {
+          target: "resource://app/",
+          outcome: "fetch error, link error",
+          text: "TypeError: Load failed",
+        },
+      ],
+    };
+    expect(
+      rowOf(withRow("resource-all", "ext-bg", observed), "resource-all", "ext-bg").verdict,
+    ).not.toBe("BLOCKED");
+  });
+
+  it("fails a management exception that names the recorder by id only nowhere, and passes one that names it by id", () => {
+    const blind = withRow("management-getall", "ext-bg", {
+      outcome: "ok",
+      text: "och-probe@test | Isolation probe extension",
+    });
+    expect(judgeIsolationRun(blind).ok).toBe(false);
+    const byId = withRow("management-getall", "ext-bg", {
+      outcome: "ok",
+      text: `${CTX.recId} | One-Click HAR | extension`,
+    });
+    expect(judgeIsolationRun(byId).ok).toBe(true);
+  });
+
+  it("passes a control that reads its mark, and fails one whose answer succeeded without the mark", () => {
+    const marked = withRow("fetch-file-dir", "file-mutated", {
+      outcome: "ok",
+      text: `status 200: ${CTX.marker}`,
+    });
+    expect(rowOf(marked, "fetch-file-dir", "file-mutated").verdict).toBe("READ");
+    expect(judgeIsolationRun(marked).ok).toBe(true);
+    const unmarked = withRow("planted-own-war-script", "file", {
+      outcome: "load",
+      text: "load; window.OCH_WAR = something else",
+    });
+    expect(judgeIsolationRun(unmarked).ok).toBe(false);
+  });
+
+  it("passes planted-resource@web as a leak where no sandbox blocks it", () => {
+    const input = withRow("planted-resource", "web", DIFFERS);
+    expect(
+      judgeIsolationRun({ ...input, context: { ...CTX, webSandboxBlocksArchive: false } }).ok,
+    ).toBe(true);
+  });
+
+  it("does not let one control stand in for another reported at the same position", () => {
+    const base = passingInput();
+    const input = {
+      ...base,
+      syntheticControls: base.syntheticControls.filter((c) => c.id !== "control-system-read"),
+    };
+    expect(rowOf(input, "control-system-read", "system").verdict).toBe("NO-RESULT");
+  });
+
+  it("calls a blind planted script control BLOCKED", () => {
+    const input = withRow("planted-own-war-script", "web", {
+      outcome: "error",
+      text: "error; window.OCH_WAR = undefined",
+    });
+    expect(rowOf(input, "planted-own-war-script", "web").verdict).toBe("BLOCKED");
+    expect(judgeIsolationRun(input).ok).toBe(false);
+  });
+
+  it("fails a missing row, and a control with no reads or reported at another position", () => {
+    const base = passingInput();
+    const rows = base.browserRows.filter(
+      (r) => !(r.probe === "xhr-file-log" && r.position === "web"),
+    );
+    expect(judgeIsolationRun({ ...base, browserRows: rows }).ok).toBe(false);
+    const empty = {
+      ...base,
+      syntheticControls: base.syntheticControls.map((c) =>
+        c.id === "limit-same-user-process" ? { ...c, reads: [] } : c,
+      ),
+    };
+    expect(judgeIsolationRun(empty).ok).toBe(false);
+    const moved = {
+      ...base,
+      syntheticControls: base.syntheticControls.map((c) =>
+        c.id === "planted-recorder-idb" ? { ...c, position: "system" as const } : c,
+      ),
+    };
+    expect(rowOf(moved, "planted-recorder-idb", "rec-page").verdict).toBe("NO-RESULT");
   });
 
   it("builds multi-entry stored XPI archives readable by readZipEntry", async () => {

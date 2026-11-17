@@ -69,6 +69,23 @@ describe("archive key oracle", () => {
     expect(guesses.has(randomKey())).toBe(false);
   });
 
+  it("hashes each source and its last path segment with every hash, hex encodes the raw text, and guesses only 32-hex names", () => {
+    const guesses = keyDerivations({
+      ...sources("/home/trent/.mozilla/abc.default/"),
+      addonUuid: "",
+    });
+    const keys = new Set(guesses.map((g) => g.key));
+    expect(keys.has(sha("sha384", "abc.default").slice(0, 32))).toBe(true);
+    expect(keys.has(sha("sha512", "trent").slice(-32))).toBe(true);
+    expect(keys.has(sha("sha256", "abc.default").slice(0, 32))).toBe(true);
+    expect(
+      keys.has(
+        Buffer.from("/home/trent/.mozilla/abc.default/", "utf8").toString("hex").slice(0, 32),
+      ),
+    ).toBe(true);
+    expect(guesses.every((g) => /^[0-9a-f]{32}$/u.test(g.key))).toBe(true);
+  });
+
   it("passes two random keys that name their archive folder", () => {
     expect(failed(evidence(randomKey(), randomKey()))).toEqual([]);
   });
@@ -85,6 +102,23 @@ describe("archive key oracle", () => {
     expect(failed(evidence(first, second))).toEqual(["key-not-derived"]);
     const fromName = sha("md5", "abc.default");
     expect(failed(evidence(fromName, randomKey()))).toEqual(["key-not-derived"]);
+  });
+
+  it("fails when only the second profile's key is derived", () => {
+    const second = sha("md5", "xyz.default");
+    expect(failed(evidence(randomKey(), second))).toEqual(["key-not-derived"]);
+  });
+
+  it("reads a key file without its trailing newline, and fails every key rule on a malformed first key", () => {
+    const key = randomKey();
+    expect(failed(evidence(key, randomKey(), { keyFileText: key }))).toEqual([]);
+    expect(failed(evidence(key, randomKey(), { keyFileText: "not a key\n" }))).toEqual([
+      "key-file-format",
+      "key-names-the-archive",
+      "key-differs-across-profiles",
+      "key-not-derived",
+      "nothing-outside-key-folder",
+    ]);
   });
 
   it("fails without a second key, a wrong mode, a malformed key file or a folder the key does not name", () => {
@@ -116,6 +150,39 @@ describe("written paths", () => {
     const late = [...archive(key), { path: "recent-sites.txt", kind: "file" as const }];
     expect(failed(evidence(key, randomKey(), { final: late }))).toEqual([
       "nothing-outside-key-folder",
+      "written-paths-targeted",
+    ]);
+  });
+
+  it("fails a predictable path written only at plan time, and a late directory outside the key folder", () => {
+    const key = randomKey();
+    const early = [...archive(key), { path: "sites", kind: "directory" as const }];
+    expect(failed(evidence(key, randomKey(), { planned: early }))).toContain(
+      "nothing-outside-key-folder",
+    );
+    const late = [...archive(key), { path: "sites", kind: "directory" as const }];
+    expect(failed(evidence(key, randomKey(), { final: late }))).toContain("written-paths-targeted");
+  });
+
+  it("tells kinds apart by depth and by last extension, and files without one", () => {
+    const key = randomKey();
+    const deeper = [
+      ...archive(key),
+      { path: `${key}/sites/bank.example/log/r1-0.json`, kind: "file" as const },
+    ];
+    expect(failed(evidence(key, randomKey(), { final: deeper }))).toEqual([
+      "written-paths-targeted",
+    ]);
+    const bare = [
+      ...archive(key),
+      { path: `${key}/sites/bank.example/bodies/r1`, kind: "file" as const },
+    ];
+    expect(failed(evidence(key, randomKey(), { final: bare }))).toEqual(["written-paths-targeted"]);
+    const dotted = [
+      ...archive(key),
+      { path: `${key}/sites/bank.example/bodies/r1.8.pack`, kind: "file" as const },
+    ];
+    expect(failed(evidence(key, randomKey(), { final: dotted }))).toEqual([
       "written-paths-targeted",
     ]);
   });

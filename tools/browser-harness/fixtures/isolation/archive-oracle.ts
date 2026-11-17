@@ -31,9 +31,7 @@ const KEY_HEX = /^[0-9a-f]{32}$/u;
 export function keyDerivations(sources: KeySources): readonly KeyGuess[] {
   const named: [string, string][] = [];
   for (const [label, value] of Object.entries(sources)) {
-    named.push([label, value]);
-    const last = value.split(/[\\/]/u).findLast((segment) => segment.length > 0);
-    if (last !== undefined && last !== value) named.push([`${label} name`, last]);
+    named.push([label, value], [`${label} name`, value.split(/[\\/]/u).findLast(Boolean) ?? value]);
   }
   const guesses = new Map<string, string>();
   const add = (from: string, hex: string): void => {
@@ -75,9 +73,7 @@ function judgeArchiveKey(evidence: KeyEvidence): readonly ExtraCheckResult[] {
   const second = "missing" in evidence.second ? null : evidence.second;
   const secondKey = second === null ? null : parseKeyFileText(second.keyFileText);
   const derivedFrom = (candidate: string | null, sources: KeySources): string | null =>
-    candidate === null
-      ? null
-      : (keyDerivations(sources).find((guess) => guess.key === candidate)?.from ?? null);
+    keyDerivations(sources).find((guess) => guess.key === candidate)?.from ?? null;
   const firstDerived = derivedFrom(key, evidence.sources);
   const secondDerived = second === null ? null : derivedFrom(secondKey, second.sources);
   return [
@@ -93,8 +89,7 @@ function judgeArchiveKey(evidence: KeyEvidence): readonly ExtraCheckResult[] {
     },
     {
       id: "key-names-the-archive",
-      ok:
-        key !== null && evidence.appFolderNames.length === 1 && evidence.appFolderNames[0] === key,
+      ok: evidence.appFolderNames.length === 1 && evidence.appFolderNames[0] === key,
       detail: `app folder holds ${JSON.stringify(evidence.appFolderNames)}, key file names ${String(key)}`,
     },
     {
@@ -128,12 +123,8 @@ export function outsideKeyFolder(entries: readonly WrittenEntry[], key: string):
 }
 
 /** Depth below the app folder, and `directory` or the file's last extension: `5 body`, `5 jsonl`, `2 json`. */
-const kindOf = (entry: WrittenEntry): string => {
-  const depth = entry.path.split("/").length;
-  if (entry.kind === "directory") return `${String(depth)} directory`;
-  const name = entry.path.slice(entry.path.lastIndexOf("/") + 1);
-  return `${String(depth)} ${name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "(none)"}`;
-};
+const kindOf = (entry: WrittenEntry): string =>
+  `${String(entry.path.split("/").length)} ${entry.kind === "directory" ? "directory" : (/\.([^./]*)$/u.exec(entry.path)?.[1] ?? "(none)")}`;
 
 /**
  * Paths present at the end of the run that no probe targeted. Traffic during the run adds lines, bodies and site

@@ -71,7 +71,6 @@ export type Shape = "single" | "pair" | "each";
 
 export type ProbeSpec = {
   readonly id: string;
-  readonly group: "file" | "resource" | "mozext" | "api" | "indirect" | "baseline";
   readonly what: string;
   readonly positions: readonly BrowserProbePosition[];
   readonly shape: Shape;
@@ -85,7 +84,8 @@ export type ExpectedRow = {
   readonly id: string;
   readonly position: Position;
   readonly what: string;
-  readonly synthetic: boolean;
+  /** The probe that runs in a browser, or null for a row the check computes itself. */
+  readonly spec: ProbeSpec | null;
   readonly expected: ExpectedOutcome;
 };
 
@@ -160,7 +160,6 @@ export const NO_MARIONETTE_PROBE_IDS: readonly string[] = [
 export const PROBE_TABLE: readonly ProbeSpec[] = [
   {
     id: "fetch-file-log",
-    group: "file",
     what: "fetch(file:///<archive>/sites/<site>/log/<run>-0.jsonl)",
     positions: ALL,
     shape: "single",
@@ -170,7 +169,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "fetch-file-body",
-    group: "file",
     what: "fetch(file:///<archive>/sites/<site>/bodies/<id>.body)",
     positions: ALL,
     shape: "single",
@@ -180,7 +178,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "fetch-file-dir",
-    group: "file",
     what: "fetch(file:///<appFolder>/) directory listing",
     positions: ALL,
     shape: "single",
@@ -195,7 +192,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "fetch-file-export",
-    group: "file",
     what: "fetch(file:///<Downloads>/<site>-<date>.har)",
     positions: ALL,
     shape: "single",
@@ -205,7 +201,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "inventory-read",
-    group: "file",
     what: "fetch of every file and directory the product wrote (app folder walk) and the key file in the profile",
     positions: ALL,
     shape: "each",
@@ -215,7 +210,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "inventory-exists",
-    group: "file",
     what: "<script> and <link> load/error of every written path outside the random key folder vs a missing sibling",
     positions: ALL,
     shape: "each",
@@ -224,7 +218,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "content-fetch-file-log",
-    group: "file",
     what: "content.fetch (page context) of the archive log",
     positions: ["cs-web", "cs-file"],
     shape: "single",
@@ -233,7 +226,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "xhr-file-log",
-    group: "file",
     what: "XMLHttpRequest GET of the archive log",
     positions: ALL,
     shape: "single",
@@ -242,7 +234,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "iframe-file-log",
-    group: "file",
     what: "<iframe src> of the archive log, then read contentDocument",
     positions: ALL,
     shape: "single",
@@ -252,7 +243,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "iframe-file-root",
-    group: "file",
     what: "<iframe src> of the archive root directory listing, then read it",
     positions: ALL,
     shape: "single",
@@ -261,7 +251,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "iframe-file-export",
-    group: "file",
     what: "<iframe src> of the exported HAR, then read it",
     positions: ALL,
     shape: "single",
@@ -270,7 +259,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "img-file-oracle",
-    group: "file",
     what: "<img> load/error: recorded site body file vs a missing path",
     positions: ALL,
     shape: "pair",
@@ -279,7 +267,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "script-file-oracle",
-    group: "file",
     what: "<script> load/error: the log under every guessed archive key (profile, user, host derivations) vs a missing path",
     positions: ALL,
     shape: "each",
@@ -288,7 +275,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "css-file-oracle",
-    group: "file",
     what: "<link rel=stylesheet> load/error: the log under every guessed archive key vs a missing path",
     positions: ALL,
     shape: "each",
@@ -297,7 +283,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "iframe-site-oracle",
-    group: "file",
     what: "<iframe> load/error: the site directory under every guessed archive key (the real one when mutated) vs an unrecorded site",
     positions: ALL,
     shape: "each",
@@ -307,7 +292,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "script-root-oracle",
-    group: "file",
     what: "<script> load/error: top-level one-click-har folder vs a missing sibling",
     positions: ALL,
     shape: "pair",
@@ -321,7 +305,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "script-site-oracle",
-    group: "file",
     what: "<script> load/error: the site directory under every guessed archive key (the real one when mutated) vs an unrecorded site",
     positions: ALL,
     shape: "each",
@@ -331,7 +314,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "viewsource-fetch",
-    group: "file",
     what: "fetch(view-source:file:///<archive log>)",
     positions: ALL,
     shape: "single",
@@ -340,7 +322,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "viewsource-iframe",
-    group: "file",
     what: "<iframe src=view-source:file:///<archive log>>",
     positions: ALL,
     shape: "single",
@@ -349,7 +330,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "jar-file-fetch",
-    group: "file",
     what: "fetch(jar:file:///<archive log>!/)",
     positions: ALL,
     shape: "single",
@@ -358,7 +338,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "jar-file-iframe",
-    group: "file",
     what: "<iframe src=jar:file:///<archive log>!/>",
     positions: ALL,
     shape: "single",
@@ -367,7 +346,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "redirect-fetch",
-    group: "file",
     what: "fetch of an http URL that 302-redirects to the archive log",
     positions: ALL,
     shape: "single",
@@ -376,7 +354,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "redirect-iframe",
-    group: "file",
     what: "<iframe> of an http URL that 302-redirects to the archive log",
     positions: ALL,
     shape: "single",
@@ -385,7 +362,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "window-open-file",
-    group: "file",
     what: "window.open(file:///<archive log>), then read the window",
     positions: DOC,
     shape: "single",
@@ -396,7 +372,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "wr-redirect-iframe",
-    group: "file",
     what: "<iframe> of a URL the test extension blocking webRequest redirects to the archive log",
     positions: ["web", "file"],
     shape: "single",
@@ -405,7 +380,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "tabs-create-file",
-    group: "file",
     what: "tabs.create({url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
@@ -414,7 +388,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "tabs-create-dir",
-    group: "file",
     what: "tabs.create({url: file:///<appFolder>/})",
     positions: TABS,
     shape: "single",
@@ -423,7 +396,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "tabs-update-file",
-    group: "file",
     what: "tabs.update(<an http tab>, {url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
@@ -432,7 +404,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "tabs-update-redirect",
-    group: "file",
     what: "tabs.update(<an http tab>, {url: <http URL that 302-redirects to the log>})",
     positions: TABS,
     shape: "single",
@@ -445,7 +416,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "windows-create-file",
-    group: "file",
     what: "windows.create({url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
@@ -454,7 +424,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "downloads-download-file",
-    group: "file",
     what: "downloads.download({url: file:///<archive log>})",
     positions: TABS,
     shape: "single",
@@ -466,7 +435,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "tabs-create-viewsource",
-    group: "file",
     what: "tabs.create({url: view-source:file:///<archive log>})",
     positions: TABS,
     shape: "single",
@@ -475,7 +443,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "wr-redirect-tab",
-    group: "file",
     what: "tabs.create of a URL the test extension blocking webRequest redirects to the archive log",
     positions: ["ext-bg"],
     shape: "single",
@@ -490,7 +457,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   // resource://, chrome://, moz-src://
   {
     id: "resource-all",
-    group: "resource",
     what: "fetch and <link> load of resource://<name>/ for every substitution found in omni.ja and the packed product",
     positions: ALL,
     shape: "each",
@@ -499,7 +465,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "resource-traversal",
-    group: "resource",
     what: "resource://<substitution>/ with encoded ../ to the archive log: fetch and <link> load",
     positions: ALL,
     shape: "each",
@@ -508,7 +473,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "planted-resource",
-    group: "resource",
     what: "planted: resource://och-planted/ (mapped by the harness to the archive with ALLOW_CONTENT_ACCESS): <link> load of the log vs a missing path",
     positions: ["web", "file"],
     shape: "pair",
@@ -521,7 +485,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "chrome-all",
-    group: "resource",
     what: "fetch and <link> load of chrome://<package>/content/ for every package found in omni.ja and the packed product",
     positions: ALL,
     shape: "each",
@@ -530,7 +493,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "chrome-traversal",
-    group: "resource",
     what: "chrome://global/content/ with encoded ../ to the archive log: fetch and <link> load",
     positions: ALL,
     shape: "each",
@@ -539,7 +501,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "moz-src-root",
-    group: "resource",
     what: "fetch and <link> load of moz-src:/// paths, and moz-src with encoded ../ to the archive log",
     positions: ALL,
     shape: "each",
@@ -550,7 +511,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   // moz-extension:// of One-Click HAR
   {
     id: "mozext-every-file",
-    group: "mozext",
     what: "fetch(moz-extension://<recorder uuid>/<path>) for every file in the installed XPI",
     positions: ALL,
     shape: "each",
@@ -559,7 +519,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-manifest",
-    group: "mozext",
     what: "fetch(moz-extension://<recorder uuid>/manifest.json)",
     positions: ALL,
     shape: "single",
@@ -568,7 +527,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-parent",
-    group: "mozext",
     what: "fetch(moz-extension://<recorder uuid>/experiment/parent.js)",
     positions: ALL,
     shape: "single",
@@ -577,7 +535,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-schema",
-    group: "mozext",
     what: "fetch(moz-extension://<recorder uuid>/experiment/schema.json)",
     positions: ALL,
     shape: "single",
@@ -586,7 +543,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-popup",
-    group: "mozext",
     what: "fetch(moz-extension://<recorder uuid>/<popup page>)",
     positions: ALL,
     shape: "single",
@@ -595,7 +551,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-script-oracle",
-    group: "mozext",
     what: "<script src> load/error: recorder popup script vs the same path under a random uuid",
     positions: ALL,
     shape: "pair",
@@ -604,7 +559,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-timing",
-    group: "mozext",
     what: "fetch error text: recorder uuid vs random uuid (medians reported, not judged)",
     positions: ["web", "ext-bg"],
     shape: "pair",
@@ -613,7 +567,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "mozext-frame-recorder",
-    group: "mozext",
     what: "<iframe> of the recorder popup page, then postMessage to it",
     positions: ["web", "file", "ext-page", "cs-web"],
     shape: "single",
@@ -622,7 +575,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "planted-own-war-fetch",
-    group: "mozext",
     what: "planted: fetch the test extension own web_accessible_resources file",
     positions: ["web", "file"],
     shape: "single",
@@ -635,7 +587,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "planted-own-war-script",
-    group: "mozext",
     what: "planted: <script src> of the test extension own web-accessible war.js, then read window.OCH_WAR",
     positions: ["web", "file"],
     shape: "single",
@@ -648,7 +599,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "own-non-war",
-    group: "mozext",
     what: "control: fetch the test extension file that is not web accessible (holds a planted mark)",
     positions: ["web", "file"],
     shape: "single",
@@ -659,7 +609,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   // Experiment API and extension messaging/injection
   {
     id: "api-namespace",
-    group: "api",
     what: "typeof browser.oneClickHar, typeof the page's own oneClickHar, and page globals a fresh frame lacks",
     positions: ALL,
     shape: "single",
@@ -672,7 +621,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "api-call",
-    group: "api",
     what: "browser.oneClickHar.getRecordingStatus()",
     positions: ALL,
     shape: "single",
@@ -685,7 +633,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "sendmessage-recorder",
-    group: "api",
     what: "runtime.sendMessage(<recorder id>, {op: getRecordingStatus})",
     positions: EXTAPI,
     shape: "single",
@@ -694,7 +641,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "sendmessage-oracle",
-    group: "api",
     what: "runtime.sendMessage error: recorder id vs an id that is not installed",
     positions: EXTAPI,
     shape: "pair",
@@ -703,7 +649,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "connect-recorder",
-    group: "api",
     what: "runtime.connect(<recorder id>) and postMessage",
     positions: EXTAPI,
     shape: "single",
@@ -716,7 +661,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "tabs-query-recorder",
-    group: "api",
     what: "tabs.query({}) for a tab showing the recorder page",
     positions: TABS,
     shape: "single",
@@ -726,7 +670,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "executescript-recorder-page",
-    group: "api",
     what: "tabs.executeScript into the tab showing the recorder popup page",
     positions: TABS,
     shape: "single",
@@ -739,7 +682,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "scripting-recorder-page",
-    group: "api",
     what: "scripting.executeScript into the tab showing the recorder popup page",
     positions: TABS,
     shape: "single",
@@ -752,7 +694,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "management-getall",
-    group: "api",
     what: "management.getAll()",
     positions: TABS,
     shape: "single",
@@ -764,7 +705,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   // Indirect paths
   {
     id: "downloads-search",
-    group: "indirect",
     what: "downloads.search({}) after recording",
     positions: TABS,
     shape: "single",
@@ -773,7 +713,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "clipboard-after-export",
-    group: "indirect",
     what: "navigator.clipboard.readText() after recording",
     positions: ["ext-page"],
     shape: "single",
@@ -782,7 +721,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "notifications-getall",
-    group: "indirect",
     what: "notifications.getAll() after recording",
     positions: ["ext-bg"],
     shape: "single",
@@ -791,7 +729,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "storage-recorder",
-    group: "indirect",
     what: "storage.local.get(null) in the test extension: its own planted value, never the recorder's",
     positions: TABS,
     shape: "single",
@@ -800,7 +737,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "idb-recorder",
-    group: "indirect",
     what: "indexedDB in the test extension: its own planted value, and open('och-recorder') never shows the recorder's",
     positions: TABS,
     shape: "single",
@@ -811,7 +747,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   // Live-traffic baselines
   {
     id: "devtools-gethar",
-    group: "baseline",
     what: "baseline: devtools.network.getHAR() on the inspected bank tab after reload",
     positions: ["ext-devtools"],
     shape: "single",
@@ -821,7 +756,6 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
   {
     id: "baseline-webrequest",
-    group: "baseline",
     what: "baseline: webRequest.onBeforeSendHeaders and filterResponseData on live bank traffic",
     positions: ["ext-bg"],
     shape: "single",
@@ -831,54 +765,56 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
   },
 ];
 
+/** Present only when the probe extension's content script did not run in the file:// page; else cs-file rows run. */
+const CS_FILE_INJECTION_ROW: ExpectedRow = {
+  id: "cs-file-injection",
+  position: "cs-file",
+  what: "test extension content script (matches <all_urls>, all_frames) in the file:// page",
+  spec: null,
+  expected: BLOCKED,
+};
+
 const SYNTHETIC_ROWS: readonly ExpectedRow[] = [
-  {
-    id: "cs-file-injection",
-    position: "cs-file",
-    what: "test extension content script (matches <all_urls>, all_frames) in the file:// page",
-    synthetic: true,
-    expected: BLOCKED,
-  },
   {
     id: "cs-in-archive-document",
     position: "cs-archive",
     what: "test extension content script injected into any archive or export document",
-    synthetic: true,
+    spec: null,
     expected: BLOCKED,
   },
   {
     id: "control-system-read",
     position: "system",
     what: "positive control: IOUtils.readUTF8 of the archive log and body from Marionette chrome sandbox",
-    synthetic: true,
+    spec: null,
     expected: { kind: "READ", control: "control-system-principal" },
   },
   {
     id: "planted-recorder-storage",
     position: "system",
     what: "planted control: a mark written to the recorder's storage.local reads back from the system principal",
-    synthetic: true,
+    spec: null,
     expected: { kind: "READ", control: "planted-recorder-store" },
   },
   {
     id: "planted-recorder-idb",
     position: "rec-page",
     what: "planted control: a mark written to the recorder origin's IndexedDB reads back in the recorder's page",
-    synthetic: true,
+    spec: null,
     expected: { kind: "READ", control: "planted-recorder-store" },
   },
   {
     id: "limit-same-user-process",
     position: "os",
     what: "named limit: a process under the same Linux user reads the log",
-    synthetic: true,
+    spec: null,
     expected: { kind: "READ", control: "named-limit-same-os-user" },
   },
   {
     id: "limit-other-experiment",
     position: "otherexp",
     what: "named limit: another add-on experiment API parent script reads the log",
-    synthetic: true,
+    spec: null,
     expected: { kind: "READ", control: "named-limit-other-experiment" },
   },
 ];
@@ -929,35 +865,24 @@ function expectedOutcomeFor(spec: ProbeSpec, position: Position): ExpectedOutcom
 }
 
 /** Expands PROBE_TABLE, NO_MARIONETTE_PROBE_IDS and SYNTHETIC_ROWS into every expected row. */
-export function expandExpectedRows(csFileInjected = false): readonly ExpectedRow[] {
-  const rows: ExpectedRow[] = [];
-  const [csFileRow, ...otherSynthetic] = SYNTHETIC_ROWS;
-  if (!csFileInjected && csFileRow !== undefined) rows.push(csFileRow);
-  for (const spec of PROBE_TABLE) {
-    for (const pos of spec.positions) {
-      if (pos === "cs-file" && !csFileInjected) continue;
-      rows.push({
-        id: spec.id,
-        position: pos,
-        what: spec.what,
-        synthetic: false,
-        expected: expectedOutcomeFor(spec, pos),
-      });
-    }
-  }
-  for (const pos of ["file-no-marionette", "file-mutated"] as const) {
-    for (const id of NO_MARIONETTE_PROBE_IDS) {
-      const spec = PROBE_TABLE.find((p) => p.id === id);
-      if (spec === undefined) throw new Error(`unknown no-marionette probe ${id}`);
-      rows.push({
-        id: spec.id,
-        position: pos,
-        what: pos === "file-mutated" ? `planted mutation: ${spec.what}` : spec.what,
-        synthetic: false,
-        expected: expectedOutcomeFor(spec, pos),
-      });
-    }
-  }
-  rows.push(...otherSynthetic);
-  return rows;
+export function expandExpectedRows(csFileInjected: boolean): readonly ExpectedRow[] {
+  const row = (spec: ProbeSpec, position: Position, what = spec.what): ExpectedRow => ({
+    id: spec.id,
+    position,
+    what,
+    spec,
+    expected: expectedOutcomeFor(spec, position),
+  });
+  const secondLaunches = PROBE_TABLE.filter((spec) => NO_MARIONETTE_PROBE_IDS.includes(spec.id));
+  return [
+    ...(csFileInjected ? [] : [CS_FILE_INJECTION_ROW]),
+    ...PROBE_TABLE.flatMap((spec) =>
+      spec.positions
+        .filter((position) => csFileInjected || position !== "cs-file")
+        .map((position) => row(spec, position)),
+    ),
+    ...secondLaunches.map((spec) => row(spec, "file-no-marionette")),
+    ...secondLaunches.map((spec) => row(spec, "file-mutated", `planted mutation: ${spec.what}`)),
+    ...SYNTHETIC_ROWS,
+  ];
 }

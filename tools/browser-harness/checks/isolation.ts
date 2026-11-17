@@ -937,7 +937,6 @@ const check: HarnessCheck = {
       context: {
         marker,
         warMark,
-        secretMark,
         storeMark,
         ownMark,
         recId: recorderId,

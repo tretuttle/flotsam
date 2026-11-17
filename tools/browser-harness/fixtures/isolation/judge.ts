@@ -3,7 +3,6 @@ import {
   denialAt,
   expandExpectedRows,
   EXTRA_CHECKS,
-  PROBE_TABLE,
   type Denial,
   type ExpectedOutcome,
   type ExtraCheckId,
@@ -45,8 +44,6 @@ export type JudgeContext = {
   readonly marker: string;
   /** In the probe extension's own web-accessible files. */
   readonly warMark: string;
-  /** In the probe extension's file that is not web accessible. */
-  readonly secretMark: string;
   /** Planted in the recorder's storage.local and its origin's IndexedDB. */
   readonly storeMark: string;
   /** Planted by the probe extension in its own storage; seeing it proves a store read worked. Not a leak. */
@@ -97,7 +94,7 @@ const FRAME_EVENTS = new Set(["load", "error", "timeout"]);
 /** Outcomes that mean the probe produced no answer to judge, or a refusal other than the declared one. */
 const NO_ANSWER = new Set(["", "threw", "no-target", "timeout", "error"]);
 
-const SEVERITY: readonly Verdict[] = ["READ", "LEAKS-EXISTENCE", "NO-RESULT", "BLOCKED"];
+const SEVERITY: readonly Verdict[] = ["READ", "LEAKS-EXISTENCE", "NO-RESULT"];
 const worst = (verdicts: readonly Verdict[]): Verdict =>
   SEVERITY.find((v) => verdicts.includes(v)) ?? "BLOCKED";
 
@@ -109,9 +106,7 @@ const isObservation = (value: unknown): value is Observation =>
 
 function carriesMark(value: unknown, ctx: JudgeContext): boolean {
   const text = JSON.stringify(value) ?? "";
-  return [ctx.marker, ctx.warMark, ctx.secretMark, ctx.storeMark].some(
-    (mark) => mark.length > 0 && text.includes(mark),
-  );
+  return [ctx.marker, ctx.warMark, ctx.storeMark].some((mark) => text.includes(mark));
 }
 
 function denies(denial: Denial, o: Observation, ctx: JudgeContext): boolean {
@@ -128,7 +123,7 @@ function denies(denial: Denial, o: Observation, ctx: JudgeContext): boolean {
         !o.text.includes(ctx.recUuid)
       );
     case "own-value-only":
-      return o.outcome === "ok" && ctx.ownMark.length > 0 && o.text.includes(ctx.ownMark);
+      return o.outcome === "ok" && o.text.includes(ctx.ownMark);
     case "frame-withheld":
       return (
         FRAME_EVENTS.has(o.outcome) && (FRAME_CROSS_ORIGIN.test(o.text) || FRAME_BLANK.test(o.text))
@@ -175,7 +170,6 @@ function eachVerdict(
   planned: readonly string[] | undefined,
   ctx: JudgeContext,
 ): { readonly verdict: Verdict; readonly summary: string } {
-  if (carriesMark(observed, ctx)) return { verdict: "READ", summary: "a planted mark was read" };
   if (planned === undefined) return { verdict: "NO-RESULT", summary: "no planned targets" };
   if (!Array.isArray(observed.each))
     return { verdict: "NO-RESULT", summary: "no per-target results" };
@@ -214,13 +208,23 @@ function judgeBrowserRow(
   observed: ObservedProbe,
   input: IsolationRunInput,
 ): { readonly verdict: Verdict; readonly summary: string } {
+  // Rows arrive as JSON from the browser, so a row may carry no observation at all.
+  if (typeof observed !== "object" || observed === null) {
+    return { verdict: "NO-RESULT", summary: "no observation" };
+  }
   const denial = denialAt(spec, position);
   const head = `${observed.outcome}: ${observed.text}`;
   switch (spec.shape) {
     case "single":
       return { verdict: singleVerdict(spec, denial, observed, input.context), summary: head };
     case "pair":
-      return { verdict: pairVerdict(spec, observed.pair, input.context), summary: head };
+      return {
+        verdict:
+          denial.kind === "indistinguishable"
+            ? pairVerdict(spec, observed.pair, input.context)
+            : "NO-RESULT",
+        summary: head,
+      };
     case "each":
       return eachVerdict(
         spec,
@@ -234,16 +238,11 @@ function judgeBrowserRow(
 
 function syntheticVerdict(
   id: string,
+  position: Position,
   input: IsolationRunInput,
 ): { verdict: Verdict; observed: string } {
   const { context, canAccessFileObserved } = input;
   if (id === "cs-file-injection") {
-    if (input.csFileInjected) {
-      return {
-        verdict: "LEAKS-EXISTENCE",
-        observed: "content script injected into a file:// page",
-      };
-    }
     return canAccessFileObserved
       ? {
           verdict: "BLOCKED",
@@ -266,7 +265,7 @@ function syntheticVerdict(
           observed: "no injection seen, and the policy was not observed to deny it",
         };
   }
-  const control = input.syntheticControls.find((c) => c.id === id);
+  const control = input.syntheticControls.find((c) => c.id === id && c.position === position);
   if (control === undefined) return { verdict: "NO-RESULT", observed: "no result reported" };
   const read =
     control.reads.length > 0 && control.reads.every((text) => carriesMark(text, context));
@@ -318,7 +317,6 @@ function judgeExtraChecks(results: readonly ExtraCheckResult[]): readonly string
 }
 
 export function judgeIsolationRun(input: IsolationRunInput): IsolationJudgment {
-  const specMap = new Map(PROBE_TABLE.map((spec) => [spec.id, spec]));
   const rowMap = new Map(input.browserRows.map((row) => [`${row.probe}|${row.position}`, row]));
 
   const rows: JudgedRow[] = expandExpectedRows(input.csFileInjected).map((expectedRow) => {
@@ -334,13 +332,13 @@ export function judgeIsolationRun(input: IsolationRunInput): IsolationJudgment {
       what: expectedRow.what,
       expected,
     };
-    if (expectedRow.synthetic) {
-      const { verdict, observed } = syntheticVerdict(expectedRow.id, input);
+    const { spec } = expectedRow;
+    if (spec === null) {
+      const { verdict, observed } = syntheticVerdict(expectedRow.id, expectedRow.position, input);
       return { ...base, observed, verdict, ok: matchesExpectation(expected, verdict) };
     }
     const reported = rowMap.get(`${expectedRow.id}|${expectedRow.position}`);
-    const spec = specMap.get(expectedRow.id);
-    if (reported === undefined || spec === undefined) {
+    if (reported === undefined) {
       return { ...base, observed: "no row reported", verdict: "NO-RESULT", ok: false };
     }
     const { verdict, summary } = judgeBrowserRow(
@@ -349,7 +347,14 @@ export function judgeIsolationRun(input: IsolationRunInput): IsolationJudgment {
       reported.observed,
       input,
     );
-    return { ...base, observed: summary, verdict, ok: matchesExpectation(expected, verdict) };
+    // A control passes only on its planted mark, so an answer that merely succeeded cannot stand in for it.
+    const marked = expected.kind !== "READ" || carriesMark(reported.observed, input.context);
+    return {
+      ...base,
+      observed: summary,
+      verdict,
+      ok: marked && matchesExpectation(expected, verdict),
+    };
   });
 
   const counts: Record<Verdict, number> = {
