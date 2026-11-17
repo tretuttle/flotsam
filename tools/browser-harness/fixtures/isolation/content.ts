@@ -60,11 +60,16 @@ export type Structured = {
 const short = (text: string): string => digest(text).slice(0, 10);
 
 /**
- * A value as it is compared: text by a digest of itself, a number by its kind alone. The browser's own numbers
- * (counters, ids, timestamps) shift with what a run did; recorded data is text, so it still shows.
+ * A value as it is compared: text by a digest of itself with every run of digits read as one number, and a number
+ * or a flag by its kind alone. The browser's own numbers and flags (counters, ids, timestamps, etags, settings an
+ * idle task flips) shift with when a run did what; recorded data is text, so it still shows.
  */
-const NUMBER = /^-?\d+(\.\d+)?(e[-+]?\d+)?$/iu;
-const valueDigest = (text: string): string => (NUMBER.test(text) ? "#" : short(text));
+const NUMBER = /^-?#(\.#)?(e[-+]?#)?$/iu;
+const KINDS = new Set(["#", "flag"]);
+const valueDigest = (text: string): string => {
+  const shape = text.replaceAll(/\d+/gu, "#");
+  return NUMBER.test(shape) ? "#" : shape === "true" || shape === "false" ? "flag" : short(shape);
+};
 
 const single = (value: string): Group => ({ fields: ["value"], rows: [[valueDigest(value)]] });
 
@@ -289,7 +294,11 @@ export function entriesBeyond(
     const a = first[group];
     const b = second[group];
     if (a === undefined && b === undefined)
-      return noisyNewGroup(group, product, controls) ? [] : [`${group}: in neither control run`];
+      // A new entry holding only numbers and flags is the browser's own bookkeeping: recorded data is text.
+      return noisyNewGroup(group, product, controls) ||
+        records.rows.every((row) => row.every((cell) => KINDS.has(cell)))
+        ? []
+        : [`${group}: in neither control run`];
     if (a === undefined || b === undefined) return [];
     const fields = [...new Set([...a.fields, ...b.fields, ...records.fields])].sort();
     const column = (g: Group, f: string): readonly string[] => {

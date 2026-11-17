@@ -106,7 +106,10 @@ describe("structured files", () => {
       readStructured("prefs.js", Buffer.from(`user_pref("x", ${v});\n`), NAMES)?.entries;
     expect(pref("1794914675")).toEqual(pref("1794914999"));
     expect(pref('"leak"')).not.toEqual(pref('"other"'));
-    expect(pref("true")).not.toEqual(pref("false"));
+    expect(pref("true")).toEqual(pref("false"));
+    expect(pref('"\\"1729003500000\\""')).toEqual(pref('"\\"1794914675890\\""'));
+    expect(pref('"2026-11-17T10:00:00Z"')).toEqual(pref('"2026-11-16T09:59:59Z"'));
+    expect(pref('"GET /log 1"')).not.toEqual(pref('"GET /other 1"'));
   });
 
   it("reads JSON as one group per leaf path, and mozlz4 JSON through its LZ4 block", () => {
@@ -241,6 +244,34 @@ describe("entries beyond the control runs", () => {
         [prefsA, prefsB],
       ),
     ).toEqual(["pref n3: in neither control run", "pref n4: in neither control run"]);
+  });
+
+  it("leaves a new entry holding only numbers and flags to the browser, and fails one holding text", () => {
+    const control: Entries = { "pref a": g({ value: "x" }) };
+    expect(
+      entriesBeyond(
+        { ...control, "pref seen": g({ value: "flag" }), "pref when": g({ value: "#" }) },
+        [control, control],
+      ),
+    ).toEqual([]);
+    expect(
+      entriesBeyond({ ...control, "pref leak": g({ value: "flag" }, { value: "t" }) }, [
+        control,
+        control,
+      ]),
+    ).toEqual(["pref leak: in neither control run"]);
+    const read = (text: string): Entries =>
+      readStructured("prefs.js", Buffer.from(text), NAMES)?.entries ?? {};
+    const base = read('user_pref("a", "x");\n');
+    expect(
+      entriesBeyond(
+        read('user_pref("a", "x");\nuser_pref("b.seen", true);\nuser_pref("b.at", 17);\n'),
+        [base, base],
+      ),
+    ).toEqual([]);
+    expect(
+      entriesBeyond(read('user_pref("a", "x");\nuser_pref("b.leak", "GET /log");\n'), [base, base]),
+    ).toEqual(["pref b.leak: in neither control run"]);
   });
 
   it("leaves out a field the two control runs fill differently, and a group only one of them has", () => {
