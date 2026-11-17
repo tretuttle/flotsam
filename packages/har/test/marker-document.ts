@@ -313,6 +313,8 @@ export function buildMarkerDocument(): {
   const reqHeaderSecret = nextMarker("request.headers[].value", "header-value-secret");
   const reqHeaderAllowlisted = nextMarker("request.headers[].value", "header-value-allowlisted");
   const reqHeaderUrl = nextMarker("request.headers[].value", "url-header");
+  const reqHeaderUrlUserinfo = nextMarker("request.headers[].value", "request-url-userinfo");
+  const reqHeaderUrlQuerySecret = nextMarker("request.headers[].value", "request-url-query-secret");
   const reqHeaderNamed = nextMarker("request.headers[].value", "named-header");
   const reqHeaderComment = nextMarker("request.headers[].comment", "comment");
   const reqHeaderCustom = nextMarker("request.headers[].<custom>", "other-custom-field");
@@ -342,6 +344,8 @@ export function buildMarkerDocument(): {
   const resStatusText = nextMarker("response.statusText", "protocol-metadata");
   const resHttpVersion = nextMarker("response.httpVersion", "protocol-metadata");
   const resRedirectUrl = nextMarker("response.redirectURL", "redirect-url");
+  const resRedirectUserinfo = nextMarker("response.redirectURL", "request-url-userinfo");
+  const resRedirectQuerySecret = nextMarker("response.redirectURL", "request-url-query-secret");
   const resComment = nextMarker("response.comment", "comment");
   const resError = nextMarker("response._error", "other-custom-field");
   const resCustom = nextMarker("response.<custom>", "other-custom-field");
@@ -358,6 +362,11 @@ export function buildMarkerDocument(): {
   const resHeaderSecret = nextMarker("response.headers[].value", "header-value-secret");
   const resHeaderAllowlisted = nextMarker("response.headers[].value", "header-value-allowlisted");
   const resHeaderUrl = nextMarker("response.headers[].value", "url-header");
+  const resHeaderUrlUserinfo = nextMarker("response.headers[].value", "request-url-userinfo");
+  const resHeaderUrlQuerySecret = nextMarker(
+    "response.headers[].value",
+    "request-url-query-secret",
+  );
   const resHeaderNamed = nextMarker("response.headers[].value", "named-header");
   const resHeaderComment = nextMarker("response.headers[].comment", "comment");
   const resHeaderCustom = nextMarker("response.headers[].<custom>", "other-custom-field");
@@ -455,6 +464,10 @@ export function buildMarkerDocument(): {
         { name: "Authorization", value: reqHeaderSecret },
         { name: "Content-Type", value: `application/json; extra=${reqHeaderAllowlisted}` },
         { name: "Referer", value: reqHeaderUrl },
+        {
+          name: "Referer",
+          value: `https://user:${reqHeaderUrlUserinfo}@ref.example/?token=${reqHeaderUrlQuerySecret}`,
+        },
       ],
       queryString: [
         {
@@ -512,6 +525,10 @@ export function buildMarkerDocument(): {
         { name: "Set-Cookie", value: resHeaderSecret },
         { name: "Content-Length", value: resHeaderAllowlisted },
         { name: "Location", value: resHeaderUrl },
+        {
+          name: "Location",
+          value: `https://user:${resHeaderUrlUserinfo}@next.example/?token=${resHeaderUrlQuerySecret}`,
+        },
       ],
       content: {
         size: 50,
@@ -521,7 +538,7 @@ export function buildMarkerDocument(): {
         comment: contentComment,
         _customContent: contentCustom,
       },
-      redirectURL: `https://redirect.example/${resRedirectUrl}`,
+      redirectURL: `https://user:${resRedirectUserinfo}@redirect.example/${resRedirectUrl}?token=${resRedirectQuerySecret}`,
       headersSize: 80,
       bodySize: 50,
       comment: resComment,

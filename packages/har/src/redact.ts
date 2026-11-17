@@ -129,7 +129,7 @@ export const HAR_PLACE_TABLE: {
     standard: "removed",
     shareable: "removed",
     label:
-      "the username and password of request URLs, and of page titles that are a URL, as the URL Standard parses them, including the URL inside up to 3 blob:, view-source:, jar: or filesystem: wrappers",
+      "the username and password of request URLs, and of page titles, URL header values and redirect URLs that are a URL, as the URL Standard parses them, including the URL inside up to 3 blob:, view-source:, jar: or filesystem: wrappers",
     selectedBy: { target: "url-userinfo", byName: false },
   },
   "request-url-host": {
@@ -148,7 +148,8 @@ export const HAR_PLACE_TABLE: {
     place: "request-url-query-secret",
     standard: "removed",
     shareable: "removed",
-    label: "values of query parameters in request URLs and URL page titles",
+    label:
+      "values of query parameters in request URLs, URL page titles, URL header values and redirect URLs",
     selectedBy: { target: "query", byName: true },
   },
   "request-url-query": {
@@ -200,7 +201,8 @@ export const HAR_PLACE_TABLE: {
     place: "url-header",
     standard: "kept-not-examined",
     shareable: "removed",
-    label: "values of headers",
+    label:
+      "values of headers, which are not examined unless the whole value is a URL with no space or control character",
     listedNames: URL_HEADER_NAMES,
   },
   cookie: {
@@ -270,7 +272,7 @@ export const HAR_PLACE_TABLE: {
     place: "redirect-url",
     standard: "kept-not-examined",
     shareable: "removed",
-    label: "redirect URLs",
+    label: "the rest of redirect URLs",
   },
   "response-body-json": {
     place: "response-body-json",
@@ -580,7 +582,14 @@ const HAR_MODEL_ROWS = {
   "request.headers[].name": { kinds: ["string"], places: ["header-name"], whenRemoved: "" },
   "request.headers[].value": {
     kinds: ["string"],
-    places: ["header-value-secret", "header-value-allowlisted", "url-header", "named-header"],
+    places: [
+      "header-value-secret",
+      "header-value-allowlisted",
+      "url-header",
+      "named-header",
+      "request-url-userinfo",
+      "request-url-query-secret",
+    ],
     whenRemoved: "",
   },
   "request.headers[].comment": { kinds: ["string"], places: ["comment"] },
@@ -621,7 +630,11 @@ const HAR_MODEL_ROWS = {
   "response.cookies": { kinds: ["array"], places: [], whenRemoved: [], items: "object" },
   "response.headers": { kinds: ["array"], places: [], whenRemoved: [], items: "object" },
   "response.content": { kinds: ["object"], places: [], whenRemoved: { size: -1, mimeType: "" } },
-  "response.redirectURL": { kinds: ["string"], places: ["redirect-url"], whenRemoved: "" },
+  "response.redirectURL": {
+    kinds: ["string"],
+    places: ["redirect-url", "request-url-userinfo", "request-url-query-secret"],
+    whenRemoved: "",
+  },
   "response.headersSize": { kinds: ["number"], places: ["measurement"], whenRemoved: -1 },
   "response.bodySize": { kinds: ["number"], places: ["measurement"], whenRemoved: -1 },
   "response.comment": { kinds: ["string"], places: ["comment"] },
@@ -640,7 +653,14 @@ const HAR_MODEL_ROWS = {
   "response.headers[].name": { kinds: ["string"], places: ["header-name"], whenRemoved: "" },
   "response.headers[].value": {
     kinds: ["string"],
-    places: ["header-value-secret", "header-value-allowlisted", "url-header", "named-header"],
+    places: [
+      "header-value-secret",
+      "header-value-allowlisted",
+      "url-header",
+      "named-header",
+      "request-url-userinfo",
+      "request-url-query-secret",
+    ],
     whenRemoved: "",
   },
   "response.headers[].comment": { kinds: ["string"], places: ["comment"] },
@@ -1377,17 +1397,21 @@ function innermostUrl(value: string): { readonly parts: UrlParts; readonly offse
 // Redacts a value that is a URL, cutting each removed part out of the original string so every
 // other byte stays as it was. Returns null when the value is not a URL by the URL Standard, or
 // wraps more than MAX_WRAPPER_DEPTH URLs.
-function redactUrlValue(
-  value: string,
-  ctx: RedactContext,
-  field: "request.url" | "log.pages[].title",
-): string | null {
+type UrlField =
+  | "request.url"
+  | "log.pages[].title"
+  | "request.headers[].value"
+  | "response.headers[].value"
+  | "response.redirectURL";
+
+function redactUrlValue(value: string, ctx: RedactContext, field: UrlField): string | null {
   const found = innermostUrl(value);
   if (found === null) {
     return null;
   }
   const { parts, offset } = found;
-  const isPage = field === "log.pages[].title";
+  // A URL inside another value keeps its host, path and fragment; only its userinfo and query secrets are examined.
+  const isPage = field !== "request.url";
   const cuts: Cut[] = [];
   const span = (part: UrlSpan) => ({ start: offset + part.start, end: offset + part.end });
 
@@ -1461,12 +1485,8 @@ function redactUrlValue(
 }
 
 // Redacts the text after a query's `?`. Returns null when the whole query, `?` included, goes.
-function redactQuery(
-  query: string,
-  ctx: RedactContext,
-  field: "request.url" | "log.pages[].title",
-): string | null {
-  const isPage = field === "log.pages[].title";
+function redactQuery(query: string, ctx: RedactContext, field: UrlField): string | null {
+  const isPage = field !== "request.url";
   const encodedReplacement = encodeURIComponent(ctx.replacement);
   const otherQueryRemoved = !isPage && ctx.isRemoved("request-url-query");
   const keptSegments: string[] = [];
@@ -1503,7 +1523,7 @@ function redactQuery(
 
 // A page title is examined as a URL only when the whole title is one, with no space or control
 // character anywhere. Any other title is text, which is not examined.
-function isUrlTitle(title: string): boolean {
+function isWholeUrl(title: string): boolean {
   for (let index = 0; index < title.length; index += 1) {
     const code = title.charCodeAt(index);
     if (code <= 0x20 || code === 0x7f) {
@@ -1514,7 +1534,7 @@ function isUrlTitle(title: string): boolean {
 }
 
 function redactPageTitle(title: string, ctx: RedactContext): string {
-  const afterUrl = isUrlTitle(title)
+  const afterUrl = isWholeUrl(title)
     ? (redactUrlValue(title, ctx, "log.pages[].title") ?? title)
     : title;
   if (ctx.isRemoved("page-title")) {
@@ -1567,11 +1587,17 @@ function redactHeaders(
     }
 
     const { place, rule } = classifyHeaderValuePlace(header.name, ctx.rules);
+    // A Referer or Location carries the page's own URL, query secrets included, so a whole URL is examined as one.
+    const afterUrl =
+      place === "url-header" && typeof header.value === "string" && isWholeUrl(header.value)
+        ? (redactUrlValue(header.value, ctx, `${side}.headers[].value`) ?? header.value)
+        : header.value;
     if (ctx.isRemoved(place)) {
       ctx.tracker.removed(`${side}.headers[].value`, place, rule?.id ?? ctx.levelRule(place));
       changes.value = ctx.emptied();
     } else {
       ctx.tracker.kept(`${side}.headers[].value`, place);
+      if (afterUrl !== header.value) changes.value = afterUrl;
     }
     return rebuild(header, changes);
   });
@@ -2009,11 +2035,17 @@ function redactResponse(entry: HarEntry, ctx: RedactContext): HarEntry["response
     comment: redactComment(response.comment, "response.comment", ctx),
   };
   if (response.redirectURL !== undefined) {
+    const afterUrl =
+      typeof response.redirectURL === "string" && isWholeUrl(response.redirectURL)
+        ? (redactUrlValue(response.redirectURL, ctx, "response.redirectURL") ??
+          response.redirectURL)
+        : response.redirectURL;
     if (ctx.isRemoved("redirect-url")) {
       ctx.tracker.removed("response.redirectURL", "redirect-url", ctx.levelRule("redirect-url"));
       changes.redirectURL = "";
     } else {
       ctx.tracker.kept("response.redirectURL", "redirect-url");
+      if (afterUrl !== response.redirectURL) changes.redirectURL = afterUrl;
     }
   }
   if (response._error !== undefined) {

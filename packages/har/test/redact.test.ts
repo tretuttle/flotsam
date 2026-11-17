@@ -442,16 +442,16 @@ describe("redactHar", () => {
       "SETCOOKIE",
       "RESCOOKIE",
       "PAGETITLE",
+      "REFERER",
+      "LOCATION",
+      "REDIRECT",
     ];
     for (const key of removedInStandard) {
       expect(stdText).not.toContain(secret(key));
     }
 
     const unexaminedInStandard: ReadonlyArray<readonly [string, string]> = [
-      ["REFERER", "url-header"],
       ["H2PATH", "url-header"],
-      ["LOCATION", "url-header"],
-      ["REDIRECT", "redirect-url"],
       ["JSONPW", "body-json"],
       ["CAMEL", "body-json"],
       ["NESTED", "body-json"],
