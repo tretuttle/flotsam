@@ -112,6 +112,7 @@ describe("disk rules", () => {
     const allowed = [
       added("profile/prefs.js"),
       added("profile/26faf9e7.sqlite-wal"),
+      added("profile/protections.sqlite-journal"),
       added("profile/zen-sessions.jsonlz4"),
       added("profile/storage/default/x/idb/1.sqlite"),
       added("profile/extensions/one-click-har@tretuttle.github.io.xpi"),

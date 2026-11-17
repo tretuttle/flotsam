@@ -124,10 +124,10 @@ const PROFILE_FILES = [
   "\\.startup-incomplete",
   "activity-stream\\.[a-z_]+\\.json",
   "zen-[a-z-]+\\.json(lz4)?",
-  "(places|favicons|cookies|permissions|content-prefs|formhistory|storage|bounce-tracking-protection|protections)\\.sqlite(-wal)?",
-  "domain_to_categories\\.sqlite(-journal)?",
+  // A database with the companion files SQLite keeps beside it while the browser runs.
+  "(places|favicons|cookies|permissions|content-prefs|formhistory|storage|bounce-tracking-protection|protections|domain_to_categories)\\.sqlite(-wal|-shm|-journal)?",
   // Gecko names one database after a hash; its name changes per run.
-  "[0-9a-f]{8}\\.sqlite(-wal|-shm)?",
+  "[0-9a-f]{8}\\.sqlite(-wal|-shm|-journal)?",
 ].join("|");
 
 const PROFILE_DIRS = [
