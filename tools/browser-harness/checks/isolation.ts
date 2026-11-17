@@ -103,6 +103,8 @@ const proxyPrefs = (port: number): readonly Pref[] => [
   { name: "toolkit.telemetry.archive.enabled", value: false },
   { name: "toolkit.telemetry.newProfilePing.enabled", value: false },
   { name: "toolkit.telemetry.firstShutdownPing.enabled", value: false },
+  // No remote-settings sync, which lands an etag and its records only in the runs whose timer happened to fire.
+  { name: "services.settings.server", value: "data:,#remote-settings-dummy/v1" },
 ];
 
 type AddonInfo = {
