@@ -202,6 +202,7 @@ describe("oneClickHar contract", () => {
       | "file-replaced"
       | "name-too-long"
       | "name-taken"
+      | "io-error"
       | "timed-out"
       | "other"
     >();

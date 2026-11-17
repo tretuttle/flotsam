@@ -1,6 +1,6 @@
 // How an export reaches disk, without Gecko: the one boundary for every export file call, where a platform error
 // becomes a WriteFailure. Where the platform holds the folder open, the file is unnamed until one link names it, and
-// nothing is renamed or deleted by path; elsewhere it is `<name>.har.part`, renamed at the end, with a crash journal.
+// nothing is renamed or deleted by path; where it cannot, or the link cannot be made, it is `<name>.har.part`.
 
 import type { WriteFailure } from "@one-click-har/export/jobs";
 import { WriteRefused, type HarSink } from "@one-click-har/export/run";
@@ -52,17 +52,70 @@ const FS_ERROR_KINDS: {
   NS_ERROR_FILE_ALREADY_EXISTS: "name-taken",
   /** Something already has the finished file's name. */
   NoModificationAllowedError: "name-taken",
-  /** The unnamed file, in a folder this user may not write. */
-  EACCES: "access-denied",
-  /** The unnamed file, on a read-only mount. */
-  EROFS: "read-only",
-  /** The link that names the file. */
-  ENAMETOOLONG: "name-too-long",
   /** The rename found no part at its name, in a folder that is still the export's. */
   NotFoundError: "file-replaced",
 };
+
+/**
+ * What an errno from file-worker.ts means for the export, for every call: the folder, the unnamed file, its writes and
+ * the link. `disk-full` comes with no free bytes, which is what the kernel said. EBADF, EFAULT and EINVAL are a fault
+ * in the call itself, and ENOMEM the process's: none of them is the folder's, and each stays `other`.
+ */
+export const ERRNO_KINDS: {
+  readonly [errno: string]: Exclude<WriteFailure["kind"], "other" | "timed-out">;
+} = {
+  EACCES: "access-denied",
+  EPERM: "access-denied",
+  EROFS: "read-only",
+  ENOSPC: "disk-full",
+  EDQUOT: "disk-full",
+  ENAMETOOLONG: "name-too-long",
+  /** The held folder was deleted. */
+  ENOENT: "folder-missing",
+  ENOTDIR: "not-a-folder",
+  /** The folder's path ends in a link, which holding it never follows. */
+  ELOOP: "folder-refused",
+  EIO: "io-error",
+};
+
+/**
+ * Errors of the link alone that say the link cannot be made here, not that the folder refuses the file: the export's
+ * bytes move to a named part, and the export finishes on the named route. Checked before ERRNO_KINDS.
+ */
+export const LINK_FALLBACK: { readonly [error: string]: NamedBecause } = {
+  /** /proc/self/fd no longer leads to the file (masked or gone since the file was made). */
+  "fd-link-unavailable": "fd-link-lost",
+  /** The file system will not link this file into the folder. */
+  EXDEV: "link-refused",
+  EMLINK: "link-refused",
+  EPERM: "link-refused",
+};
 /** A failure that is only its kind. */
 type Refused = Exclude<WriteFailure["kind"], "disk-full">;
+
+/**
+ * Why an export took the named route: no held folder on this platform, or the harness asked; the folder's file system
+ * makes no unnamed files, or /proc cannot lead to one; or the link failed after the file was written, and the file was
+ * copied to a named part.
+ */
+export type NamedBecause =
+  | "platform"
+  | "harness-pref"
+  | "unnamed-refused"
+  | "fd-link-unavailable"
+  | "fd-link-lost"
+  | "link-refused";
+
+/** The route an export took, kept in the parent for diagnosis. A page sees only `route`. */
+export type ExportRoute =
+  | { readonly route: "link" }
+  | { readonly route: "named"; readonly because: NamedBecause; readonly errno?: string };
+
+/** Why a held folder made no linkable unnamed file, and the error that said so. */
+export interface UnnamedRefused {
+  readonly refused: "unnamed-refused" | "fd-link-unavailable";
+  readonly errno: string;
+}
 
 /** `check`'s answer, or `otherwise` when it throws: a check that could not run proves nothing. */
 const proven = <T>(check: () => T, otherwise: T): T => {
@@ -124,6 +177,8 @@ export interface ExportPlatform {
   readonly freeBytes: (folder: string) => number;
   /** Where the platform can hold a folder open and create unnamed files in it; absent elsewhere. */
   readonly holdFolder?: (realFolder: string) => Promise<HeldFolder>;
+  /** Why there is no `holdFolder`. */
+  readonly namedBecause?: "platform" | "harness-pref";
 }
 
 /** A file's identity: its device and inode, as the kernel reports them. */
@@ -134,10 +189,10 @@ export interface FileIdentity {
 
 /** A folder held open: files are created and named in it, wherever its path goes. */
 export interface HeldFolder {
-  /** The path the held folder has now; null once it was deleted. */
+  /** The path the held folder has now; null once it was deleted. Any other path, "" included, is somewhere else. */
   readonly where: () => Promise<string | null>;
-  /** A new unnamed file in the folder; null when the folder's file system cannot make one. */
-  readonly createUnnamed: () => Promise<UnnamedFile | null>;
+  /** A new unnamed file in the folder that a link can name, or why there is none. */
+  readonly createUnnamed: () => Promise<{ readonly file: UnnamedFile } | UnnamedRefused>;
   /** What has `name` in the held folder, never following a link; null when nothing has it. */
   readonly identityOf: (name: string) => Promise<FileIdentity | null>;
   readonly close: () => void;
@@ -152,6 +207,11 @@ export interface UnnamedFile {
   readonly write: (text: string) => Promise<void>;
   readonly size: () => Promise<number>;
   readonly readHead: (bytes: number) => Promise<Uint8Array>;
+  /** Whole UTF-8 sequences from `offset`, at most `bytes` of them, and how many bytes they took. */
+  readonly readText: (
+    offset: number,
+    bytes: number,
+  ) => Promise<{ readonly text: string; readonly bytes: number }>;
   /** Gives this file `name` in its folder, never replacing anything: false when something has that name. */
   readonly link: (name: string) => Promise<boolean>;
   readonly close: () => void;
@@ -192,8 +252,9 @@ export interface Part {
   readonly finish: (planned: string) => Promise<string>;
   /** Deletes the part if it is still this export's file. Returns at once if a timed-out rename is still running. */
   readonly discard: () => Promise<void>;
-  /** The name the export's own file kept after a failure, when it was named before the failure was found. */
-  readonly kept: () => string | null;
+  /** True once the export named its file and then could not prove the name still holds it: nothing is named. */
+  readonly unconfirmed: () => boolean;
+  readonly route: () => ExportRoute;
 }
 
 export interface ExportFolder {
@@ -206,6 +267,8 @@ export interface ExportFolder {
 }
 
 const NAME_TRIES = 100;
+/** How much of an unnamed file is copied at a time when its bytes move to a named part. */
+const COPY_BYTES = 1_048_576;
 /** How much of the part's first write is its identity: the document's opening, with the export's random id. */
 const HEAD_BYTES = 128;
 
@@ -306,7 +369,20 @@ export function exportFiles(
     const moved = resolved ? folderProblem(folder) : null;
     if (moved !== null) return { kind: moved } as WriteFailure;
     const name = errorName(error);
-    const kind = name !== null && Object.hasOwn(FS_ERROR_KINDS, name) ? FS_ERROR_KINDS[name] : null;
+    const kind =
+      name === null
+        ? null
+        : Object.hasOwn(FS_ERROR_KINDS, name)
+          ? FS_ERROR_KINDS[name]
+          : Object.hasOwn(ERRNO_KINDS, name)
+            ? ERRNO_KINDS[name]
+            : null;
+    if (kind === "disk-full")
+      return {
+        kind,
+        needBytes: Math.max(needBytes, 1) as ByteCount,
+        freeBytes: 0 as ByteCount,
+      };
     return { kind: kind ?? "other" } as WriteFailure;
   };
   const run = async <T>(
@@ -363,7 +439,7 @@ export function exportFiles(
     const step = <T>(call: () => T | Promise<T>, needBytes = 0): Promise<T> =>
       run(folder, true, call, needBytes);
 
-    const openPart = (path: string, journal: PartJournal): Part => {
+    const openPart = (path: string, journal: PartJournal, route: ExportRoute): Part => {
       const handle = platform.createExclusive(path);
       let written = 0;
       /** The first write's ASCII start; once `journaled`, it is on disk and in the journal. */
@@ -502,19 +578,45 @@ export function exportFiles(
           settled.catch(() => undefined);
           return undefined;
         },
-        kept: () => null,
+        unconfirmed: () => false,
+        route: () => route,
       };
+    };
+
+    /** A free name for `planned` and its `.har.part`, created exclusively. */
+    const namedPart = async (
+      planned: string,
+      journal: PartJournal,
+      route: ExportRoute,
+    ): Promise<{ readonly part: Part; readonly path: string }> => {
+      for (let n = 1; n <= NAME_TRIES; n += 1) {
+        const name = numbered(planned, n);
+        const final = platform.join(folder, name);
+        const path = `${final}${PART_SUFFIX}`;
+        const part = await step(() => {
+          stillFolder(folder);
+          return openPart(path, journal, route);
+        }).catch((error: unknown) => {
+          if (isTaken(error)) return null;
+          throw error;
+        });
+        if (part !== null) return { part, path };
+      }
+      return refuse("name-taken");
     };
 
     /**
      * The export's file, unnamed in the held folder until one link names it. Nothing here renames or deletes: a failure
-     * before the link closes the file and it is gone; one after leaves the export's own named file, reported as kept.
+     * before the link closes the file and it is gone. A link the platform cannot make moves the bytes to a named part.
      */
-    const unnamedPart = (held: HeldFolder, file: UnnamedFile): Part => {
+    const unnamedPart = (held: HeldFolder, file: UnnamedFile, journal: PartJournal): Part => {
       let written = 0;
       let head = "";
       let open = true;
-      let named: string | null = null;
+      /** Linked under a name that the checks after the link did not prove. */
+      let unproved = false;
+      /** The named part the bytes moved to, once the link could not be made. */
+      let moved: Part | null = null;
       const close = (): void => {
         if (!open) return;
         open = false;
@@ -531,12 +633,27 @@ export function exportFiles(
       };
       const provenNamed = (name: string) => async (): Promise<void> => {
         await bounded(limits.pause("after-link"));
-        const moved = await bounded(away());
-        if (moved !== null) refuse(moved);
+        const gone = await bounded(away());
+        if (gone !== null) refuse(gone);
         const at = await bounded(held.identityOf(name));
         if (at === null || at.dev !== file.identity.dev || at.ino !== file.identity.ino)
           refuse("file-replaced");
         if (!(await bounded(holdsWritten()))) refuse("file-replaced");
+      };
+      /** Copies the whole file, as written, to a new named part, which then finishes as the named route does. */
+      const toNamed = async (planned: string, route: ExportRoute): Promise<string> => {
+        const { part } = await namedPart(planned, journal, route);
+        moved = part;
+        for (let offset = 0; offset < written;) {
+          if (limits.signal.aborted) throw new ExportCancelled();
+          const at = offset;
+          const chunk = await step(() => bounded(file.readText(at, COPY_BYTES)));
+          if (chunk.bytes === 0) refuse("file-replaced");
+          await part.append(chunk.text, chunk.bytes);
+          offset += chunk.bytes;
+        }
+        close();
+        return part.finish(planned);
       };
       return {
         append: async (text, needBytes) => {
@@ -551,8 +668,8 @@ export function exportFiles(
         finish: async (planned) => {
           await step(async () => {
             if (!(await bounded(holdsWritten()))) refuse("file-replaced");
-            const moved = await bounded(away());
-            if (moved !== null) refuse(moved);
+            const gone = await bounded(away());
+            if (gone !== null) refuse(gone);
           });
           for (let n = 1; n <= NAME_TRIES; n += 1) {
             if (limits.signal.aborted) throw new ExportCancelled();
@@ -562,13 +679,19 @@ export function exportFiles(
                 limits.pause("before-link").then(() => {
                   // A step that timed out or a cancel while held never names the file afterwards.
                   if (!open || limits.signal.aborted) throw new ExportCancelled();
-                  return file.link(name);
+                  return file.link(name).catch((error: unknown): ExportRoute => {
+                    const errno = errorName(error) ?? "";
+                    if (!Object.hasOwn(LINK_FALLBACK, errno)) throw error;
+                    return { route: "named", because: LINK_FALLBACK[errno]!, errno };
+                  });
                 }),
               ),
             );
+            if (typeof linked === "object") return toNamed(planned, linked);
             if (!linked) continue;
-            named = name;
+            unproved = true;
             await step(provenNamed(name));
+            unproved = false;
             close();
             return name;
           }
@@ -576,8 +699,10 @@ export function exportFiles(
         },
         discard: async () => {
           close();
+          await moved?.discard();
         },
-        kept: () => named,
+        unconfirmed: () => unproved,
+        route: () => moved?.route() ?? { route: "link" },
       };
     };
 
@@ -600,28 +725,22 @@ export function exportFiles(
       path: folder,
       createPart: async (planned, journal) => {
         const held = await holdFolder();
-        if (held !== null) {
-          const file = await step(() => bounded(held.createUnnamed())).catch((error: unknown) => {
-            held.close();
-            throw error;
+        if (held === null)
+          return namedPart(planned, journal, {
+            route: "named",
+            because: platform.namedBecause ?? "platform",
           });
-          if (file !== null) return { part: unnamedPart(held, file), path: folder };
+        const made = await step(() => bounded(held.createUnnamed())).catch((error: unknown) => {
           held.close();
-        }
-        for (let n = 1; n <= NAME_TRIES; n += 1) {
-          const name = numbered(planned, n);
-          const final = platform.join(folder, name);
-          const path = `${final}${PART_SUFFIX}`;
-          const part = await step(() => {
-            stillFolder(folder);
-            return openPart(path, journal);
-          }).catch((error: unknown) => {
-            if (isTaken(error)) return null;
-            throw error;
-          });
-          if (part !== null) return { part, path };
-        }
-        return refuse("name-taken");
+          throw error;
+        });
+        if ("file" in made) return { part: unnamedPart(held, made.file, journal), path: folder };
+        held.close();
+        return namedPart(planned, journal, {
+          route: "named",
+          because: made.refused,
+          errno: made.errno,
+        });
       },
     };
   };

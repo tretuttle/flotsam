@@ -221,6 +221,7 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       expect: { kind: "write-failed", failure: "access-denied" } as const,
       state: { kind: "write-failed", failure: { kind: "access-denied" } },
       served: '{"job":{"state":{"kind":"write-failed","failure":{"kind":"access-denied"}}}}',
+      route: null,
       paths,
       files: [],
       untouched: [{ path: "/w/profile/prefs.js", before: "a", after: "a" }],
@@ -276,6 +277,39 @@ describe("the tab, cancel, disk-full and crash judges", () => {
     expect(judgeRow({ ...done, files: ["a (2).har", "a.har.part"] })).toEqual([
       "files: a (2).har, a.har.part",
     ]);
+    const named = {
+      ...done,
+      expect: { ...done.expect, route: "named", because: "fd-link-lost" } as const,
+      state: { ...done.state, route: "named" },
+      route: { route: "named", because: "fd-link-lost", errno: "fd-link-unavailable" },
+    };
+    expect(judgeRow(named)).toEqual([]);
+    expect(
+      judgeRow({
+        ...named,
+        state: { ...done.state, route: { route: "named", because: "fd-link-lost" } },
+        served: '{"route":"named","because":"fd-link-lost","errno":"fd-link-unavailable"}',
+        route: { route: "link" },
+      }),
+    ).toEqual([
+      'route [object Object] on the page and {"route":"link"} kept, expected named',
+      "took the named route because undefined, expected fd-link-lost",
+      'the page\'s route is {"route":"named","because":"fd-link-lost"}, not a route\'s kind',
+      '"because" reached the page',
+      '"errno" reached the page',
+    ]);
+    const unconfirmed = {
+      ...failed,
+      expect: { kind: "write-failed", failure: "file-replaced", unconfirmed: true } as const,
+      state: { kind: "write-failed", failure: { kind: "file-replaced" }, unconfirmed: true },
+    };
+    expect(judgeRow(unconfirmed)).toEqual([]);
+    expect(
+      judgeRow({
+        ...unconfirmed,
+        state: { kind: "write-failed", failure: { kind: "file-replaced" } },
+      }),
+    ).toEqual(["unconfirmed undefined, expected true"]);
     const full = { ...failed, expect: { kind: "write-failed", failure: "disk-full" } as const };
     expect(
       judgeRow({
@@ -290,6 +324,7 @@ describe("the tab, cancel, disk-full and crash judges", () => {
       expect: { kind: "cancelled" } as const,
       state: { kind: "cancelled" },
       served: "{}",
+      route: null,
       paths: [],
       files: [],
       untouched: [],

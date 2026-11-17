@@ -28,7 +28,8 @@ export type HookRequest =
   | { readonly kind: "exclude"; readonly site: string }
   | { readonly kind: "arm" | "reached"; readonly point: string }
   | { readonly kind: "guard"; readonly path: string }
-  | { readonly kind: "export-audit"; readonly id: string }
+  | { readonly kind: "export-audit" | "export-route"; readonly id: string }
+  | { readonly kind: "export-fault"; readonly op: string; readonly errno: string }
   | {
       readonly kind: "export-pause";
       readonly point: "before-link" | "after-link";

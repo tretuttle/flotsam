@@ -1,7 +1,9 @@
 // The export's Linux file calls, in a ChromeWorker so none of them can stall the parent's main thread: libc through
 // js-ctypes. A folder is held as a directory descriptor, the export's file is created unnamed in it (O_TMPFILE), and
 // the file is named by linking its own descriptor (linkat through /proc/self/fd), which never replaces anything.
-// Nothing here renames or deletes a path. Every answer is a value or the errno's name.
+// Nothing here renames or deletes a path. Every answer is a value or the errno's name, or FD_LINK_UNAVAILABLE.
+
+import { wholeSequences } from "./whole-utf8.ts";
 
 /** The js-ctypes surface this worker uses. */
 interface CType {
@@ -61,6 +63,8 @@ const ERRNO: { readonly [code: number]: string } = {
   2: "ENOENT",
   5: "EIO",
   9: "EBADF",
+  12: "ENOMEM",
+  14: "EFAULT",
   13: "EACCES",
   17: "EEXIST",
   18: "EXDEV",
@@ -78,6 +82,12 @@ const ERRNO: { readonly [code: number]: string } = {
   122: "EDQUOT",
 };
 
+/**
+ * The answer when `/proc/self/fd/<n>` does not lead to the descriptor's own file (no /proc, or it is masked), so this
+ * process cannot link the file there. Not an errno: the export takes the named route instead.
+ */
+const FD_LINK_UNAVAILABLE = "fd-link-unavailable";
+
 /** A file's identity: the device and inode statx reports. */
 export interface Identity {
   readonly dev: string;
@@ -88,8 +98,9 @@ export interface Identity {
 export type WorkerRequest =
   | { readonly id: number; readonly op: "init"; readonly arch: WorkerArch }
   | { readonly id: number; readonly op: "hold-folder"; readonly path: string }
-  | { readonly id: number; readonly op: "where"; readonly fd: number }
+  | { readonly id: number; readonly op: "where"; readonly fd: number; readonly expected: string }
   | { readonly id: number; readonly op: "create"; readonly folder: number; readonly mode: number }
+  | { readonly id: number; readonly op: "fd-link"; readonly fd: number }
   | { readonly id: number; readonly op: "write"; readonly fd: number; readonly text: string }
   | { readonly id: number; readonly op: "identity"; readonly fd: number }
   | {
@@ -100,6 +111,13 @@ export type WorkerRequest =
     }
   | { readonly id: number; readonly op: "size"; readonly fd: number }
   | { readonly id: number; readonly op: "head"; readonly fd: number; readonly bytes: number }
+  | {
+      readonly id: number;
+      readonly op: "read-text";
+      readonly fd: number;
+      readonly offset: number;
+      readonly bytes: number;
+    }
   | {
       readonly id: number;
       readonly op: "link";
@@ -157,7 +175,7 @@ const statx = (
   dirfd: number,
   name: string,
   atFlags: number,
-): { readonly identity: Identity; readonly size: number } | null => {
+): { readonly identity: Identity; readonly size: number; readonly links: number } | null => {
   const buffer = new ArrayBuffer(256);
   if (Number(call.statx(dirfd, name, atFlags, STATX_BASIC, buffer)) !== 0) {
     if (ctypes.errno === 2) return null;
@@ -171,6 +189,7 @@ const statx = (
       kind: kindOf(view.getUint16(28, true)),
     },
     size: Number(view.getBigUint64(40, true)),
+    links: view.getUint32(16, true),
   };
 };
 const ofDescriptor = (fd: number) => {
@@ -179,12 +198,34 @@ const ofDescriptor = (fd: number) => {
   return found;
 };
 
-/** The path the kernel gives an open descriptor now; null once what it names was deleted. */
-const where = (fd: number): string | null => {
+const sameFile = (a: Identity, b: Identity): boolean => a.dev === b.dev && a.ino === b.ino;
+const fdLink = (fd: number): string => `/proc/self/fd/${String(fd)}`;
+
+/**
+ * The path the kernel gives a held folder now; null once it was deleted. Where /proc cannot be read, the path is
+ * `expected` while that path still reaches this folder, and "" (somewhere else) while it does not.
+ */
+const where = (fd: number, expected: string): string | null => {
   const buffer = new Uint8Array(4096);
-  const length = checked(call.readlink(`/proc/self/fd/${String(fd)}`, buffer, buffer.length));
-  const path = new TextDecoder().decode(buffer.subarray(0, length));
-  return path.endsWith(" (deleted)") ? null : path;
+  const length = Number(call.readlink(fdLink(fd), buffer, buffer.length));
+  if (length >= 0) {
+    const path = new TextDecoder().decode(buffer.subarray(0, length));
+    return path.endsWith(" (deleted)") ? null : path;
+  }
+  const held = ofDescriptor(fd);
+  if (held.links === 0) return null;
+  const there = statx(AT_FDCWD, expected, AT_SYMLINK_NOFOLLOW);
+  return there !== null && sameFile(there.identity, held.identity) ? expected : "";
+};
+
+/** Whether `/proc/self/fd/<fd>` leads to the descriptor's own file, the one way linkat can name it. */
+const linkable = (fd: number): boolean => {
+  try {
+    const through = statx(AT_FDCWD, fdLink(fd), 0);
+    return through !== null && sameFile(through.identity, ofDescriptor(fd).identity);
+  } catch {
+    return false;
+  }
 };
 
 const need = () => {
@@ -202,9 +243,9 @@ const ANSWERS: {
   "hold-folder": ({ path }) => {
     const { directory, noFollow } = need();
     const fd = checked(call.openat(AT_FDCWD, path, O_RDONLY | directory | noFollow | O_CLOEXEC, 0));
-    return { fd, identity: ofDescriptor(fd).identity, at: where(fd) };
+    return { fd, identity: ofDescriptor(fd).identity };
   },
-  where: ({ fd }) => where(fd),
+  where: ({ fd, expected }) => where(fd, expected),
   create: ({ folder, mode }) => {
     const { directory } = need();
     const fd = checked(
@@ -212,6 +253,7 @@ const ANSWERS: {
     );
     return { fd, identity: ofDescriptor(fd).identity };
   },
+  "fd-link": ({ fd }) => linkable(fd),
   write: ({ fd, text }) => {
     const all = new TextEncoder().encode(text);
     let done = 0;
@@ -229,6 +271,13 @@ const ANSWERS: {
     const read = checked(call.pread(fd, buffer, bytes, 0));
     return buffer.slice(0, read).buffer;
   },
+  /** Whole UTF-8 sequences from `offset`: the text and how many bytes it took. Fewer bytes only at the file's end. */
+  "read-text": ({ fd, offset, bytes }) => {
+    const buffer = new Uint8Array(bytes);
+    const read = checked(call.pread(fd, buffer, bytes, offset));
+    const whole = read < bytes ? read : wholeSequences(buffer, read);
+    return { text: new TextDecoder().decode(buffer.subarray(0, whole)), bytes: whole };
+  },
   link: ({ fd, folder, name }) => {
     if (
       Number(
@@ -236,8 +285,11 @@ const ANSWERS: {
       ) === 0
     )
       return true;
-    if (ctypes.errno === 17) return false;
-    return failed();
+    const code = ctypes.errno;
+    if (code === 17) return false;
+    // A failed link through a /proc that no longer leads to the file is that, whatever errno it gave.
+    if (!linkable(fd)) throw new Errno(FD_LINK_UNAVAILABLE);
+    throw new Errno(ERRNO[code] ?? `errno ${String(code)}`);
   },
   close: ({ fd }) => checked(call.close(fd)),
 };

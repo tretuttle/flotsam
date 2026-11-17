@@ -86,10 +86,18 @@ export type WriteFailure =
   | { readonly kind: "file-replaced" }
   | { readonly kind: "name-too-long" }
   | { readonly kind: "name-taken" }
+  /** The disk or the file system reported an input/output error. */
+  | { readonly kind: "io-error" }
   /** A file call was still running after the export's time limit for one call. */
   | { readonly kind: "timed-out" }
   /** An error the table does not name. */
   | { readonly kind: "other" };
+
+/**
+ * How the file was written: `link` names an unnamed file once, where the folder is held open (Linux); `named` writes
+ * `<name>.har.part` and renames it. Why an export took the named route stays in the parent.
+ */
+export type ExportRouteKind = "link" | "named";
 
 export type ExportState =
   | {
@@ -103,13 +111,16 @@ export type ExportState =
       readonly fileName: string;
       readonly folderLabel: string;
       readonly report: ExportReport;
+      readonly route: ExportRouteKind;
     }
   | { readonly kind: "cancelled" }
   | {
       readonly kind: "write-failed";
       readonly failure: WriteFailure;
-      /** The name the export's own file kept: it was named before the failure was found, and is left as it is. */
-      readonly kept?: string;
+      /** Absent when the export failed before it had a file. */
+      readonly route?: ExportRouteKind;
+      /** The export named its file, then could not prove the name still holds it, so it names no file. */
+      readonly unconfirmed?: true;
     };
 
 export interface ExportJob {

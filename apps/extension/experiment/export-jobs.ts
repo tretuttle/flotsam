@@ -11,6 +11,7 @@ import type {
 import type { ExportReport } from "@one-click-har/export/report";
 import type { AbortSignalLike } from "@one-click-har/export/source";
 import type { ByteCount, EpochMs } from "@one-click-har/recording/ids";
+import type { ExportRoute } from "./export-file.ts";
 
 /** How one run ended. A run never throws: the host turns every refusal into `write-failed`. */
 export type RunOutcome =
@@ -19,13 +20,15 @@ export type RunOutcome =
       readonly fileName: string;
       readonly folderLabel: string;
       readonly report: ExportReport;
+      readonly route: ExportRoute;
     }
   | { readonly kind: "cancelled" }
   | {
       readonly kind: "write-failed";
       readonly failure: WriteFailure;
-      /** The name the export's own file kept: it was named before the failure was found, and is left as it is. */
-      readonly kept?: string;
+      readonly route?: ExportRoute;
+      /** The export named its file, then could not prove the name still holds it. */
+      readonly unconfirmed?: true;
     };
 
 export interface RunProgress {
@@ -46,7 +49,7 @@ export type ExportRun = (
 export interface CancelAudit {
   readonly bytesAtCancel: number;
   readonly bytesAtStop: number | null;
-  /** The export's own file, when its run named it before it saw the cancel: left as it is. */
+  /** The export's own file, when its run finished it before it saw the cancel: left as it is. */
   readonly keptFile: string | null;
 }
 
@@ -61,7 +64,17 @@ interface Slot {
   started: boolean;
   bytes: number;
   audit: { bytesAtCancel: number; bytesAtStop: number | null; keptFile: string | null } | null;
+  /** The route the run took and why, for diagnosis: never in the job a page sees, which has only its kind. */
+  route: ExportRoute | null;
 }
+
+/** What a page sees of an outcome: the route's kind, never why. */
+const shown = (outcome: RunOutcome): ExportState => {
+  if (outcome.kind !== "write-failed")
+    return outcome.kind === "done" ? { ...outcome, route: outcome.route.route } : outcome;
+  const { route, ...failed } = outcome;
+  return route === undefined ? failed : { ...failed, route: route.route };
+};
 
 const WAITING: ExportState = { kind: "writing", done: 0, total: 0, bytes: 0 as ByteCount };
 
@@ -105,18 +118,14 @@ export function createExportJobs(ports: {
       )
       .catch((): RunOutcome => ({ kind: "write-failed", failure: { kind: "other" } }))
       .then((outcome) => {
+        slot.route = outcome.kind === "cancelled" ? null : (outcome.route ?? null);
         if (slot.audit !== null) {
           slot.audit.bytesAtStop = slot.bytes;
-          slot.audit.keptFile =
-            outcome.kind === "done"
-              ? outcome.fileName
-              : outcome.kind === "write-failed"
-                ? (outcome.kept ?? null)
-                : null;
+          slot.audit.keptFile = outcome.kind === "done" ? outcome.fileName : null;
         }
         return outcome;
       });
-    set(slot, await Promise.race([ran, stopped]));
+    set(slot, shown(await Promise.race([ran, stopped])));
   };
 
   const find = (id: ExportId): Slot | undefined => slots.find((slot) => slot.job.id === id);
@@ -136,6 +145,7 @@ export function createExportJobs(ports: {
         started: false,
         bytes: 0,
         audit: null,
+        route: null,
       };
       slots.unshift(slot);
       const dropped = slots.findLastIndex((s, index) => index >= KEPT_JOBS && isFinal(s.job.state));
@@ -160,6 +170,8 @@ export function createExportJobs(ports: {
     },
     job: (id: ExportId): ExportJob | null => find(id)?.job ?? null,
     audit: (id: ExportId): CancelAudit | null => find(id)?.audit ?? null,
+    /** The route a finished or failed run took, and why: for the harness and diagnosis only. */
+    route: (id: ExportId): ExportRoute | null => find(id)?.route ?? null,
     /** Resolves when every job queued so far has ended. */
     idle: (): Promise<void> => queue,
   };

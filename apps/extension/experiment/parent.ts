@@ -145,19 +145,23 @@ type HarnessRequest =
   | { readonly kind: "exclude"; readonly site: string }
   | { readonly kind: "arm" | "reached"; readonly point: string }
   | { readonly kind: "guard"; readonly path: string }
-  | { readonly kind: "export-audit"; readonly id: string }
+  | { readonly kind: "export-audit" | "export-route"; readonly id: string }
+  | { readonly kind: "export-fault"; readonly op: string; readonly errno: string }
   | {
       readonly kind: "export-pause";
       readonly point: string;
       readonly action: "arm" | "reached" | "release";
     };
 
+/** The worker calls a harness profile may make answer an errno, once. */
+const FAULT_OPS = new Set(["hold-folder", "create", "write", "link"]);
+
 const isHoldPoint = (value: string): value is HoldPoint =>
   (HOLD_POINTS as readonly string[]).includes(value);
 
 /**
- * The harness's way in: flush, seal, exclude, hold the write chain at a crash point or an export at a pause, read
- * recovery and the guard.
+ * The harness's way in: flush, seal, exclude, hold the write chain at a crash point or an export at a pause, arm an
+ * export's worker call to fail, read recovery, the guard and an export's route.
  */
 async function answerHarness(
   state: Running,
@@ -200,6 +204,17 @@ async function answerHarness(
       const id = parseExportId(request.id);
       if (id === null) throw new Error(`not an export id: ${request.id}`);
       return host.jobs.audit(id);
+    }
+    case "export-route": {
+      const id = parseExportId(request.id);
+      if (id === null) throw new Error(`not an export id: ${request.id}`);
+      return host.jobs.route(id);
+    }
+    case "export-fault": {
+      if (!FAULT_OPS.has(request.op)) throw new Error(`not a worker call: ${request.op}`);
+      if (!/^E[A-Z]{2,15}$/u.test(request.errno)) throw new Error(`not an errno: ${request.errno}`);
+      host.faults.arm(request.op, request.errno);
+      return null;
     }
     case "export-pause": {
       const point = request.point;

@@ -26,6 +26,7 @@ const done: RunOutcome = {
   fileName: "a.har",
   folderLabel: "Downloads",
   report: {} as ExportReport,
+  route: { route: "link" },
 };
 
 const slot = (run: ExportRun) => {
@@ -139,6 +140,45 @@ describe("the export slot", () => {
     expect(jobs.job(waiting.id)?.state).toEqual({ kind: "cancelled" });
     expect(jobs.cancel(first.id)).toBe(false);
     expect(jobs.cancel("nope" as ExportId)).toBe(false);
+  });
+
+  it("shows a page only the route's kind, and keeps why in the parent", async () => {
+    const outcomes: RunOutcome[] = [
+      { ...done, route: { route: "named", because: "fd-link-lost", errno: "fd-link-unavailable" } },
+      {
+        kind: "write-failed",
+        failure: { kind: "file-replaced" },
+        route: { route: "link" },
+        unconfirmed: true,
+      },
+      { kind: "write-failed", failure: { kind: "folder-missing" } },
+    ];
+    const jobs = slot(async () => outcomes.shift()!);
+    const [named, unconfirmed, early] = [
+      jobs.start(request),
+      jobs.start(request),
+      jobs.start(request),
+    ];
+    await jobs.idle();
+    expect(jobs.job(named.id)?.state).toMatchObject({ kind: "done", route: "named" });
+    expect(jobs.route(named.id)).toEqual({
+      route: "named",
+      because: "fd-link-lost",
+      errno: "fd-link-unavailable",
+    });
+    expect(jobs.job(unconfirmed.id)?.state).toEqual({
+      kind: "write-failed",
+      failure: { kind: "file-replaced" },
+      route: "link",
+      unconfirmed: true,
+    });
+    expect(jobs.route(unconfirmed.id)).toEqual({ route: "link" });
+    expect(jobs.job(early.id)?.state).toEqual({
+      kind: "write-failed",
+      failure: { kind: "folder-missing" },
+    });
+    expect(jobs.route(early.id)).toBeNull();
+    for (const job of jobs.list()) expect(JSON.stringify(job)).not.toMatch(/because|errno/u);
   });
 
   it("turns a run that throws into write-failed, and keeps the newest jobs", async () => {

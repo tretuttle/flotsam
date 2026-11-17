@@ -3,9 +3,11 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   carriesHead,
   createPartSink,
+  ERRNO_KINDS,
   ExportCancelled,
   exportFiles,
   journalLine,
+  LINK_FALLBACK,
   SINK_BATCH_UNITS,
   unfinishedExports,
   type ExportLimits,
@@ -105,6 +107,8 @@ class MemoryFs {
   readonly failUnnamed = new Map<"createUnnamed" | "link", unknown>();
   /** Set to make every folder's file system unable to hold an unnamed file. */
   noUnnamedFiles = false;
+  /** Set to hide /proc/self/fd, so no unnamed file can be linked. */
+  noFdLink = false;
   /** The last unnamed file made, as another process reaches it through /proc/<pid>/fd. */
   lastUnnamed: FileNode | null = null;
 
@@ -122,23 +126,30 @@ class MemoryFs {
       },
       createUnnamed: async () => {
         if (this.failUnnamed.has("createUnnamed")) throw this.failUnnamed.get("createUnnamed");
-        if (this.noUnnamedFiles) return null;
+        if (this.noUnnamedFiles) return { refused: "unnamed-refused", errno: "EOPNOTSUPP" };
+        if (this.noFdLink) return { refused: "fd-link-unavailable", errno: "fd-link-unavailable" };
         const node: FileNode = { kind: "file", bytes: [] };
         this.lastUnnamed = node;
         return {
-          identity: { dev: "m", ino: this.ino(node) },
-          write: async (text) => void node.bytes.push(...Buffer.from(text)),
-          size: async () => node.bytes.length,
-          readHead: async (bytes) => Uint8Array.from(node.bytes.slice(0, bytes)),
-          link: async (name) => {
-            if (this.failUnnamed.has("link")) throw this.failUnnamed.get("link");
-            const at = where();
-            if (at === null) throw { name: "ENOENT" };
-            if (this.nodes.has(this.join(at, name))) return false;
-            this.nodes.set(this.join(at, name), node);
-            return true;
+          file: {
+            identity: { dev: "m", ino: this.ino(node) },
+            write: async (text) => void node.bytes.push(...Buffer.from(text)),
+            size: async () => node.bytes.length,
+            readHead: async (bytes) => Uint8Array.from(node.bytes.slice(0, bytes)),
+            readText: async (offset, bytes) => {
+              const taken = node.bytes.slice(offset, offset + bytes);
+              return { text: Buffer.from(taken).toString(), bytes: taken.length };
+            },
+            link: async (name) => {
+              if (this.failUnnamed.has("link")) throw this.failUnnamed.get("link");
+              const at = where();
+              if (at === null) throw { name: "ENOENT" };
+              if (this.nodes.has(this.join(at, name))) return false;
+              this.nodes.set(this.join(at, name), node);
+              return true;
+            },
+            close: () => undefined,
           },
-          close: () => undefined,
         };
       },
       close: () => undefined,
@@ -920,7 +931,7 @@ const RACES: readonly {
   readonly cause: string;
   readonly at: ExportPause;
   readonly act: (fs: MemoryFs) => void;
-  readonly ends: { readonly done: string } | { readonly kind: string; readonly kept?: string };
+  readonly ends: { readonly done: string } | { readonly kind: string; readonly unconfirmed?: true };
   readonly left: { readonly [folder: string]: readonly string[] };
 }[] = [
   {
@@ -948,7 +959,7 @@ const RACES: readonly {
     cause: "the folder is replaced by a link to the profile",
     at: "before-link",
     act: folderToProfileLink,
-    ends: { kind: "folder-refused", kept: "site.har" },
+    ends: { kind: "folder-refused", unconfirmed: true },
     left: { "/home/u/moved": ["/home/u/moved/site.har"], [PROFILE]: [`${PROFILE}/prefs.js`] },
   },
   {
@@ -959,7 +970,7 @@ const RACES: readonly {
       folderToProfileLink(fs);
       fs.file(`${PROFILE}/site.har.part`, "planted");
     },
-    ends: { kind: "folder-refused", kept: "site.har" },
+    ends: { kind: "folder-refused", unconfirmed: true },
     left: {
       "/home/u/moved": ["/home/u/moved/site.har"],
       [PROFILE]: [`${PROFILE}/prefs.js`, `${PROFILE}/site.har.part`],
@@ -988,21 +999,21 @@ const RACES: readonly {
     cause: "the finished name is removed",
     at: "after-link",
     act: (fs) => fs.nodes.delete(`${DOWNLOADS}/site.har`),
-    ends: { kind: "file-replaced", kept: "site.har" },
+    ends: { kind: "file-replaced", unconfirmed: true },
     left: { [DOWNLOADS]: [] },
   },
   {
     cause: "a foreign file takes the finished name",
     at: "after-link",
     act: (fs) => fs.file(`${DOWNLOADS}/site.har`, "theirs"),
-    ends: { kind: "file-replaced", kept: "site.har" },
+    ends: { kind: "file-replaced", unconfirmed: true },
     left: { [DOWNLOADS]: [`${DOWNLOADS}/site.har`] },
   },
   {
     cause: "the finished file's first bytes are overwritten",
     at: "after-link",
     act: (fs) => (fs.nodes.get(`${DOWNLOADS}/site.har`) as FileNode).bytes.fill(0x20, 0, 16),
-    ends: { kind: "file-replaced", kept: "site.har" },
+    ends: { kind: "file-replaced", unconfirmed: true },
     left: { [DOWNLOADS]: [`${DOWNLOADS}/site.har`] },
   },
   {
@@ -1013,7 +1024,7 @@ const RACES: readonly {
       folderToProfileLink(fs);
       fs.file(`${PROFILE}/site.har`, "planted");
     },
-    ends: { kind: "folder-refused", kept: "site.har" },
+    ends: { kind: "folder-refused", unconfirmed: true },
     left: {
       "/home/u/moved": ["/home/u/moved/site.har"],
       [PROFILE]: [`${PROFILE}/prefs.js`, `${PROFILE}/site.har`],
@@ -1054,7 +1065,7 @@ describe("an export folder held open, its file unnamed until one link", () => {
       else {
         expect(outcome).toBeInstanceOf(WriteRefused);
         expect((outcome as WriteRefused).failure).toEqual({ kind: ends.kind });
-        expect(part.kept()).toBe(ends.kept ?? null);
+        expect(part.unconfirmed()).toBe(ends.unconfirmed === true);
       }
       for (const [folder, names] of Object.entries(left))
         expect(under(at.fs, folder)).toEqual(names);
@@ -1071,7 +1082,7 @@ describe("an export folder held open, its file unnamed until one link", () => {
     const at = held();
     const { part } = await exportOnce(at, () => at.fs.lastUnnamed?.bytes.fill(0x20, 0, 16));
     expect(await finishOrDiscard(part)).toEqual({ kind: "file-replaced" });
-    expect(part.kept()).toBeNull();
+    expect(part.unconfirmed()).toBe(false);
     expect(inDownloads(at.fs)).toEqual([]);
   });
 
@@ -1079,7 +1090,7 @@ describe("an export folder held open, its file unnamed until one link", () => {
     const at = held();
     const { part } = await exportOnce(at, () => folderToProfileLink(at.fs));
     expect(await finishOrDiscard(part)).toEqual({ kind: "folder-refused" });
-    expect(part.kept()).toBeNull();
+    expect(part.unconfirmed()).toBe(false);
     expect(under(at.fs, "/home/u/moved")).toEqual([]);
     expect(under(at.fs, PROFILE)).toEqual([`${PROFILE}/prefs.js`]);
   });
@@ -1095,7 +1106,7 @@ describe("an export folder held open, its file unnamed until one link", () => {
     expect(await finished).toBeInstanceOf(ExportCancelled);
     await part.discard();
     expect(inDownloads(at.fs)).toEqual([]);
-    expect(part.kept()).toBeNull();
+    expect(part.unconfirmed()).toBe(false);
   });
 
   it("a link still waiting at the step limit ends timed-out, and names nothing once let go", async () => {
@@ -1112,13 +1123,22 @@ describe("an export folder held open, its file unnamed until one link", () => {
     expect(inDownloads(at.fs)).toEqual([]);
   });
 
-  it("reports the kernel's refusals by their errno names, with nothing left", async () => {
-    const causes = [
-      { call: "createUnnamed", errno: "EACCES", kind: "access-denied" },
-      { call: "createUnnamed", errno: "EROFS", kind: "read-only" },
-      { call: "link", errno: "ENAMETOOLONG", kind: "name-too-long" },
-    ] as const;
-    for (const { call, errno, kind } of causes) {
+  it("finishes on the link route and says so", async () => {
+    const at = held();
+    const { part } = await exportOnce(at);
+    expect(await part.finish("site.har")).toBe("site.har");
+    expect(part.route()).toEqual({ route: "link" });
+  });
+
+  /** Every errno the table names, from the call that makes the file and from the link, with what it must end as. */
+  const ERRNO_ROWS = Object.entries(ERRNO_KINDS).flatMap(([errno, kind]) =>
+    (["createUnnamed", "link"] as const)
+      .filter((call) => call !== "link" || !Object.hasOwn(LINK_FALLBACK, errno))
+      .map((call) => ({ errno, call, kind })),
+  );
+  it.each(ERRNO_ROWS)(
+    "reports $errno from $call as $kind, with nothing left",
+    async ({ errno, call, kind }) => {
       const at = held();
       at.fs.failUnnamed.set(call, { name: errno });
       const failure = await failureOf(
@@ -1130,18 +1150,89 @@ describe("an export folder held open, its file unnamed until one link", () => {
           }
         }),
       );
-      expect(failure, errno).toEqual({ kind });
+      expect(failure).toEqual(
+        kind === "disk-full" ? { kind, needBytes: 1, freeBytes: 0 } : { kind },
+      );
       expect(inDownloads(at.fs)).toEqual([]);
+    },
+  );
+
+  it("leaves an errno the table does not name as other: a fault in the call itself", async () => {
+    for (const errno of ["EBADF", "EFAULT", "EINVAL", "ENOMEM"]) {
+      expect(Object.hasOwn(ERRNO_KINDS, errno), errno).toBe(false);
+      const at = held();
+      at.fs.failUnnamed.set("link", { name: errno });
+      const { part } = await exportOnce(at);
+      expect(await finishOrDiscard(part), errno).toEqual({ kind: "other" });
     }
   });
 
-  it("names a part instead where the folder's file system cannot hold an unnamed file", async () => {
+  it.each(Object.entries(LINK_FALLBACK).map(([errno, because]) => ({ errno, because })))(
+    "a link refused with $errno moves the whole file to a named part and finishes there ($because)",
+    async ({ errno, because }) => {
+      const at = held();
+      at.fs.failUnnamed.set("link", { name: errno });
+      const { part } = await exportOnce(at);
+      expect(await part.finish("site.har")).toBe("site.har");
+      expect(at.fs.text(`${DOWNLOADS}/site.har`)).toBe(DOCUMENT);
+      expect(inDownloads(at.fs)).toEqual([`${DOWNLOADS}/site.har`]);
+      expect(part.route()).toEqual({ route: "named", because, errno });
+      // The copy's first piece is up to a MiB, so the head is the file's first 128 ASCII bytes, not the opening alone.
+      const path = `${DOWNLOADS}/site.har.part`;
+      const head = DOCUMENT.slice(0, 128);
+      expect(at.journal.lines).toEqual([{ started: path, head }, { ended: path }]);
+      expect(part.unconfirmed()).toBe(false);
+    },
+  );
+
+  it("a copy to a named part that fails is discarded, and the export names nothing", async () => {
     const at = held();
-    at.fs.noUnnamedFiles = true;
+    at.fs.failUnnamed.set("link", { name: "EXDEV" });
+    const { part } = await exportOnce(at);
+    at.fs.fail.set("rename", new DOMException("x", "NotReadableError"));
+    expect(await finishOrDiscard(part)).toEqual({ kind: "other" });
+    expect(inDownloads(at.fs)).toEqual([]);
+    expect(at.journal.unended()).toEqual([]);
+  });
+
+  it("cancel while the bytes move to a named part ends cancelled, with nothing left", async () => {
+    const at = held();
+    const { part } = await exportOnce(at);
+    // The cancel comes as the link's refusal is read, so it lands while the bytes are being moved.
+    at.fs.failUnnamed.set("link", {
+      get name() {
+        at.limits.signal.aborted = true;
+        return "EXDEV";
+      },
+    });
+    expect(await part.finish("site.har").catch((e: unknown) => e)).toBeInstanceOf(ExportCancelled);
+    await part.discard();
+    expect(inDownloads(at.fs)).toEqual([]);
+    // Not one piece was copied after the cancel: the named part never got its first bytes, so never a journal line.
+    expect(at.journal.lines).toEqual([]);
+  });
+
+  it.each([
+    {
+      cause: "the folder's file system makes no unnamed file",
+      set: "noUnnamedFiles",
+      because: "unnamed-refused",
+      errno: "EOPNOTSUPP",
+    },
+    {
+      cause: "/proc/self/fd cannot lead to the unnamed file",
+      set: "noFdLink",
+      because: "fd-link-unavailable",
+      errno: "fd-link-unavailable",
+    },
+  ] as const)("names a part from the start where $cause", async ({ set, because, errno }) => {
+    const at = held();
+    at.fs[set] = true;
     const { part, path } = await exportOnce(at);
     expect(path).toBe(`${DOWNLOADS}/site.har.part`);
     expect(await part.finish("site.har")).toBe("site.har");
     expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
+    expect(part.route()).toEqual({ route: "named", because, errno });
   });
 });
 

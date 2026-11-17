@@ -36,8 +36,16 @@ const NOWHERE = "/nonexistent";
 const NAMED_PARTS_PREF = "extensions.oneClickHar.harness.namedParts";
 
 type Place = { readonly base: string; readonly folder: string; readonly profile: string };
-/** What a row acts on mid-export: the part's path (named parts only) and the browser's own process. */
-type During = Place & { readonly part: string; readonly name: string; readonly pid: number };
+/**
+ * What a row acts on mid-export: the part's path (named parts only), the browser's own process, and `maskProcFd`,
+ * which hides that process's /proc/<pid>/fd inside its own mount namespace (mask-proc-fd.c).
+ */
+type During = Place & {
+  readonly part: string;
+  readonly name: string;
+  readonly pid: number;
+  readonly maskProcFd: () => void;
+};
 
 type Row = {
   readonly cause: string;
@@ -46,8 +54,18 @@ type Row = {
   readonly folder: (base: string, profile: string) => string;
   /** A tmpfs mounted inside the browser's mount namespace, over the folder or one above it. */
   readonly mount?: { readonly options: string; readonly at?: (base: string) => string };
+  /** Done just before the export starts. */
+  readonly atStart?: (at: During) => void;
   /** Done once the export has written its first MiB. */
   readonly during?: (at: During) => void;
+  /**
+   * An errno the export's next worker call of `op` answers instead of running, armed through the harness topic before
+   * the export starts: for the errnos no file system here produces on demand.
+   */
+  readonly fault?: {
+    readonly op: "hold-folder" | "create" | "write" | "link";
+    readonly errno: string;
+  };
   readonly after?: (at: Place) => void;
   /** What the row itself put in the folder, before or during the export: not the export's, each left as it was. */
   readonly theirs?: readonly string[];
@@ -72,14 +90,12 @@ type Hold = {
 };
 
 const failed = (failure: string) => (): RowOutcome => ({ kind: "write-failed", failure });
-/** A failure found after the link named the export's own file, which stays under `suffix`. */
-const failedKeeping =
-  (failure: string, suffix = "") =>
-  (fileName: string): RowOutcome => ({
-    kind: "write-failed",
-    failure,
-    kept: `${fileName}${suffix}.har`,
-  });
+/** A failure found after the link named the export's file: no name is proven, so none is given. */
+const failedUnconfirmed = (failure: string) => (): RowOutcome => ({
+  kind: "write-failed",
+  failure,
+  unconfirmed: true,
+});
 const cancelled = (): RowOutcome => ({ kind: "cancelled" });
 /** The product's time limit for one export file call (EXPORT_STEP_MS in host.ts). */
 const STEP_MS = 15_000;
@@ -88,6 +104,17 @@ const PROMPTLY_MS = 5_000;
 const doneAs =
   (suffix: string) =>
   (fileName: string): RowOutcome => ({ kind: "done", fileName: `${fileName}${suffix}.har` });
+/** Done as `<name>.har` on the named route, for the reason the parent keeps. */
+const doneNamed =
+  (because: string) =>
+  (fileName: string): RowOutcome => ({
+    kind: "done",
+    fileName: `${fileName}.har`,
+    route: "named",
+    because,
+  });
+/** How long a row's export may take once let go when it copies the whole file to a named part. */
+const COPY_MS = 30_000;
 const dir = (path: string): string => {
   NodeFS.mkdirSync(path, { recursive: true, mode: 0o700 });
   return path;
@@ -605,7 +632,7 @@ const UNNAMED_ROWS: readonly Row[] = [
       },
       withinMs: PROMPTLY_MS,
     },
-    expect: failedKeeping("folder-refused"),
+    expect: failedUnconfirmed("folder-refused"),
   },
   {
     cause:
@@ -623,7 +650,7 @@ const UNNAMED_ROWS: readonly Row[] = [
       withinMs: PROMPTLY_MS,
     },
     theirs: ["plant-folder.har.part", "plant-folder.har"],
-    expect: failedKeeping("folder-refused"),
+    expect: failedUnconfirmed("folder-refused"),
   },
   {
     cause: "folder replaced by a link to the profile and put back while the link waits",
@@ -684,7 +711,7 @@ const UNNAMED_ROWS: readonly Row[] = [
       },
       withinMs: PROMPTLY_MS,
     },
-    expect: failedKeeping("file-replaced"),
+    expect: failedUnconfirmed("file-replaced"),
   },
   {
     cause: "a foreign file renamed over the finished name after the link",
@@ -700,7 +727,7 @@ const UNNAMED_ROWS: readonly Row[] = [
       withinMs: PROMPTLY_MS,
     },
     theirs: ["replaced-finish.har"],
-    expect: failedKeeping("file-replaced"),
+    expect: failedUnconfirmed("file-replaced"),
   },
   {
     cause:
@@ -717,8 +744,76 @@ const UNNAMED_ROWS: readonly Row[] = [
       withinMs: PROMPTLY_MS,
     },
     theirs: ["after-folder.har"],
-    expect: failedKeeping("folder-refused"),
+    expect: failedUnconfirmed("folder-refused"),
   },
+  {
+    cause:
+      "/proc/<pid>/fd masked before the export starts: no file can be linked, so a part is named",
+    fileName: "proc-at-start",
+    folder: (b) => dir(`${b}/proc-at-start`),
+    atStart: ({ maskProcFd }) => maskProcFd(),
+    expect: doneNamed("fd-link-unavailable"),
+  },
+  {
+    cause: "/proc/<pid>/fd masked while the link waits: the whole file is copied to a named part",
+    fileName: "proc-before-link",
+    folder: (b) => dir(`${b}/proc-before-link`),
+    pause: {
+      at: "before-link",
+      act: ({ maskProcFd }) => {
+        maskProcFd();
+        return () => true;
+      },
+      withinMs: COPY_MS,
+    },
+    expect: doneNamed("fd-link-lost"),
+  },
+  {
+    cause: "/proc/<pid>/fd masked after the link: the folder is proved through its path instead",
+    fileName: "proc-after-link",
+    folder: (b) => dir(`${b}/proc-after-link`),
+    pause: {
+      at: "after-link",
+      act: ({ maskProcFd }) => {
+        maskProcFd();
+        return () => true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    expect: (fileName) => ({ kind: "done", fileName: `${fileName}.har`, route: "link" }),
+  },
+  {
+    cause: "O_TMPFILE refused (simulated: the create answers EOPNOTSUPP), so a part is named",
+    fileName: "no-tmpfile",
+    folder: (b) => dir(`${b}/no-tmpfile`),
+    fault: { op: "create", errno: "EOPNOTSUPP" },
+    expect: doneNamed("unnamed-refused"),
+  },
+  ...(["EXDEV", "EMLINK", "EPERM"] as const).map((errno): Row => ({
+    cause: `the link refused with ${errno} (simulated): the whole file is copied to a named part`,
+    fileName: `link-${errno.toLowerCase()}`,
+    folder: (b) => dir(`${b}/link-${errno.toLowerCase()}`),
+    fault: { op: "link", errno },
+    expect: doneNamed("link-refused"),
+  })),
+  ...(
+    [
+      ["link", "ENOSPC", "disk-full"],
+      ["link", "EDQUOT", "disk-full"],
+      ["link", "ENOENT", "folder-missing"],
+      ["link", "ENOTDIR", "not-a-folder"],
+      ["link", "EIO", "io-error"],
+      ["write", "EIO", "io-error"],
+      ["write", "EDQUOT", "disk-full"],
+      ["hold-folder", "ELOOP", "folder-refused"],
+    ] as const
+  ).map(([op, errno, kind]): Row => ({
+    cause: `the ${op} answered ${errno} (simulated)`,
+    fileName: `${op}-${errno.toLowerCase()}`,
+    folder: (b) => dir(`${b}/${op}-${errno.toLowerCase()}`),
+    fault: { op, errno },
+    expect: failed(kind),
+  })),
   {
     cause: "a name of 255 bytes with .har (the part suffix no longer counts)",
     fileName: "n".repeat(251),
@@ -732,6 +827,15 @@ const UNNAMED_ROWS: readonly Row[] = [
     expect: failed("name-too-long"),
   },
 ];
+
+/** A row's outcome; a done row that names no route was written on its table's own: the link, or the pref's part. */
+const expected = (row: Row): RowOutcome => {
+  const outcome = row.expect(row.fileName);
+  if (outcome.kind !== "done" || outcome.route !== undefined) return outcome;
+  return row.named === true
+    ? { ...outcome, route: "named", because: "harness-pref" }
+    : { ...outcome, route: "link" };
+};
 
 const ROWS: readonly Row[] = [
   ...UNNAMED_ROWS,
@@ -870,6 +974,20 @@ const namespacesRefused = (): string | null => {
 };
 
 const HOLD_SOURCE = NodePath.join(import.meta.dirname, "..", "native", "hold-part-call.c");
+const MASK_SOURCE = NodePath.join(import.meta.dirname, "..", "native", "mask-proc-fd.c");
+
+/** Hides `pid`'s /proc/<pid>/fd inside its own mount namespace, with mask-proc-fd.c built into `folder`. */
+const maskProcFdOf = (folder: string, pid: number) => (): void => {
+  const program = NodePath.join(folder, "mask-proc-fd");
+  if (!NodeFS.existsSync(program)) {
+    const built = NodeChildProcess.spawnSync("cc", ["-O2", "-o", program, MASK_SOURCE], {
+      encoding: "utf8",
+    });
+    if (built.status !== 0) throw new Error(`no C compiler for mask-proc-fd.c: ${built.stderr}`);
+  }
+  const masked = NodeChildProcess.spawnSync(program, [String(pid)], { encoding: "utf8" });
+  if (masked.status !== 0) throw new Error(`mask-proc-fd ${String(pid)}: ${masked.stderr}`);
+};
 
 /** Builds hold-part-call.c into `folder`; the error text when no C compiler can. */
 const buildHold = (folder: string): string | { readonly error: string } => {
@@ -978,6 +1096,17 @@ async function runRow(
     if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "arm"), "");
     if (row.pause !== undefined)
       await callHook(session, { kind: "export-pause", point: row.pause.at, action: "arm" });
+    if (row.fault !== undefined) await callHook(session, { kind: "export-fault", ...row.fault });
+    const name = `${folder}/${row.fileName}.har`;
+    const at: During = {
+      ...place,
+      part: `${name}.part`,
+      name,
+      pid: session.browserPid,
+      maskProcFd: maskProcFdOf(base, session.browserPid),
+    };
+    row.atStart?.(at);
+    let route: unknown = null;
     try {
       const job = await startExport(page, {
         selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
@@ -986,8 +1115,6 @@ async function runRow(
         packaging: "har",
         fileName: row.fileName,
       });
-      const name = `${folder}/${row.fileName}.har`;
-      const at: During = { ...place, part: `${name}.part`, name, pid: session.browserPid };
       if (row.during !== undefined) {
         const writing = await waitForJob(
           page,
@@ -1013,6 +1140,7 @@ async function runRow(
       if (state === undefined || ended({ state } as Parameters<typeof ended>[0]))
         state = (await waitForJob(page, job.id, ended)).state;
       journal = await journalSettled(NodePath.join(workspace.root(), "exports.jsonl"));
+      route = await callHook(session, { kind: "export-route", id: job.id });
     } finally {
       if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
       if (row.pause !== undefined)
@@ -1035,9 +1163,10 @@ async function runRow(
         (name) => name.startsWith(row.fileName) && !(row.theirs ?? []).includes(name),
       );
     observation = {
-      expect: row.expect(row.fileName),
+      expect: expected(row),
       state,
       served,
+      route,
       paths: [profile, folder, workspace.dataHome, base],
       files: [...named(folder), ...named(profile)],
       untouched: [
@@ -1251,6 +1380,7 @@ const check: HarnessCheck = {
       expect: { kind: "write-failed", failure: "access-denied" },
       state: { kind: "write-failed", failure: { kind: "other", detail: "/w/out/x.har.part" } },
       served: '{"detail":"/w/out/x.har.part"}',
+      route: null,
       paths: ["/w/out"],
       files: [],
       untouched: [],

@@ -334,8 +334,14 @@ export function judgeAfterCrash(o: AfterCrashObservation): readonly string[] {
 
 /** How one cause must end: a named failure kind, done under a given name, or cancelled. */
 export type RowOutcome =
-  | { readonly kind: "write-failed"; readonly failure: string; readonly kept?: string }
-  | { readonly kind: "done"; readonly fileName: string }
+  | { readonly kind: "write-failed"; readonly failure: string; readonly unconfirmed?: true }
+  | {
+      readonly kind: "done";
+      readonly fileName: string;
+      /** The route's kind the page must see, and why the parent says it took the named route. */
+      readonly route?: "link" | "named";
+      readonly because?: string;
+    }
   | { readonly kind: "cancelled" };
 
 export type RowObservation = {
@@ -343,6 +349,8 @@ export type RowObservation = {
   readonly state: unknown;
   /** Everything the API handed the page after the export: the job, listExports and getPopup, serialized. */
   readonly served: string;
+  /** The route the parent kept for the export, read through the harness topic. */
+  readonly route: unknown;
   /** Folders whose paths may never reach a page: the profile, the export folder, the data home. */
   readonly paths: readonly string[];
   /** Files named like this export, in the export folder and the profile, after it ended. */
@@ -393,8 +401,10 @@ export function judgeRow(o: RowObservation): readonly string[] {
     kind?: string;
     fileName?: string;
     failure?: Record<string, unknown>;
-    kept?: string;
+    route?: unknown;
+    unconfirmed?: unknown;
   };
+  const kept = (o.route ?? {}) as { route?: unknown; because?: unknown };
   const failure = state.failure ?? {};
   if (o.timing !== null && o.timing.tookMs > o.timing.withinMs)
     problems.push(
@@ -407,9 +417,9 @@ export function judgeRow(o: RowObservation): readonly string[] {
   } else if (o.expect.kind === "write-failed") {
     if (state.kind !== "write-failed" || failure["kind"] !== o.expect.failure)
       problems.push(`ended ${JSON.stringify(o.state)}, expected write-failed ${o.expect.failure}`);
-    if (state.kept !== o.expect.kept)
+    if (state.unconfirmed !== o.expect.unconfirmed)
       problems.push(
-        `kept ${String(state.kept)}, expected ${o.expect.kept === undefined ? "nothing kept" : o.expect.kept}`,
+        `unconfirmed ${String(state.unconfirmed)}, expected ${String(o.expect.unconfirmed)}`,
       );
     if (
       failure["kind"] === "disk-full" &&
@@ -421,7 +431,23 @@ export function judgeRow(o: RowObservation): readonly string[] {
     if (state.kind !== "done" || state.fileName !== o.expect.fileName)
       problems.push(`ended ${JSON.stringify(o.state)}, expected done as ${o.expect.fileName}`);
     if (o.files.join() !== o.expect.fileName) problems.push(`files: ${o.files.join(", ")}`);
+    if (
+      o.expect.route !== undefined &&
+      (state.route !== o.expect.route || kept.route !== o.expect.route)
+    )
+      problems.push(
+        `route ${String(state.route)} on the page and ${JSON.stringify(o.route)} kept, expected ${o.expect.route}`,
+      );
+    if (o.expect.because !== undefined && kept.because !== o.expect.because)
+      problems.push(
+        `took the named route because ${String(kept.because)}, expected ${o.expect.because}`,
+      );
   }
+  if (state.route !== undefined && state.route !== "link" && state.route !== "named")
+    problems.push(`the page's route is ${JSON.stringify(state.route)}, not a route's kind`);
+  // Why a route was taken stays in the parent: no field of it reaches a page.
+  for (const key of ['"because"', '"errno"'])
+    if (o.served.includes(key)) problems.push(`${key} reached the page`);
   const extra = Object.keys(failure).filter((key) => !FAILURE_KEYS.includes(key));
   if (extra.length > 0) problems.push(`the failure carries ${extra.join(", ")}`);
   for (const path of o.paths)

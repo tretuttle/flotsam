@@ -51,7 +51,6 @@ import {
   journalLine,
   type ExportPause,
   type ExportPlatform,
-  type HeldFolder,
   type JournalEntry,
   type Part,
   type PartJournal,
@@ -59,7 +58,7 @@ import {
 import { createExportJobs, type ExportJobs, type RunOutcome } from "./export-jobs.ts";
 import { forbiddenRoots, platform } from "./files.ts";
 import type { WorkerArch } from "./file-worker.ts";
-import { holdFolderIn } from "./held-folder.ts";
+import { holdFolderIn, type FaultFor } from "./held-folder.ts";
 import {
   appendText,
   localFile,
@@ -188,15 +187,35 @@ const NAMED_PARTS_PREF = "extensions.oneClickHar.harness.namedParts";
 const heldFolders = (
   workerUrl: string | null,
   modes: Modes,
-): ((realFolder: string) => Promise<HeldFolder>) | undefined => {
+  fault: FaultFor,
+): Pick<ExportPlatform, "holdFolder" | "namedBecause"> => {
   const arch = WORKER_ARCHES[Services.sysinfo.getProperty("arch")];
-  if (workerUrl === null || Services.appinfo.OS !== "Linux" || arch === undefined) return undefined;
+  if (workerUrl === null || Services.appinfo.OS !== "Linux" || arch === undefined)
+    return { namedBecause: "platform" };
   if (
     Services.prefs.getBoolPref("extensions.oneClickHar.harness", false) &&
     Services.prefs.getBoolPref(NAMED_PARTS_PREF, false)
   )
-    return undefined;
-  return holdFolderIn(workerUrl, arch, modes.file ?? 0o644);
+    return { namedBecause: "harness-pref" };
+  return { holdFolder: holdFolderIn(workerUrl, arch, modes.file ?? 0o644, fault) };
+};
+
+/**
+ * Errors a harness profile arms through the harness topic for the next worker call of one kind, for the errnos no
+ * file system here produces: the call answers the errno instead of running. Unarmed, every call runs.
+ */
+const exportFaults = () => {
+  const armed = new Map<string, string>();
+  return {
+    take: ((op) => {
+      const errno = armed.get(op) ?? null;
+      armed.delete(op);
+      return errno;
+    }) satisfies FaultFor,
+    arm: (op: string, errno: string): void => {
+      armed.set(op, errno);
+    },
+  };
 };
 
 /** Points where a harness profile can hold an export, armed and let go through the harness topic. */
@@ -224,9 +243,9 @@ const exportPauses = () => {
 /** The only raw file calls an export makes. `exportFiles` classifies whatever they throw. */
 const geckoExportPlatform = (
   modes: Modes,
-  holdFolder: ExportPlatform["holdFolder"],
+  held: Pick<ExportPlatform, "holdFolder" | "namedBecause">,
 ): ExportPlatform => ({
-  ...(holdFolder === undefined ? {} : { holdFolder }),
+  ...held,
   state: pathState,
   realPath: realPathOf,
   parent: (path) => PathUtils.parent(path),
@@ -299,6 +318,7 @@ export function createGeckoHost(options: {
   readonly workerUrl: string | null;
 }) {
   const pauses = exportPauses();
+  const faults = exportFaults();
   const { reads, creator } = options;
   const finished = new Map<ExportId, string>();
 
@@ -430,7 +450,7 @@ export function createGeckoHost(options: {
     };
     const roots = realRoots(rec?.root ?? null);
     const files = exportFiles(
-      geckoExportPlatform(modes, heldFolders(options.workerUrl, modes)),
+      geckoExportPlatform(modes, heldFolders(options.workerUrl, modes, faults.take)),
       (real) => guardFolder(real, roots, platform()).ok,
       { stepMs: EXPORT_STEP_MS, timer: oneShot, signal: control.signal, pause: pauses.pass },
     );
@@ -478,13 +498,18 @@ export function createGeckoHost(options: {
         fileName: name,
         folderLabel: configured.label ?? PathUtils.filename(folder.path),
         report,
+        route: part.route(),
       };
     } catch (error) {
       if (written !== null) await written.part.discard().catch(() => undefined);
       if (control.signal.aborted) return { kind: "cancelled" };
-      const kept = written?.part.kept() ?? null;
       const failure = error instanceof WriteRefused ? error.failure : { kind: "other" as const };
-      return { kind: "write-failed", failure, ...(kept === null ? {} : { kept }) };
+      return {
+        kind: "write-failed",
+        failure,
+        ...(written === null ? {} : { route: written.part.route() }),
+        ...(written?.part.unconfirmed() === true ? { unconfirmed: true as const } : {}),
+      };
     }
   };
 
@@ -507,6 +532,7 @@ export function createGeckoHost(options: {
   return {
     jobs,
     pauses,
+    faults,
     lookup,
     popup,
     preview,
