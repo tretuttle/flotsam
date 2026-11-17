@@ -1,0 +1,351 @@
+// Judges an exported HAR against the fixture servers' own record of what they sent: every entry's body must hash to
+// the server's decoded SHA-256 for its X-Seq, and the entries must be exactly the requests the servers logged. The
+// product's reader is never the oracle.
+
+import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
+import * as HarValidator from "har-validator";
+import type { FixtureServer } from "./server.ts";
+
+/** One fixture server as the judge sees it: the host its URLs use, and its ground truth. */
+export type TruthServer = {
+  readonly host: string;
+  readonly server: Pick<FixtureServer, "getSequenceTruth" | "getRequestLog">;
+};
+
+type Entry = {
+  readonly request: { readonly url: string };
+  readonly response: {
+    readonly status: number;
+    readonly headers: readonly { readonly name: string; readonly value: string }[];
+    readonly content: { readonly size: number; readonly text?: string; readonly encoding?: string };
+  };
+  readonly _harExport?: { readonly bodyState?: string; readonly reason?: string };
+};
+
+type Document = {
+  readonly log: {
+    readonly entries: readonly Entry[];
+    readonly pages: readonly { readonly title: string }[];
+  };
+};
+
+export type ExportExpectation = {
+  readonly servers: readonly TruthServer[];
+  /** Hosts whose whole request log must be in the file, and no other server's requests. */
+  readonly hosts: readonly string[];
+  /** What the popup said this preset would export. */
+  readonly previewCount: number;
+  /** Text planted in the navigation URL; it may appear nowhere in the file. */
+  readonly secret: string;
+};
+
+export type ExportVerdict = {
+  readonly entries: number;
+  readonly exact: number;
+  readonly problems: readonly string[];
+};
+
+const sha256 = (bytes: Uint8Array): string =>
+  NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+
+const bodyBytes = (content: Entry["response"]["content"]): Buffer | null => {
+  if (content.text === undefined) return null;
+  return content.encoding === "base64"
+    ? Buffer.from(content.text, "base64")
+    : Buffer.from(content.text, "utf8");
+};
+
+const seqOf = (entry: Entry): number =>
+  Number(entry.response.headers.find((h) => h.name.toLowerCase() === "x-seq")?.value);
+
+export function judgeExport(text: string, expected: ExportExpectation): ExportVerdict {
+  const problems: string[] = [];
+  let document: Document;
+  try {
+    document = JSON.parse(text) as Document;
+  } catch (error) {
+    return { entries: 0, exact: 0, problems: [`not JSON: ${String(error)}`] };
+  }
+  const { entries, pages } = document.log;
+  if (text.includes(expected.secret)) {
+    const at = text.indexOf(expected.secret);
+    problems.push(`the planted secret is in the file: ...${text.slice(Math.max(0, at - 80), at)}`);
+  }
+  if (entries.length > 0 && pages.length === 0) problems.push("entries but no log.pages");
+  if (entries.length !== expected.previewCount)
+    problems.push(
+      `${String(entries.length)} entries, the popup said ${String(expected.previewCount)}`,
+    );
+
+  const seen = new Set<string>();
+  let exact = 0;
+  for (const entry of entries) {
+    const host = new URL(entry.request.url).host;
+    const server = expected.servers.find((s) => s.host === host);
+    const seq = seqOf(entry);
+    const key = `${host}#${String(seq)}`;
+    if (server === undefined || !expected.hosts.includes(host)) {
+      problems.push(`unexpected entry ${entry.request.url}`);
+      continue;
+    }
+    const truth = server.server.getSequenceTruth(seq);
+    if (truth === undefined) {
+      problems.push(`${entry.request.url}: no server record for X-Seq ${String(seq)}`);
+      continue;
+    }
+    if (seen.has(key)) problems.push(`${key} exported twice`);
+    seen.add(key);
+    const { content } = entry.response;
+    const bytes = bodyBytes(content);
+    const wanted = truth.decodedLength ?? 0;
+    if (bytes === null && wanted > 0) {
+      problems.push(
+        `${truth.path} #${String(seq)}: body missing (${JSON.stringify(entry._harExport ?? null)})`,
+      );
+      continue;
+    }
+    const got = bytes ?? Buffer.alloc(0);
+    if (wanted > 0 && sha256(got) !== truth.decodedSha256)
+      problems.push(`${truth.path} #${String(seq)}: wrong body bytes`);
+    else if (content.size !== wanted || got.length !== wanted)
+      problems.push(
+        `${truth.path} #${String(seq)}: content.size ${String(content.size)}, ${String(got.length)} bytes, server sent ${String(wanted)} decoded`,
+      );
+    else exact += 1;
+  }
+  for (const host of expected.hosts) {
+    const server = expected.servers.find((s) => s.host === host);
+    for (const served of server?.server.getRequestLog() ?? []) {
+      if (!seen.has(`${host}#${String(served.seq)}`))
+        problems.push(`missing ${served.method} ${host}${served.url} #${String(served.seq)}`);
+    }
+  }
+  return { entries: entries.length, exact, problems };
+}
+
+/** har-validator 5.1.5's verdict: null when valid, else its first errors. */
+export async function validateHar(text: string): Promise<string | null> {
+  try {
+    await HarValidator.har(JSON.parse(text));
+    return null;
+  } catch (error) {
+    const errors = (error as { errors?: unknown }).errors;
+    return JSON.stringify(errors ?? String(error)).slice(0, 400);
+  }
+}
+
+const require = NodeModule.createRequire(import.meta.url);
+
+/**
+ * har-to-k6 0.13.0 on a file. It exits 0 even when it rejects the file and writes nothing (deepseek F4), so the
+ * result is whether the output file exists and is not empty.
+ */
+export function convertsWithK6(harFile: string, workDir: string): boolean {
+  const bin = NodePath.join(
+    NodePath.dirname(require.resolve("har-to-k6/package.json")),
+    "bin",
+    "har-to-k6.js",
+  );
+  const out = NodePath.join(workDir, `${NodePath.basename(harFile)}.k6.js`);
+  NodeChildProcess.spawnSync(process.execPath, [bin, harFile, "-o", out], { stdio: "ignore" });
+  const ok = NodeFS.existsSync(out) && NodeFS.statSync(out).size > 0;
+  NodeFS.rmSync(out, { force: true });
+  return ok;
+}
+
+/** Plants: the judge must see each one. */
+export const PLANTS: readonly {
+  readonly name: string;
+  readonly mutate: (document: Document) => Document;
+}[] = [
+  {
+    name: "a flipped byte in one body",
+    mutate: (doc) => {
+      const index = doc.log.entries.findIndex((e) => (e.response.content.text ?? "").length > 0);
+      return withEntry(doc, index, (entry) => {
+        const bytes = bodyBytes(entry.response.content) ?? Buffer.alloc(1);
+        bytes[0] = (bytes[0] ?? 0) ^ 0xff;
+        const content = {
+          ...entry.response.content,
+          text: bytes.toString("base64"),
+          encoding: "base64",
+        };
+        return { ...entry, response: { ...entry.response, content } };
+      });
+    },
+  },
+  {
+    name: "one entry left out",
+    mutate: (doc) => ({ log: { ...doc.log, entries: doc.log.entries.slice(1) } }),
+  },
+  {
+    name: "a gzip body's size written as its wire size",
+    mutate: (doc) => {
+      const index = doc.log.entries.findIndex((e) => e.request.url.includes("/fixtures/gzip"));
+      return withEntry(doc, index, (entry) => {
+        const wire = entry.response.headers.find((h) => h.name.toLowerCase() === "content-length");
+        const content = { ...entry.response.content, size: Number(wire?.value ?? -1) };
+        return { ...entry, response: { ...entry.response, content } };
+      });
+    },
+  },
+];
+
+const withEntry = (doc: Document, index: number, change: (entry: Entry) => Entry): Document => {
+  if (index < 0) throw new Error("no entry to plant in");
+  return {
+    log: {
+      ...doc.log,
+      entries: doc.log.entries.map((entry, i) => (i === index ? change(entry) : entry)),
+    },
+  };
+};
+
+/** The secret back in a page title, where a redaction that missed titles would leave it. */
+export const plantSecretInTitle = (text: string, secret: string): string => {
+  const doc = JSON.parse(text) as Document;
+  const pages = doc.log.pages.map((page, i) =>
+    i === 0 ? { ...page, title: `${page.title}&s=${secret}` } : page,
+  );
+  return JSON.stringify({ log: { ...doc.log, pages } });
+};
+
+/** A data: row, which har-to-k6 rejects with the whole file while exiting 0. */
+export const plantDataRow = (text: string): string => {
+  const doc = JSON.parse(text) as Document;
+  const first = doc.log.entries[0];
+  if (first === undefined) throw new Error("no entry to copy");
+  const row = { ...first, request: { ...first.request, url: "data:text/plain,x" } };
+  return JSON.stringify({ log: { ...doc.log, entries: [...doc.log.entries, row] } });
+};
+
+/** A document har-validator must refuse: the log without its creator. */
+export const plantNoCreator = (text: string): string => {
+  const { log } = JSON.parse(text) as { log: Record<string, unknown> };
+  const { creator: _creator, ...rest } = log;
+  return JSON.stringify({ log: rest });
+};
+
+/** One API call a page can make with a tab id, and whether it must come back as a state or as a refusal. */
+export type TabCase = {
+  readonly name: string;
+  readonly expect: "state" | "refused";
+  /** For a state: the field the answer must carry, as JSON. */
+  readonly state?: { readonly read: (value: unknown) => unknown; readonly equals: unknown };
+};
+
+export type TabObservation = {
+  readonly case: TabCase;
+  readonly called:
+    | { readonly ok: true; readonly value: unknown }
+    | { readonly ok: false; readonly error: string };
+};
+
+/** A tab id that names no tab is a state, never an error; a negative id is refused by the parser or schema. */
+export function judgeTabCases(observations: readonly TabObservation[]): readonly string[] {
+  const problems: string[] = [];
+  for (const { case: c, called } of observations) {
+    if (c.expect === "refused") {
+      if (called.ok)
+        problems.push(`${c.name}: answered ${JSON.stringify(called.value)}, expected a refusal`);
+      continue;
+    }
+    if (!called.ok) {
+      problems.push(`${c.name}: threw ${called.error}`);
+      continue;
+    }
+    const got = c.state === undefined ? undefined : c.state.read(called.value);
+    if (c.state !== undefined && JSON.stringify(got) !== JSON.stringify(c.state.equals))
+      problems.push(
+        `${c.name}: ${JSON.stringify(got)}, expected ${JSON.stringify(c.state.equals)}`,
+      );
+  }
+  return problems;
+}
+
+const MIB = 1_048_576;
+/** One body chunk (3 MiB) as base64 is 4 MiB; the sink may still hold one batch of 1 MiB when cancel arrives. */
+export const CANCEL_BOUND_BYTES = 4 * MIB + MIB;
+
+export type CancelObservation = {
+  readonly state: string;
+  readonly audit: { readonly bytesAtCancel: number; readonly bytesAtStop: number | null } | null;
+  /** Files in the export folder named like this export. */
+  readonly left: readonly string[];
+  readonly journal: string;
+};
+
+export function judgeCancel(o: CancelObservation): readonly string[] {
+  const problems: string[] = [];
+  if (o.state !== "cancelled") problems.push(`ended ${o.state}, not cancelled`);
+  if (o.audit === null || o.audit.bytesAtStop === null) problems.push("no cancel audit");
+  else if (o.audit.bytesAtStop - o.audit.bytesAtCancel > CANCEL_BOUND_BYTES)
+    problems.push(
+      `wrote ${String(o.audit.bytesAtStop - o.audit.bytesAtCancel)} bytes after cancel, more than one chunk (${String(CANCEL_BOUND_BYTES)})`,
+    );
+  if (o.left.length > 0) problems.push(`left behind: ${o.left.join(", ")}`);
+  const lines = o.journal.split("\n").filter((line) => line.length > 0);
+  const startedParts = lines.filter((l) => l.startsWith('{"started"')).length;
+  const endedParts = lines.filter((l) => l.startsWith('{"ended"')).length;
+  if (startedParts === 0 || startedParts !== endedParts)
+    problems.push(
+      `journal has ${String(startedParts)} started and ${String(endedParts)} ended lines`,
+    );
+  return problems;
+}
+
+export type DiskFullObservation = {
+  readonly state: unknown;
+  /** The export folder, as the browser sees it, is the size-limited tmpfs. */
+  readonly tmpfs: boolean;
+  /** Everything in the export folder, as the browser sees it, after the export ended. */
+  readonly left: readonly string[];
+  readonly journal: string;
+};
+
+export function judgeDiskFull(o: DiskFullObservation): readonly string[] {
+  const problems: string[] = [];
+  if (!o.tmpfs) problems.push("the export folder was not the size-limited tmpfs");
+  const state = o.state as {
+    kind?: string;
+    failure?: { kind?: string; needBytes?: unknown; freeBytes?: unknown };
+  };
+  const failure = state.failure;
+  if (state.kind !== "write-failed" || failure?.kind !== "disk-full")
+    problems.push(`ended ${JSON.stringify(o.state)}, not write-failed with disk-full`);
+  else if (
+    typeof failure.needBytes !== "number" ||
+    typeof failure.freeBytes !== "number" ||
+    failure.needBytes <= 0 ||
+    failure.freeBytes < 0 ||
+    failure.freeBytes >= failure.needBytes
+  )
+    problems.push(`disk-full without a need above the free bytes: ${JSON.stringify(failure)}`);
+  if (o.left.length > 0) problems.push(`left behind: ${o.left.join(", ")}`);
+  const lines = o.journal.split("\n").filter((line) => line.length > 0);
+  const startedParts = lines.filter((l) => l.startsWith('{"started"')).length;
+  if (startedParts === 0 || startedParts !== lines.length - startedParts)
+    problems.push(`journal: ${JSON.stringify(lines)}`);
+  return problems;
+}
+
+export type AfterCrashObservation = {
+  /** The kinds of step the next start's recovery ran. */
+  readonly steps: readonly string[];
+  /** Files named like the export in its folder, after the next start. */
+  readonly left: readonly string[];
+};
+
+/** Crash row 13: the killed export left no .har, and the next start deleted the .har.part the journal named. */
+export function judgeAfterCrash(o: AfterCrashObservation): readonly string[] {
+  return [
+    ...(o.steps.includes("delete-export-part")
+      ? []
+      : [`recovery ran ${JSON.stringify(o.steps)}, no delete-export-part`]),
+    ...(o.left.length === 0 ? [] : [`left after the next start: ${o.left.join(", ")}`]),
+  ];
+}

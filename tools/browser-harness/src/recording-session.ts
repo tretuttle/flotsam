@@ -27,7 +27,8 @@ export type HookRequest =
   | { readonly kind: "flush" | "seal" | "recovery" | "status" }
   | { readonly kind: "exclude"; readonly site: string }
   | { readonly kind: "arm" | "reached"; readonly point: string }
-  | { readonly kind: "guard"; readonly path: string };
+  | { readonly kind: "guard"; readonly path: string }
+  | { readonly kind: "export-audit"; readonly id: string };
 
 const HOOK_SCRIPT = `const done = arguments[arguments.length - 1];
   const request = arguments[0];

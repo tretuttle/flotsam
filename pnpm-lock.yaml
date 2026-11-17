@@ -411,6 +411,12 @@ importers:
       '@types/node':
         specifier: 'catalog:'
         version: 24.12.4
+      har-to-k6:
+        specifier: 0.13.0
+        version: 0.13.0(supports-color@8.1.1)
+      har-validator:
+        specifier: 5.1.5
+        version: 5.1.5
       vite-plus:
         specifier: 1.4.0
         version: 1.4.0(@types/node@24.12.4)(@vitest/ui@5.0.5)(jiti@2.7.0)(less@4.9.1(supports-color@8.1.1))(svelte@5.57.3)(terser@5.51.2)(yaml@2.9.1)

@@ -129,6 +129,24 @@ export default defineConfig({
         files: ["apps/*/src/**", "packages/*/src/**"],
         rules: { "one-click-har/no-unreasoned-state-sync": "error" },
       },
+      {
+        // Pages hold the moz-extension principal and reach the host only through browser.oneClickHar.
+        files: ["apps/extension/src/**"],
+        rules: {
+          "eslint/no-restricted-imports": [
+            "error",
+            {
+              patterns: [
+                {
+                  group: ["**/experiment/*", "!**/experiment/contract.ts"],
+                  message:
+                    "Extension pages call browser.oneClickHar; only experiment/contract.ts is theirs to import.",
+                },
+              ],
+            },
+          ],
+        },
+      },
     ],
     options: {
       reportUnusedDisableDirectives: "error",
