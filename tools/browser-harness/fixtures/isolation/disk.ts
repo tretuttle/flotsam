@@ -90,9 +90,11 @@ export function diffSnapshots(before: DiskSnapshot, after: DiskSnapshot): readon
  */
 export type RunNames = readonly (readonly [text: string, role: string])[];
 
-/** One run's changes: what it wrote by plan time and by the end, and its own run names. */
+/**
+ * One run's changes once its last browser quit, and its own run names. The end state, not a moment mid-run: in the
+ * middle of a run the browser's own background writes (a database journal, a temporary file) come and go by timing.
+ */
 export type RunChanges = {
-  readonly plan: readonly DiskChange[];
   readonly final: readonly DiskChange[];
   readonly names: RunNames;
 };
@@ -109,19 +111,10 @@ const signature = (change: DiskChange, names: RunNames): string =>
     change.entry.link === null ? null : withRoles(change.entry.link, names),
   ]);
 
-/**
- * Every write the product run made, by plan time or by the end, that the control run did not make at the same place
- * with the same kind, mode and link target. A file that came and went before the end is still seen at plan time.
- */
+/** Every write the product run left that the control run did not leave at the same place, kind, mode and link. */
 export function beyondControl(product: RunChanges, control: RunChanges): readonly DiskChange[] {
-  const made = new Set([...control.plan, ...control.final].map((c) => signature(c, control.names)));
-  const seen = new Set<string>();
-  return [...product.final, ...product.plan].filter((change) => {
-    const key = signature(change, product.names);
-    if (made.has(key) || seen.has(change.path)) return false;
-    seen.add(change.path);
-    return true;
-  });
+  const made = new Set(control.final.map((c) => signature(c, control.names)));
+  return product.final.filter((change) => !made.has(signature(change, product.names)));
 }
 
 /** The product's own places, known only once the run has read its key. */

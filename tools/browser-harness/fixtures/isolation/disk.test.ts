@@ -47,12 +47,7 @@ const added = (path: string, entry: DiskEntry = file): DiskChange => ({
   change: "new",
   entry,
 });
-const run = (
-  final: readonly DiskChange[],
-  names: RunChanges["names"] = [],
-  plan: readonly DiskChange[] = [],
-): RunChanges => ({
-  plan,
+const run = (final: readonly DiskChange[], names: RunChanges["names"] = []): RunChanges => ({
   final,
   names,
 });
@@ -170,7 +165,7 @@ describe("the control run", () => {
       ],
       names,
     );
-    const theirs = run([added("downloads/bank.example-2026-11-16.har")], [], []);
+    const theirs = run([added("downloads/bank.example-2026-11-16.har")]);
     expect(
       beyondControl(product, { ...control, final: [...control.final, ...theirs.final] }).map(
         (c) => c.path,
@@ -183,15 +178,6 @@ describe("the control run", () => {
     expect(beyondControl(run([added("profile/lock", link("/w1/data"))], names), control)).toEqual([
       added("profile/lock", link("/w1/data")),
     ]);
-  });
-
-  it("counts what the product wrote by plan time, once, though it was gone by the end", () => {
-    const transient = added("home/.config/zen/sites.txt");
-    expect(beyondControl(run([], names, [transient, transient]), control)).toEqual([transient]);
-    expect(beyondControl(run([], names, [browser[0]!]), control)).toEqual([]);
-    expect(
-      beyondControl(run([], names, [browser[0]!]), run([], control.names, [control.final[0]!])),
-    ).toEqual([]);
   });
 
   it("matches on the uuid's role, never on the uuid", () => {
@@ -284,11 +270,8 @@ describe("the product's places", () => {
 });
 
 describe("disk problems", () => {
-  const evidence = (
-    product: readonly DiskChange[],
-    plan: readonly DiskChange[] = [],
-  ): DiskEvidence => ({
-    product: run(product, [], plan),
+  const evidence = (product: readonly DiskChange[]): DiskEvidence => ({
+    product: run(product),
     control: run([added("profile/prefs.js", { ...file, mode: 0o644 })]),
     area: AREA,
     probed: ["profile/one-click-har.archive-key", "downloads/planned.har"],
@@ -310,18 +293,17 @@ describe("disk problems", () => {
   it("fails a write outside, a hard link even where the control wrote, and an export the plan never saw", () => {
     expect(
       diskProblems(
-        evidence(
-          [
-            added("profile/prefs.js", { ...file, mode: 0o644, nlink: 2 }),
-            added("downloads/late.har"),
-          ],
-          [added("home/.config/zen/sites.txt")],
-        ),
+        evidence([
+          added("profile/prefs.js", { ...file, mode: 0o644, nlink: 2 }),
+          added("downloads/late.har"),
+          added("home/.config/zen/sites.txt"),
+        ]),
       ),
     ).toEqual([
       "new file home/.config/zen/sites.txt: outside the key folder, the key file and the export folder",
       "profile/prefs.js has 2 links",
       "new file downloads/late.har: written after the plan, so never probed",
     ]);
+    expect(diskProblems({ ...evidence([]), control: run([]) })).toEqual([]);
   });
 });

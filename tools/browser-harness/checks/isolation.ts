@@ -32,7 +32,6 @@ import {
   inProductArea,
   snapshotTree,
   type DiskEvidence,
-  type DiskSnapshot,
   type ProductArea,
   type RunChanges,
   type RunNames,
@@ -723,8 +722,8 @@ type PageRead = {
 
 /**
  * Reads every recorder page as it shows: its listeners and frames from the system principal, then whether anything
- * answers a message the page posts to itself. One page at a time; each but the popup is closed after, and the popup,
- * which the probes need, is opened again if a new Marionette tab replaced it, as some builds do.
+ * answers a message the page posts to itself. One page at a time, left open: closing a tab can strand Marionette's
+ * current window. The popup, which the probes need, is opened again if a new tab replaced it, as some builds do.
  */
 async function readPages(
   session: BrowserSession,
@@ -751,7 +750,6 @@ async function readPages(
         echo: echo === "none" ? null : echo,
       });
     }
-    if (url !== popup.url) await session.closeTab(tab);
   }
   const popupShows = (await session.evaluateChrome(CHROME_TAB_SHOWS_SCRIPT, [popup.url])) === true;
   return { pages, popupTab: popupShows ? popup.tab : await session.openTab(popup.url) };
@@ -905,7 +903,6 @@ async function controlRun(
     const standInPath = NodePath.join(standInDir, "stand-in.xpi");
     NodeFS.writeFileSync(standInPath, plan.standInXpi);
     const before = snapshotTree(workspace.base);
-    let planSnapshot: DiskSnapshot = {};
     let names: RunNames = [];
     let storeId = "";
     const pids: number[] = [];
@@ -937,7 +934,6 @@ async function controlRun(
       );
       const popupUrl = await waitForActiveExtensionUrl(session, plan.recorderId, plan.popupPath);
       let popupTab = await session.openTab(popupUrl);
-      planSnapshot = snapshotTree(workspace.base);
       storeId = String(await session.evaluateChrome(CHROME_STORE_ID_SCRIPT));
       pids.push(session.browserPid, session.spawnedPid);
 
@@ -985,7 +981,6 @@ async function controlRun(
       signal: context.signal,
     });
     return {
-      plan: diffSnapshots(before, planSnapshot),
       final: diffSnapshots(before, snapshotTree(workspace.base)),
       names: [...names, ...browserNames(storeId, [...pids, last.pid])],
     };
@@ -1060,7 +1055,6 @@ const check: HarnessCheck = {
     let plannedEntries: ReturnType<typeof workspace.entries> = [];
     let keyEvidence: KeyEvidence | null = null;
     let area: ProductArea | null = null;
-    let planSnapshot: DiskSnapshot = {};
     let names: RunNames = [];
     let storeId = "";
     const pids: number[] = [];
@@ -1163,7 +1157,7 @@ const check: HarnessCheck = {
       );
 
       // The inventory is what the disk diff says the product wrote in its own places by now.
-      planSnapshot = snapshotTree(workspace.base);
+      const planSnapshot = snapshotTree(workspace.base);
       storeId = String(await session.evaluateChrome(CHROME_STORE_ID_SCRIPT));
       pids.push(session.browserPid, session.spawnedPid);
       area = { archiveKey, keyFileName: ARCHIVE_KEY_FILE };
@@ -1523,7 +1517,6 @@ const check: HarnessCheck = {
     record("positions-completed", positionProblems, "every position reported done");
 
     const productRun: RunChanges = {
-      plan: diffSnapshots(diskBefore, planSnapshot),
       final: diffSnapshots(diskBefore, snapshotTree(workspace.base)),
       names: [...names, ...browserNames(storeId, [...pids, last.pid])],
     };
