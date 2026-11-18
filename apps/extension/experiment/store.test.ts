@@ -14,7 +14,11 @@ import {
   packPath,
   type SafeFolder,
 } from "@one-click-har/recording/layout";
-import { DEFAULT_USER_SETTINGS, type StoredSettings } from "@one-click-har/recording/settings";
+import {
+  DEFAULT_USER_SETTINGS,
+  parseStoredSettings,
+  type StoredSettings,
+} from "@one-click-har/recording/settings";
 import type { Timers } from "./gecko-io.ts";
 import { openStore } from "./store.ts";
 
@@ -241,6 +245,56 @@ describe("openStore startup gate and ledger persistence", () => {
     await store.initRetention();
     return { store, pAbs, removedPaths };
   };
+
+  it("saves a settings change to settings.json before applying it, and a failed write changes nothing", async () => {
+    const timers = {
+      repeat: () => ({ cancel: () => undefined }),
+      once: () => ({ cancel: () => undefined }),
+      cancelAll: () => undefined,
+    } as unknown as Timers;
+    const applied: StoredSettings[] = [];
+    const site = parseSite("kept.example")!;
+    const store = openStore({
+      run: RUN,
+      root: ROOT,
+      modes: { dir: null, file: null },
+      settings: {
+        ...makeSettings(10_000_000),
+        user: { ...makeSettings(10_000_000).user, excludedSites: [site] },
+      },
+      timers,
+      onSettings: (next) => applied.push(next),
+    });
+    await store.initRetention();
+    const path = `${ROOT}/${LAYOUT.settings}`;
+    const saved = await store.updateSettings({
+      user: { ...DEFAULT_USER_SETTINGS, media: "keep-bodies" },
+      exportFolder: { kind: "chosen", path: "/exports/hars", label: "hars" },
+    });
+    const onDisk = parseStoredSettings(JSON.parse(written.get(path) ?? "null"));
+    expect(onDisk).toEqual(saved);
+    expect(onDisk?.user.media).toBe("keep-bodies");
+    expect(onDisk?.user.excludedSites).toEqual([site]);
+    expect(onDisk?.exportFolder).toEqual({ kind: "chosen", path: "/exports/hars", label: "hars" });
+    expect(store.settings()).toEqual(saved);
+    expect(applied.at(-1)).toEqual(saved);
+
+    const included = await store.includeSite(site);
+    expect(included.user.excludedSites).toEqual([]);
+    expect(parseStoredSettings(JSON.parse(written.get(path)!))?.user.excludedSites).toEqual([]);
+
+    const io = (globalThis as Record<string, unknown>)["IOUtils"] as Record<string, unknown>;
+    const move = io["move"];
+    io["move"] = async () => {
+      throw new Error("ENOSPC");
+    };
+    await expect(
+      store.updateSettings({ user: { ...DEFAULT_USER_SETTINGS, media: "details-only" } }),
+    ).rejects.toThrow("ENOSPC");
+    io["move"] = move;
+    expect(store.settings().user.media).toBe("keep-bodies");
+    expect(parseStoredSettings(JSON.parse(written.get(path)!))?.user.media).toBe("keep-bodies");
+  });
 
   it("serializes updatePart deletions through the write chain rather than deleting synchronously", async () => {
     const { store, pAbs, removedPaths } = await openSinglePackStore("chain.example", 400, 500);

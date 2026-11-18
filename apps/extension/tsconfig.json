@@ -21,6 +21,8 @@
     "experiment/store.ts",
     "experiment/store.test.ts",
     "experiment/host.ts",
+    "experiment/settings-host.ts",
+    "experiment/settings-host.test.ts",
     "experiment/archive-source.ts",
     "experiment/devtools.ts",
     "experiment/file-worker.ts",

@@ -43,7 +43,11 @@ import {
 } from "@one-click-har/recording/layout";
 import { encodeLine, encodeSummary, summarize } from "@one-click-har/recording/log";
 import type { RetentionRef, RetentionStep } from "@one-click-har/recording/retention";
-import type { StoredSettings } from "@one-click-har/recording/settings";
+import type {
+  EditableSettings,
+  ExportFolder,
+  StoredSettings,
+} from "@one-click-har/recording/settings";
 import {
   appendStreams,
   appendText,
@@ -151,6 +155,16 @@ export interface Store {
   ): void;
   /** Settings first, so the gate stops new captures; then, on the chain, the site's directory is deleted. */
   excludeSite(site: Site): Promise<void>;
+  /** Records the site again from its next request. What was deleted when it was excluded stays deleted. */
+  includeSite(site: Site): Promise<StoredSettings>;
+  /**
+   * Replaces the editable settings or the export folder. The excluded-site list is not in it: excludeSite and
+   * includeSite own that list. Resolves once settings.json holds the change; a failed write rejects and changes nothing.
+   */
+  updateSettings(change: {
+    readonly user?: EditableSettings;
+    readonly exportFolder?: ExportFolder;
+  }): Promise<StoredSettings>;
   /** Appends every pending batch and resolves when the chain is empty. */
   flush(): Promise<void>;
   /** Seals every open segment now, as an idle rotation would. */
@@ -359,6 +373,30 @@ export function openStore(options: {
       notifyDrain();
     }
   };
+
+  /** On the chain. `settings` changes only after settings.json holds `next`, so a failed write changes nothing. */
+  const saveSettings = async (next: StoredSettings): Promise<void> => {
+    await writeAtomic(at([LAYOUT.settings]), JSON.stringify(next), modes);
+    settings = next;
+    options.onSettings(next);
+  };
+
+  /** A settings change whose failure reaches the caller, not only the problem list. */
+  const changeSettings = (
+    make: (current: StoredSettings) => StoredSettings,
+    applied: () => Promise<void> | void,
+  ): Promise<StoredSettings> =>
+    new Promise((resolve, reject) => {
+      void enqueue(async () => {
+        try {
+          await saveSettings(make(settings));
+          await applied();
+          resolve(settings);
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+    });
 
   const scheduleRetention = (): void => {
     if (retentionQueued) return;
@@ -626,13 +664,10 @@ export function openStore(options: {
       sites.delete(site);
       applyActivity(activity, { kind: "site-forgotten", site });
       return enqueue(async () => {
-        const next: StoredSettings = {
+        await saveSettings({
           ...settings,
           user: { ...settings.user, excludedSites: [...settings.user.excludedSites, site] },
-        };
-        await writeAtomic(at([LAYOUT.settings]), JSON.stringify(next), modes);
-        settings = next;
-        options.onSettings(next);
+        });
         const dir = at([LAYOUT.sitesDir, siteDirName(site)]);
         for (const [index, sub] of [LAYOUT.logDir, LAYOUT.packDir, LAYOUT.bodyDir].entries()) {
           await IOUtils.remove(PathUtils.join(dir, sub), { recursive: true, ignoreAbsent: true });
@@ -645,6 +680,32 @@ export function openStore(options: {
         notifyDrain();
       });
     },
+    includeSite: (site) =>
+      changeSettings(
+        (current) => ({
+          ...current,
+          user: {
+            ...current.user,
+            excludedSites: current.user.excludedSites.filter((s) => s !== site),
+          },
+        }),
+        () => {
+          excluded.delete(site);
+        },
+      ),
+    updateSettings: (change) =>
+      changeSettings(
+        (current) => ({
+          user: {
+            ...(change.user ?? current.user),
+            excludedSites: current.user.excludedSites,
+          },
+          exportFolder: change.exportFolder ?? current.exportFolder,
+        }),
+        async () => {
+          if (maintenance.isOverCap(settings.user)) await runRetention();
+        },
+      ),
     flush: async () => {
       for (const state of sites.values()) flushSite(state);
       await enqueue(async () => undefined);
