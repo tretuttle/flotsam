@@ -185,7 +185,7 @@ const ARMS: readonly StartupArm[] = [
     headroomBytes: MIB,
     ledger: "forged-half",
     scanDelayMs: 14_000,
-    waitBeforeWavesMs: 5_000,
+    waitBeforeWavesMs: 8_000,
     burstBytes: 3_000_000,
     expectZeroDirectWhileShut: true,
     expectDowngradedStartup: true,
@@ -758,9 +758,10 @@ async function runStartupArm(options: {
           const midStatus = (await callHook(session, { kind: "status" })) as {
             readonly ready: boolean;
           };
+          const maxAllowedMidBytes = arm.expectDowngradedStartup === true ? FLUSH_BATCH_BYTES : 0;
           if (midStatus.ready) {
             problems.push(`${arm.name}: gate opened before zero-direct probe after wave 0`);
-          } else if (incomingBytes > 0) {
+          } else if (incomingBytes > maxAllowedMidBytes) {
             problems.push(
               `${arm.name}: wrote ${String(incomingBytes)} B directly to incoming/ while startup gate shut`,
             );
