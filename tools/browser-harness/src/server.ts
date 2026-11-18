@@ -54,6 +54,7 @@ export type FixtureServer = AsyncDisposable & {
   readonly getRequestLog: () => readonly ServedRequest[];
   readonly getSequenceTruth: (seq: number) => SequenceTruth | undefined;
   readonly getAllSequenceTruth: () => ReadonlyMap<number, SequenceTruth>;
+  readonly releasePaused: () => void;
 };
 
 export async function startFixtureServer(): Promise<FixtureServer> {
@@ -69,6 +70,11 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   const seqTruth = new Map<number, SequenceTruth>();
   let nextSeq = 0;
   let pollCount = 0;
+  const pausedWaiters = new Set<() => void>();
+  const releasePaused = (): void => {
+    for (const wake of pausedWaiters) wake();
+    pausedWaiters.clear();
+  };
 
   const state: ServerState = {
     routes,
@@ -92,6 +98,11 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     getTruth: (seq) => seqTruth.get(seq),
     allTruth: () => seqTruth,
     allRequests: () => requestLog,
+    waitForRelease: () =>
+      new Promise<void>((resolve) => {
+        pausedWaiters.add(resolve);
+      }),
+    releasePaused,
   };
 
   const server = NodeHttp.createServer((request, response) => {
@@ -124,11 +135,14 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     getRequestLog: () => [...requestLog],
     getSequenceTruth: (seq) => seqTruth.get(seq),
     getAllSequenceTruth: () => new Map(seqTruth),
-    [Symbol.asyncDispose]: () =>
-      new Promise((resolve, reject) => {
+    releasePaused,
+    [Symbol.asyncDispose]: () => {
+      releasePaused();
+      return new Promise((resolve, reject) => {
         server.closeAllConnections();
         server.close((error) => (error ? reject(error) : resolve()));
-      }),
+      });
+    },
   };
 }
 
@@ -143,6 +157,8 @@ type ServerState = {
   readonly getTruth: (seq: number) => SequenceTruth | undefined;
   readonly allTruth: () => ReadonlyMap<number, SequenceTruth>;
   readonly allRequests: () => readonly ServedRequest[];
+  readonly waitForRelease: () => Promise<void>;
+  readonly releasePaused: () => void;
 };
 
 async function handle(
@@ -240,6 +256,54 @@ async function handle(
     return;
   }
 
+  if (method === "GET" && path === "/retention/page") {
+    const body = Buffer.from(
+      '<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>retention</title></head><body>ok</body></html>',
+      "utf8",
+    );
+    sendBuffered(
+      state,
+      response,
+      meta,
+      200,
+      { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      body,
+      body,
+    );
+    return;
+  }
+
+  if (method === "GET" && path === "/retention/blob") {
+    const rawBytes = Number(parsedUrl.searchParams.get("bytes") ?? "0");
+    if (!Number.isInteger(rawBytes) || rawBytes < 1 || rawBytes > 50_000_000) {
+      const err = Buffer.from("invalid bytes\n", "utf8");
+      sendBuffered(state, response, meta, 400, { "content-type": "text/plain" }, err, err);
+      return;
+    }
+    const tag = parsedUrl.searchParams.get("tag") ?? "default";
+    const body = deterministicBytes(rawBytes, `${String(rawBytes)}:${tag}`);
+    if (parsedUrl.searchParams.get("chunked") === "1") {
+      await writeChunked(
+        state,
+        response,
+        meta,
+        { "content-type": "application/octet-stream", "cache-control": "no-store" },
+        body,
+      );
+      return;
+    }
+    sendBuffered(
+      state,
+      response,
+      meta,
+      200,
+      { "content-type": "application/octet-stream", "cache-control": "no-store" },
+      body,
+      body,
+    );
+    return;
+  }
+
   const extended = state.extendedRoutes.get(routeKey(method, path));
   if (extended !== undefined) {
     const headers: Record<string, string> = {
@@ -296,6 +360,14 @@ async function handle(
     writeRange(state, response, meta, headers, bytes, request.headers.range);
     return;
   }
+  const pauseParam = parsedUrl.searchParams.get("pauseAfterBytes");
+  if (pauseParam !== null && /^\d+$/u.test(pauseParam)) {
+    const pauseAfter = Number(pauseParam);
+    if (pauseAfter > 0 && pauseAfter < bytes.length) {
+      await writePaused(state, request, response, meta, headers, bytes, pauseAfter);
+      return;
+    }
+  }
   sendBuffered(state, response, meta, 200, headers, bytes, bytes);
 }
 
@@ -345,6 +417,78 @@ type RequestMeta = {
   readonly path: string;
   readonly url: string;
 };
+
+function writePaused(
+  state: ServerState,
+  request: NodeHttp.IncomingMessage,
+  response: NodeHttp.ServerResponse,
+  meta: RequestMeta,
+  headers: Record<string, string>,
+  bytes: Buffer,
+  pauseAfter: number,
+): Promise<void> {
+  const fullHash = sha256(bytes);
+  state.setTruth({
+    seq: meta.seq,
+    method: meta.method,
+    path: meta.path,
+    url: meta.url,
+    status: 200,
+    expectedLength: bytes.length,
+    wireBytesSent: bytes.length,
+    wireSha256: fullHash,
+    decodedLength: bytes.length,
+    decodedSha256: fullHash,
+    aborted: false,
+  });
+  state.recordRequest({ ...meta, status: 200 });
+  response.writeHead(200, {
+    ...headers,
+    "content-length": String(bytes.length),
+    "x-seq": String(meta.seq),
+  });
+  response.write(bytes.subarray(0, pauseAfter));
+  return new Promise((resolve) => {
+    let closed = false;
+    const finish = (): void => {
+      if (closed) return;
+      closed = true;
+      resolve();
+    };
+    request.once("close", finish);
+    response.once("close", finish);
+    void state.waitForRelease().then(() => {
+      if (closed) return;
+      response.end(bytes.subarray(pauseAfter), finish);
+    });
+  });
+}
+
+export function deterministicBytes(length: number, seed: string): Buffer {
+  const buffer = Buffer.allocUnsafe(length);
+  let state = NodeCrypto.createHash("sha256").update(seed).digest().readUInt32LE(0);
+  let cursor = 0;
+  while (cursor + 4 <= buffer.length) {
+    state = (state + 0x9e3779b9) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 16), 0x85ebca6b) >>> 0;
+    value = Math.imul(value ^ (value >>> 13), 0xc2b2ae35) >>> 0;
+    value = (value ^ (value >>> 16)) >>> 0;
+    buffer.writeUInt32LE(value, cursor);
+    cursor += 4;
+  }
+  if (cursor < buffer.length) {
+    state = (state + 0x9e3779b9) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 16), 0x85ebca6b) >>> 0;
+    value = Math.imul(value ^ (value >>> 13), 0xc2b2ae35) >>> 0;
+    value = (value ^ (value >>> 16)) >>> 0;
+    const tail = Buffer.allocUnsafe(4);
+    tail.writeUInt32LE(value, 0);
+    tail.copy(buffer, cursor, 0, buffer.length - cursor);
+  }
+  return buffer;
+}
 
 function sendBuffered(
   state: ServerState,

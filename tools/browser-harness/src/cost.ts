@@ -125,6 +125,11 @@ export function computeBudget(offMedian: number, panelMedian: number): number {
   return offMedian + 0.5 * (panelMedian - offMedian);
 }
 
+export const ARCHIVE_DOWNLOAD_RATIO = 1.45;
+export const ARCHIVE_DOWNLOAD_SLACK_MS = 10;
+export const ARCHIVE_BROWSE_RATIO = 1.18;
+export const ARCHIVE_BROWSE_SLACK_MS = 15;
+
 export function detectSlowArm(options: {
   readonly arm: CostArm;
   readonly observedMedianMs: number;
@@ -142,6 +147,47 @@ export function detectSlowArm(options: {
     };
   }
   return { ok: true, budgetMs, reason: null };
+}
+
+export function detectSlowArchiveCost(options: {
+  readonly emptyDownloadMedianMs: number;
+  readonly fullDownloadMedianMs: number;
+  readonly emptyBrowseMedianMs: number;
+  readonly fullBrowseMedianMs: number;
+  readonly downloadRatio?: number;
+  readonly downloadSlackMs?: number;
+  readonly browseRatio?: number;
+  readonly browseSlackMs?: number;
+}): {
+  readonly ok: boolean;
+  readonly downloadBudgetMs: number;
+  readonly browseBudgetMs: number;
+  readonly reason: string | null;
+} {
+  const dlRatio = options.downloadRatio ?? ARCHIVE_DOWNLOAD_RATIO;
+  const dlSlack = options.downloadSlackMs ?? ARCHIVE_DOWNLOAD_SLACK_MS;
+  const brRatio = options.browseRatio ?? ARCHIVE_BROWSE_RATIO;
+  const brSlack = options.browseSlackMs ?? ARCHIVE_BROWSE_SLACK_MS;
+  const downloadBudgetMs =
+    Math.round((options.emptyDownloadMedianMs * dlRatio + dlSlack) * 10) / 10;
+  const browseBudgetMs = Math.round((options.emptyBrowseMedianMs * brRatio + brSlack) * 10) / 10;
+  const reasons: string[] = [];
+  if (options.fullDownloadMedianMs > downloadBudgetMs) {
+    reasons.push(
+      `10,000-file download median ${options.fullDownloadMedianMs.toFixed(1)} ms exceeded budget ${downloadBudgetMs.toFixed(1)} ms (empty ${options.emptyDownloadMedianMs.toFixed(1)} ms * ${String(dlRatio)} + ${String(dlSlack)} ms)`,
+    );
+  }
+  if (options.fullBrowseMedianMs > browseBudgetMs) {
+    reasons.push(
+      `10,000-file browse median ${options.fullBrowseMedianMs.toFixed(1)} ms exceeded budget ${browseBudgetMs.toFixed(1)} ms (empty ${options.emptyBrowseMedianMs.toFixed(1)} ms * ${String(brRatio)} + ${String(brSlack)} ms)`,
+    );
+  }
+  return {
+    ok: reasons.length === 0,
+    downloadBudgetMs,
+    browseBudgetMs,
+    reason: reasons.length === 0 ? null : reasons.join("; "),
+  };
 }
 
 export function summarizeCostSamples(samples: readonly CostSample[], arm: CostArm): ArmSummary {

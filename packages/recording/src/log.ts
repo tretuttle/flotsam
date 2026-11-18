@@ -71,12 +71,17 @@ const NOT_KEPT = members<NotKeptReason>({
   "streaming-response": true,
   "not-recordable-here": true,
 });
-const INCOMPLETE = members<IncompleteReason>({ "network-aborted": true, "write-failed": true });
+const INCOMPLETE = members<IncompleteReason>({
+  "network-aborted": true,
+  "write-failed": true,
+  "scan-timeout": true,
+});
 const ABANDON = members<AbandonReason>({ "browser-closed": true, "recording-stopped": true });
 const CHECKS = members<BodyCheck>({
   "length-matched": true,
   "sink-only": true,
   "first-part": true,
+  "scan-timeout": true,
 });
 const SOURCES = members<ResponseSource>({
   network: true,

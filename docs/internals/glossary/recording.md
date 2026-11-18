@@ -14,4 +14,5 @@
 - **Exclusion.** A site the user stopped recording. Its directory is deleted, and recovery finishes a deletion a crash interrupted.
 - **Recovery.** The plan the next start makes from what is on disk after a crash. Planning again after it runs plans nothing.
 - **Retention.** Deleting the oldest sealed files when the archive passes its size or age cap. It stops at a file an export has pinned.
+- **Pin.** A lock held while an export lists and reads recorded files; retention stops at the oldest pinned file instead of skipping past it.
 - **Activity index.** The in-memory counts behind the popup and history pages, derived from summaries and open segments and never written to disk.

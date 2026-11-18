@@ -24,8 +24,19 @@ const downloadPrefs = (folder: string): readonly Pref[] => [
 ];
 
 export type HookRequest =
-  | { readonly kind: "flush" | "seal" | "recovery" | "status" }
+  | {
+      readonly kind:
+        | "flush"
+        | "seal"
+        | "recovery"
+        | "status"
+        | "retain"
+        | "reset-work"
+        | "pin-oldest-pack"
+        | "sites";
+    }
   | { readonly kind: "exclude"; readonly site: string }
+  | { readonly kind: "unpin"; readonly pinId: string }
   | { readonly kind: "arm" | "reached"; readonly point: string }
   | { readonly kind: "guard"; readonly path: string }
   | { readonly kind: "export-audit" | "export-route"; readonly id: string }

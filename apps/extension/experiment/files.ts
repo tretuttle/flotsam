@@ -2,6 +2,7 @@
 // already has a place to go, and an excluded site is excluded from the first channel. Each read or write here is one
 // small file. Paths are built with PathUtils; nothing assumes a separator.
 
+import type { RunId } from "@one-click-har/recording/ids";
 import {
   ARCHIVE_KEY_FILE,
   ARCHIVE_ROOTS,
@@ -191,4 +192,156 @@ export const loadSettings = (
   if (parsed !== null) return { settings: parsed, rejected: false };
   localFile(path).moveTo(null, `${LAYOUT.settings}.rejected`);
   return { settings: defaults, rejected: true };
+};
+
+const NONNEGATIVE_INT = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+const MAX_SYNC_LEDGER_SITES = 256;
+
+const dirHasEntries = (dir: LocalFile): boolean => {
+  if (!dir.exists() || dir.isDirectory?.() === false) return false;
+  const entries = dir.directoryEntries;
+  if (entries === undefined) return false;
+  try {
+    return entries.hasMoreElements();
+  } finally {
+    entries.close?.();
+  }
+};
+
+const ledgerConsistentWithDisk = (
+  root: SafeFolder,
+  ledgerMtime: number,
+  bodyCount: number,
+  detailCount: number,
+  siteCount: number,
+  bodyBytes: number,
+  detailBytes: number,
+): boolean => {
+  if (localFile(PathUtils.join(root, `${LAYOUT.ledger}${LAYOUT.tmpSuffix}`)).exists()) return false;
+  if (dirHasEntries(localFile(PathUtils.join(root, LAYOUT.incomingDir)))) return false;
+  const sitesDir = localFile(PathUtils.join(root, LAYOUT.sitesDir));
+  if (!sitesDir.exists()) {
+    return (
+      siteCount === 0 &&
+      bodyCount === 0 &&
+      detailCount === 0 &&
+      bodyBytes === 0 &&
+      detailBytes === 0
+    );
+  }
+  if ((sitesDir.lastModifiedTime ?? Number.MAX_SAFE_INTEGER) > ledgerMtime) return false;
+  const entries = sitesDir.directoryEntries;
+  if (entries === undefined) return false;
+  let actualSites = 0;
+  try {
+    while (entries.hasMoreElements()) {
+      const raw = entries.getNext() as LocalFile & {
+        readonly QueryInterface?: (iid: unknown) => LocalFile;
+      };
+      const siteDir = raw.QueryInterface !== undefined ? raw.QueryInterface(Ci.nsIFile) : raw;
+      if (siteDir.isDirectory?.() === false) continue;
+      actualSites += 1;
+      if (actualSites > MAX_SYNC_LEDGER_SITES) return false;
+      if ((siteDir.lastModifiedTime ?? Number.MAX_SAFE_INTEGER) > ledgerMtime) return false;
+      for (const subName of [LAYOUT.packDir, LAYOUT.bodyDir, LAYOUT.logDir]) {
+        const sub = localFile(PathUtils.join(siteDir.path, subName));
+        if (!sub.exists()) continue;
+        if ((sub.lastModifiedTime ?? Number.MAX_SAFE_INTEGER) > ledgerMtime) return false;
+        if (
+          (subName === LAYOUT.packDir || subName === LAYOUT.bodyDir) &&
+          bodyCount === 0 &&
+          dirHasEntries(sub)
+        ) {
+          return false;
+        }
+        if (subName === LAYOUT.logDir && detailCount === 0 && dirHasEntries(sub)) return false;
+      }
+    }
+  } finally {
+    entries.close?.();
+  }
+  return actualSites === siteCount;
+};
+
+/** Validates a clean-shutdown ledger against current archive directories, or returns null when unknown. */
+export const loadPersistedLedger = (
+  root: SafeFolder,
+): {
+  readonly bodyBytes: number;
+  readonly detailBytes: number;
+  readonly bodyCount: number;
+  readonly detailCount: number;
+} | null => {
+  try {
+    const ledgerPath = PathUtils.join(root, LAYOUT.ledger);
+    const text = readTextSync(ledgerPath);
+    if (text === null) return null;
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const rec = parsed as Record<string, unknown>;
+    if (rec["version"] !== 1 || rec["clean"] !== true) return null;
+    if (typeof rec["run"] !== "string" || rec["run"].length === 0) return null;
+    const bodyBytes = rec["bodyBytes"];
+    const detailBytes = rec["detailBytes"];
+    const bodyCount = rec["bodyCount"];
+    const detailCount = rec["detailCount"];
+    const siteCount = rec["siteCount"];
+    if (
+      !NONNEGATIVE_INT(bodyBytes) ||
+      !NONNEGATIVE_INT(detailBytes) ||
+      !NONNEGATIVE_INT(bodyCount) ||
+      !NONNEGATIVE_INT(detailCount) ||
+      !NONNEGATIVE_INT(siteCount)
+    ) {
+      return null;
+    }
+    const ledgerMtime = localFile(ledgerPath).lastModifiedTime;
+    if (ledgerMtime === undefined) return null;
+    if (
+      !ledgerConsistentWithDisk(
+        root,
+        ledgerMtime,
+        bodyCount,
+        detailCount,
+        siteCount,
+        bodyBytes,
+        detailBytes,
+      )
+    ) {
+      return null;
+    }
+    return { bodyBytes, detailBytes, bodyCount, detailCount };
+  } catch {
+    return null;
+  }
+};
+
+/** Validates prior clean ledger before marking this session active (`clean: false`) synchronously on disk. */
+export const openPersistedLedger = (
+  root: SafeFolder,
+  modes: Modes,
+  run: RunId,
+): ReturnType<typeof loadPersistedLedger> => {
+  const prior = loadPersistedLedger(root);
+  try {
+    writeAsciiSync(
+      PathUtils.join(root, LAYOUT.ledger),
+      JSON.stringify({
+        version: 1,
+        run,
+        clean: false,
+        bodyBytes: 0,
+        detailBytes: 0,
+        bodyCount: 0,
+        detailCount: 0,
+        siteCount: 0,
+      }),
+      modes,
+    );
+    return prior;
+  } catch {
+    return null;
+  }
 };

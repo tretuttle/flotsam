@@ -11,7 +11,7 @@
     "lint": "vp lint --report-unused-disable-directives",
     "knip": "knip",
     "knip:check": "knip --no-config-hints",
-    "test": "vp run -r test",
+    "test": "vp run -r --concurrency-limit 1 test",
     "fmt": "vp fmt",
     "fmt:check": "vp fmt --check",
     "check": "vp fmt --check && vp lint --report-unused-disable-directives && knip --no-config-hints && vp run typecheck && vp run test && vp run agent-context:check && vp run rename:check"

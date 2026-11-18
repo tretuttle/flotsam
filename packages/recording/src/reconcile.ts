@@ -114,7 +114,7 @@ export function planReconcile(snapshot: DirSnapshot): readonly ReconcileStep[] {
       steps.push({ kind: "delete-part", path: e.path });
   }
   for (const e of live) {
-    if (e.name.kind === "tmp" && isOld(snapshot, e.name.of === "settings" ? null : e.name.run))
+    if (e.name.kind === "tmp" && isOld(snapshot, e.name.of === "summary" ? e.name.run : null))
       steps.push({ kind: "delete-tmp", path: e.path });
   }
   const logs = live.filter(isLog);

@@ -46,7 +46,11 @@ export type RecordingProblem =
   | "settings-unreadable"
   | "write-failed"
   /** More requests were in flight at once than the recorder tracks; the extra ones were not recorded. */
-  | "too-many-live-requests";
+  | "too-many-live-requests"
+  /** A pinned export is holding the archive over its retention cap. */
+  | "over-cap-while-exporting"
+  /** Unreadable files or folders in the archive were skipped during startup scan. */
+  | "archive-entries-unreadable";
 
 export interface RecordingStatus {
   readonly recording: boolean;

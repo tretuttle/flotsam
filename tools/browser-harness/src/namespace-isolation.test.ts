@@ -170,6 +170,25 @@ describe("the user namespace probe", () => {
     });
   });
 
+  it("refuses a nested namespaced run inside an isolated PID namespace regardless of env", async () => {
+    const prev = process.env.ONE_CLICK_HAR_NAMESPACE_RUN;
+    try {
+      delete process.env.ONE_CLICK_HAR_NAMESPACE_RUN;
+      expect(await runNamespacedSuites("/nonexistent", null, { isolated: true })).toEqual({
+        outcome: "failed",
+        detail: "refusing to start a nested namespaced run inside an isolated PID namespace",
+      });
+      process.env.ONE_CLICK_HAR_NAMESPACE_RUN = "0";
+      expect(await runNamespacedSuites("/nonexistent", null, { isolated: true })).toEqual({
+        outcome: "failed",
+        detail: "refusing to start a nested namespaced run inside an isolated PID namespace",
+      });
+    } finally {
+      if (prev === undefined) delete process.env.ONE_CLICK_HAR_NAMESPACE_RUN;
+      else process.env.ONE_CLICK_HAR_NAMESPACE_RUN = prev;
+    }
+  });
+
   it.each([
     { name: "unshare succeeded", probe: { status: 0, stdout: "", stderr: "" }, refusal: null },
     {

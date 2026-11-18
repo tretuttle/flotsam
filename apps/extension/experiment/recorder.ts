@@ -68,6 +68,9 @@ const TOPICS: readonly string[] = [OPENING, ...Object.keys(EXAMINE_SOURCE), STOP
 
 const NS_BINDING_REDIRECTED = 0x804b0003;
 const STORAGE_SEGMENT = 16_384;
+const COPY_CHUNK = 65_536;
+const STARTUP_PER_STREAM_MAX = 4 * 1_048_576;
+const STARTUP_TOTAL_BUFFER_MAX = 16 * 1_048_576;
 const WATCHDOG_MS = 250;
 const UPLOAD_MAX = 1_048_576;
 /** Past this many live requests, new ones are not recorded and the overflow is counted. */
@@ -87,9 +90,10 @@ interface Sink {
   /** Set by the sink's own onStopRequest, after it closed its stream. */
   result: SinkResult | null;
   bytes: CopiedBytes | null;
-  /** file-tee only: the watchdog closes it at the cap; shutdown closes it so the tee stops writing. */
-  readonly output: FileOutputStream | null;
-  readonly part: string | null;
+  /** file-tee only: the watchdog/chunk guard closes it at the cap; shutdown closes it so the tee stops writing. */
+  id: ExchangeId | null;
+  output: FileOutputStream | null;
+  part: string | null;
   readonly cap: number;
   cappedAt: number | null;
 }
@@ -113,10 +117,14 @@ export interface Recorder {
   readonly counts: () => {
     readonly live: number;
     readonly overflow: number;
+    readonly overBudgetReentries: number;
+    readonly startupBufferedPeak: number;
+    readonly startupSuspends: number;
     readonly observerErrors: readonly string[];
     /** Main-thread milliseconds spent in each topic's observer, for the harness's cost breakdown. */
     readonly observerMs: Readonly<Record<string, number>>;
   };
+  resetGuardCounts(): void;
 }
 
 const optional = <T>(read: () => T): T | null => {
@@ -245,11 +253,16 @@ export function startRecorder(options: {
   let routes = options.routes;
   let stopped = false;
   let overflow = 0;
+  let overBudgetReentries = 0;
   let admitted = 0;
+  let startupBufferedBytes = 0;
+  let startupBufferedPeak = 0;
+  let startupSuspends = 0;
   const observerErrors: string[] = [];
   const observerMs: Record<string, number> = {};
   const live = new Map<number, LiveEntry>();
   const watched = new Set<Sink>();
+  const pendingStartup = new Set<() => void>();
   let watchdog: { cancel(): void } | null = null;
   const neverStore = (): boolean => store.settings().user.secretStorage === "never-store";
 
@@ -336,16 +349,23 @@ export function startRecorder(options: {
     watched.add(sink);
     watchdog ??= timers.repeat(WATCHDOG_MS, () => {
       for (const each of watched) {
-        if (each.result !== null || each.part === null || each.output === null) {
+        if (
+          each.result !== null ||
+          each.part === null ||
+          each.output === null ||
+          each.id === null
+        ) {
           watched.delete(each);
           continue;
         }
         const size = optional(() => localFile(each.part ?? "").fileSize) ?? 0;
-        if (size >= each.cap) {
+        const budget = store.partBudget(each.id, each.cap);
+        if (size >= budget) {
           optional(() => each.output?.close());
           each.cappedAt = size;
           watched.delete(each);
         }
+        store.updatePart(each.id, size);
       }
       if (watched.size === 0) {
         watchdog?.cancel();
@@ -394,6 +414,7 @@ export function startRecorder(options: {
     entry: LiveEntry,
     route: Extract<Route, { readonly kind: "memory-tee" | "file-tee" }>,
     id: ExchangeId,
+    expectedBytes: ByteCount | null,
   ): Sink => {
     const traceable = entry.channel.QueryInterface(Ci.nsITraceableChannel);
     const tee = Cc["@mozilla.org/network/stream-listener-tee;1"].createInstance(
@@ -406,6 +427,7 @@ export function startRecorder(options: {
       const sink: Sink = {
         result: null,
         bytes: null,
+        id: null,
         output: null,
         part: null,
         cap: route.cap,
@@ -426,6 +448,490 @@ export function startRecorder(options: {
       return sink;
     }
     const part = PathUtils.join(root, ...partPath(id));
+    const guardFileChunk = (
+      streamTee: StreamListener,
+      getOriginal: () => StreamListener,
+      partId: ExchangeId,
+      sink: Sink,
+      projectedRef: { value: number },
+      closeAtCap: (size: number) => void,
+      cappedRef: { value: boolean },
+      request: unknown,
+      stream: InputStream,
+      offset: number,
+      count: number,
+    ): void => {
+      if (cappedRef.value) {
+        getOriginal().onDataAvailable(request, stream, offset, count);
+        return;
+      }
+      if (count > 0) {
+        const current = optional(() => localFile(part).fileSize) ?? projectedRef.value;
+        const budget = store.partBudget(partId, sink.cap);
+        if (current >= budget) {
+          if (budget > 0 && current > 0) overBudgetReentries += 1;
+          closeAtCap(current);
+          getOriginal().onDataAvailable(request, stream, offset, count);
+          return;
+        }
+        streamTee.onDataAvailable(request, stream, offset, count);
+        const after = optional(() => localFile(part).fileSize) ?? current + count;
+        projectedRef.value = after;
+        if (after >= budget) closeAtCap(after);
+        else store.updatePart(partId, after);
+        return;
+      }
+      streamTee.onDataAvailable(request, stream, offset, count);
+    };
+    const scanDone = store.isScanCompleted();
+    const initialBudget = scanDone ? route.cap : store.partBudget(id, route.cap);
+    if (store.needsStartupBuffer(expectedBytes) || (!scanDone && initialBudget === 0)) {
+      if (
+        store.isReady() &&
+        !scanDone &&
+        initialBudget === 0 &&
+        startupBufferedBytes >= STARTUP_TOTAL_BUFFER_MAX
+      ) {
+        const sink: Sink = {
+          result: null,
+          bytes: null,
+          id: null,
+          output: null,
+          part: null,
+          cap: route.cap,
+          cappedAt: 0,
+        };
+        let original!: StreamListener;
+        const passListener: StreamListener = {
+          onStartRequest: (request) => original.onStartRequest(request),
+          onDataAvailable: (request, stream, offset, count) =>
+            original.onDataAvailable(request, stream, offset, count),
+          onStopRequest: (request, status) => {
+            original.onStopRequest(request, status);
+            if (stopped) return;
+            sink.result = {
+              kind: "closed",
+              bytes: 0 as ByteCount,
+              cappedAt: 0 as ByteCount,
+              cutWhy: "scan-timeout",
+            };
+            sink.bytes = null;
+            commit(entry);
+          },
+        };
+        original = traceable.setNewListener(passListener);
+        return sink;
+      }
+      const storage = Cc["@mozilla.org/storagestream;1"].createInstance(Ci.nsIStorageStream);
+      storage.init(STORAGE_SEGMENT, Math.max(route.cap, 1));
+      const storageOut = storage.getOutputStream(0);
+      const sink: Sink = {
+        result: null,
+        bytes: null,
+        id,
+        output: null,
+        part: null,
+        cap: route.cap,
+        cappedAt: null,
+      };
+      let phase: "buffering" | "flushing" | "file" | "done" = "buffering";
+      const cappedRef = { value: false };
+      let storageClosed = false;
+      let cappedStorageBytes: number | null = null;
+      let cutWhy: "scan-timeout" | null = null;
+      let suspended = false;
+      let buffered = 0;
+      const projectedRef = { value: 0 };
+      let stopPending: { readonly request: unknown; readonly status: number } | null = null;
+      let unsubscribeReady: () => void = () => undefined;
+      let unsubscribeScan: (() => void) | null = null;
+      let flushOverflow: StorageStream | null = null;
+      let flushOverflowOut: ReturnType<StorageStream["getOutputStream"]> | null = null;
+      let flushOverflowTee: StreamListenerTee | null = null;
+      const fileObserver: RequestObserver = {
+        onStartRequest: () => undefined,
+        onStopRequest: () => {
+          optional(() => sink.output?.close());
+          watched.delete(sink);
+          if (stopped) return;
+          const bytes = optional(() => localFile(part).fileSize) ?? projectedRef.value;
+          store.updatePart(id, bytes);
+          sink.result = {
+            kind: "closed",
+            bytes: bytes as ByteCount,
+            cappedAt: (sink.cappedAt ?? (bytes >= sink.cap ? bytes : null)) as ByteCount | null,
+          };
+          sink.bytes = { kind: "part", id };
+          commit(entry);
+        },
+      };
+      const storageTee = Cc["@mozilla.org/network/stream-listener-tee;1"].createInstance(
+        Ci.nsIStreamListenerTee,
+      );
+      let fileTee: StreamListenerTee | null = null;
+      const closeStorageOut = (capAt: number | null): void => {
+        if (!storageClosed) {
+          storageClosed = true;
+          optional(() => storageOut.close());
+        }
+        if (capAt !== null && cappedStorageBytes === null) {
+          cappedStorageBytes = capAt;
+        }
+      };
+      const closeAtCap = (size: number): void => {
+        cappedRef.value = true;
+        if (phase === "buffering") {
+          closeStorageOut(size);
+        } else {
+          optional(() => flushOverflowOut?.close());
+          optional(() => sink.output?.close());
+          if (phase === "file") store.updatePart(id, size);
+        }
+        sink.cappedAt = size;
+        watched.delete(sink);
+      };
+      const closeAtScanTimeout = (size: number): void => {
+        cappedRef.value = true;
+        cutWhy = "scan-timeout";
+        closeStorageOut(size);
+        sink.cappedAt = size;
+        watched.delete(sink);
+      };
+      const releaseStartup = (): void => {
+        if (buffered > 0) {
+          startupBufferedBytes = Math.max(0, startupBufferedBytes - buffered);
+        }
+        pendingStartup.delete(abortStartup);
+        unsubscribeReady();
+        unsubscribeScan?.();
+        unsubscribeScan = null;
+      };
+      const abortStartup = (): void => {
+        unsubscribeReady();
+        unsubscribeScan?.();
+        unsubscribeScan = null;
+        if (suspended) {
+          suspended = false;
+          optional(() => entry.channel.resume());
+        }
+        closeStorageOut(null);
+        optional(() => flushOverflowOut?.close());
+      };
+      const startFileFlush = (): void => {
+        if (phase !== "buffering") return;
+        if (stopped) {
+          phase = "flushing";
+          pendingStartup.delete(abortStartup);
+          abortStartup();
+          return;
+        }
+        if (cappedRef.value) return;
+        const budget = store.partBudget(id, sink.cap);
+        if (budget === 0 && !store.isScanCompleted()) {
+          if (suspended) {
+            suspended = false;
+            optional(() => entry.channel.resume());
+          }
+          if (unsubscribeScan === null) {
+            unsubscribeScan = store.onScanComplete(startFileFlush);
+          }
+          return;
+        }
+        phase = "flushing";
+        if (!suspended) {
+          suspended = true;
+          optional(() => entry.channel.suspend());
+        }
+        closeStorageOut(null);
+        let output: FileOutputStream;
+        try {
+          output = openOutput(part, false, modes);
+        } catch (error) {
+          const name = errorName((error as { result?: number }).result ?? 0);
+          releaseStartup();
+          phase = "done";
+          sink.result = { kind: "prepare-failed", why: PREPARE_FAILURES[name] ?? "other" };
+          if (suspended) {
+            suspended = false;
+            optional(() => entry.channel.resume());
+          }
+          if (stopPending !== null) {
+            const pending = stopPending;
+            stopPending = null;
+            original.onStopRequest(pending.request, pending.status);
+          }
+          return;
+        }
+        sink.output = output;
+        sink.part = part;
+        const tee2 = Cc["@mozilla.org/network/stream-listener-tee;1"].createInstance(
+          Ci.nsIStreamListenerTee,
+        );
+        tee2.init(original, output, fileObserver);
+        fileTee = tee2;
+        store.openPart(id, part, buffered);
+        if (budget === 0) {
+          store.updatePart(id, 0);
+          projectedRef.value = 0;
+          cappedRef.value = true;
+          sink.cappedAt = 0;
+        } else {
+          store.updatePart(id, buffered);
+          projectedRef.value = buffered;
+          if (buffered >= budget) {
+            cappedRef.value = true;
+            sink.cappedAt = buffered;
+          }
+        }
+        const finishSwitch = (): void => {
+          releaseStartup();
+          if (stopped) {
+            optional(() => output.close());
+            if (suspended) {
+              suspended = false;
+              optional(() => entry.channel.resume());
+            }
+            return;
+          }
+          phase = "file";
+          if (cappedRef.value) optional(() => output.close());
+          else watch(sink);
+          if (suspended) {
+            suspended = false;
+            optional(() => entry.channel.resume());
+          }
+          if (stopPending !== null) {
+            const pending = stopPending;
+            stopPending = null;
+            tee2.onStopRequest(pending.request, pending.status);
+          }
+        };
+        if (buffered === 0 || budget === 0) {
+          finishSwitch();
+          return;
+        }
+        const transport = Cc["@mozilla.org/network/stream-transport-service;1"].getService(
+          Ci.nsIEventTarget,
+        );
+        const copyStreamToOutput = (inputStream: InputStream, done: () => void): void => {
+          const copier = Cc["@mozilla.org/network/async-stream-copier;1"].createInstance(
+            Ci.nsIAsyncStreamCopier,
+          );
+          copier.init(inputStream, output, transport, true, false, COPY_CHUNK, true, false);
+          copier.asyncCopy(
+            {
+              onStartRequest: () => undefined,
+              onStopRequest: () => done(),
+            },
+            null,
+          );
+        };
+        const afterInitialCopy = (): void => {
+          optional(() => flushOverflowOut?.close());
+          const extra = flushOverflow;
+          flushOverflow = null;
+          flushOverflowOut = null;
+          flushOverflowTee = null;
+          if (extra === null || extra.length === 0 || stopped || cappedRef.value) {
+            finishSwitch();
+            return;
+          }
+          const nextTotal = projectedRef.value + extra.length;
+          projectedRef.value = nextTotal;
+          store.updatePart(id, nextTotal);
+          if (nextTotal >= store.partBudget(id, sink.cap)) {
+            cappedRef.value = true;
+            sink.cappedAt = nextTotal;
+          }
+          copyStreamToOutput(extra.newInputStream(0), finishSwitch);
+        };
+        copyStreamToOutput(storage.newInputStream(0), afterInitialCopy);
+      };
+      const appendBufferedChunk = (
+        request: unknown,
+        stream: InputStream,
+        offset: number,
+        count: number,
+      ): void => {
+        storageTee.onDataAvailable(request, stream, offset, count);
+        const nextLen = storage.length;
+        const delta = Math.max(0, nextLen - buffered);
+        buffered = nextLen;
+        startupBufferedBytes += delta;
+        if (startupBufferedBytes > startupBufferedPeak) {
+          startupBufferedPeak = startupBufferedBytes;
+        }
+      };
+      const appendFlushOverflowChunk = (
+        request: unknown,
+        stream: InputStream,
+        offset: number,
+        count: number,
+      ): void => {
+        if (flushOverflow === null || flushOverflowTee === null) {
+          flushOverflow = Cc["@mozilla.org/storagestream;1"].createInstance(Ci.nsIStorageStream);
+          flushOverflow.init(STORAGE_SEGMENT, Math.max(sink.cap, 1));
+          flushOverflowOut = flushOverflow.getOutputStream(0);
+          flushOverflowTee = Cc["@mozilla.org/network/stream-listener-tee;1"].createInstance(
+            Ci.nsIStreamListenerTee,
+          );
+          flushOverflowTee.init(original, flushOverflowOut, {
+            onStartRequest: () => undefined,
+            onStopRequest: () => undefined,
+          });
+        }
+        flushOverflowTee.onDataAvailable(request, stream, offset, count);
+      };
+      const guardListener: StreamListener = {
+        onStartRequest: (request) => storageTee.onStartRequest(request),
+        onDataAvailable: (request, stream, offset, count) => {
+          if (phase === "buffering") {
+            // Once storageOut is closed, never call storageTee.onDataAvailable: Gecko nsIStorageStream grows length with 0xE5 fill after Close().
+            if (cappedRef.value || storageClosed) {
+              original.onDataAvailable(request, stream, offset, count);
+              return;
+            }
+            if (count > 0) {
+              if (buffered >= sink.cap) {
+                closeAtCap(buffered);
+                original.onDataAvailable(request, stream, offset, count);
+                return;
+              }
+              const postTimeout = store.isReady() && !store.isScanCompleted();
+              if (postTimeout) {
+                if (
+                  buffered >= STARTUP_PER_STREAM_MAX ||
+                  startupBufferedBytes >= STARTUP_TOTAL_BUFFER_MAX
+                ) {
+                  closeAtScanTimeout(buffered);
+                  original.onDataAvailable(request, stream, offset, count);
+                  return;
+                }
+                appendBufferedChunk(request, stream, offset, count);
+                if (buffered >= sink.cap) {
+                  closeAtCap(buffered);
+                } else if (
+                  buffered >= STARTUP_PER_STREAM_MAX ||
+                  startupBufferedBytes >= STARTUP_TOTAL_BUFFER_MAX
+                ) {
+                  closeAtScanTimeout(buffered);
+                }
+                return;
+              }
+              const budget = store.isScanCompleted() ? store.partBudget(id, sink.cap) : sink.cap;
+              if (buffered >= budget) {
+                if (budget > 0 && buffered > 0) overBudgetReentries += 1;
+                closeAtCap(buffered);
+                original.onDataAvailable(request, stream, offset, count);
+                return;
+              }
+              appendBufferedChunk(request, stream, offset, count);
+              if (buffered >= budget) {
+                closeAtCap(buffered);
+              } else if (
+                !suspended &&
+                (buffered >= STARTUP_PER_STREAM_MAX ||
+                  startupBufferedBytes >= STARTUP_TOTAL_BUFFER_MAX)
+              ) {
+                suspended = true;
+                startupSuspends += 1;
+                optional(() => entry.channel.suspend());
+              }
+              return;
+            }
+            storageTee.onDataAvailable(request, stream, offset, count);
+            return;
+          }
+          if (phase === "flushing" || fileTee === null) {
+            if (cappedRef.value) {
+              original.onDataAvailable(request, stream, offset, count);
+              return;
+            }
+            if (count > 0) {
+              appendFlushOverflowChunk(request, stream, offset, count);
+              return;
+            }
+            original.onDataAvailable(request, stream, offset, count);
+            return;
+          }
+          guardFileChunk(
+            fileTee,
+            () => original,
+            id,
+            sink,
+            projectedRef,
+            closeAtCap,
+            cappedRef,
+            request,
+            stream,
+            offset,
+            count,
+          );
+        },
+        onStopRequest: (request, status) => {
+          if (phase === "buffering") {
+            phase = "done";
+            const savedBytes = cappedStorageBytes ?? storage.length;
+            const closedBeforeStop = storageClosed;
+            closeStorageOut(null);
+            releaseStartup();
+            if (closedBeforeStop) original.onStopRequest(request, status);
+            else storageTee.onStopRequest(request, status);
+            if (stopped) return;
+            if (cutWhy === "scan-timeout") {
+              sink.result = {
+                kind: "closed",
+                bytes: savedBytes as ByteCount,
+                cappedAt: savedBytes as ByteCount,
+                cutWhy: "scan-timeout",
+              };
+              sink.bytes =
+                savedBytes === 0
+                  ? null
+                  : {
+                      kind: "buffer",
+                      id,
+                      stream: storage.newInputStream(0),
+                      length: savedBytes,
+                    };
+              commit(entry);
+              return;
+            }
+            sink.result = {
+              kind: "closed",
+              bytes: savedBytes as ByteCount,
+              cappedAt: (sink.cappedAt ??
+                (savedBytes >= sink.cap ? savedBytes : null)) as ByteCount | null,
+            };
+            sink.bytes = {
+              kind: "buffer",
+              id,
+              stream: storage.newInputStream(0),
+              length: savedBytes,
+            };
+            commit(entry);
+            return;
+          }
+          if (phase === "flushing") {
+            stopPending = { request, status };
+            return;
+          }
+          (fileTee ?? storageTee).onStopRequest(request, status);
+        },
+      };
+      const original = traceable.setNewListener(guardListener);
+      storageTee.init(original, storageOut, {
+        onStartRequest: () => undefined,
+        onStopRequest: () => undefined,
+      });
+      pendingStartup.add(abortStartup);
+      if (store.isReady() && !store.isScanCompleted()) {
+        unsubscribeScan = store.onScanComplete(startFileFlush);
+      } else {
+        unsubscribeReady = store.onReady(startFileFlush);
+      }
+      return sink;
+    }
     let output: FileOutputStream;
     try {
       output = openOutput(part, false, modes);
@@ -434,30 +940,69 @@ export function startRecorder(options: {
       return {
         result: { kind: "prepare-failed", why: PREPARE_FAILURES[name] ?? "other" },
         bytes: null,
+        id: null,
         output: null,
         part: null,
         cap: route.cap,
         cappedAt: null,
       };
     }
-    const sink: Sink = { result: null, bytes: null, output, part, cap: route.cap, cappedAt: null };
+    store.openPart(id, part, expectedBytes ?? undefined);
+    const sink: Sink = {
+      result: null,
+      bytes: null,
+      id,
+      output,
+      part,
+      cap: route.cap,
+      cappedAt: null,
+    };
+    const cappedRef = { value: false };
+    const closeAtCap = (size: number): void => {
+      cappedRef.value = true;
+      optional(() => output.close());
+      sink.cappedAt = size;
+      watched.delete(sink);
+      store.updatePart(id, size);
+    };
     const observer: RequestObserver = {
       onStartRequest: () => undefined,
       onStopRequest: () => {
         optional(() => output.close());
+        watched.delete(sink);
         if (stopped) return;
         const bytes = optional(() => localFile(part).fileSize) ?? 0;
+        store.updatePart(id, bytes);
         sink.result = {
           kind: "closed",
           bytes: bytes as ByteCount,
-          // The watchdog can run late; a part that reached the cap is the body's first part however it ended.
+          // A part stopped at either the per-body cap or the remaining ledger budget keeps its first part.
           cappedAt: (sink.cappedAt ?? (bytes >= sink.cap ? bytes : null)) as ByteCount | null,
         };
         sink.bytes = { kind: "part", id };
         commit(entry);
       },
     };
-    const original = traceable.setNewListener(tee);
+    const projectedRef = { value: 0 };
+    const guardListener: StreamListener = {
+      onStartRequest: (request) => tee.onStartRequest(request),
+      onDataAvailable: (request, stream, offset, count) =>
+        guardFileChunk(
+          tee,
+          () => original,
+          id,
+          sink,
+          projectedRef,
+          closeAtCap,
+          cappedRef,
+          request,
+          stream,
+          offset,
+          count,
+        ),
+      onStopRequest: (request, status) => tee.onStopRequest(request, status),
+    };
+    const original = traceable.setNewListener(guardListener);
     tee.init(original, output, observer);
     watch(sink);
     return sink;
@@ -524,10 +1069,11 @@ export function startRecorder(options: {
       const copy = next.route;
       entry.sink =
         copy.kind === "memory-tee" || copy.kind === "file-tee"
-          ? startSink(entry, copy, id)
+          ? startSink(entry, copy, id, response.contentLength)
           : {
               result: { kind: "prepare-failed", why: "other" },
               bytes: null,
+              id: null,
               output: null,
               part: null,
               cap: 0,
@@ -575,6 +1121,8 @@ export function startRecorder(options: {
       for (const topic of TOPICS) optional(() => Services.obs.removeObserver(observer, topic));
       watchdog?.cancel();
       watchdog = null;
+      for (const abort of pendingStartup) abort();
+      pendingStartup.clear();
       const abandoned = [...live.values()].map((entry) => {
         optional(() => entry.sink?.output?.close());
         const { capture } = entry;
@@ -598,6 +1146,19 @@ export function startRecorder(options: {
         const response = capture.phase === "opened" ? null : capture.facts.response;
         return { site: entry.site, live: { request, response, phase: capture.phase } };
       }),
-    counts: () => ({ live: live.size, overflow, observerErrors, observerMs }),
+    counts: () => ({
+      live: live.size,
+      overflow,
+      overBudgetReentries,
+      startupBufferedPeak,
+      startupSuspends,
+      observerErrors,
+      observerMs,
+    }),
+    resetGuardCounts: () => {
+      overBudgetReentries = 0;
+      startupBufferedPeak = 0;
+      startupSuspends = 0;
+    },
   };
 }

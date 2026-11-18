@@ -281,6 +281,14 @@ describe("oneClickHar contract", () => {
       problems: ["archive-refused", "write-failed"],
     });
     expect((await api.getPopup({ tabId: null })).problems).toEqual([]);
+    expect(recordingStatus({ ...healthy, overCapWhileExporting: true })).toEqual({
+      recording: true,
+      problems: ["over-cap-while-exporting"],
+    });
+    expect(recordingStatus({ ...healthy, unreadableEntries: 2 })).toEqual({
+      recording: true,
+      problems: ["archive-entries-unreadable"],
+    });
   });
 
   it("fails the key comparison when a returned variable carries an extra property", async () => {

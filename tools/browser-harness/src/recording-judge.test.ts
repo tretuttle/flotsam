@@ -1,7 +1,15 @@
 import * as NodeCrypto from "node:crypto";
 import { describe, expect, it } from "vite-plus/test";
 import type { BodyLocation, SettledExchange, StopFacts } from "@one-click-har/recording/exchange";
-import type { ByteCount, EpochMs, ExchangeId, PackId, Site } from "@one-click-har/recording/ids";
+import type {
+  ByteCount,
+  EpochMs,
+  ExchangeId,
+  LogSegmentId,
+  PackId,
+  Site,
+} from "@one-click-har/recording/ids";
+import { encodeLine, encodeSummary, summarize } from "@one-click-har/recording/log";
 import type { BodyRouteId } from "@one-click-har/recording/routes";
 import type { ArchiveEntry, ArchiveLine } from "./archive.ts";
 import { ID_ENDLESS_CHUNK } from "./extended-fixtures.ts";
@@ -9,9 +17,13 @@ import {
   flipFirstByte,
   identityExpectations,
   judgeArchiveModes,
+  judgeArchiveOracle,
   judgeDownloads,
+  judgeExcludeDuringTee,
   judgeExpectations,
+  judgeRetentionRun,
   judgeStoredBodies,
+  judgeSummaryFiles,
   ROUTE_ROWS,
   routeExpectations,
 } from "./recording-judge.ts";
@@ -291,5 +303,209 @@ describe("archive files", () => {
     expect(judgeDownloads(["/data/one-click-har/x.har"], "/data")).toMatch(
       /points into the data home/,
     );
+  });
+
+  it("flags torn, missing, size-mismatched, or line-dropping summary files", () => {
+    const segId = "127.0.0.1/r0-0" as LogSegmentId;
+    const first = { v: 2 as const, exchange: answered("/poll") };
+    const second = { v: 2 as const, exchange: answered("/poll", { status: 200 }) };
+    const oneText = encodeLine(first);
+    const twoText = `${oneText}${encodeLine(second)}`;
+    const validOne = encodeSummary(summarize(segId, [first], oneText.length as ByteCount));
+    const droppedLineSameBytes = encodeSummary(
+      summarize(segId, [second], twoText.length as ByteCount),
+    );
+    expect(
+      judgeSummaryFiles([
+        {
+          name: "r0-0.summary.json",
+          raw: validOne,
+          segmentBytes: oneText.length,
+          segmentText: oneText,
+        },
+      ]),
+    ).toEqual([]);
+    expect(
+      judgeSummaryFiles([
+        {
+          name: "r0-0.summary.json",
+          raw: "{corrupt",
+          segmentBytes: oneText.length,
+          segmentText: oneText,
+        },
+      ]),
+    ).toHaveLength(1);
+    expect(
+      judgeSummaryFiles([
+        {
+          name: "r0-0.summary.json",
+          raw: validOne,
+          segmentBytes: 999,
+          segmentText: oneText,
+        },
+      ]),
+    ).toHaveLength(1);
+    expect(
+      judgeSummaryFiles([
+        {
+          name: "r0-0.summary.json",
+          raw: null,
+          segmentBytes: oneText.length,
+          segmentText: oneText,
+        },
+      ]),
+    ).toHaveLength(1);
+    expect(
+      judgeSummaryFiles([
+        {
+          name: "r0-0.summary.json",
+          raw: droppedLineSameBytes,
+          segmentBytes: twoText.length,
+          segmentText: twoText,
+        },
+      ]).join("\n"),
+    ).toMatch(/summary lines 1 != segment lines 2/);
+  });
+
+  it("flags ledger/disk skew, missing or modified pins, leftover parts, and missing summaries in archive oracle", () => {
+    const cleanDisk = {
+      partBytes: 0,
+      partCount: 0,
+      packBytes: 1000,
+      bodyFileBytes: 2000,
+      bodyBytes: 3000,
+      logBytes: 400,
+      summaryBytes: 120,
+      detailBytes: 520,
+      summaries: [],
+      missingSummarySegments: [],
+    };
+    const cleanUsage = { bodyBytes: 3000, detailBytes: 520 };
+    expect(
+      judgeArchiveOracle({
+        step: "clean",
+        usage: cleanUsage,
+        disk: cleanDisk,
+        pinned: [{ label: "p0", exists: true, expectedSha256: "abc", actualSha256: "abc" }],
+        expectZeroParts: true,
+        maxBodyBytes: 5000,
+        requireAllSummarized: true,
+      }),
+    ).toEqual([]);
+    expect(
+      judgeArchiveOracle({
+        step: "bad-body",
+        usage: { bodyBytes: 13000, detailBytes: 520 },
+        disk: cleanDisk,
+      }).join("\n"),
+    ).toMatch(/usage\.bodyBytes 13000 != disk 3000/);
+    expect(
+      judgeArchiveOracle({
+        step: "bad-detail",
+        usage: { bodyBytes: 3000, detailBytes: 999 },
+        disk: cleanDisk,
+      }).join("\n"),
+    ).toMatch(/usage\.detailBytes 999 != disk 520/);
+    expect(
+      judgeArchiveOracle({
+        step: "deleted-pin",
+        usage: cleanUsage,
+        disk: cleanDisk,
+        pinned: [{ label: "p0", exists: false }],
+      }).join("\n"),
+    ).toMatch(/pinned file missing/);
+    expect(
+      judgeArchiveOracle({
+        step: "leftover-part",
+        usage: cleanUsage,
+        disk: { ...cleanDisk, partCount: 1 },
+        expectZeroParts: true,
+      }).join("\n"),
+    ).toMatch(/expected 0 parts/);
+    expect(
+      judgeArchiveOracle({
+        step: "missing-summary",
+        usage: cleanUsage,
+        disk: { ...cleanDisk, missingSummarySegments: ["site/seg.jsonl"] },
+        requireAllSummarized: true,
+      }).join("\n"),
+    ).toMatch(/missing summary/);
+  });
+
+  it("catches planted retention failures: uncapped growth, deleted pinned pack, deleted newest pack, missing problem", () => {
+    const clean = {
+      capBytes: 64 * 1_048_576,
+      flushBatchBytes: 2 * 1_048_576,
+      totalServedBytes: 90 * 1_048_576,
+      duSamples: [30 * 1_048_576, 65 * 1_048_576, 64 * 1_048_576],
+      duAfterFlush: 63 * 1_048_576,
+      pinCheck: {
+        oldestPackIsActuallyOldest: true,
+        oldestPackExistsBeforeUnpin: true,
+        newestPackExistsBeforeUnpin: true,
+        problemsBeforeUnpin: ["over-cap-while-exporting"],
+        oldestPackExistsAfterUnpin: false,
+        problemsAfterUnpin: [],
+        duAfterUnpin: 62 * 1_048_576,
+      },
+    };
+    expect(judgeRetentionRun(clean)).toEqual([]);
+    expect(judgeRetentionRun({ ...clean, duSamples: [80 * 1_048_576] }).join("\n")).toMatch(
+      /> cap\+batch/,
+    );
+    expect(
+      judgeRetentionRun({
+        ...clean,
+        usageBodyBytesAfterFlush: 50_000_000,
+        diskBodyBytesAfterFlush: 60_000_000,
+      }).join("\n"),
+    ).toMatch(/usage\.bodyBytes after flush/);
+    expect(
+      judgeRetentionRun({
+        ...clean,
+        pinCheck: { ...clean.pinCheck, oldestPackIsActuallyOldest: false },
+      }).join("\n"),
+    ).toMatch(/did not pin the oldest pack/);
+    expect(
+      judgeRetentionRun({
+        ...clean,
+        pinCheck: { ...clean.pinCheck, oldestPackExistsBeforeUnpin: false },
+      }).join("\n"),
+    ).toMatch(/deleted a pinned pack/);
+    expect(
+      judgeRetentionRun({
+        ...clean,
+        pinCheck: { ...clean.pinCheck, newestPackExistsBeforeUnpin: false },
+      }).join("\n"),
+    ).toMatch(/deleted the newest pack/);
+    expect(
+      judgeRetentionRun({
+        ...clean,
+        pinCheck: { ...clean.pinCheck, problemsBeforeUnpin: [] },
+      }).join("\n"),
+    ).toMatch(/over-cap-while-exporting not reported/);
+  });
+
+  it("catches planted exclude-during-tee failures", () => {
+    const clean = {
+      excludedSite: "127.0.0.1",
+      siteDirExistsDuringTee: false,
+      sitesIndexDuringTee: [],
+      partCountDuringTee: 1,
+      siteDirExistsAfterStop: false,
+      partsAfterStop: [],
+      sitesIndexAfterStop: [],
+      problems: [],
+    };
+    expect(judgeExcludeDuringTee(clean)).toEqual([]);
+    expect(judgeExcludeDuringTee({ ...clean, siteDirExistsAfterStop: true }).join("\n")).toMatch(
+      /site directory reappeared/,
+    );
+    expect(judgeExcludeDuringTee({ ...clean, partsAfterStop: ["r.1.part"] }).join("\n")).toMatch(
+      /part files left/,
+    );
+    expect(
+      judgeExcludeDuringTee({ ...clean, sitesIndexAfterStop: ["127.0.0.1"] }).join("\n"),
+    ).toMatch(/reappeared in index/);
   });
 });

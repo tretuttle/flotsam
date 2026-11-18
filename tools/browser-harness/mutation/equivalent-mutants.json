@@ -17,7 +17,5 @@
   "src/namespace-isolation.ts spawnIsolated condition: sentinel === undefined -> false": "This process can always read its own /proc entry, so the sentinel is never undefined.",
   "src/namespace-isolation.ts spawnIsolated property: cwd: options.cwd, -> (removed)": "Every caller runs with the same working directory it passes, so inheriting it changes nothing.",
   "src/namespace-isolation.ts runNamespacedSuites property: cwd: packageDir, -> (removed)": "Every caller runs with the same working directory it passes, so inheriting it changes nothing.",
-  "src/namespace-isolation.ts runNamespacedSuites property: , force: true -> (removed)": "The private TMPDIR always exists when it is removed, so `force` never matters.",
-  "src/namespace-isolation.ts runNamespacedSuites boolean: true -> false #2": "The private TMPDIR always exists when it is removed, so `force` never matters.",
   "src/browser.ts spawnLeasedBrowser condition: spawned.ownership !== null -> true": "Ownership is null only when the child exits before its start time is read, a race no test can force."
 }

@@ -86,19 +86,25 @@ export type BodyLocation =
 
 /** What the sink reported after its own onStopRequest closed it. The adapter builds it; settle trusts it. */
 export type SinkResult =
-  | { readonly kind: "closed"; readonly bytes: ByteCount; readonly cappedAt: ByteCount | null }
+  | {
+      readonly kind: "closed";
+      readonly bytes: ByteCount;
+      readonly cappedAt: ByteCount | null;
+      readonly cutWhy?: "scan-timeout";
+    }
   | { readonly kind: "prepare-failed"; readonly why: "disk-full" | "access-denied" | "other" };
 
-export type IncompleteReason = "network-aborted" | "write-failed";
+export type IncompleteReason = "network-aborted" | "write-failed" | "scan-timeout";
 /** isAppShutdown true is the browser closing; false is a disable, uninstall or update of this add-on (deepseek F5). */
 export type AbandonReason = "browser-closed" | "recording-stopped";
 
 /**
  * How a stored body was checked at stop. length-matched: the count equals encodedBodySize, or Content-Length where
  * that is 0. sink-only: neither exists (a service-worker body of unknown length, row R5). first-part: the watchdog
- * closed the file at the body cap, so these are the body's first bytes and the rest was never kept.
+ * closed the file at the body cap, so these are the body's first bytes and the rest was never kept. scan-timeout:
+ * startup retention scan timed out and the RAM buffer capped out before disk budget could open.
  */
-export type BodyCheck = "length-matched" | "sink-only" | "first-part";
+export type BodyCheck = "length-matched" | "sink-only" | "first-part" | "scan-timeout";
 
 /** The protocol has no body: HEAD, 1xx, 204, 205, a redirect hop, a 304 that was not merged, or zero bytes. */
 type EmptyBody = { readonly kind: "empty" };
@@ -322,8 +328,15 @@ export const SETTLE_RULES: readonly SettleRule[] = [
   {
     id: "capped",
     when: (i) => i.sink.kind === "closed" && i.sink.cappedAt !== null,
-    body: (i, at) => storedAt(i, at, "first-part"),
-    why: "The watchdog closed the file at the body cap and the page was not affected (proto-premise 9). Its first part is kept, however the request ended.",
+    body: (i, at) => {
+      if (i.sink.kind === "closed" && i.sink.cutWhy === "scan-timeout") {
+        return i.sink.bytes === 0
+          ? { kind: "incomplete", reason: "scan-timeout" }
+          : storedAt(i, at, "scan-timeout");
+      }
+      return storedAt(i, at, "first-part");
+    },
+    why: "The watchdog closed the file at the body cap or scan-timeout buffer limit and the page was not affected (proto-premise 9). Any kept prefix is stored with its true reason, however the request ended.",
   },
   {
     id: "stop-failed",

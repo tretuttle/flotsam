@@ -23,6 +23,8 @@ export interface RecordingFacts {
   readonly settingsRejected: boolean;
   readonly writeFailures: number;
   readonly liveOverflow: number;
+  readonly overCapWhileExporting?: boolean;
+  readonly unreadableEntries?: number;
 }
 
 /** One row per problem, in the order the status lists them. */
@@ -36,6 +38,8 @@ const PROBLEM_RULES: readonly {
   { problem: "settings-unreadable", when: (f) => f.settingsRejected },
   { problem: "write-failed", when: (f) => f.writeFailures > 0 },
   { problem: "too-many-live-requests", when: (f) => f.liveOverflow > 0 },
+  { problem: "over-cap-while-exporting", when: (f) => f.overCapWhileExporting === true },
+  { problem: "archive-entries-unreadable", when: (f) => (f.unreadableEntries ?? 0) > 0 },
 ];
 
 export const recordingStatus = (facts: RecordingFacts): RecordingStatus => ({

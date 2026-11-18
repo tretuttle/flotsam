@@ -51,6 +51,7 @@ describe("the loss tables", () => {
       "not-recordable-here": "unavailable",
       "network-aborted": "aborted",
       "write-failed": "unavailable",
+      "scan-timeout": "unavailable",
       "over-body-cap": "size-limit",
       "browser-closed": "aborted",
       "recording-stopped": "aborted",

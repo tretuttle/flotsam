@@ -277,6 +277,7 @@ export function parseSiteDir(dir: string): Site | null {
  */
 export const LAYOUT = {
   settings: "settings.json",
+  ledger: "ledger.json",
   exportsJournal: "exports.jsonl",
   incomingDir: "incoming",
   sitesDir: "sites",
@@ -347,8 +348,8 @@ export type ArchiveName =
     } & InSite)
   | { readonly kind: "part"; readonly id: ExchangeId; readonly run: RunId }
   | ({ readonly kind: "body"; readonly id: ExchangeId; readonly run: RunId } & InSite)
-  /** settings.json.tmp: an interrupted settings write. It belongs to no run. */
-  | { readonly kind: "tmp"; readonly of: "settings" }
+  /** settings.json.tmp or ledger.json.tmp: an interrupted root JSON write. It belongs to no run. */
+  | { readonly kind: "tmp"; readonly of: "settings" | "ledger" }
   /** <segment>.summary.json.tmp: an interrupted summary write, of the segment's run. */
   | ({
       readonly kind: "tmp";
@@ -423,10 +424,11 @@ function inSiteFile(scope: InSite, folder: string, file: string): ArchiveName | 
 export function parseArchiveName(relativePath: readonly string[]): ArchiveName | null {
   const [first, second, third, fourth, ...rest] = relativePath;
   if (rest.length > 0 || first === undefined) return null;
-  if (second === undefined)
-    return first === `${LAYOUT.settings}${LAYOUT.tmpSuffix}`
-      ? { kind: "tmp", of: "settings" }
-      : null;
+  if (second === undefined) {
+    if (first === `${LAYOUT.settings}${LAYOUT.tmpSuffix}`) return { kind: "tmp", of: "settings" };
+    if (first === `${LAYOUT.ledger}${LAYOUT.tmpSuffix}`) return { kind: "tmp", of: "ledger" };
+    return null;
+  }
   if (first === LAYOUT.incomingDir) {
     const id =
       third === undefined && second.endsWith(".part")
@@ -449,5 +451,9 @@ export function parseArchiveName(relativePath: readonly string[]): ArchiveName |
 export const LOG_SEAL_BYTES = 2 * 1_048_576;
 /** @public */
 export const PACK_SEAL_BYTES = 8 * 1_048_576;
+/** Maximum pending pack bytes before an early flush fires in the store. @public */
+export const PACK_PENDING_MAX = 1_048_576;
+/** Maximum bytes buffered in one batch (pending below PACK_PENDING_MAX plus one memory-tee body). @public */
+export const FLUSH_BATCH_BYTES = 2 * PACK_PENDING_MAX;
 /** @public */
 export const ROTATE_IDLE_MS = 60_000;

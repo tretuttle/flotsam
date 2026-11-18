@@ -8,6 +8,7 @@ import {
   COST_ARMS,
   computeBudget,
   costBaselineFileName,
+  detectSlowArchiveCost,
   detectSlowArm,
   highLoadReason,
   readProcInfoFromChrome,
@@ -89,6 +90,42 @@ describe("three-arm cost measurement", () => {
     });
     expect(planted.ok).toBe(false);
     expect(planted.reason).toMatch(/extension median 95\.0 ms exceeded budget 80\.0 ms/);
+
+    expect(
+      detectSlowArchiveCost({
+        emptyDownloadMedianMs: 40,
+        fullDownloadMedianMs: 48,
+        emptyBrowseMedianMs: 280,
+        fullBrowseMedianMs: 300,
+      }),
+    ).toMatchObject({
+      ok: true,
+      downloadBudgetMs: 68,
+      browseBudgetMs: 345.4,
+      reason: null,
+    });
+
+    const slowDownload = detectSlowArchiveCost({
+      emptyDownloadMedianMs: 38.3,
+      fullDownloadMedianMs: 75.8,
+      emptyBrowseMedianMs: 280,
+      fullBrowseMedianMs: 295,
+    });
+    expect(slowDownload.ok).toBe(false);
+    expect(slowDownload.reason).toMatch(
+      /10,000-file download median 75\.8 ms exceeded budget 65\.5 ms/,
+    );
+
+    const slowBrowse = detectSlowArchiveCost({
+      emptyDownloadMedianMs: 40,
+      fullDownloadMedianMs: 46,
+      emptyBrowseMedianMs: 280,
+      fullBrowseMedianMs: 365,
+    });
+    expect(slowBrowse.ok).toBe(false);
+    expect(slowBrowse.reason).toMatch(
+      /10,000-file browse median 365\.0 ms exceeded budget 345\.4 ms/,
+    );
   });
 
   it("drives the panel arm through chrome toolbox open, netmonitor verification, and close", async () => {

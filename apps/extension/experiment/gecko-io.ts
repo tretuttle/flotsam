@@ -159,6 +159,27 @@ export class Timers {
     };
   }
 
+  once(ms: number, fire: () => void): { cancel(): void } {
+    const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    this.#live.add(timer);
+    timer.initWithCallback(
+      {
+        notify: () => {
+          this.#live.delete(timer);
+          fire();
+        },
+      },
+      ms,
+      Ci.nsITimer.TYPE_ONE_SHOT,
+    );
+    return {
+      cancel: () => {
+        timer.cancel();
+        this.#live.delete(timer);
+      },
+    };
+  }
+
   cancelAll(): void {
     for (const timer of this.#live) timer.cancel();
     this.#live.clear();

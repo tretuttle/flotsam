@@ -388,6 +388,10 @@ describe("archive names", () => {
       kind: "tmp",
       of: "settings",
     });
+    expect(parseArchiveName([`${LAYOUT.ledger}${LAYOUT.tmpSuffix}`])).toEqual({
+      kind: "tmp",
+      of: "ledger",
+    });
     const tmp = [...logSummaryPath(segment).slice(0, -1), "mhz01-3.summary.json.tmp"];
     expect(parseArchiveName(tmp)).toEqual({
       kind: "tmp",
@@ -413,6 +417,7 @@ describe("archive names", () => {
 
   it.each([
     [["settings.json"]],
+    [["ledger.json"]],
     [["exports.jsonl"]],
     [["incoming"]],
     [["incoming", "notes.txt"]],
