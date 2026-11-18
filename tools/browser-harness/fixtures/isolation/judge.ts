@@ -10,6 +10,7 @@ import {
   type Outcome,
   OUTCOMES,
   type Position,
+  PROBE_TABLE,
   type ProbeSpec,
   type Shape,
   type Verdict,
@@ -205,7 +206,7 @@ function leakOf(spec: ProbeSpec, denial: Denial, o: Observation): Verdict {
   return leakKind(spec);
 }
 
-type Judged = { readonly verdict: Verdict; readonly line: string };
+export type Judged = { readonly verdict: Verdict; readonly line: string };
 
 /** Why a target cannot carry a verdict: the witness did not find it as planned. Null when it did. */
 function witnessProblem(
@@ -358,6 +359,39 @@ function eachVerdict(
       ...judged.filter((t) => t.verdict !== "BLOCKED").map((t) => `${t.verdict} ${t.line}`),
     ].join("; "),
   };
+}
+
+/**
+ * The verdict one target got in the row of an `each` probe at one position, judged as the row judges it, so a rule
+ * about one target does not lean on the row's verdict over all of them.
+ */
+export function eachUnitVerdict(
+  input: IsolationRunInput,
+  probeId: string,
+  position: Position,
+  unit: string,
+): Judged {
+  const spec = PROBE_TABLE.find((s) => s.id === probeId);
+  const at = `${probeId}@${position}`;
+  if (spec?.shape !== "each")
+    return { verdict: "NO-RESULT", line: `${probeId} is not an each probe` };
+  const planned = input.targets[at] ?? input.targets[probeId] ?? [];
+  if (!planned.some((u) => unitKey(u) === unit))
+    return { verdict: "NO-RESULT", line: `${unit} was not planned for ${at}` };
+  const reports = input.browserRows.filter((r) => r.probe === probeId && r.position === position);
+  const each = (reports[0]?.observed as { readonly each?: unknown } | undefined)?.each;
+  if (reports.length !== 1 || !Array.isArray(each))
+    return {
+      verdict: "NO-RESULT",
+      line: `${String(reports.length)} rows for ${at}, expected one with per-target results`,
+    };
+  const mine = each.filter((e) => (e as { readonly target?: unknown } | null)?.target === unit);
+  if (mine.length !== 1)
+    return {
+      verdict: "NO-RESULT",
+      line: `${unit} -> ${String(mine.length)} results at ${at}, expected one`,
+    };
+  return judgeUnit(spec, denialAt(spec, position), unit, mine[0], input);
 }
 
 /** Whether a planned unit has the probe's shape. A shape not named here, or none at all, fits nothing. */

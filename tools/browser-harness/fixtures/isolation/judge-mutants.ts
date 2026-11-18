@@ -16,12 +16,14 @@ import type { IsolationRunInput } from "./judge.ts";
 import { PLANTS, readCheckResults, recordedIsolation } from "./regressions.ts";
 import type * as TargetsModule from "./targets.ts";
 import type { ExtraCheckId } from "./probe-table.ts";
+import type * as SubstitutionModule from "./substitution.ts";
+import type { SubstitutionEvidence } from "./substitution.ts";
 import type { CheckOutcome, PlanInput } from "./targets.ts";
 
-// Every operator mutant of the isolation judges (the row judge, the archive oracle, the probe table, the target plan
-// and witness, the target identities, the file readers, the disk rules and the exposure rules) must be killed, or be listed in equivalent-mutants.json with
-// its reason. A mutant is killed when it changes anything the judges print for a recorded real run: a verdict, an
-// ok, a count, a mismatch line, an extra check's detail, a disk or exposure problem. Or when a unit test fails.
+// Every operator mutant of the isolation judges (row judge, archive oracle, probe table, target plan and witness,
+// identities, file readers, disk, exposure and substitution rules) must be killed, or be listed in
+// equivalent-mutants.json with its reason. A mutant is killed when it changes anything the judges print for a
+// recorded real run (a verdict, an ok, a count, a mismatch, a check's detail, a problem) or fails a unit test.
 
 const HERE = import.meta.dirname;
 const PACKAGE_DIR = NodePath.resolve(HERE, "..", "..");
@@ -35,6 +37,7 @@ const MODULES = [
   "content.ts",
   "disk.ts",
   "exposure.ts",
+  "substitution.ts",
 ] as const;
 const EQUIVALENT_FILE = NodePath.join(HERE, "equivalent-mutants.json");
 
@@ -46,6 +49,8 @@ type Recorded = {
   readonly evidence: ArchiveEvidence;
   readonly exposure: ExposureEvidence;
   readonly disk: DiskEvidence;
+  /** Absent in runs recorded before the substitution rows existed; their rows are then kept as recorded. */
+  readonly substitution: SubstitutionEvidence | undefined;
   readonly planInput: PlanInput;
   readonly witnessResults: readonly (readonly [string, CheckOutcome])[];
 };
@@ -57,6 +62,7 @@ type Judges = {
   readonly identity: typeof IdentityModule;
   readonly disk: typeof DiskModule;
   readonly exposure: typeof ExposureModule;
+  readonly substitution: typeof SubstitutionModule;
 };
 
 function loadRecorded(runsDirs: readonly string[]): readonly Recorded[] {
@@ -81,6 +87,7 @@ function loadRecorded(runsDirs: readonly string[]): readonly Recorded[] {
         evidence: data["archiveEvidence"] as ArchiveEvidence,
         exposure: data["exposureEvidence"] as ExposureEvidence,
         disk: data["diskEvidence"] as DiskEvidence,
+        substitution: data["substitutionEvidence"] as SubstitutionEvidence | undefined,
         planInput: data["planInput"] as PlanInput,
         witnessResults: data["witnessResults"] as Recorded["witnessResults"],
       });
@@ -90,6 +97,12 @@ function loadRecorded(runsDirs: readonly string[]): readonly Recorded[] {
 }
 
 const REJUDGED = new Set(["disk-writes-allowed", "exposure-allowed"]);
+const SUBSTITUTION_IDS = new Set([
+  "substitution-name",
+  "substitution-target",
+  "substitution-reach",
+  "substitution-lifetime",
+]);
 
 const rejudged = (
   run: Recorded,
@@ -116,18 +129,36 @@ function replay(j: Judges, run: Recorded): string {
   const archiveIds = new Set(archiveChecks.map((c) => c.id));
   const disk = j.disk.diskProblems(run.disk);
   const exposure = j.exposure.exposureProblems(run.exposure);
-  const judgment = j.judge.judgeIsolationRun({
+  const input = {
     ...run.input,
     targets: plan.targets,
     witness,
     identity: j.identity.identities(run.planInput),
     places: j.identity.unitPlaces(plan.targets, run.planInput),
+  };
+  const evidence = run.substitution;
+  const substitution =
+    evidence === undefined
+      ? null
+      : j.substitution.judgeSubstitutions(
+          evidence,
+          (probe, url, position) => j.judge.eachUnitVerdict(input, probe, position, url),
+          input.csFileInjected,
+        );
+  const judgment = j.judge.judgeIsolationRun({
+    ...input,
     // In the order the check records them; a check that holds keeps the summary the check wrote for it.
     extraChecks: [
-      ...run.input.extraChecks.filter((c) => !archiveIds.has(c.id) && !REJUDGED.has(c.id)),
+      ...run.input.extraChecks.filter(
+        (c) =>
+          !archiveIds.has(c.id) &&
+          !REJUDGED.has(c.id) &&
+          (substitution === null || !SUBSTITUTION_IDS.has(c.id)),
+      ),
       rejudged(run, "disk-writes-allowed", disk),
       rejudged(run, "exposure-allowed", exposure),
       ...archiveChecks,
+      ...(substitution ?? []),
     ],
   });
   return JSON.stringify({ judgment, disk, exposure });
@@ -143,6 +174,7 @@ async function loadJudges(dir: string): Promise<Judges> {
     identity: (await load("identity.ts")) as typeof IdentityModule,
     disk: (await load("disk.ts")) as typeof DiskModule,
     exposure: (await load("exposure.ts")) as typeof ExposureModule,
+    substitution: (await load("substitution.ts")) as typeof SubstitutionModule,
   };
 }
 

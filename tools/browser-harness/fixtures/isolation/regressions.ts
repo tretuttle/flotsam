@@ -34,6 +34,20 @@ const TARGETS = "tools/browser-harness/fixtures/isolation/targets.ts";
 const ISOLATION = "tools/browser-harness/checks/isolation.ts";
 const IDENTITY = "tools/browser-harness/fixtures/isolation/identity.ts";
 const MANIFEST_ANCHOR = '  "experiment_apis": {';
+const WORKER_REGISTER =
+  "      resourceHandler().setSubstitution(WORKER_ROOT, this.extension.rootURI);";
+const WORKER_REMOVE =
+  "      if (this.#host !== null) resourceHandler().setSubstitution(WORKER_ROOT, null);";
+/** The worker name pointed at another folder, from the same place the product registers it. */
+const workerAt = (folder: string): Edit => ({
+  file: PARENT,
+  from: WORKER_REGISTER,
+  to: `      {
+        const at = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        at.initWithPath(${folder});
+        resourceHandler().setSubstitution(WORKER_ROOT, Services.io.newFileURI(at));
+      }`,
+});
 const KEY_LINE = "const key = archiveKeyFromBytes(randomBytes(ARCHIVE_KEY_BYTES));";
 const MODES_LINE = "const modes: Modes = { dir: row.dirMode, file: row.fileMode };";
 const STEPS_LINE = "  let steps: readonly ReconcileStep[] = [];";
@@ -208,7 +222,7 @@ ${STEPS_LINE}`,
   },
   {
     id: "resource-sub",
-    what: "the product maps resource://one-click-har/ to the archive with ALLOW_CONTENT_ACCESS",
+    what: "the product maps resource://one-click-har-data/ to the archive with ALLOW_CONTENT_ACCESS at startup",
     edits: [
       {
         file: PARENT,
@@ -217,7 +231,7 @@ ${STEPS_LINE}`,
     const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
     const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
     f.initWithPath(archive.root);
-    res.setSubstitutionWithFlags("one-click-har", Services.io.newFileURI(f), Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS);
+    res.setSubstitutionWithFlags("one-click-har-data", Services.io.newFileURI(f), Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS);
   }
 ${STEPS_LINE}`,
       },
@@ -225,7 +239,8 @@ ${STEPS_LINE}`,
     mustFail: [
       "resource-all@file",
       "no-scheme-into-profile-or-data-home",
-      "no-registration-in-packed-scripts",
+      "substitution-name",
+      "substitution-lifetime",
     ],
   },
   {
@@ -294,17 +309,17 @@ ${STEPS_LINE}`,
   },
   {
     id: "popup-postmessage",
-    what: "the recorder popup echoes the recording status to any postMessage",
+    what: "the recorder popup echoes its environment to any postMessage",
     edits: [
       {
         file: POPUP,
-        from: "const readEnvironment = async (): Promise<Reading> => {",
+        from: "const store = createPopupStore({",
         to: `window.addEventListener("message", (event) => {
-  void browser.oneClickHar?.getRecordingStatus().then((status) => {
+  void browser.oneClickHar?.getEnvironment(0).then((status) => {
     (event.source as WindowProxy | null)?.postMessage({ oneClickHar: status }, "*");
   });
 });
-const readEnvironment = async (): Promise<Reading> => {`,
+const store = createPopupStore({`,
       },
     ],
     mustFail: ["exposure-allowed"],
@@ -571,11 +586,7 @@ ${STEPS_LINE}`,
         f.initWithPath(archive.root);
         res.setSubstitutionWithFlags("one-click-har", Services.io.newFileURI(f), Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS);`),
     ],
-    mustFail: [
-      "no-scheme-into-profile-or-data-home",
-      "no-registration-in-packed-scripts",
-      "exposure-allowed",
-    ],
+    mustFail: ["no-scheme-into-profile-or-data-home", "substitution-lifetime", "exposure-allowed"],
   },
   {
     id: "resource-sub-late",
@@ -619,12 +630,12 @@ ${STEPS_LINE}`,
   },
   {
     id: "schema-fn-allowed-contexts",
-    what: "one function of the experiment schema, getRecordingStatus, allowed in content and add-on contexts",
+    what: "one function of the experiment schema, getEnvironment, allowed in content and add-on contexts",
     edits: [
       {
         file: SCHEMA,
-        from: "      parameters,\n    })),",
-        to: '      parameters,\n      ...(name === "getRecordingStatus" ? { allowedContexts: ["content", "addon"] } : {}),\n    })),',
+        from: "      parameters: parameters.map(({ parse: _parse, ...gecko }) => gecko),\n    })),",
+        to: '      parameters: parameters.map(({ parse: _parse, ...gecko }) => gecko),\n      ...(name === "getEnvironment" ? { allowedContexts: ["content", "addon"] } : {}),\n    })),',
       },
     ],
     mustFail: ["exposure-allowed"],
@@ -854,15 +865,15 @@ ${STEPS_LINE}`,
     edits: [
       {
         file: POPUP,
-        from: "const readEnvironment = async (): Promise<Reading> => {",
+        from: "const store = createPopupStore({",
         to: `setTimeout(() => {
   window.addEventListener("message", (event) => {
-    void browser.oneClickHar?.getRecordingStatus().then((status) => {
+    void browser.oneClickHar?.getEnvironment(0).then((status) => {
       (event.source as WindowProxy | null)?.postMessage({ oneClickHar: status }, "*");
     });
   });
 }, 1500);
-const readEnvironment = async (): Promise<Reading> => {`,
+const store = createPopupStore({`,
       },
     ],
     mustFail: ["exposure-allowed"],
@@ -890,13 +901,13 @@ const Options = () => (`,
     edits: [
       {
         file: POPUP,
-        from: "const readEnvironment = async (): Promise<Reading> => {",
+        from: "const store = createPopupStore({",
         to: `setTimeout(() => {
   const rt = (browser as unknown as { runtime: Record<string, { addListener(fn: () => Promise<unknown>): void }> }).runtime;
   const ev = ["onMessage", "External"].join("");
   rt[ev]?.addListener(() => Promise.resolve({ recording: true, problems: [] }));
 }, 1500);
-const readEnvironment = async (): Promise<Reading> => {`,
+const store = createPopupStore({`,
       },
     ],
     mustFail: ["sendmessage-recorder@ext-bg", "sendmessage-oracle@ext-bg"],
@@ -1000,6 +1011,57 @@ const readEnvironment = async (): Promise<Reading> => {`,
       },
     ],
     mustFail: ["fetch-file-log@web=NO-RESULT", "mozext-parent@web=NO-RESULT"],
+  },
+  {
+    id: "worker-second-host",
+    what: "the product registers a second resource:// host into its own packed files beside one-click-har",
+    edits: [
+      {
+        file: PARENT,
+        from: WORKER_REGISTER,
+        to: `${WORKER_REGISTER}
+      resourceHandler().setSubstitution("one-click-har-extra", this.extension.rootURI);`,
+      },
+    ],
+    mustFail: ["substitution-name"],
+  },
+  {
+    id: "worker-into-data-folder",
+    what: "resource://one-click-har/ points at the app folder in the data home, which holds the archive",
+    edits: [
+      workerAt(
+        'PathUtils.join(Services.env.get("XDG_DATA_HOME") || PathUtils.join(Services.dirsvc.get("Home", Ci.nsIFile).path, ".local", "share"), "one-click-har")',
+      ),
+    ],
+    mustFail: ["substitution-target", "no-scheme-into-profile-or-data-home"],
+  },
+  {
+    id: "worker-into-profile-root",
+    what: "resource://one-click-har/ points at the profile root",
+    edits: [workerAt('Services.dirsvc.get("ProfD", Ci.nsIFile).path')],
+    mustFail: ["substitution-target", "no-scheme-into-profile-or-data-home"],
+  },
+  {
+    id: "worker-content-accessible",
+    what: "resource://one-click-har/ registered into the packed files with content access",
+    edits: [
+      {
+        file: PARENT,
+        from: WORKER_REGISTER,
+        to: `      (resourceHandler() as unknown as { setSubstitutionWithFlags(n: string, u: unknown, f: number): void }).setSubstitutionWithFlags(
+        WORKER_ROOT,
+        this.extension.rootURI,
+        Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS,
+      );`,
+      },
+    ],
+    mustFail: ["substitution-reach"],
+  },
+  {
+    id: "worker-left-registered",
+    what: "the product no longer removes resource://one-click-har/ when it shuts down",
+    edits: [{ file: PARENT, from: WORKER_REMOVE, to: "      if (this.#host !== null) void 0;" }],
+    mustFail: ["substitution-lifetime"],
   },
 ];
 

@@ -48,6 +48,7 @@ import {
 } from "../fixtures/isolation/exposure.ts";
 import { identities, unitPlaces } from "../fixtures/isolation/identity.ts";
 import {
+  eachUnitVerdict,
   judgeIsolationRun,
   type BrowserRowReport,
   type IsolationRunInput,
@@ -77,6 +78,15 @@ import {
   PROBES_JS,
 } from "../fixtures/isolation/probe-script.ts";
 import { NO_MARIONETTE_PROBE_IDS } from "../fixtures/isolation/probe-table.ts";
+import {
+  isWorkerSubstitution,
+  judgeSubstitutions,
+  substitutionLine,
+  WORKER_HOST,
+  type Registration,
+  type Substitution,
+  type SubstitutionEvidence,
+} from "../fixtures/isolation/substitution.ts";
 import { startIsolationServer, type IsolationReport } from "../fixtures/isolation/server.ts";
 
 const POSITION_TIMEOUT_MS = 60_000;
@@ -127,7 +137,7 @@ type ChromeBootstrapInfo = {
 };
 
 type EnumeratedSchemes = {
-  readonly subs: readonly { readonly name: string; readonly resolved: string }[];
+  readonly subs: readonly Substitution[];
   readonly chrome: readonly { readonly pkg: string; readonly target: string }[];
   /** moz-src:/// URLs named in omni.ja; the first one is the witness that the scheme serves files. */
   readonly mozSrc: readonly string[];
@@ -147,7 +157,11 @@ type PackedExposure = {
   readonly pageUrls: readonly string[];
   readonly files: readonly string[];
   readonly literals: readonly string[];
-  readonly registrations: readonly string[];
+  readonly registrations: readonly Registration[];
+  /** The recorder's root URL as the browser installed it. */
+  readonly rootUrl: string;
+  /** Paths the packed scripts build after a resource:// host. */
+  readonly servedPaths: readonly string[];
 };
 
 const CHROME_INFO_SCRIPT = `
@@ -194,6 +208,7 @@ const CHROME_EXPOSURE_SCRIPT = `
     const files = [];
     const literals = new Set();
     const registrations = [];
+    const servedPaths = new Set();
     const externalListeners = [];
     const it = zr.findEntries(null);
     while (it.hasMore()) {
@@ -203,7 +218,8 @@ const CHROME_EXPOSURE_SCRIPT = `
       if (!/\\.(m?js|json|html)$/.test(name)) continue;
       const text = read(name);
       for (const m of text.matchAll(/["'\`]([A-Za-z0-9][A-Za-z0-9._-]{0,62})["'\`]/g)) literals.add(m[1].toLowerCase());
-      for (const m of text.matchAll(/(setSubstitution(?:WithFlags)?|registerChrome|addSubstitution)/g)) registrations.push(name + ": " + m[1]);
+      for (const m of text.matchAll(/(setSubstitution(?:WithFlags)?|registerChrome|addSubstitution)(?:\\s*\\(([^()]{0,200}))?/g)) registrations.push({ file: name, call: m[1], removes: /^\\s*[^,]+,\\s*null\\s*$/.test(m[2] ?? "") });
+      for (const m of text.matchAll(/resource:\\/\\/(?:\\$\\{[^}]*\\}|one-click-har)\\/([A-Za-z0-9_][A-Za-z0-9_.\\/-]*)/g)) servedPaths.add(m[1]);
       for (const m of text.matchAll(/\\b(onMessageExternal|onConnectExternal|externally_connectable)\\b/g)) externalListeners.push(name + ": " + m[1]);
     }
     const manifest = JSON.parse(read("manifest.json"));
@@ -235,6 +251,8 @@ const CHROME_EXPOSURE_SCRIPT = `
       files: files.sort(),
       literals: [...literals].sort(),
       registrations,
+      rootUrl: ext.rootURI.spec,
+      servedPaths: [...servedPaths].sort(),
     });
   })().catch((e) => done({ error: String(e) }));
 `;
@@ -417,7 +435,9 @@ const CHROME_ENUMERATE_SCRIPT = `
     if (!res.hasSubstitution(name)) continue;
     let resolved = "";
     try { resolved = res.resolveURI(Services.io.newURI("resource://" + name + "/")); } catch (e) { resolved = "error " + e; }
-    subs.push({ name, resolved });
+    let contentAccess = null;
+    try { contentAccess = res.allowContentToAccess(Services.io.newURI("resource://" + name + "/")); } catch {}
+    subs.push({ name, resolved, contentAccess });
   }
   const chrome = [];
   for (const pkg of [...pkgs].sort()) {
@@ -639,14 +659,49 @@ async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
   return NodeFS.existsSync(path);
 }
 
-/** A second fresh profile with the same XPI: the key it makes, and what that profile exposes to a guesser. */
-async function secondProfileKey(
+/**
+ * Which of `names` are registered while the add-on runs, with its popup open so its API is in use, and which are
+ * still registered once the add-on is disabled and its policy is gone.
+ */
+const CHROME_SHUTDOWN_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [id, names, expected] = arguments;
+  (async () => {
+    const { AddonManager } = ChromeUtils.importESModule("resource://gre/modules/AddonManager.sys.mjs");
+    const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+    const registered = () => names.filter((n) => res.hasSubstitution(n));
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let waited = 0; waited < 10000 && !res.hasSubstitution(expected); waited += 100) await wait(100);
+    await wait(1000);
+    const before = registered();
+    const addon = await AddonManager.getAddonByID(id);
+    if (!addon) return done({ missing: "no add-on " + id });
+    await addon.disable();
+    for (let waited = 0; waited < 10000 && WebExtensionPolicy.getByID(id); waited += 100) await wait(100);
+    if (WebExtensionPolicy.getByID(id)) return done({ missing: "the add-on's policy outlived its disable" });
+    await wait(1000);
+    done({ before, after: registered() });
+  })().catch((e) => done({ missing: String(e) }));
+`;
+
+type SecondProfile = {
+  readonly key: KeyEvidence["second"];
+  readonly shutdown: SubstitutionEvidence["shutdown"];
+};
+
+/**
+ * A second fresh profile with the same XPI: the key it makes, what that profile exposes to a guesser, and, with the
+ * popup open, which of the packed names are registered before and after the add-on shuts down.
+ */
+async function secondProfile(
   context: CheckContext,
   recorderId: string,
+  popupPath: string,
   prefs: readonly Pref[],
-): Promise<KeyEvidence["second"]> {
+): Promise<SecondProfile> {
   await using second = recordingWorkspace("isolation-second");
-  if (context.extensionPath === null) return { missing: "no extension" };
+  if (context.extensionPath === null)
+    return { key: { missing: "no extension" }, shutdown: { missing: "no extension" } };
   await using session = await second.launch({
     binaryPath: context.binaryPath,
     extensionPath: context.extensionPath,
@@ -660,19 +715,33 @@ async function secondProfileKey(
     [recorderId],
   ])) as ChromeBootstrapInfo;
   const keyFile = NodePath.join(second.profileDir, ARCHIVE_KEY_FILE);
-  if (!(await waitForFile(keyFile, KEY_WAIT_MS)))
-    return { missing: `no ${ARCHIVE_KEY_FILE} after ${String(KEY_WAIT_MS)} ms` };
-  const result = {
-    keyFileText: NodeFS.readFileSync(keyFile, "utf8"),
-    sources: keySources(
-      second.profileDir,
-      second.dataHome,
-      recorderId,
-      info.addons[recorderId]?.uuid ?? "",
-    ),
+  const key: KeyEvidence["second"] = (await waitForFile(keyFile, KEY_WAIT_MS))
+    ? {
+        keyFileText: NodeFS.readFileSync(keyFile, "utf8"),
+        sources: keySources(
+          second.profileDir,
+          second.dataHome,
+          recorderId,
+          info.addons[recorderId]?.uuid ?? "",
+        ),
+      }
+    : { missing: `no ${ARCHIVE_KEY_FILE} after ${String(KEY_WAIT_MS)} ms` };
+  const packed = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [recorderId])) as {
+    readonly literals?: readonly string[];
+    readonly error?: string;
   };
+  await session.openTab(await waitForActiveExtensionUrl(session, recorderId, popupPath));
+  const shutdown = (await session.evaluateChrome(CHROME_SHUTDOWN_SCRIPT, [
+    recorderId,
+    [...new Set([...(packed.literals ?? []), WORKER_HOST])],
+    WORKER_HOST,
+  ])) as SubstitutionEvidence["shutdown"];
   await session.quit();
-  return result;
+  return {
+    key,
+    shutdown:
+      packed.error === undefined ? shutdown : { missing: `exposure read failed: ${packed.error}` },
+  };
 }
 
 /**
@@ -873,7 +942,7 @@ async function readPages(
 const schemeLines = (
   enumerated: EnumeratedSchemes,
 ): Pick<RuntimeSurface, "substitutions" | "chromePackages"> => ({
-  substitutions: enumerated.subs.map((s) => `resource://${s.name}/ -> ${s.resolved}`),
+  substitutions: enumerated.subs.map(substitutionLine),
   chromePackages: enumerated.chrome.map((c) => `chrome://${c.pkg}/ -> ${c.target}`),
 });
 
@@ -1015,7 +1084,7 @@ async function controlRun(
   context: CheckContext,
   server: Awaited<ReturnType<typeof startIsolationServer>>,
   plan: ControlPlan,
-): Promise<RunDisk> {
+): Promise<{ readonly disk: RunDisk; readonly substitutions: readonly string[] }> {
   await using workspace = recordingWorkspace("isolation-control", { ownHome: true });
   const installed = installProbeAddons(workspace.profileDir, plan.probeXpi);
   const standInDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-stand-in-"));
@@ -1028,6 +1097,7 @@ async function controlRun(
     let names: RunNames = [];
     let storeId = "";
     const pids: number[] = [];
+    const substitutions: string[] = [];
     const savedPagePath = NodePath.join(workspace.downloads, plan.savedPageName);
     const savedPageUrl = fileHref(savedPagePath);
     {
@@ -1072,7 +1142,10 @@ async function controlRun(
       const pageUrls = plan.pageFiles.map(
         (f) => `moz-extension://${info.addons[plan.recorderId]?.uuid ?? ""}/${f}`,
       );
-      await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [plan.candidates]);
+      const atStart = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
+        plan.candidates,
+      ])) as EnumeratedSchemes;
+      substitutions.push(...atStart.subs.map(substitutionLine));
       await readPages(session, plan.recorderId, pageUrls, true);
       await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [plan.plantRoot]);
       NodeFS.writeFileSync(savedPagePath, plan.savedPageHtml, "utf8");
@@ -1090,7 +1163,10 @@ async function controlRun(
         site: plan.site,
       });
       await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [""]);
-      await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [plan.candidates]);
+      const atEnd = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
+        plan.candidates,
+      ])) as EnumeratedSchemes;
+      substitutions.push(...atEnd.subs.map(substitutionLine));
       await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [plan.recorderId]);
       await readPages(session, plan.recorderId, pageUrls, false);
       probesSnapshot = snapshotTree(workspace.base, { marker: plan.marker });
@@ -1116,7 +1192,7 @@ async function controlRun(
       server,
       signal: context.signal,
     });
-    return runDisk({
+    const disk = runDisk({
       base: workspace.base,
       before,
       plan: planSnapshot,
@@ -1130,6 +1206,7 @@ async function controlRun(
         [`downloads/${plan.savedPageName}`]: plan.savedPageHtml,
       },
     });
+    return { disk, substitutions };
   } finally {
     NodeFS.rmSync(standInDir, { recursive: true, force: true });
   }
@@ -1165,7 +1242,12 @@ const check: HarnessCheck = {
     });
 
     context.log("isolation: second fresh profile for the key oracle");
-    const secondKey = await secondProfileKey(context, recorderId, proxyPrefs(server.port));
+    const { key: secondKey, shutdown } = await secondProfile(
+      context,
+      recorderId,
+      popupPath,
+      proxyPrefs(server.port),
+    );
 
     await using workspace = recordingWorkspace("isolation", { ownHome: true });
     const probeXpi = buildProbeExtensionXpi({
@@ -1207,6 +1289,7 @@ const check: HarnessCheck = {
     let storeId = "";
     const pids: number[] = [];
     let exposureEvidence: ExposureEvidence | null = null;
+    let productSchemes: Omit<SubstitutionEvidence, "control" | "shutdown"> | null = null;
     let controlPlan: ControlPlan | null = null;
     const noMarionetteExtraPrefs = [...HARNESS_PREFS, ...proxyPrefs(server.port)];
     const exportName = `${site}-2026-11-16.har`;
@@ -1331,11 +1414,6 @@ const check: HarnessCheck = {
         recorderId,
       ])) as PackedExposure & { readonly error?: string };
       if (packed.error !== undefined) throw new Error(`exposure read failed: ${packed.error}`);
-      record(
-        "no-registration-in-packed-scripts",
-        packed.registrations,
-        "no setSubstitution or registerChrome",
-      );
 
       const siteDirPath = NodePath.join(located.root, "sites", site);
       const logPath = findFirstFile(NodePath.join(siteDirPath, "log"), ".jsonl");
@@ -1581,6 +1659,12 @@ const check: HarnessCheck = {
       };
       const inside = (target: string): boolean =>
         target.includes(workspace.profileDir) || target.includes(workspace.dataHome);
+      // The worker name into the add-on's own files is the one allowed; the substitution rows hold it.
+      const worker = new Set(
+        [...enumerated.subs, ...enumeratedAtEnd.subs]
+          .filter((sub) => isWorkerSubstitution(sub, packed.rootUrl))
+          .map(substitutionLine),
+      );
       record(
         "no-scheme-into-profile-or-data-home",
         [
@@ -1590,11 +1674,21 @@ const check: HarnessCheck = {
               ...start.chromePackages,
               ...end.substitutions,
               ...end.chromePackages,
-            ].filter((line) => inside(line.slice(line.indexOf(" -> ") + 4))),
+            ].filter((line) => !worker.has(line) && inside(line.slice(line.indexOf(" -> ") + 4))),
           ),
         ],
         `${String(enumerated.subs.length)} substitutions and ${String(enumerated.chrome.length)} packages outside, before and after the probes`,
       );
+      productSchemes = {
+        addonRoot: packed.rootUrl,
+        packedFiles: packed.files,
+        servedPaths: packed.servedPaths,
+        profileDir: workspace.profileDir,
+        dataHome: workspace.dataHome,
+        start: enumerated.subs,
+        end: enumeratedAtEnd.subs,
+        registrations: packed.registrations,
+      };
       exposureEvidence = {
         manifestKeys: Object.keys(packed.manifest),
         experimentApis: (packed.manifest["experiment_apis"] ?? {}) as Record<string, unknown>,
@@ -1687,10 +1781,13 @@ const check: HarnessCheck = {
 
     // Two control runs: what differs between them is the browser's own noise.
     const controls: RunDisk[] = [];
+    const controlSubstitutions: string[] = [];
     for (const round of [1, 2]) {
       context.log(`isolation: control run ${String(round)} without the product`);
       server.clear();
-      controls.push(await controlRun(context, server, controlPlan));
+      const control = await controlRun(context, server, controlPlan);
+      controls.push(control.disk);
+      controlSubstitutions.push(...control.substitutions);
     }
     const [product, firstControl, secondControl] = pruneStructured(
       productRun,
@@ -1753,6 +1850,19 @@ const check: HarnessCheck = {
         .map((r) => ({ href: r.href, text: r.text })),
       extraChecks,
     };
+    if (productSchemes === null) throw new Error("no substitutions were read");
+    const substitutionEvidence: SubstitutionEvidence = {
+      ...productSchemes,
+      control: [...new Set(controlSubstitutions)].sort(),
+      shutdown,
+    };
+    extraChecks.push(
+      ...judgeSubstitutions(
+        substitutionEvidence,
+        (probe, url, position) => eachUnitVerdict(input, probe, position, url),
+        input.csFileInjected,
+      ),
+    );
     const judgment = judgeIsolationRun(input);
 
     const summary = `${String(judgment.rows.length)} probes: ${String(judgment.counts.BLOCKED)} BLOCKED, ${String(judgment.counts.READ)} READ, ${String(judgment.counts["LEAKS-EXISTENCE"])} LEAKS-EXISTENCE, ${String(judgment.counts["NO-RESULT"])} NO-RESULT; ${String(extraChecks.filter((c) => c.ok).length)} of ${String(extraChecks.length)} extra checks hold`;
@@ -1768,6 +1878,7 @@ const check: HarnessCheck = {
         archiveEvidence,
         exposureEvidence,
         diskEvidence,
+        substitutionEvidence,
         planInput,
         witnessResults: [...witnessResults],
       },

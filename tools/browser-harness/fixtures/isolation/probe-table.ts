@@ -959,10 +959,15 @@ export const EXTRA_CHECKS = {
     "every surface the recorder exposes (manifest keys, experiment scopes and child, schema contexts, declared and runtime web-accessible resources, external listeners, message listeners, frames and postMessage answers on its pages) is in the allowed set",
   "disk-writes-allowed":
     "every new or changed path in the throwaway home, profile, data home and Downloads, links included, is the browser's, the harness's, the key file, inside the key folder, or an export",
-  "no-registration-in-packed-scripts":
-    "the packed scripts register no resource:// substitution or chrome package",
   "no-scheme-into-profile-or-data-home":
-    "no resource:// or chrome:// name resolves into the profile or the data home",
+    "no resource:// or chrome:// name resolves into the profile or the data home, but the worker name into the add-on's own packed files, which the substitution rows hold",
+  "substitution-name": "the product registers no resource:// name but one-click-har, and no other",
+  "substitution-target":
+    "the product's name resolves into its own installed add-on, never the profile root, a folder holding the profile, or the data home, and every URL its packed scripts build under it is a packed file",
+  "substitution-reach":
+    "the product's name is not flagged for content access, and resource-all is BLOCKED on it from every position",
+  "substitution-lifetime":
+    "the packed scripts call setSubstitution once to register and once to remove, and nothing else; the name is the same before and after the probes, and gone once the add-on shuts down",
   "planted-resource-removed":
     "the harness's planted resource:// substitution is gone after the run",
   "positions-completed": "every probe position reported completion",

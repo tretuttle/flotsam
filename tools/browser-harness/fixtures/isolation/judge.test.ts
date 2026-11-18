@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { readZipEntry } from "../../src/zip.ts";
 import type { ExtraCheckResult } from "./archive-oracle.ts";
 import {
+  eachUnitVerdict,
   judgeIsolationRun,
   readObservation,
   type BrowserRowReport,
@@ -1525,5 +1526,44 @@ describe("isolation judge details", () => {
         { verdict, ok },
       ]);
     }
+  });
+});
+
+describe("one target of an each row", () => {
+  const gre = unitsOf("resource-all").find((u) => u === "resource://gre/") as string;
+  const loaded = (position: Position) =>
+    withRow(
+      "resource-all",
+      position,
+      each(
+        unitsOf("resource-all").map((u) =>
+          u === gre
+            ? at(gre, "fetch ok, link load", "status 200, 30 chars")
+            : deniedUnit("resource-all", u, position),
+        ),
+      ),
+    );
+
+  it("is judged as the row judges it, from that position only", () => {
+    expect(eachUnitVerdict(passingInput(), "resource-all", "web", gre).verdict).toBe("BLOCKED");
+    expect(eachUnitVerdict(loaded("web"), "resource-all", "web", gre).verdict).toBe("READ");
+    expect(eachUnitVerdict(loaded("web"), "resource-all", "file", gre).verdict).toBe("BLOCKED");
+  });
+
+  it("is NO-RESULT for a target the row never planned or answered, or a probe without per-target results", () => {
+    expect(
+      eachUnitVerdict(passingInput(), "resource-all", "web", "resource://nope/"),
+    ).toMatchObject({
+      verdict: "NO-RESULT",
+      line: "resource://nope/ was not planned for resource-all@web",
+    });
+    expect(
+      eachUnitVerdict(withRow("resource-all", "web", each([])), "resource-all", "web", gre).verdict,
+    ).toBe("NO-RESULT");
+    expect(
+      eachUnitVerdict(withRow("resource-all", "web", { outcome: "ok" }), "resource-all", "web", gre)
+        .verdict,
+    ).toBe("NO-RESULT");
+    expect(eachUnitVerdict(passingInput(), "fetch-file-log", "web", gre).verdict).toBe("NO-RESULT");
   });
 });
