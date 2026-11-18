@@ -60,6 +60,8 @@ export async function discoverChecks(
 export async function runDiscoveredChecks(options: {
   readonly checksDir?: string;
   readonly filter?: readonly string[];
+  /** Names left out; each must name a discovered check, so a renamed check cannot silently run in two jobs. */
+  readonly skip?: readonly string[];
   readonly context: CheckContext;
 }): Promise<DiscoveredChecksRun> {
   const discovered = await discoverChecks(options.checksDir);
@@ -77,8 +79,14 @@ export async function runDiscoveredChecks(options: {
           return found;
         });
 
+  const skip = options.skip ?? [];
+  for (const name of skip)
+    if (!discovered.some((item) => item.name === name))
+      throw new Error(
+        `unknown check ${name} in --skip; discovered: ${discovered.map((item) => item.name).join(", ")}`,
+      );
   const results: CheckResult[] = [];
-  for (const item of selected) {
+  for (const item of selected.filter((check) => !skip.includes(check.name))) {
     options.context.signal.throwIfAborted();
     options.context.log(`running check: ${item.name} (${item.description})`);
     const started = Date.now();

@@ -48,6 +48,14 @@ Before each launch, `reapOrphanedLaunches` scans a `0700` per-user lease directo
 - A chrome screenshot of the window does not include the popup panel; `drawSnapshot` on the popup's `<browser>` does.
 - Zen draws a private window and its popups dark whatever `ui.systemUsesDarkTheme` and `browser.theme.dark-private-windows` say, so the private state has a dark screenshot only.
 
+## Driving the extension pages
+
+The history and options pages run in tabs, and the `pages-*` checks drive them with clicks as a user would. They run in their own CI job, `Browser pages`; the `Browser` job passes them to `--skip`, which refuses a name no check has, so a renamed check cannot run in both jobs or neither.
+
+- Zen restores its spaces after the window opens, even with `browser.startup.page` 0. On the first start after a restart, a tab opened before that finished was closed under Marionette (`contentBrowser is null`, a navigation that never ended, or a page whose API calls never answered; 3 of 7 runs). `PageDriver.origin` waits for `SessionStore.promiseAllWindowsRestored`, `gZenWorkspaces.promiseInitialized` and a stable tab list first; 8 of 8 passed after.
+- The folder picker is replaced for one browser by a factory registered for `@mozilla.org/filepicker;1` from chrome, answering the folder a pref names, so the product's own picker call runs unchanged and carries no harness hook.
+- A screenshot draws the selected tab's whole document with `drawSnapshot` after scrolling to the top; a sticky element is drawn where the current scroll puts it.
+
 ## Tests that can send a signal
 
 `scripts/signal-reach.ts` parses the repository and follows static imports from every function to `process.kill`, a `.kill()` call, or a spawned kill command; a dynamic import it cannot follow counts as reaching any module of its own package. `pnpm run check` fails, printing the path, when a test outside a `*.namespace.test.ts` file can reach one, or when a namespaced file does not call `requireIsolatedPidNamespace()` first.

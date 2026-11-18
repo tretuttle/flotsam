@@ -194,3 +194,9 @@ export const popupAuditExpression = (): string => `(() => {
   const h = { parseColor: ${parseColor.toString()}, contrastRatio: ${contrastRatio.toString()}, copyProblems: ${copyProblems.toString()} };
   return (${DOM_AUDIT})(w, h);
 })()`;
+
+/** An expression for an extension page in a tab: the same audits run on that page's own document. */
+export const pageAuditExpression = (): string => `(() => {
+  const h = { parseColor: ${parseColor.toString()}, contrastRatio: ${contrastRatio.toString()}, copyProblems: ${copyProblems.toString()} };
+  return (${DOM_AUDIT})(window, h);
+})()`;
