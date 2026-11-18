@@ -263,6 +263,20 @@ export function startRecorder(options: {
   const live = new Map<number, LiveEntry>();
   const watched = new Set<Sink>();
   const pendingStartup = new Set<() => void>();
+  const drainChannels = new Map<HttpChannel, () => void>();
+  const pauseForDrain = (channel: HttpChannel): void => {
+    if (stopped || drainChannels.has(channel) || !store.needsRetentionDrain()) return;
+    optional(() => channel.suspend());
+    let unsub: () => void = () => undefined;
+    const release = (): void => {
+      if (!drainChannels.has(channel)) return;
+      drainChannels.delete(channel);
+      unsub();
+      optional(() => channel.resume());
+    };
+    drainChannels.set(channel, release);
+    unsub = store.onRetentionDrain(release);
+  };
   let watchdog: { cancel(): void } | null = null;
   const neverStore = (): boolean => store.settings().user.secretStorage === "never-store";
 
@@ -449,6 +463,7 @@ export function startRecorder(options: {
     }
     const part = PathUtils.join(root, ...partPath(id));
     const guardFileChunk = (
+      channel: HttpChannel,
       streamTee: StreamListener,
       getOriginal: () => StreamListener,
       partId: ExchangeId,
@@ -477,8 +492,12 @@ export function startRecorder(options: {
         streamTee.onDataAvailable(request, stream, offset, count);
         const after = optional(() => localFile(part).fileSize) ?? current + count;
         projectedRef.value = after;
-        if (after >= budget) closeAtCap(after);
-        else store.updatePart(partId, after);
+        if (after >= budget) {
+          closeAtCap(after);
+        } else {
+          store.updatePart(partId, after);
+          pauseForDrain(channel);
+        }
         return;
       }
       streamTee.onDataAvailable(request, stream, offset, count);
@@ -545,6 +564,9 @@ export function startRecorder(options: {
       let stopPending: { readonly request: unknown; readonly status: number } | null = null;
       let unsubscribeReady: () => void = () => undefined;
       let unsubscribeScan: (() => void) | null = null;
+      let unsubscribeDrain: (() => void) | null = null;
+      let flushRelease: (() => void) | null = null;
+      let flushReservedBytes = 0;
       let flushOverflow: StorageStream | null = null;
       let flushOverflowOut: ReturnType<StorageStream["getOutputStream"]> | null = null;
       let flushOverflowTee: StreamListenerTee | null = null;
@@ -597,6 +619,13 @@ export function startRecorder(options: {
         sink.cappedAt = size;
         watched.delete(sink);
       };
+      const releaseFlushReserve = (): void => {
+        unsubscribeDrain?.();
+        unsubscribeDrain = null;
+        flushRelease?.();
+        flushRelease = null;
+        flushReservedBytes = 0;
+      };
       const releaseStartup = (): void => {
         if (buffered > 0) {
           startupBufferedBytes = Math.max(0, startupBufferedBytes - buffered);
@@ -605,11 +634,13 @@ export function startRecorder(options: {
         unsubscribeReady();
         unsubscribeScan?.();
         unsubscribeScan = null;
+        releaseFlushReserve();
       };
       const abortStartup = (): void => {
         unsubscribeReady();
         unsubscribeScan?.();
         unsubscribeScan = null;
+        releaseFlushReserve();
         if (suspended) {
           suspended = false;
           optional(() => entry.channel.resume());
@@ -625,7 +656,10 @@ export function startRecorder(options: {
           abortStartup();
           return;
         }
-        if (cappedRef.value) return;
+        if (cappedRef.value) {
+          releaseFlushReserve();
+          return;
+        }
         const budget = store.partBudget(id, sink.cap);
         if (budget === 0 && !store.isScanCompleted()) {
           if (suspended) {
@@ -637,11 +671,27 @@ export function startRecorder(options: {
           }
           return;
         }
-        phase = "flushing";
         if (!suspended) {
           suspended = true;
           optional(() => entry.channel.suspend());
         }
+        if (buffered > 0) {
+          if (flushReservedBytes !== buffered) {
+            flushRelease?.();
+            flushReservedBytes = buffered;
+            flushRelease = store.reserveWrite(flushReservedBytes);
+          }
+          if (store.needsRetentionDrain()) {
+            if (unsubscribeDrain === null) {
+              unsubscribeDrain = store.onRetentionDrain(() => {
+                unsubscribeDrain = null;
+                startFileFlush();
+              });
+            }
+            return;
+          }
+        }
+        phase = "flushing";
         closeStorageOut(null);
         let output: FileOutputStream;
         try {
@@ -670,6 +720,7 @@ export function startRecorder(options: {
         tee2.init(original, output, fileObserver);
         fileTee = tee2;
         store.openPart(id, part, buffered);
+        releaseFlushReserve();
         if (budget === 0) {
           store.updatePart(id, 0);
           projectedRef.value = 0;
@@ -700,6 +751,7 @@ export function startRecorder(options: {
             suspended = false;
             optional(() => entry.channel.resume());
           }
+          if (!cappedRef.value) pauseForDrain(entry.channel);
           if (stopPending !== null) {
             const pending = stopPending;
             stopPending = null;
@@ -855,6 +907,7 @@ export function startRecorder(options: {
             return;
           }
           guardFileChunk(
+            entry.channel,
             fileTee,
             () => original,
             id,
@@ -988,6 +1041,7 @@ export function startRecorder(options: {
       onStartRequest: (request) => tee.onStartRequest(request),
       onDataAvailable: (request, stream, offset, count) =>
         guardFileChunk(
+          entry.channel,
           tee,
           () => original,
           id,
@@ -1005,6 +1059,7 @@ export function startRecorder(options: {
     const original = traceable.setNewListener(guardListener);
     tee.init(original, output, observer);
     watch(sink);
+    pauseForDrain(entry.channel);
     return sink;
   };
 
@@ -1123,6 +1178,7 @@ export function startRecorder(options: {
       watchdog = null;
       for (const abort of pendingStartup) abort();
       pendingStartup.clear();
+      for (const release of drainChannels.values()) release();
       const abandoned = [...live.values()].map((entry) => {
         optional(() => entry.sink?.output?.close());
         const { capture } = entry;

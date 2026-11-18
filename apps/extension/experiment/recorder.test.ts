@@ -165,6 +165,9 @@ describe("recorder file-tee guardListener", () => {
       openPart: () => undefined,
       updatePart: () => undefined,
       partBudget: (_id: ExchangeId, routeCap: number) => Math.min(routeCap, state.budget),
+      reserveWrite: () => () => undefined,
+      needsRetentionDrain: () => false,
+      onRetentionDrain: () => () => undefined,
       pin: () => {
         throw new Error("unused");
       },
@@ -419,6 +422,9 @@ describe("recorder file-tee guardListener", () => {
       openPart: () => undefined,
       updatePart: () => undefined,
       partBudget: (_id: ExchangeId, routeCap: number) => Math.min(routeCap, state.budget),
+      reserveWrite: () => () => undefined,
+      needsRetentionDrain: () => false,
+      onRetentionDrain: () => () => undefined,
       pin: () => {
         throw new Error("unused");
       },
@@ -683,6 +689,9 @@ describe("recorder file-tee guardListener", () => {
       },
       updatePart: () => undefined,
       partBudget: (_id: ExchangeId, routeCap: number) => Math.min(routeCap, state.budget),
+      reserveWrite: () => () => undefined,
+      needsRetentionDrain: () => false,
+      onRetentionDrain: () => () => undefined,
       pin: () => {
         throw new Error("unused");
       },
@@ -1073,6 +1082,9 @@ describe("recorder file-tee guardListener", () => {
         if (rec !== undefined) rec.bytes = bytes;
       },
       partBudget: (_id: ExchangeId, routeCap: number) => Math.min(routeCap, state.budget),
+      reserveWrite: () => () => undefined,
+      needsRetentionDrain: () => false,
+      onRetentionDrain: () => () => undefined,
       pin: () => {
         throw new Error("unused");
       },

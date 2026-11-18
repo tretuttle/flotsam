@@ -370,59 +370,14 @@ class RetentionOracle {
     if (!this.parts.has(id)) this.parts.set(id, { id, path, bytes: 0 });
   }
 
-  updatePart(
-    id: ExchangeId,
-    bytes: number,
-    settings: UserSettings,
-    now: number,
-    canRotatePack: (pack: PackId) => boolean,
-  ): boolean {
+  updatePart(id: ExchangeId, bytes: number, settings: UserSettings): boolean {
     const part = this.parts.get(id);
     if (part === undefined) return false;
     part.bytes = bytes;
-    const cutoff = now - settings.retention.maxAgeDays * DAY_MS;
-    const startUsage = this.usage();
-    let bodyBytes = startUsage.bodyBytes;
-    if (bodyBytes <= settings.retention.maxBodyBytes) {
-      return startUsage.detailBytes > settings.retention.maxDetailBytes;
-    }
-    const sorted = this.sortedBodies();
-    const expiredToDelete: OracleBody[] = [];
-    for (const item of sorted) {
-      if (item.newestAt >= cutoff) break;
-      if (!item.open && !this.isPinned(item.ref)) expiredToDelete.push(item);
-    }
-    for (const item of expiredToDelete) {
-      this.fs.remove(item.path);
-      this.bodies.delete(item.key);
-      bodyBytes -= item.bytes;
-    }
-    if (expiredToDelete.length > 0) this.invalidateBodies();
-    const sortedAfterAge = this.sortedBodies();
-    const capToDelete: OracleBody[] = [];
-    let blocked = false;
-    for (const item of sortedAfterAge) {
-      if (bodyBytes <= settings.retention.maxBodyBytes) break;
-      if (this.isPinned(item.ref)) {
-        blocked = true;
-        break;
-      }
-      if (item.open && (item.ref.kind !== "pack" || !canRotatePack(item.ref.pack))) {
-        blocked = true;
-        break;
-      }
-      capToDelete.push(item);
-      bodyBytes -= item.bytes;
-    }
-    for (const item of capToDelete) {
-      this.fs.remove(item.path);
-      this.bodies.delete(item.key);
-    }
-    if (capToDelete.length > 0) this.invalidateBodies();
-    if (blocked) return true;
+    const usage = this.usage();
     return (
-      bodyBytes > settings.retention.maxBodyBytes ||
-      startUsage.detailBytes > settings.retention.maxDetailBytes
+      usage.bodyBytes > settings.retention.maxBodyBytes ||
+      usage.detailBytes > settings.retention.maxDetailBytes
     );
   }
 
@@ -738,12 +693,8 @@ describe("createMaintenance heap and retention oracle", () => {
           } else {
             const id = pick(partIds);
             const bytes = randInt(50, 2_500);
-            const allowRotate = rand() < 0.5;
-            const sutRes = sut.updatePart(id, bytes, settings, () => {
-              fs.tick();
-              return allowRotate;
-            });
-            const oracleRes = oracle.updatePart(id, bytes, settings, fakeNow, () => allowRotate);
+            const sutRes = sut.updatePart(id, bytes, settings);
+            const oracleRes = oracle.updatePart(id, bytes, settings);
             expect(sutRes).toBe(oracleRes);
             if (rand() < 0.3) {
               sut.untrackPart(id);
@@ -854,9 +805,15 @@ describe("createMaintenance heap and retention oracle", () => {
     const part = mkExId(99);
     sut.trackPart(part, `${TEST_ROOT}/parts/ex-part.part`);
     fs.callbackBudget = 30;
-    const stillOver = sut.updatePart(part, 150, settings, () => false);
+    const needsRetain = sut.updatePart(part, 150, settings);
 
-    expect(stillOver).toBe(true);
+    expect(needsRetain).toBe(true);
+    expect(fs.files.has(pathClosed)).toBe(true);
+    const pinnedSteps = await sut.retain(settings, async () => false);
+    expect(pinnedSteps).toEqual([
+      { kind: "delete", ref: { kind: "pack", pack: pClosed }, why: "age" },
+      { kind: "rotate", ref: { kind: "pack", pack: pOpen } },
+    ]);
     expect(fs.files.has(pathClosed)).toBe(false);
     expect(fs.files.has(pathOpen)).toBe(true);
     expect(fs.files.has(pathPinned)).toBe(true);
@@ -918,7 +875,7 @@ describe("createMaintenance heap and retention oracle", () => {
     expect(sut.needsStartupBuffer(settings)).toBe(true);
     sut.trackPart(liveId, `${TEST_ROOT}/parts/live-99.part`);
     expect(sut.partBudget(liveId, 450, settings)).toBe(450);
-    expect(sut.updatePart(liveId, 100, settings, () => false)).toBe(true);
+    expect(sut.updatePart(liveId, 100, settings)).toBe(true);
     sut.untrackPart(liveId);
 
     const io = (globalThis as Record<string, unknown>)["IOUtils"] as {
@@ -1146,20 +1103,18 @@ describe("createMaintenance heap and retention oracle", () => {
     const liveId = exchangeId(testRun, parseChannelKey("77")!);
     sut.trackPart(liveId, `${TEST_ROOT}/parts/live-77.part`);
     expect(sut.partBudget(liveId, 10_000, settings)).toBe(10_000);
-    expect(sut.updatePart(liveId, 1_500, settings, () => false)).toBe(false);
+    expect(sut.updatePart(liveId, 1_500, settings)).toBe(true);
+    await sut.retain(settings, async () => false);
 
     const metrics = sut.workMetrics();
     const logFactor = Math.max(8, Math.ceil(Math.log2(metrics.inventorySize + 2)));
     const flushPerEviction = 6 * logFactor;
-    expect(metrics.flushDeletes).toBe(20);
-    expect(metrics.chunkDeletes).toBe(15);
+    expect(metrics.flushDeletes).toBe(35);
+    expect(metrics.chunkDeletes).toBe(0);
     expect(metrics.flushTouched).toBeGreaterThanOrEqual(metrics.flushDeletes);
-    expect(metrics.chunkTouched).toBeGreaterThanOrEqual(metrics.chunkDeletes);
+    expect(metrics.chunkTouched).toBeLessThanOrEqual(4 * metrics.chunkCalls);
     expect(metrics.flushTouched).toBeLessThanOrEqual(
       flushPerEviction * (metrics.flushDeletes + metrics.flushRotates) + 4 * metrics.flushPasses,
-    );
-    expect(metrics.chunkTouched).toBeLessThanOrEqual(
-      flushPerEviction * metrics.chunkDeletes + 4 * metrics.chunkCalls,
     );
   });
 
@@ -1194,7 +1149,9 @@ describe("createMaintenance heap and retention oracle", () => {
 
     const liveId = exchangeId(testRun, parseChannelKey("88")!);
     sut.trackPart(liveId, `${TEST_ROOT}/parts/live-88.part`);
-    sut.updatePart(liveId, 100, settings, () => false);
+    expect(sut.updatePart(liveId, 100, settings)).toBe(true);
+    expect(fs.files.has(packPaths[2]!)).toBe(true);
+    await sut.retain(settings, async () => false);
     expect(fs.files.has(packPaths[2]!)).toBe(false);
     expect(fs.files.has(packPaths[0]!)).toBe(true);
   });
@@ -1345,11 +1302,13 @@ describe("createMaintenance heap and retention oracle", () => {
     expect(fs.files.has(pack2)).toBe(true);
     expect(sut.usage().bodyBytes).toBe(450);
 
-    // While the async append still holds 250 B, a concurrent file-tee part sees maxBodyBytes - pending = 250 B cap and evicts pack2 synchronously at > 500 B.
+    // While the async append still holds 250 B, a concurrent file-tee part sees maxBodyBytes - pending = 250 B cap and schedules retention at > 500 B.
     const partId = exchangeId(testRun, parseChannelKey("77")!);
     sut.trackPart(partId, `${TEST_ROOT}/parts/77.part`);
     expect(sut.partBudget(partId, 400, settings)).toBe(250);
-    sut.updatePart(partId, 100, settings, () => false);
+    expect(sut.updatePart(partId, 100, settings)).toBe(true);
+    expect(fs.files.has(pack2)).toBe(true);
+    await sut.retain(settings, async () => false);
     expect(fs.files.has(pack2)).toBe(false);
     expect(sut.usage().bodyBytes).toBe(350);
 

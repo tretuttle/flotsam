@@ -255,7 +255,7 @@ async function answerHarness(
     }
     case "export-pause": {
       const point = request.point;
-      if (point !== "before-link" && point !== "after-link")
+      if (point !== "before-bodies" && point !== "before-link" && point !== "after-link")
         throw new Error(`not an export pause: ${point}`);
       return host.pauses[request.action](point) ?? null;
     }
@@ -277,6 +277,8 @@ const recordingReads = (state: Lifecycle): RecordingReads | null =>
           await state.store.flush();
           await state.store.flush();
         },
+        enqueue: state.store.enqueue,
+        pin: state.store.pin,
         live: () => state.recorder.snapshot(),
         recovered: state.recovery,
       };

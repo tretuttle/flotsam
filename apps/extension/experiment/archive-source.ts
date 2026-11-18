@@ -10,7 +10,7 @@ import type {
   SourceListing,
   SourceRef,
 } from "@one-click-har/export/source";
-import { applyActivity, segmentsFor, type ActivityIndex } from "@one-click-har/recording/activity";
+import { segmentsFor, type ActivityIndex } from "@one-click-har/recording/activity";
 import {
   bodyAvailability,
   type BodyAvailability,
@@ -20,16 +20,15 @@ import {
   type RequestFacts,
   type SettledExchange,
 } from "@one-click-har/recording/exchange";
-import { toMinute, type ByteCount, type Site } from "@one-click-har/recording/ids";
+import { toMinute, type ExchangeId, type PackId, type Site } from "@one-click-har/recording/ids";
 import {
   bodyFilePath,
-  LAYOUT,
   logSegmentPath,
   packPath,
-  parseArchiveName,
   type SafeFolder,
 } from "@one-click-har/recording/layout";
-import { decodeLine, decodeSummary } from "@one-click-har/recording/log";
+import { decodeLine } from "@one-click-har/recording/log";
+import type { PinHandle, PinTargets } from "./maintenance.ts";
 
 /** loadInfo.externalContentPolicyType: a top-level document, and XMLHttpRequest or fetch. */
 const DOCUMENT_POLICY_TYPE = 6;
@@ -44,6 +43,8 @@ export interface ArchiveReads {
   readonly activity: ActivityIndex;
   /** Resolves when every line committed before the call is in a segment on disk. */
   readonly settle: () => Promise<void>;
+  readonly enqueue: (task: () => Promise<void>) => Promise<void>;
+  readonly pin: (targets: PinTargets) => PinHandle;
   readonly live: () => readonly { readonly site: Site | null; readonly live: LiveExchange }[];
 }
 
@@ -135,20 +136,36 @@ export function archiveSource(reads: ArchiveReads): ExchangeSource {
     list: async (selection: ResolvedSelection): Promise<SourceListing> => {
       await reads.settle();
       const items: SourceItem[] = [];
-      for (const segment of segmentsFor(reads.activity, selection.windows)) {
-        let text: string;
-        try {
-          text = await IOUtils.readUTF8(PathUtils.join(reads.root, ...logSegmentPath(segment)));
-        } catch {
-          continue;
+      await reads.enqueue(async () => {
+        const segments = segmentsFor(reads.activity, selection.windows);
+        const packs = new Set<PackId>();
+        const bodyFiles = new Set<ExchangeId>();
+        for (const segment of segments) {
+          let text: string;
+          try {
+            text = await IOUtils.readUTF8(PathUtils.join(reads.root, ...logSegmentPath(segment)));
+          } catch {
+            continue;
+          }
+          for (const settled of linesOf(text)) {
+            const item = itemOf(settled.request, null, false, held.length);
+            if (!inSelection(selection, item)) continue;
+            held.push({ kind: "settled", settled });
+            items.push(item);
+            for (const location of storedLocations(settled)) {
+              if (location.kind === "pack") packs.add(location.pack);
+              else bodyFiles.add(location.id);
+            }
+          }
         }
-        for (const settled of linesOf(text)) {
-          const item = itemOf(settled.request, null, false, held.length);
-          if (!inSelection(selection, item)) continue;
-          held.push({ kind: "settled", settled });
-          items.push(item);
+        if (segments.length > 0 || packs.size > 0 || bodyFiles.size > 0) {
+          reads.pin({
+            segments,
+            packs: [...packs],
+            bodyFiles: [...bodyFiles],
+          });
         }
-      }
+      });
       for (const { site, live } of reads.live()) {
         const item = itemOf(live.request, site, true, held.length);
         if (!inSelection(selection, item)) continue;
@@ -252,27 +269,3 @@ export const decodeContent = (
     .filter((coding) => coding !== "" && coding !== "identity")
     .reverse()
     .reduce((stream, coding) => decodeOne(coding, stream), chunks);
-
-/**
- * Fills the activity index from every valid segment summary, after recovery summarized each earlier run's segments.
- * The current run's lines join it as the store appends them.
- */
-export async function loadActivity(root: SafeFolder, activity: ActivityIndex): Promise<void> {
-  const sitesDir = PathUtils.join(root, LAYOUT.sitesDir);
-  for (const site of await IOUtils.getChildren(sitesDir, { ignoreAbsent: true })) {
-    const logDir = PathUtils.join(site, LAYOUT.logDir);
-    for (const path of await IOUtils.getChildren(logDir, { ignoreAbsent: true })) {
-      const name = parseArchiveName([
-        LAYOUT.sitesDir,
-        PathUtils.filename(site),
-        LAYOUT.logDir,
-        PathUtils.filename(path),
-      ]);
-      if (name?.kind !== "summary") continue;
-      const bytes = await sizeOf(PathUtils.join(root, ...logSegmentPath(name.segment)));
-      if (bytes === null) continue;
-      const summary = decodeSummary(await IOUtils.readUTF8(path), bytes as ByteCount);
-      if (summary !== null) applyActivity(activity, { kind: "segment-summarized", summary });
-    }
-  }
-}

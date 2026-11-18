@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
-import { parseSite, runIdAt, type ByteCount, type EpochMs } from "@one-click-har/recording/ids";
+import {
+  parseSite,
+  runIdAt,
+  type ByteCount,
+  type EpochMs,
+  type ExchangeId,
+} from "@one-click-har/recording/ids";
 import {
   LAYOUT,
   logSegmentId,
@@ -185,5 +191,100 @@ describe("openStore startup gate and ledger persistence", () => {
     expect(storeWithHeadroom.needsStartupBuffer(1_000_000)).toBe(false);
     expect(storeWithHeadroom.usage()).toEqual({ bodyBytes: 2_000_000, detailBytes: 50_000 });
     await storeWithHeadroom.close();
+  });
+
+  const openSinglePackStore = async (siteHost: string, packBytes: number, capBytes: number) => {
+    const timers: Timers = {
+      repeat: () => ({ cancel: () => undefined }),
+      once: () => ({ cancel: () => undefined }),
+      cancelAll: () => undefined,
+    } as unknown as Timers;
+    const site = parseSite(siteHost)!;
+    const pRel = packPath(packId(site, RUN, 1));
+    const pAbs = `${ROOT}/${pRel.join("/")}`;
+    const siteDir = `${ROOT}/${LAYOUT.sitesDir}/${pRel[1]!}`;
+    const packsDir = `${siteDir}/${LAYOUT.packDir}`;
+    const removedPaths: string[] = [];
+    const g = globalThis as Record<string, unknown>;
+    const prevIo = g["IOUtils"] as Record<string, unknown>;
+    g["IOUtils"] = {
+      ...prevIo,
+      exists: async (path: string) =>
+        path === `${ROOT}/${LAYOUT.sitesDir}` ||
+        path === siteDir ||
+        path === packsDir ||
+        path === pAbs,
+      getChildren: async (path: string) => {
+        if (path === `${ROOT}/${LAYOUT.sitesDir}`) return [siteDir];
+        if (path === siteDir) return [packsDir];
+        if (path === packsDir) return [pAbs];
+        return [];
+      },
+      stat: async (path: string) => ({
+        type: path === pAbs ? "regular" : "directory",
+        size: path === pAbs ? packBytes : 0,
+        lastModified: Date.now() - 1_000,
+      }),
+      remove: async (path: string) => {
+        removedPaths.push(path);
+        written.delete(path);
+      },
+    };
+    const store = openStore({
+      run: RUN,
+      root: ROOT,
+      modes: { dir: null, file: null },
+      settings: makeSettings(capBytes),
+      timers,
+      onSettings: () => undefined,
+    });
+    await store.initRetention();
+    return { store, pAbs, removedPaths };
+  };
+
+  it("serializes updatePart deletions through the write chain rather than deleting synchronously", async () => {
+    const { store, pAbs, removedPaths } = await openSinglePackStore("chain.example", 400, 500);
+
+    let releaseChain!: () => void;
+    const releasePromise = new Promise<void>((resolve) => {
+      releaseChain = resolve;
+    });
+    const blocked = store.enqueue(() => releasePromise);
+
+    const partId = `${RUN}-1` as unknown as ExchangeId;
+    store.openPart(partId, `${ROOT}/incoming/part.part`);
+    store.updatePart(partId, 200);
+    // While the write chain is blocked, updatePart must not delete old packs synchronously off-chain.
+    expect(removedPaths).toEqual([]);
+
+    releaseChain();
+    await blocked;
+    await store.flush();
+    expect(removedPaths).toEqual([pAbs]);
+    await store.close();
+  });
+
+  it("holds drain listeners while reserveWrite exceeds cap and wakes them once retention frees space", async () => {
+    const { store, pAbs, removedPaths } = await openSinglePackStore(
+      "drain.example",
+      200_000,
+      200_000,
+    );
+
+    const release = store.reserveWrite(150_000);
+    expect(store.needsRetentionDrain()).toBe(true);
+    let woken = 0;
+    store.onRetentionDrain(() => {
+      woken += 1;
+    });
+    expect(woken).toBe(0);
+
+    await store.flush();
+    expect(removedPaths).toEqual([pAbs]);
+    expect(store.needsRetentionDrain()).toBe(false);
+    expect(woken).toBe(1);
+    release();
+    expect(store.usage().bodyBytes).toBe(0);
+    await store.close();
   });
 });

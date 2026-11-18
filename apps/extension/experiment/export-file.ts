@@ -223,8 +223,8 @@ export interface UnnamedFile {
   readonly close: () => void;
 }
 
-/** Where the harness may hold an unnamed export: before the link that names the file, and after it. */
-export type ExportPause = "before-link" | "after-link";
+/** Where the harness may hold an export: before reading bodies, before the link that names the file, and after it. */
+export type ExportPause = "before-bodies" | "before-link" | "after-link";
 
 /** What bounds an export's file calls: a call still running after `stepMs` is `timed-out`, and cancel is honored. */
 export interface ExportLimits {

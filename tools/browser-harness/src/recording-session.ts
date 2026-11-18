@@ -43,7 +43,7 @@ export type HookRequest =
   | { readonly kind: "export-fault"; readonly op: string; readonly errno: string }
   | {
       readonly kind: "export-pause";
-      readonly point: "before-link" | "after-link";
+      readonly point: "before-bodies" | "before-link" | "after-link";
       readonly action: "arm" | "reached" | "release";
     };
 

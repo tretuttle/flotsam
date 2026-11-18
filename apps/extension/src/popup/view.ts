@@ -147,6 +147,8 @@ export const RECORDING_PROBLEMS: {
   "settings-unreadable": { blocking: false },
   "write-failed": { blocking: false },
   "too-many-live-requests": { blocking: false },
+  "over-cap-while-exporting": { blocking: false },
+  "archive-entries-unreadable": { blocking: false },
 };
 
 const rowCount = (reading: PopupReading, row: PresetId): number =>

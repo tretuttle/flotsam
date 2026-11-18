@@ -49,6 +49,7 @@ import type { StoredSettings } from "@one-click-har/recording/settings";
 import { archiveBodies, archiveSource, decodeContent, itemOf } from "./archive-source.ts";
 import type { PopupTabArgument, PopupView, ToolboxState } from "./contract.ts";
 import { createDevtoolsSource, toolboxOf } from "./devtools.ts";
+import type { PinHandle, PinTargets } from "./maintenance.ts";
 import {
   createPartSink,
   exportFiles,
@@ -86,6 +87,8 @@ export interface RecordingReads {
   readonly settings: () => StoredSettings;
   /** Resolves when every line committed before the call is in a segment on disk. */
   readonly settle: () => Promise<void>;
+  readonly enqueue: (task: () => Promise<void>) => Promise<void>;
+  readonly pin: (targets: PinTargets) => PinHandle;
   readonly live: () => readonly { readonly site: Site | null; readonly live: LiveExchange }[];
   /** Startup recovery, which reads and then clears the export journal. */
   readonly recovered: Promise<unknown>;
@@ -548,6 +551,7 @@ export function createGeckoHost(options: {
     );
     let written: { readonly part: Part; readonly path: string } | null = null;
     let last = { done: 0, total: 0 };
+    const pins: PinHandle[] = [];
     try {
       const configured = await configuredFolder(rec?.settings() ?? null);
       const folder = await files.openFolder(configured.path);
@@ -561,6 +565,10 @@ export function createGeckoHost(options: {
         job.request.selection,
         await selectionContext(rec, job.request.selection, devtools),
       );
+      const baseBodies = combinedBodies(
+        rec === null ? EMPTY_BODY_READER : archiveBodies(rec.root),
+        devtools.bodies,
+      );
       const report = await runExport(job.request, resolved, {
         recording:
           rec === null
@@ -569,13 +577,21 @@ export function createGeckoHost(options: {
                 root: rec.root,
                 activity: rec.activity,
                 settle: rec.settle,
+                enqueue: rec.enqueue,
+                pin: (targets) => {
+                  const handle = rec.pin(targets);
+                  pins.push(handle);
+                  return handle;
+                },
                 live: rec.live,
               }),
         devtools: devtools.source,
-        bodies: combinedBodies(
-          rec === null ? EMPTY_BODY_READER : archiveBodies(rec.root),
-          devtools.bodies,
-        ),
+        bodies: {
+          open: async (source, chunkBytes, signal) => {
+            await pauses.pass("before-bodies");
+            return baseBodies.open(source, chunkBytes, signal);
+          },
+        },
         sink,
         creator,
         fileId: Array.from(randomBytes(16), (b) => b.toString(16).padStart(2, "0")).join(""),
@@ -607,6 +623,8 @@ export function createGeckoHost(options: {
         ...(written === null ? {} : { route: written.part.route() }),
         ...(written?.part.unconfirmed() === true ? { unconfirmed: true as const } : {}),
       };
+    } finally {
+      for (const pin of pins) pin.release();
     }
   };
 

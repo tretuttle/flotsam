@@ -40,7 +40,14 @@ import {
 import { carriesHead, type JournaledPart } from "./export-file.ts";
 import type { RetentionRef, RetentionStep } from "@one-click-har/recording/retention";
 import type { UserSettings } from "@one-click-har/recording/settings";
-import { localFile, type Modes, pathState, readHead, type Timers, writeAtomic } from "./gecko-io.ts";
+import {
+  localFile,
+  type Modes,
+  pathState,
+  readHead,
+  type Timers,
+  writeAtomic,
+} from "./gecko-io.ts";
 
 export const RETENTION_EVERY_MS = 10 * 60_000;
 const DEFAULT_SCAN_TIMEOUT_MS = 30_000;
@@ -323,19 +330,7 @@ interface TrackedPart {
 }
 
 const DAY_MS = 86_400_000;
-const syncUnlink = (path: string): boolean => {
-  try {
-    const file = localFile(path);
-    if (file.exists()) file.remove(false);
-    return true;
-  } catch {
-    try {
-      return !localFile(path).exists();
-    } catch {
-      return false;
-    }
-  }
-};
+const DRAIN_MARGIN_BYTES = 128 * 1024;
 
 interface HeapSortable {
   readonly newestAt: EpochMs;
@@ -649,12 +644,7 @@ export interface Maintenance {
   ): void;
   markPackClosed(pack: PackId): boolean;
   trackPart(id: ExchangeId, path: string, expectedBytes?: number): void;
-  updatePart(
-    id: ExchangeId,
-    bytes: number,
-    settings: UserSettings,
-    canRotatePack: (pack: PackId) => boolean,
-  ): boolean;
+  updatePart(id: ExchangeId, bytes: number, settings: UserSettings): boolean;
   untrackPart(id: ExchangeId): void;
   partBudget(id: ExchangeId, routeCap: number, settings: UserSettings): number;
   recordBodyFile(site: Site, id: ExchangeId, path: string, bytes: number, now: EpochMs): void;
@@ -677,6 +667,7 @@ export interface Maintenance {
   ): void;
   forgetSite(site: Site): void;
   isOverCap(settings: UserSettings, reserveBytes?: number): boolean;
+  needsRetentionDrain(settings: UserSettings): boolean;
   retain(
     settings: UserSettings,
     rotate: (ref: RetentionRef) => Promise<boolean>,
@@ -1364,10 +1355,9 @@ export function createMaintenance(options: {
       }
     },
 
-    updatePart: (id, bytes, settings, canRotatePack) => {
+    updatePart: (id, bytes, settings) => {
       chunkCalls += 1;
       const syncStart = opsCount;
-      let removed = 0;
       try {
         const part = parts.get(id);
         if (part === undefined) return false;
@@ -1389,54 +1379,16 @@ export function createMaintenance(options: {
               Math.max(0, reserved - bytes),
           );
         }
-        if (!ready || !scanCompleted) {
-          return (
-            bodyBytes > settings.retention.maxBodyBytes ||
-            detailBytes > settings.retention.maxDetailBytes
-          );
-        }
-        if (bodyBytes <= settings.retention.maxBodyBytes) {
-          return detailBytes > settings.retention.maxDetailBytes;
-        }
-        const cutoff = Date.now() - settings.retention.maxAgeDays * DAY_MS;
-        const oldestNow = bodyHeap.peek();
-        if (oldestNow !== undefined && oldestNow.newestAt < cutoff) {
-          const skipped: TrackedBody[] = [];
-          while (true) {
-            const item = bodyHeap.peek();
-            if (item === undefined || item.newestAt >= cutoff) break;
-            if (!item.open && !isPinned(item.ref) && syncUnlink(item.path)) {
-              removeTrackedBody(item);
-              removed += 1;
-              continue;
-            }
-            bodyHeap.pop();
-            skipped.push(item);
-          }
-          for (const item of skipped) bodyHeap.push(item);
-        }
-        while (bodyBytes > settings.retention.maxBodyBytes) {
-          const item = bodyHeap.peek();
-          if (item === undefined) break;
-          if (isPinned(item.ref)) return true;
-          if (item.open && (item.ref.kind !== "pack" || !canRotatePack(item.ref.pack))) {
-            return true;
-          }
-          if (!syncUnlink(item.path)) return true;
-          removeTrackedBody(item);
-          removed += 1;
-        }
         return (
           bodyBytes > settings.retention.maxBodyBytes ||
           detailBytes > settings.retention.maxDetailBytes
         );
       } finally {
         const dt = opsCount - syncStart;
-        chunkDeletes += removed;
         chunkTouched += dt;
         if (dt > chunkMaxTouched) {
           chunkMaxTouched = dt;
-          chunkMaxDeletes = removed;
+          chunkMaxDeletes = 0;
         }
       }
     },
@@ -1613,6 +1565,15 @@ export function createMaintenance(options: {
     isOverCap: (settings, reserveBytes = 0) =>
       bodyBytes + reserveBytes > settings.retention.maxBodyBytes ||
       detailBytes > settings.retention.maxDetailBytes,
+
+    needsRetentionDrain: (settings) => {
+      if (!scanCompleted || !ready) return false;
+      if (bodyBytes <= settings.retention.maxBodyBytes + DRAIN_MARGIN_BYTES) return false;
+      if (partBytes + lockedBytes + pendingWriteBytes > settings.retention.maxBodyBytes)
+        return false;
+      const oldest = bodyHeap.peek();
+      return oldest !== undefined && !isPinned(oldest.ref);
+    },
 
     retain,
     pin,

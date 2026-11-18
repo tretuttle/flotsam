@@ -170,6 +170,9 @@ export interface Store {
   openPart(id: ExchangeId, path: string, expectedBytes?: number): void;
   updatePart(id: ExchangeId, bytes: number): void;
   partBudget(id: ExchangeId, routeCap: number): number;
+  reserveWrite(bytes: number): () => void;
+  needsRetentionDrain(): boolean;
+  onRetentionDrain(listener: () => void): () => void;
   pin(targets: PinTargets): PinHandle;
   pinOldestPack(): Promise<{ readonly pinId: string; readonly pack: PackId } | null>;
   unpin(pinId: string): Promise<boolean>;
@@ -214,7 +217,7 @@ export function openStore(options: {
   const armed = new Set<HoldPoint>();
   const reachedPoints = new Set<HoldPoint>();
   const activity = emptyActivity(run);
-  const inFlightPacks = new Map<PackId, number>();
+  const drainListeners = new Set<() => void>();
   let retentionQueued = false;
   const maintenance = createMaintenance({
     root,
@@ -321,8 +324,7 @@ export function openStore(options: {
         state.pack = null;
         state.packSeq += 1;
         if (batch.streams.length > 0 || batch.lines.length > 0) {
-          const releasePackTrack = trackPackWrite(ref.pack, batch.streams.length);
-          await writeBatch(state, batch, false, false, releasePackTrack);
+          await writeBatch(state, batch, false, false);
         }
         maintenance.markPackClosed(ref.pack);
         return true;
@@ -334,8 +336,7 @@ export function openStore(options: {
         if (state.segment?.id !== ref.segment) continue;
         const batch = takeBatch(state);
         if (batch.streams.length > 0 || batch.lines.length > 0) {
-          const releasePackTrack = trackPackWrite(batch.pack?.id ?? null, batch.streams.length);
-          await writeBatch(state, batch, false, false, releasePackTrack);
+          await writeBatch(state, batch, false, false);
         }
         await seal(state);
         return true;
@@ -344,8 +345,20 @@ export function openStore(options: {
     return false;
   };
 
-  const runRetention = (reserveBytes = 0): Promise<readonly RetentionStep[]> =>
-    maintenance.retain(settings.user, rotateFile, reserveBytes);
+  const notifyDrain = (): void => {
+    if (drainListeners.size === 0) return;
+    const listeners = [...drainListeners];
+    drainListeners.clear();
+    for (const listener of listeners) listener();
+  };
+
+  const runRetention = async (reserveBytes = 0): Promise<readonly RetentionStep[]> => {
+    try {
+      return await maintenance.retain(settings.user, rotateFile, reserveBytes);
+    } finally {
+      notifyDrain();
+    }
+  };
 
   const scheduleRetention = (): void => {
     if (retentionQueued) return;
@@ -356,39 +369,13 @@ export function openStore(options: {
     });
   };
 
-  const trackPackWrite = (pack: PackId | null, streamsCount: number): (() => void) => {
-    if (pack === null || streamsCount === 0) return () => undefined;
-    inFlightPacks.set(pack, (inFlightPacks.get(pack) ?? 0) + 1);
-    return () => {
-      const next = (inFlightPacks.get(pack) ?? 0) - 1;
-      if (next <= 0) inFlightPacks.delete(pack);
-      else inFlightPacks.set(pack, next);
-    };
-  };
-
-  const canRotatePack = (pack: PackId): boolean => {
-    if ((inFlightPacks.get(pack) ?? 0) > 0) return false;
-    for (const state of sites.values()) {
-      if (state.pack?.id !== pack) continue;
-      if (state.streams.length > 0 || state.lines.length > 0) return false;
-      state.pack = null;
-      state.packSeq += 1;
-      return true;
-    }
-    return true;
-  };
-
   const writeBatch = async (
     state: SiteState,
     batch: PendingBatch,
     allowHold: boolean,
     allowRetention: boolean,
-    releasePackTrack: () => void,
   ): Promise<void> => {
-    if (excluded.has(state.site)) {
-      releasePackTrack();
-      return;
-    }
+    if (excluded.has(state.site)) return;
     const now = Date.now() as EpochMs;
     const hasPackWrite = batch.streams.length > 0 && batch.pack !== null;
     const releaseWrite = hasPackWrite
@@ -413,7 +400,6 @@ export function openStore(options: {
       }
     } finally {
       releaseWrite();
-      releasePackTrack();
     }
     if (allowHold) await hold("before-line-append");
     let sealed = false;
@@ -450,14 +436,15 @@ export function openStore(options: {
     }
     if (allowRetention && (sealed || maintenance.isOverCap(settings.user))) {
       await runRetention();
+    } else {
+      notifyDrain();
     }
   };
 
   const flushSite = (state: SiteState): void => {
     if (state.streams.length === 0 && state.lines.length === 0) return;
     const batch = takeBatch(state);
-    const releasePackTrack = trackPackWrite(batch.pack?.id ?? null, batch.streams.length);
-    void enqueue(() => writeBatch(state, batch, true, true, releasePackTrack));
+    void enqueue(() => writeBatch(state, batch, true, true));
   };
 
   const tick = (): void => {
@@ -530,7 +517,11 @@ export function openStore(options: {
 
   const removePart = (id: ExchangeId): void => {
     maintenance.untrackPart(id);
-    void enqueue(() => IOUtils.remove(at(partPath(id)), { ignoreAbsent: true }));
+    notifyDrain();
+    void enqueue(async () => {
+      await IOUtils.remove(at(partPath(id)), { ignoreAbsent: true });
+      notifyDrain();
+    });
   };
 
   const onPinRelease = (): void => {
@@ -651,6 +642,7 @@ export function openStore(options: {
         for (const made of madeDirs) if (made.startsWith(dir)) madeDirs.delete(made);
         maintenance.forgetSite(site);
         applyActivity(activity, { kind: "site-forgotten", site });
+        notifyDrain();
       });
     },
     flush: async () => {
@@ -701,11 +693,28 @@ export function openStore(options: {
       });
       return steps;
     },
-    openPart: (id, path, expectedBytes) => maintenance.trackPart(id, path, expectedBytes),
+    openPart: (id, path, expectedBytes) => {
+      maintenance.trackPart(id, path, expectedBytes);
+      if (
+        maintenance.isScanCompleted() &&
+        maintenance.isOverCap(settings.user, expectedBytes ?? 0)
+      ) {
+        scheduleRetention();
+      }
+    },
     updatePart: (id, bytes) => {
-      if (maintenance.updatePart(id, bytes, settings.user, canRotatePack)) scheduleRetention();
+      if (maintenance.updatePart(id, bytes, settings.user)) scheduleRetention();
     },
     partBudget: (id, routeCap) => maintenance.partBudget(id, routeCap, settings.user),
+    reserveWrite: (bytes) => maintenance.reserveWrite(bytes),
+    needsRetentionDrain: () => maintenance.needsRetentionDrain(settings.user),
+    onRetentionDrain: (listener) => {
+      drainListeners.add(listener);
+      scheduleRetention();
+      return () => {
+        drainListeners.delete(listener);
+      };
+    },
     pin: (targets) => maintenance.pin(targets, onPinRelease),
     pinOldestPack: async () => {
       await store.flush();
