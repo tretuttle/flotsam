@@ -83,7 +83,7 @@ const ARMS: readonly StartupArm[] = [
     detailCap: SMALL_CAP_SETTINGS.user.retention.maxDetailBytes,
     packCount: 100,
     headroomBytes: 512 * 1024,
-    scanDelayMs: 2_000,
+    scanDelayMs: 8_000,
     testSuspend: true,
   },
   {
