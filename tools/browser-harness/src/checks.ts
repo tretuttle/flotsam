@@ -57,6 +57,14 @@ export async function discoverChecks(
   return checks;
 }
 
+function formatCheckError(error: unknown, depth = 0): string {
+  if (depth > 4) return "...";
+  if (typeof SuppressedError === "function" && error instanceof SuppressedError) {
+    return `${formatCheckError(error.error, depth + 1)}; suppressed during disposal: ${formatCheckError(error.suppressed, depth + 1)}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
 export async function runDiscoveredChecks(options: {
   readonly checksDir?: string;
   readonly filter?: readonly string[];
@@ -91,7 +99,7 @@ export async function runDiscoveredChecks(options: {
         name: item.name,
         ok: false,
         durationMs: Date.now() - started,
-        detail: error instanceof Error ? error.message : String(error),
+        detail: formatCheckError(error),
       };
     }
     results.push(result);

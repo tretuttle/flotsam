@@ -2,11 +2,26 @@
 // that export's worker, never the main thread, and the export's step limit still ends it. A refused call rejects with
 // `{ name: <errno name> }`, which exportFiles classifies like any platform error.
 
-import type { FileIdentity, HeldFolder, UnnamedFile, UnnamedRefused } from "./export-file.ts";
-import type { Identity, WorkerAnswer, WorkerArch, WorkerRequest } from "./file-worker.ts";
+import type {
+  FileIdentity,
+  HeldFolder,
+  NamedPartFile,
+  UnnamedFile,
+  UnnamedRefused,
+} from "./export-file.ts";
+import type {
+  Identity,
+  WorkerAnswer,
+  WorkerArch,
+  WorkerPlatform,
+  WorkerRequest,
+} from "./file-worker.ts";
 
 /** What O_TMPFILE answers on a file system that cannot make an unnamed file: the export then names a part instead. */
 const NO_UNNAMED_FILES = new Set(["EOPNOTSUPP", "EISDIR", "EINVAL"]);
+
+/** What rename-part answers when no atomic no-replace rename is available, including simulated faults. */
+const UNSUPPORTED_ATOMIC_ERRNOS = new Set(["ENOSYS", "EINVAL", "ENOTSUP", "EOPNOTSUPP"]);
 
 type Ask = {
   [Op in WorkerRequest["op"]]: Omit<Extract<WorkerRequest, { op: Op }>, "id">;
@@ -24,7 +39,7 @@ class FileWorker {
   readonly #fault: FaultFor;
   #next = 1;
 
-  constructor(url: string, arch: WorkerArch, fault: FaultFor) {
+  constructor(url: string, platform: WorkerPlatform, arch: WorkerArch, fault: FaultFor) {
     this.#fault = fault;
     this.#worker = new ChromeWorker(url);
     this.#worker.onmessage = ({ data }: { readonly data: WorkerAnswer }) => {
@@ -37,7 +52,7 @@ class FileWorker {
       for (const waiting of this.#pending.values()) waiting.reject({ name: "worker-error" });
       this.#pending.clear();
     };
-    void this.ask({ op: "init", arch }).catch(() => undefined);
+    void this.ask({ op: "init", platform, arch }).catch(() => undefined);
   }
 
   ask<T>(request: Ask): Promise<T> {
@@ -60,6 +75,7 @@ class FileWorker {
 const sameIdentity = (identity: Identity): FileIdentity => ({
   dev: identity.dev,
   ino: identity.ino,
+  kind: identity.kind,
 });
 
 const nameOf = (error: unknown): string => {
@@ -70,9 +86,9 @@ const nameOf = (error: unknown): string => {
 
 /** Holds `realFolder` open in a new worker. The worker ends once the folder and its file are closed. */
 export const holdFolderIn =
-  (url: string, arch: WorkerArch, mode: number, fault: FaultFor) =>
+  (url: string, platform: WorkerPlatform, arch: WorkerArch, mode: number, fault: FaultFor) =>
   async (realFolder: string): Promise<HeldFolder> => {
-    const worker = new FileWorker(url, arch, fault);
+    const worker = new FileWorker(url, platform, arch, fault);
     const held = await worker
       .ask<{ readonly fd: number }>({ op: "hold-folder", path: realFolder })
       .catch((error: unknown) => {
@@ -99,6 +115,32 @@ export const holdFolderIn =
       link: (name) => worker.ask<boolean>({ op: "link", fd, folder, name }),
       close: () => closeFd(fd),
     });
+    const namedPartFile = (fd: number, identity: Identity): NamedPartFile => ({
+      identity: sameIdentity(identity),
+      write: async (text) => {
+        await worker.ask({ op: "write", fd, text });
+      },
+      size: () => worker.ask<number>({ op: "size", fd }),
+      read: async (offset, bytes) =>
+        new Uint8Array(await worker.ask<ArrayBuffer>({ op: "read", fd, offset, bytes })),
+      rename: (fromName, toName, toPath) =>
+        worker
+          .ask<boolean>({ op: "rename-part", fd, folder, fromName, toName, toPath })
+          .catch((error: unknown) => {
+            if (UNSUPPORTED_ATOMIC_ERRNOS.has(nameOf(error))) throw { name: "NO_ATOMIC_RENAME" };
+            throw error;
+          }),
+      discard: async (name) => {
+        if (!open.delete(fd)) return;
+        const discarding = worker.ask({ op: "discard-part", fd, folder, name });
+        try {
+          await discarding;
+        } finally {
+          if (open.size === 0) worker.terminate();
+        }
+      },
+      close: () => closeFd(fd),
+    });
     return {
       where: () => worker.ask<string | null>({ op: "where", fd: folder, expected: realFolder }),
       createUnnamed: async () => {
@@ -123,8 +165,25 @@ export const holdFolderIn =
           errno: "fd-link-unavailable",
         } satisfies UnnamedRefused;
       },
+      createNamedPart: async (name, path) => {
+        const made = await worker.ask<{ readonly fd: number; readonly identity: Identity } | null>({
+          op: "create-part",
+          folder,
+          path,
+          name,
+          mode,
+        });
+        if (made === null) return null;
+        open.add(made.fd);
+        return namedPartFile(made.fd, made.identity);
+      },
       identityOf: async (name) => {
-        const found = await worker.ask<Identity | null>({ op: "identity-at", folder, name });
+        const found = await worker.ask<Identity | null>({
+          op: "identity-at",
+          folder,
+          folderPath: realFolder,
+          name,
+        });
         return found === null ? null : sameIdentity(found);
       },
       close: () => closeFd(folder),

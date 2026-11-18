@@ -62,16 +62,14 @@ import {
 } from "./export-file.ts";
 import { createExportJobs, type ExportJobs, type RunOutcome } from "./export-jobs.ts";
 import { forbiddenRoots, platform } from "./files.ts";
-import type { WorkerArch } from "./file-worker.ts";
+import type { WorkerArch, WorkerPlatform } from "./file-worker.ts";
 import { holdFolderIn, type FaultFor } from "./held-folder.ts";
 import {
   appendText,
   localFile,
   oneShot,
-  openReadWrite,
   pathState,
   randomBytes,
-  readAt,
   readHead,
   sha256,
   siteOfUri,
@@ -176,13 +174,6 @@ const yieldNow = (): Promise<void> =>
  * milliseconds; this leaves room for a slow network share.
  */
 const EXPORT_STEP_MS = 15_000;
-const PR_CREATE_FILE = 0x08;
-const PR_EXCL = 0x80;
-/**
- * nsIFileInputStream.SHARE_DELETE: on Windows the part is opened so it can be renamed while its handle is open, which
- * the checks after the rename need. Other platforms ignore it.
- */
-const SHARE_DELETE = 1 << 5;
 
 const realPathOf = (path: string): string => {
   const file = localFile(path);
@@ -195,27 +186,34 @@ const WORKER_ARCHES: { readonly [arch: string]: WorkerArch } = {
   "x86-64": "x86-64",
   aarch64: "aarch64",
 };
-/** Set only in a harness profile, beside `extensions.oneClickHar.harness`: exports name a part as other platforms do. */
+const WORKER_PLATFORMS: { readonly [os: string]: WorkerPlatform } = {
+  Linux: "linux",
+  WINNT: "win",
+  Darwin: "macosx",
+};
+/** Set only in a harness profile, beside `extensions.oneClickHar.harness`: exports name a part on Linux too. */
 const NAMED_PARTS_PREF = "extensions.oneClickHar.harness.namedParts";
 
 /**
- * Where exports hold their folder open and write an unnamed file: Linux, through file-worker.ts. Elsewhere, and in a
- * harness profile that asks for named parts, there is none and exports use `<name>.har.part`.
+ * Held-folder worker setup for Linux, Windows, and macOS. Non-Linux platforms (and Linux when the harness asks)
+ * prefer named parts inside the held folder rather than unnamed files.
  */
 const heldFolders = (
   workerUrl: string | null,
   modes: Modes,
   fault: FaultFor,
-): Pick<ExportPlatform, "holdFolder" | "namedBecause"> => {
+): Pick<ExportPlatform, "holdFolder" | "preferNamed"> => {
   const arch = WORKER_ARCHES[Services.sysinfo.getProperty("arch")];
-  if (workerUrl === null || Services.appinfo.OS !== "Linux" || arch === undefined)
-    return { namedBecause: "platform" };
+  const workerPlatform = WORKER_PLATFORMS[Services.appinfo.OS];
+  if (workerUrl === null || workerPlatform === undefined || arch === undefined) return {};
+  const holdFolder = holdFolderIn(workerUrl, workerPlatform, arch, modes.file ?? 0o644, fault);
+  if (workerPlatform !== "linux") return { holdFolder, preferNamed: "platform" };
   if (
     Services.prefs.getBoolPref("extensions.oneClickHar.harness", false) &&
     Services.prefs.getBoolPref(NAMED_PARTS_PREF, false)
   )
-    return { namedBecause: "harness-pref" };
-  return { holdFolder: holdFolderIn(workerUrl, arch, modes.file ?? 0o644, fault) };
+    return { holdFolder, preferNamed: "harness-pref" };
+  return { holdFolder };
 };
 
 /**
@@ -258,10 +256,9 @@ const exportPauses = () => {
   };
 };
 
-/** The only raw file calls an export makes. `exportFiles` classifies whatever they throw. */
+/** The only raw file calls an export makes outside the worker. `exportFiles` classifies whatever they throw. */
 const geckoExportPlatform = (
-  modes: Modes,
-  held: Pick<ExportPlatform, "holdFolder" | "namedBecause">,
+  held: Pick<ExportPlatform, "holdFolder" | "preferNamed">,
 ): ExportPlatform => ({
   ...held,
   state: pathState,
@@ -271,37 +268,7 @@ const geckoExportPlatform = (
   filename: (path) => PathUtils.filename(path),
   makeFolder: (folder) =>
     IOUtils.makeDirectory(folder, { createAncestors: true, ignoreExisting: true }),
-  createExclusive: (path) => {
-    const file = openReadWrite(path, PR_CREATE_FILE | PR_EXCL, modes.file ?? 0o644, SHARE_DELETE);
-    const utf8 = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(
-      Ci.nsIConverterOutputStream,
-    );
-    utf8.init(file, "UTF-8");
-    const toEnd = (): void => file.seek(Ci.nsISeekableStream.NS_SEEK_END, 0);
-    return {
-      write: (text) => {
-        if (!utf8.writeString(text)) throw new Error("short write");
-      },
-      flush: () => utf8.flush(),
-      size: () => file.size,
-      read: (offset, bytes) => {
-        try {
-          return readAt(file, offset, bytes);
-        } finally {
-          toEnd();
-        }
-      },
-      resize: (bytes) => {
-        file.seek(Ci.nsISeekableStream.NS_SEEK_SET, bytes);
-        file.setEOF();
-        toEnd();
-      },
-      close: () => utf8.close(),
-    };
-  },
   readHead,
-  rename: (from, to) => IOUtils.move(from, to, { noOverwrite: true }),
-  remove: (path) => IOUtils.remove(path, { ignoreAbsent: true }),
   freeBytes: (folder) => localFile(folder).diskSpaceAvailable,
   sha256,
 });
@@ -542,10 +509,11 @@ export function createGeckoHost(options: {
     const partJournal: PartJournal = {
       started: (path, head) => note({ started: path, head }),
       ended: (path) => note({ ended: path }),
+      discardFailed: (path, reason) => note({ discardFailed: path, reason }),
     };
     const roots = realRoots(rec?.root ?? null);
     const files = exportFiles(
-      geckoExportPlatform(modes, heldFolders(options.workerUrl, modes, faults.take)),
+      geckoExportPlatform(heldFolders(options.workerUrl, modes, faults.take)),
       (real) => guardFolder(real, roots, platform()).ok,
       { stepMs: EXPORT_STEP_MS, timer: oneShot, signal: control.signal, pause: pauses.pass },
     );

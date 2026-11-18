@@ -49,6 +49,7 @@
       "ignoreBinaries": [
         "taskkill.exe",
         "powershell.exe",
+        "icacls",
         "getconf",
         "coredumpctl",
         "unshare",

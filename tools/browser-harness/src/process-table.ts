@@ -80,7 +80,9 @@ export const PROCESS_PLATFORMS: Readonly<Record<ProcessPlatformName, ProcessPlat
     groupSignals: true,
     // `ps -o lstart=` has one-second resolution (not observed on Linux).
     table: () =>
-      parseDarwinProcessTable(run("ps", ["-A", "-ww", "-o", "pid=,ppid=,pgid=,lstart=,args="])),
+      parseDarwinProcessTable(
+        run("ps", ["-A", "-ww", "-o", "pid=,ppid=,pgid=,state=,lstart=,args="]),
+      ),
     identity: (pid) => PROCESS_PLATFORMS.darwin.table().get(pid),
     snapshot: (pid) =>
       PROCESS_PLATFORMS.darwin.parseSnapshot(
@@ -170,16 +172,19 @@ export function parseWin32ProcessTable(text: string): ProcessTable {
   return table;
 }
 
-// `ps -o pid=,ppid=,pgid=,lstart=,args=`: lstart is five tokens ("Mon Nov 16 12:00:00 2026").
+// `ps -o pid=,ppid=,pgid=,state=,lstart=,args=`: zombies (`Z`), exiting (`E`), and kernel-masked
+// `(proc)` entries have lost their argv and are no longer running; lstart is five tokens.
 export function parseDarwinProcessTable(text: string): ProcessTable {
   const table = new Map<number, ProcessIdentity>();
   for (const line of text.split("\n")) {
     const tokens = line.trim().split(/\s+/u);
-    const [pidText, parentText, pgidText, ...rest] = tokens;
+    const [pidText, parentText, pgidText, state = "", ...rest] = tokens;
     const lstart = rest.slice(0, 5);
     const args = rest.slice(5);
     const pid = Number(pidText);
     if (!Number.isInteger(pid) || pid <= 0 || lstart.length < 5 || args.length === 0) continue;
+    if (state.startsWith("Z") || state.includes("E")) continue;
+    if (args.length === 1 && /^\([^)]+\)$/u.test(args[0] ?? "")) continue;
     table.set(pid, {
       pid,
       parentPid: Number.isInteger(Number(parentText)) ? Number(parentText) : null,

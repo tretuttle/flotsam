@@ -205,6 +205,7 @@ describe("oneClickHar contract", () => {
       | "io-error"
       | "copy-mismatch"
       | "timed-out"
+      | "no-atomic-rename"
       | "other"
     >();
     expectTypeOf<FailureText<FailureOf<typeof oneClickHarApi>>>().toEqualTypeOf<never>();

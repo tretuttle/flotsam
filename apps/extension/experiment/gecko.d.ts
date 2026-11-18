@@ -358,6 +358,7 @@ declare const Services: {
   readonly prefs: {
     getBoolPref(name: string, fallback: boolean): boolean;
     getIntPref(name: string, fallback: number): number;
+    getStringPref(name: string, fallback: string): string;
   };
   readonly env: {
     get(name: string): string;

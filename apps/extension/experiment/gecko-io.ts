@@ -196,20 +196,29 @@ export const randomBytes = (length: number): Uint8Array =>
 /** What is at a path, without following a link there. */
 export const pathState = (path: string): PathState => {
   const file = localFile(path);
+  let symlink = false;
   try {
-    if (file.isSymlink()) return { kind: "link", size: file.fileSizeOfLink };
+    symlink = file.isSymlink();
   } catch {
     return { kind: "missing" };
   }
+  if (symlink) {
+    try {
+      return { kind: "link", size: file.fileSizeOfLink };
+    } catch {
+      return { kind: "link", size: 0 };
+    }
+  }
   if (!file.exists()) return { kind: "missing" };
   const kind = file.isDirectory() ? "folder" : file.isFile() ? "file" : "other";
-  return { kind, size: file.fileSize };
+  // Windows nsIFile.fileSize throws on directories; callers only check size on regular files.
+  return { kind, size: kind === "file" ? file.fileSize : 0 };
 };
 
 const PR_RDWR = 0x04;
 
 /** Opens for reading and writing: an open that never waits, since a FIFO opened both ways has its own writer. */
-export const openReadWrite = (
+const openReadWrite = (
   path: string,
   flags: number,
   mode: number,
@@ -230,11 +239,7 @@ export const openReadWrite = (
 };
 
 /** Up to `bytes` bytes through `stream`, from `offset`; fewer only at its end. */
-export const readAt = (
-  stream: FileRandomAccessStream,
-  offset: number,
-  bytes: number,
-): Uint8Array => {
+const readAt = (stream: FileRandomAccessStream, offset: number, bytes: number): Uint8Array => {
   stream.seek(Ci.nsISeekableStream.NS_SEEK_SET, offset);
   const reader = Cc["@mozilla.org/binaryinputstream;1"].createInstance(Ci.nsIBinaryInputStream);
   reader.setInputStream(stream);
