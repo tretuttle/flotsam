@@ -92,6 +92,8 @@ export type WriteFailure =
   | { readonly kind: "copy-mismatch" }
   /** A file call was still running after the export's time limit for one call. */
   | { readonly kind: "timed-out" }
+  /** The platform or file system has no atomic no-replace rename primitive. */
+  | { readonly kind: "no-atomic-rename" }
   /** An error the table does not name. */
   | { readonly kind: "other" };
 

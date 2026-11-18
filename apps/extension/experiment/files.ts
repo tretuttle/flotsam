@@ -142,11 +142,17 @@ export const openArchive = ():
   const row = ARCHIVE_ROOTS[os];
   const modes: Modes = { dir: row.dirMode, file: row.fileMode };
   try {
-    const segments = rootSegments(
-      row,
-      (name) => (Services.env.exists(name) ? Services.env.get(name) : null),
-      dirPath,
-    );
+    const harnessDataHome = Services.prefs.getBoolPref("extensions.oneClickHar.harness", false)
+      ? Services.prefs.getStringPref("extensions.oneClickHar.harness.dataHome", "")
+      : "";
+    const segments =
+      harnessDataHome !== ""
+        ? [harnessDataHome, "one-click-har"]
+        : rootSegments(
+            row,
+            (name) => (Services.env.exists(name) ? Services.env.get(name) : null),
+            dirPath,
+          );
     const appFolder = PathUtils.join(...segments);
     const forbidden = forbiddenRoots();
     const guardedApp = guardFolder(appFolder, forbidden, os);

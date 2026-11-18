@@ -14,6 +14,7 @@ import {
   type ExportLimits,
   type ExportPause,
   type ExportPlatform,
+  type FileIdentity,
   type HeldFolder,
   type JournaledPart,
   type JournalEntry,
@@ -23,9 +24,7 @@ import {
 } from "./export-file.ts";
 
 /**
- * An inode. A handle and every hard link hold the same object, so a write through a handle follows the inode. A folder
- * or FIFO may report any size through lstat, or the size of another inode, as a user-space file system can, so a check
- * can be shown to hold without the size agreeing by luck. Opened both ways, a FIFO reports 0 bytes.
+ * An inode. A handle and every hard link hold the same object, so a write through a handle follows the inode.
  */
 type FileNode = { readonly kind: "file"; bytes: number[] };
 type Node =
@@ -40,12 +39,14 @@ interface Hold {
   readonly release: () => void;
 }
 
+type OpKey = "makeFolder" | "createPart" | "write" | "rename" | "discard";
+
 /** A small POSIX file system: paths name inodes, links resolve, an open handle keeps writing its own inode. */
 class MemoryFs {
   readonly nodes = new Map<string, Node>([["/", { kind: "folder" }]]);
   /** Errors to throw from one platform call, as the browser threw them for one cause. */
-  readonly fail = new Map<keyof ExportPlatform, unknown>();
-  readonly holds = new Map<keyof ExportPlatform, { gate: Promise<void>; reached: () => void }>();
+  readonly fail = new Map<OpKey, unknown>();
+  readonly holds = new Map<OpKey, { gate: Promise<void>; reached: () => void }>();
   /** Every rename that moved something, as `from -> to`. */
   readonly moves: string[] = [];
   /** Set when anything reads a FIFO by its path. */
@@ -114,7 +115,7 @@ class MemoryFs {
   lastUnnamed: FileNode | null = null;
   /**
    * Bytes the disk still takes; null for room enough. A write past them stores what fits, a short write, and then
-   * throws what the next write meets: the worker's ENOSPC, or the name Gecko gave the part's handle.
+   * throws the worker's ENOSPC.
    */
   room: number | null = null;
   /** Set to make readText hand back its last byte changed, as a copy that is not byte-exact would. */
@@ -130,7 +131,15 @@ class MemoryFs {
     if (taken.length < bytes.length) throw full;
   }
 
-  /** Holds the folder at `path` open, as file-worker.ts does with a directory descriptor. */
+  private identityOfNode(node: Node): FileIdentity {
+    return {
+      dev: "m",
+      ino: this.ino(node),
+      kind: node.kind === "fifo" ? "other" : node.kind,
+    };
+  }
+
+  /** Holds the folder at `path` open, as file-worker.ts does with a directory descriptor/handle. */
   holdFolder = async (path: string): Promise<HeldFolder> => {
     const folder = this.nodes.get(path);
     if (folder?.kind !== "folder") throw new DOMException("x", "NotFoundError");
@@ -140,7 +149,7 @@ class MemoryFs {
       identityOf: async (name) => {
         const at = where();
         const node = at === null ? undefined : this.nodes.get(this.join(at, name));
-        return node === undefined ? null : { dev: "m", ino: this.ino(node) };
+        return node === undefined ? null : this.identityOfNode(node);
       },
       createUnnamed: async () => {
         if (this.failUnnamed.has("createUnnamed")) throw this.failUnnamed.get("createUnnamed");
@@ -150,7 +159,7 @@ class MemoryFs {
         this.lastUnnamed = node;
         return {
           file: {
-            identity: { dev: "m", ino: this.ino(node) },
+            identity: this.identityOfNode(node),
             write: async (text) => this.store(node, text, { name: "ENOSPC" }),
             size: async () => node.bytes.length,
             read: async (offset, bytes) =>
@@ -172,6 +181,51 @@ class MemoryFs {
           },
         };
       },
+      createNamedPart: async (name) => {
+        this.check("createPart");
+        const at = where();
+        if (at === null) throw { name: "ENOENT" };
+        const full = this.join(at, name);
+        if (this.nodes.has(full)) return null;
+        const node = this.file(full, "");
+        return {
+          identity: this.identityOfNode(node),
+          write: async (text) => {
+            this.check("write");
+            this.store(node, text, { name: "ENOSPC" });
+          },
+          size: async () => node.bytes.length,
+          read: async (offset, bytes) => Uint8Array.from(node.bytes.slice(offset, offset + bytes)),
+          rename: async (fromName, toName) => {
+            await this.wait("rename");
+            this.check("rename");
+            const currentFolder = where();
+            if (currentFolder === null) throw { name: "ENOENT" };
+            const target = this.join(currentFolder, toName);
+            if (this.nodes.has(target)) return false;
+            const source = this.join(currentFolder, fromName);
+            const current = this.nodes.get(source);
+            if (current === undefined) throw { name: "ENOENT" };
+            this.nodes.delete(source);
+            this.nodes.set(target, current);
+            this.moves.push(`${source} -> ${target}`);
+            this.removes.push(`rename ${source}`);
+            return true;
+          },
+          discard: async (atName) => {
+            this.check("discard");
+            const currentFolder = where();
+            if (currentFolder === null) return;
+            const target = this.join(currentFolder, atName);
+            const there = this.nodes.get(target);
+            if (there === node) {
+              this.removes.push(`remove ${target}`);
+              this.nodes.delete(target);
+            }
+          },
+          close: () => undefined,
+        };
+      },
       close: () => undefined,
     };
   };
@@ -186,7 +240,7 @@ class MemoryFs {
       if (key === path || key.startsWith(`${path}/`)) this.nodes.delete(key);
   }
   /** The next `call` waits at its start until released. */
-  hold(call: keyof ExportPlatform): Hold {
+  hold(call: OpKey): Hold {
     let reached = (): void => undefined;
     let release = (): void => undefined;
     const atStart = new Promise<void>((resolve) => {
@@ -199,19 +253,21 @@ class MemoryFs {
     return { reached: atStart, release };
   }
 
-  private async wait(call: keyof ExportPlatform): Promise<void> {
+  private async wait(call: OpKey): Promise<void> {
     const held = this.holds.get(call);
     if (held === undefined) return;
     this.holds.delete(call);
     held.reached();
     await held.gate;
   }
-  private check(call: keyof ExportPlatform): void {
+  private check(call: OpKey): void {
     if (this.fail.has(call)) throw this.fail.get(call);
   }
 
-  platform(): ExportPlatform {
+  platform(options: { readonly preferNamed?: "platform" | "harness-pref" } = {}): ExportPlatform {
     return {
+      holdFolder: this.holdFolder,
+      ...(options.preferNamed === undefined ? {} : { preferNamed: options.preferNamed }),
       state: (path): PathState => {
         const node = this.nodes.get(this.resolveParent(path));
         if (node === undefined) return { kind: "missing" };
@@ -238,26 +294,6 @@ class MemoryFs {
         if (up !== null && !this.nodes.has(up)) await this.platform().makeFolder(up);
         if (node === undefined) this.folder(real);
       },
-      createExclusive: (path) => {
-        this.check("createExclusive");
-        const at = this.resolveParent(path);
-        if (this.nodes.has(at)) throw { name: "NS_ERROR_FILE_ALREADY_EXISTS" };
-        const node = this.file(at, "");
-        return {
-          write: (text) => {
-            this.check("createExclusive");
-            this.store(node, text, { name: "NS_ERROR_FILE_NO_DEVICE_SPACE" });
-          },
-          flush: () => undefined,
-          size: () => node.bytes.length,
-          read: (offset, bytes) => Uint8Array.from(node.bytes.slice(offset, offset + bytes)),
-          resize: (bytes) => {
-            node.bytes.length = Math.min(node.bytes.length, bytes);
-            while (node.bytes.length < bytes) node.bytes.push(0);
-          },
-          close: () => undefined,
-        };
-      },
       readHead: async (path, bytes) => {
         const node = this.nodes.get(this.realPath(path));
         if (node?.kind === "fifo") {
@@ -268,24 +304,6 @@ class MemoryFs {
         return node.bytes.length < bytes
           ? new Uint8Array(0)
           : Uint8Array.from(node.bytes.slice(0, bytes));
-      },
-      rename: async (from, to) => {
-        await this.wait("rename");
-        this.check("rename");
-        const target = this.resolveParent(to);
-        if (this.nodes.has(target)) throw new DOMException("x", "NoModificationAllowedError");
-        const source = this.resolveParent(from);
-        const node = this.nodes.get(source);
-        if (node === undefined) throw new DOMException("x", "NotFoundError");
-        this.nodes.delete(source);
-        this.nodes.set(target, node);
-        this.moves.push(`${source} -> ${target}`);
-        this.removes.push(`rename ${source}`);
-      },
-      remove: async (path) => {
-        this.check("remove");
-        this.removes.push(`remove ${path}`);
-        this.nodes.delete(this.resolveParent(path));
       },
       freeBytes: () => this.room ?? 1 << 30,
       sha256: () => {
@@ -353,18 +371,28 @@ class MemoryJournal implements PartJournal {
   ended = async (path: string): Promise<void> => {
     this.lines.push({ ended: path });
   };
+  discardFailed = async (path: string, reason: string): Promise<void> => {
+    this.lines.push({ discardFailed: path, reason });
+  };
   /** What the next start would act on. */
   unended(): readonly JournaledPart[] {
     return unfinishedExports(this.lines.map(journalLine).join(""));
   }
 }
 
-const setup = (wrap: (platform: ExportPlatform, fs: MemoryFs) => ExportPlatform = (p) => p) => {
+const setup = (
+  wrap: (platform: ExportPlatform, fs: MemoryFs) => ExportPlatform = (p) => p,
+  options: { readonly preferNamed?: "platform" | "harness-pref" } = { preferNamed: "platform" },
+) => {
   const fs = new MemoryFs();
   for (const folder of ["/home", "/home/u", PROFILE, DOWNLOADS]) fs.folder(folder);
   fs.file(`${PROFILE}/prefs.js`, "user_pref(1);");
   const limits = new Limits();
-  const files = exportFiles(wrap(fs.platform(), fs), (real) => !real.startsWith(PROFILE), limits);
+  const files = exportFiles(
+    wrap(fs.platform(options), fs),
+    (real) => !real.startsWith(PROFILE),
+    limits,
+  );
   return { fs, files, limits, journal: new MemoryJournal() };
 };
 type Setup = ReturnType<typeof setup>;
@@ -408,12 +436,11 @@ const inDownloads = (fs: MemoryFs): readonly string[] =>
   [...fs.nodes.keys()].filter((p) => p.startsWith(`${DOWNLOADS}/`)).sort();
 
 /**
- * What each cause must report, from the contract's kinds. The error is the one the browser gave for that cause, as
- * observed on Zen 1.24.2b and Zen Twilight 1.25t; the kind is written here, not read from FS_ERROR_KINDS.
+ * What each cause must report, from the contract's kinds.
  */
 const CAUSES: readonly {
   readonly cause: string;
-  readonly call: keyof ExportPlatform;
+  readonly call: OpKey;
   readonly error: unknown;
   readonly kind: string;
 }[] = [
@@ -425,8 +452,8 @@ const CAUSES: readonly {
   },
   {
     cause: "read-only mount, part creation",
-    call: "createExclusive",
-    error: { name: "NS_ERROR_FILE_READ_ONLY" },
+    call: "createPart",
+    error: { name: "EROFS" },
     kind: "read-only",
   },
   {
@@ -443,21 +470,21 @@ const CAUSES: readonly {
   },
   {
     cause: "no permission, part creation",
-    call: "createExclusive",
-    error: { name: "NS_ERROR_FILE_ACCESS_DENIED" },
+    call: "createPart",
+    error: { name: "EACCES" },
     kind: "access-denied",
   },
   {
     cause: "name too long",
-    call: "createExclusive",
-    error: { name: "NS_ERROR_FILE_NAME_TOO_LONG" },
+    call: "createPart",
+    error: { name: "ENAMETOOLONG" },
     kind: "name-too-long",
   },
   {
-    cause: "the rename finds no part, in a folder that is still there",
+    cause: "no atomic rename primitive on filesystem",
     call: "rename",
-    error: new DOMException("x", "NotFoundError"),
-    kind: "file-replaced",
+    error: { name: "NO_ATOMIC_RENAME" },
+    kind: "no-atomic-rename",
   },
   {
     cause: "an I/O error the table does not name, on purpose",
@@ -479,9 +506,7 @@ const folderToProfileLink = (fs: MemoryFs): void => {
 };
 
 /**
- * What happens between the pre-rename check and the rename, and how the export must end. The kind is written here.
- * `left` is every name under the export folder afterwards: a replacement is put back where it was found. `profile` is
- * every name in the profile afterwards, each holding what it held when the row acted.
+ * What happens while paused before the rename, and how the export must end.
  */
 const BEFORE_RENAME: readonly {
   readonly cause: string;
@@ -549,7 +574,30 @@ const BEFORE_RENAME: readonly {
   },
 ];
 
-describe("the export file boundary", () => {
+describe("the export file boundary (held-folder named part)", () => {
+  it("refuses with no-atomic-rename when the platform cannot hold folders or rename atomically", async () => {
+    const at = setup((p) => ({
+      ...p,
+      holdFolder: async () => Promise.reject({ name: "NO_ATOMIC_RENAME" }),
+    }));
+    const folder = await at.files.openFolder(DOWNLOADS);
+    expect(await failureOf(folder.createPart("site.har", at.journal))).toEqual({
+      kind: "no-atomic-rename",
+    });
+    expect(inDownloads(at.fs)).toEqual([]);
+  });
+
+  it("refuses under a taken name when the filesystem refuses atomic no-replace rename, leaving the taken name untouched", async () => {
+    const at = setup();
+    at.fs.file(`${DOWNLOADS}/site.har`, "theirs");
+    at.fs.fail.set("rename", { name: "NO_ATOMIC_RENAME" });
+    const { part } = await exportOnce(at);
+    expect(await finishOrDiscard(part)).toEqual({ kind: "no-atomic-rename" });
+    expect(at.fs.text(`${DOWNLOADS}/site.har`)).toBe("theirs");
+    expect(inDownloads(at.fs)).toEqual([`${DOWNLOADS}/site.har`]);
+    expect(at.journal.unended()).toEqual([]);
+  });
+
   it.each(CAUSES)(
     "reports $cause as $kind, with no text, and leaves no journal line open",
     async ({ call, error, kind }) => {
@@ -571,11 +619,11 @@ describe("the export file boundary", () => {
   );
 
   it.each(BEFORE_RENAME)(
-    "when $cause between the check and the rename, reports $kind and changes nothing else",
+    "when $cause while paused before the rename, reports $kind and changes nothing else",
     async ({ act, kind, left, profile = [`${PROFILE}/prefs.js`] }) => {
       const at = setup();
       const { part, path } = await exportOnce(at);
-      const held = at.fs.hold("rename");
+      const held = at.limits.hold("before-link");
       const finished = failureOf(part.finish("site.har"));
       await held.reached;
       act(at.fs, path);
@@ -598,11 +646,11 @@ describe("the export file boundary", () => {
   it("reports a full disk with the bytes a write needed and the free bytes", async () => {
     const fs = new MemoryFs();
     fs.folder("/d");
-    const platform = { ...fs.platform(), freeBytes: () => 4096 };
+    const platform = { ...fs.platform({ preferNamed: "platform" }), freeBytes: () => 4096 };
     const files = exportFiles(platform, () => true, new Limits());
     const folder = await files.openFolder("/d");
     const { part } = await folder.createPart("a.har", new MemoryJournal());
-    fs.fail.set("createExclusive", { name: "NS_ERROR_FILE_NO_DEVICE_SPACE" });
+    fs.fail.set("write", { name: "ENOSPC" });
     expect(await failureOf(part.append("x".repeat(10_000), 10_000))).toEqual({
       kind: "disk-full",
       needBytes: 10_000,
@@ -642,16 +690,10 @@ describe("the export file boundary", () => {
     }
   });
 
-  /**
-   * The pre-rename check: the path is a regular file (kind) of the handle's length (size) whose length follows the
-   * handle (follows), and the handle's file has the written length and first bytes. Each case is seen by one conjunct
-   * only. The rename's own check would still catch kind and size after a move, so nothing may have moved.
-   */
   const ONE_CONJUNCT: readonly {
-    readonly seenBy: "kind" | "size" | "follows" | "written length" | "first bytes";
+    readonly seenBy: string;
     readonly change: string;
     readonly make: (fs: MemoryFs, path: string) => void;
-    /** The export's own file, changed in place: still the export's, so discarded. */
     readonly inPlace: boolean;
   }[] = [
     {
@@ -667,7 +709,7 @@ describe("the export file boundary", () => {
       inPlace: false,
     },
     {
-      seenBy: "follows",
+      seenBy: "identity",
       change: "a regular file with the part's size and first bytes, at another inode",
       make: (fs, p) => fs.file(p, partText(fs, p)),
       inPlace: false,
@@ -700,107 +742,47 @@ describe("the export file boundary", () => {
     },
   );
 
-  it("the rename's own check moves back anything but a regular file of the written length", async () => {
-    const at = setup();
-    const { part, path } = await exportOnce(at, () => undefined, "");
-    const held = at.fs.hold("rename");
-    const finished = failureOf(part.finish("site.har"));
-    await held.reached;
-    at.fs.file(path, `${DOCUMENT}x`);
-    const replacement = at.fs.nodes.get(path);
-    held.release();
-    expect(await finished).toEqual({ kind: "file-replaced" });
-    await part.discard();
-    expect(at.fs.moves).toEqual([
-      `${path} -> ${DOWNLOADS}/site.har`,
-      `${DOWNLOADS}/site.har -> ${path}`,
-    ]);
-    expect(at.fs.nodes.get(path)).toBe(replacement);
-    expect(inDownloads(at.fs)).toEqual([path]);
-  });
-
-  it("a file the export renamed into a folder that became a link is moved back out, never deleted, and the export is folder-refused", async () => {
+  it("after rename, a folder swapped for a link with a planted file is refused and cleans up inside the held folder only", async () => {
     const at = setup();
     const { part, path } = await exportOnce(at);
-    const held = at.fs.hold("rename");
+    const held = at.limits.hold("after-link");
     const finished = failureOf(part.finish("site.har"));
     await held.reached;
     folderToProfileLink(at.fs);
-    const ours = at.fs.nodes.get(path.replace(DOWNLOADS, "/home/u/moved"));
-    at.fs.nodes.set(`${PROFILE}/site.har.part`, ours!);
+    const planted = at.fs.file(`${PROFILE}/site.har`, "planted");
     held.release();
     expect(await finished).toEqual({ kind: "folder-refused" });
     await part.discard();
-    expect(at.fs.moves).toEqual([
-      `${PROFILE}/site.har.part -> ${PROFILE}/site.har`,
-      `${PROFILE}/site.har -> ${PROFILE}/site.har.part`,
-    ]);
-    expect(at.fs.nodes.get(`${PROFILE}/site.har.part`)).toBe(ours);
-    expect(at.fs.nodes.get("/home/u/moved/site.har.part")).toBe(ours);
-    expect(at.fs.nodes.has(`${PROFILE}/site.har`)).toBe(false);
+    expect(at.fs.nodes.get(`${PROFILE}/site.har`)).toBe(planted);
+    expect(at.fs.nodes.has("/home/u/moved/site.har")).toBe(false);
     expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
   });
 
-  it("a folder swapped for a link between the folder's check and the entry's, the file hard-linked behind it, is refused", async () => {
-    let swapAt: string | null = null;
-    const at = setup((platform, fs) => ({
-      ...platform,
-      state: (p) => {
-        if (p === swapAt) {
-          swapAt = null;
-          folderToProfileLink(fs);
-          fs.nodes.set(`${PROFILE}/site.har`, fs.nodes.get("/home/u/moved/site.har")!);
-        }
-        return platform.state(p);
-      },
-    }));
-    const { part, path } = await exportOnce(at);
-    swapAt = `${DOWNLOADS}/site.har`;
-    expect(await failureOf(part.finish("site.har"))).toEqual({ kind: "folder-refused" });
-    await part.discard();
-    const ours = at.fs.nodes.get("/home/u/moved/site.har");
-    expect(at.fs.nodes.get(`${PROFILE}/site.har.part`)).toBe(ours);
-    expect([...at.fs.nodes.keys()].filter((p) => p.startsWith(`${PROFILE}/`)).sort()).toEqual([
-      `${PROFILE}/prefs.js`,
-      `${PROFILE}/site.har.part`,
-    ]);
-    expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
+  it("a finished name removed or replaced right after rename is file-replaced and never deletes the replacement", async () => {
+    const removed = setup();
+    const first = await exportOnce(removed);
+    const holdRemoved = removed.limits.hold("after-link");
+    const resRemoved = failureOf(first.part.finish("site.har"));
+    await holdRemoved.reached;
+    removed.fs.nodes.delete(`${DOWNLOADS}/site.har`);
+    holdRemoved.release();
+    expect(await resRemoved).toEqual({ kind: "file-replaced" });
+    await first.part.discard();
+    expect(inDownloads(removed.fs)).toEqual([]);
+
+    const replaced = setup();
+    const second = await exportOnce(replaced);
+    const holdReplaced = replaced.limits.hold("after-link");
+    const resReplaced = failureOf(second.part.finish("site.har"));
+    await holdReplaced.reached;
+    const theirs = replaced.fs.file(`${DOWNLOADS}/site.har`, "theirs");
+    holdReplaced.release();
+    expect(await resReplaced).toEqual({ kind: "file-replaced" });
+    await second.part.discard();
+    expect(replaced.fs.nodes.get(`${DOWNLOADS}/site.har`)).toBe(theirs);
   });
 
-  it("a file not the export's, renamed in a folder that became a link, is put back under the name it had", async () => {
-    const at = setup();
-    const { part } = await exportOnce(at);
-    const held = at.fs.hold("rename");
-    const finished = failureOf(part.finish("site.har"));
-    await held.reached;
-    folderToProfileLink(at.fs);
-    const theirs = at.fs.file(`${PROFILE}/site.har.part`, "theirs");
-    held.release();
-    expect(await finished).toEqual({ kind: "folder-refused" });
-    await part.discard();
-    expect(at.fs.nodes.get(`${PROFILE}/site.har.part`)).toBe(theirs);
-    expect(at.fs.nodes.has(`${PROFILE}/site.har`)).toBe(false);
-    expect(at.fs.moves).toEqual([
-      `${PROFILE}/site.har.part -> ${PROFILE}/site.har`,
-      `${PROFILE}/site.har -> ${PROFILE}/site.har.part`,
-    ]);
-    expect(at.fs.nodes.get("/home/u/moved/site.har.part")).toBeDefined();
-  });
-
-  it("a finished name removed right after the rename is file-replaced, not a folder problem", async () => {
-    const at = setup((platform, fs) => ({
-      ...platform,
-      rename: async (from, to) => {
-        await platform.rename(from, to);
-        if (to.endsWith(".har")) fs.nodes.delete(to);
-      },
-    }));
-    const { part } = await exportOnce(at);
-    expect(await finishOrDiscard(part)).toEqual({ kind: "file-replaced" });
-    expect(inDownloads(at.fs)).toEqual([]);
-  });
-
-  it("a rename still running after the step limit ends the export timed-out, and the file is deleted once it lands", async () => {
+  it("a rename still running after the step limit ends timed-out, and the file is deleted once it lands", async () => {
     const at = setup();
     const { part, path } = await exportOnce(at);
     const held = at.fs.hold("rename");
@@ -816,25 +798,7 @@ describe("the export file boundary", () => {
     expect(inDownloads(at.fs)).toEqual([]);
   });
 
-  it("a late rename that moved a FIFO puts it back, and deletes nothing", async () => {
-    const at = setup();
-    const { part, path } = await exportOnce(at);
-    const held = at.fs.hold("rename");
-    const finished = failureOf(part.finish("site.har"));
-    await held.reached;
-    at.fs.fifo(path);
-    const fifo = at.fs.nodes.get(path);
-    at.limits.elapse();
-    expect(await finished).toEqual({ kind: "timed-out" });
-    await part.discard();
-    held.release();
-    await expect.poll(() => at.journal.unended()).toEqual([]);
-    expect(at.fs.nodes.get(path)).toBe(fifo);
-    expect(inDownloads(at.fs)).toEqual([path]);
-    expect(at.fs.fifoRead).toBe(false);
-  });
-
-  it("cancel during the rename ends the export cancelled once the rename lands, and deletes the finished file", async () => {
+  it("cancel during the rename ends cancelled once the rename lands, and deletes the finished file", async () => {
     const at = setup();
     const { part, path } = await exportOnce(at);
     const held = at.fs.hold("rename");
@@ -905,25 +869,30 @@ describe("the export file boundary", () => {
     expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
   });
 
-  it("discards only its own part, never through a folder that became a link, and keeps the line of a part it could not delete", async () => {
+  it("moves past a taken finished name during atomic rename without overwriting it", async () => {
+    const at = setup();
+    const { part, path } = await exportOnce(at);
+    const held = at.limits.hold("before-link");
+    const finished = part.finish("site.har");
+    await held.reached;
+    at.fs.file(`${DOWNLOADS}/site.har`, "raced");
+    held.release();
+    expect(await finished).toBe("site (2).har");
+    expect(at.fs.text(`${DOWNLOADS}/site.har`)).toBe("raced");
+    expect(at.fs.text(`${DOWNLOADS}/site (2).har`)).toBe(DOCUMENT);
+    expect(at.journal.lines).toEqual([{ started: path, head: OPENING }, { ended: path }]);
+  });
+
+  it("discards only its own part, and keeps the line of a part it could not delete", async () => {
     const own = setup();
     const { part, path } = await exportOnce(own);
     await part.discard();
     expect(own.fs.nodes.has(path)).toBe(false);
     expect(own.journal.unended()).toEqual([]);
 
-    const later = setup();
-    later.fs.file(`${PROFILE}/site.har.part`, DOCUMENT);
-    const second = await exportOnce(later, () => {
-      later.fs.nodes.delete(DOWNLOADS);
-      later.fs.link(DOWNLOADS, PROFILE);
-    });
-    await second.part.discard();
-    expect(later.fs.text(`${PROFILE}/site.har.part`)).toBe(DOCUMENT);
-
     const stuck = setup();
     const third = await exportOnce(stuck);
-    stuck.fs.fail.set("remove", new DOMException("x", "NotAllowedError"));
+    stuck.fs.fail.set("discard", new DOMException("x", "NotAllowedError"));
     await third.part.discard();
     expect(stuck.fs.text(third.path)).toBe(DOCUMENT);
     expect(stuck.journal.unended()).toEqual([{ path: third.path, head: OPENING }]);
@@ -940,7 +909,7 @@ describe("the export file boundary", () => {
 });
 
 /** An export folder the platform holds open, as on Linux. */
-const held = () => setup((platform, fs) => ({ ...platform, holdFolder: fs.holdFolder }));
+const held = () => setup((p) => p, {});
 
 /** Names under a folder, links and FIFOs included. */
 const under = (fs: MemoryFs, folder: string): readonly string[] =>
@@ -948,8 +917,7 @@ const under = (fs: MemoryFs, folder: string): readonly string[] =>
 
 /**
  * The review's racing rows, made at the moment named, each with what the export must report and every name under the
- * export folder, the folder it was moved to, and the profile afterwards. Nothing the row put anywhere may change, and
- * the export renames and deletes nothing.
+ * export folder, the folder it was moved to, and the profile afterwards.
  */
 const RACES: readonly {
   readonly cause: string;
@@ -1093,7 +1061,6 @@ describe("an export folder held open, its file unnamed until one link", () => {
       }
       for (const [folder, names] of Object.entries(left))
         expect(under(at.fs, folder)).toEqual(names);
-      // Everything there before the export, and everything the row put down, is the same node at the same name.
       for (const [path, node] of acted)
         if (before.get(path) === node || !before.has(path))
           expect(at.fs.nodes.get(path), path).toBe(node);
@@ -1201,7 +1168,6 @@ describe("an export folder held open, its file unnamed until one link", () => {
       expect(at.fs.text(`${DOWNLOADS}/site.har`)).toBe(DOCUMENT);
       expect(inDownloads(at.fs)).toEqual([`${DOWNLOADS}/site.har`]);
       expect(part.route()).toEqual({ route: "named", because, errno });
-      // The copy's first piece is up to a MiB, so the head is the file's first 128 ASCII bytes, not the opening alone.
       const path = `${DOWNLOADS}/site.har.part`;
       const head = DOCUMENT.slice(0, 128);
       expect(at.journal.lines).toEqual([{ started: path, head }, { ended: path }]);
@@ -1227,7 +1193,6 @@ describe("an export folder held open, its file unnamed until one link", () => {
       exportOnce(at, () => undefined, rest).then(async ({ part }) => part.finish("site.har")),
     );
     expect(failure).toEqual({ kind: "disk-full", needBytes: 100, freeBytes: 0 });
-    // The unnamed file took the 10 bytes that fit; closed unnamed, it is gone.
     expect(at.fs.lastUnnamed?.bytes.length).toBe(OPENING.length + 10);
     expect(inDownloads(at.fs)).toEqual([]);
     expect(at.journal.lines).toEqual([]);
@@ -1237,7 +1202,6 @@ describe("an export folder held open, its file unnamed until one link", () => {
     const at = held();
     at.fs.failUnnamed.set("link", { name: "EXDEV" });
     const { part } = await exportOnce(at);
-    // About 8 KiB free when the copy starts, as in review: here 10 bytes of a document that needs more.
     at.fs.room = 10;
     expect(await finishOrDiscard(part)).toEqual({
       kind: "disk-full",
@@ -1261,7 +1225,6 @@ describe("an export folder held open, its file unnamed until one link", () => {
   it("cancel while the bytes move to a named part ends cancelled, with nothing left", async () => {
     const at = held();
     const { part } = await exportOnce(at);
-    // The cancel comes as the link's refusal is read, so it lands while the bytes are being moved.
     at.fs.failUnnamed.set("link", {
       get name() {
         at.limits.signal.aborted = true;
@@ -1271,7 +1234,6 @@ describe("an export folder held open, its file unnamed until one link", () => {
     expect(await part.finish("site.har").catch((e: unknown) => e)).toBeInstanceOf(ExportCancelled);
     await part.discard();
     expect(inDownloads(at.fs)).toEqual([]);
-    // Not one piece was copied after the cancel: the named part never got its first bytes, so never a journal line.
     expect(at.journal.lines).toEqual([]);
   });
 
@@ -1377,5 +1339,34 @@ describe("the export journal", () => {
     ].join("");
     expect(unfinishedExports(journal)).toEqual([{ path: "/d/b.har.part", head: OPENING }]);
     expect(unfinishedExports("")).toEqual([]);
+  });
+
+  it("keeps the started line open with a discardFailed reason when discard throws", async () => {
+    const { files, journal } = setup((base) => ({
+      ...base,
+      holdFolder: async (path) => {
+        const held = await base.holdFolder!(path);
+        return {
+          ...held,
+          createNamedPart: async (name, partPath) => {
+            const created = await held.createNamedPart(name, partPath);
+            if (created === null) return null;
+            return {
+              ...created,
+              discard: () => Promise.reject(Object.assign(new Error("locked"), { name: "EACCES" })),
+            };
+          },
+        };
+      },
+    }));
+    const opened = await files.openFolder(DOWNLOADS);
+    const { part } = await opened.createPart("a.har", journal);
+    await part.append(OPENING, OPENING.length);
+    await part.discard();
+    expect(journal.unended()).toEqual([{ path: `${DOWNLOADS}/a.har.part`, head: OPENING }]);
+    expect(journal.lines).toContainEqual({
+      discardFailed: `${DOWNLOADS}/a.har.part`,
+      reason: "EACCES",
+    });
   });
 });

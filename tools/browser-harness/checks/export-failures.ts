@@ -75,17 +75,24 @@ type Row = {
    * the export starts: for the errnos no file system here produces on demand.
    */
   readonly fault?: {
-    readonly op: "hold-folder" | "create" | "write" | "link";
+    readonly op:
+      | "hold-folder"
+      | "create"
+      | "create-part"
+      | "write"
+      | "link"
+      | "rename-part"
+      | "discard-part";
     readonly errno: string;
   };
   readonly after?: (at: Place) => void;
   /** What the row itself put in the folder, before or during the export: not the export's, each left as it was. */
   readonly theirs?: readonly string[];
-  /** Named parts: the export's rename of its part, held by hold-part-call.c (armed before the export starts). */
-  readonly hold?: Hold;
-  /** An unnamed file: the export held at a pause through the harness topic (armed before the export starts). */
-  readonly pause?: Hold & { readonly at: "before-bodies" | "before-link" | "after-link" };
-  /** The export names a `.har.part` and renames it, as where no folder can be held (the harness-only pref). */
+  /** An export held at a pause through the harness topic (armed before the export starts). */
+  readonly pause?: Hold & {
+    readonly at: "before-bodies" | "before-link" | "before-rename" | "after-link";
+  };
+  /** The export names a `.har.part` and renames it, as where no unnamed file is made (the harness-only pref). */
   readonly named?: true;
   readonly expect: (fileName: string) => RowOutcome;
 };
@@ -134,28 +141,96 @@ const dir = (path: string): string => {
   return path;
 };
 const locked = (path: string): string => {
-  NodeFS.chmodSync(dir(path), 0o500);
+  dir(path);
+  if (process.platform === "win32") {
+    const deny = NodeChildProcess.spawnSync("icacls", [path, "/deny", "*S-1-1-0:(W,WD,AD)"], {
+      encoding: "utf8",
+    });
+    if (deny.status !== 0) throw new Error(`icacls deny ${path}: ${deny.stderr || deny.stdout}`);
+  } else {
+    NodeFS.chmodSync(path, 0o500);
+  }
   return path;
 };
-const replace = (part: string, make: (path: string) => void): void => {
-  NodeFS.rmSync(part);
+const unlock = (path: string): void => {
+  if (process.platform === "win32") {
+    NodeChildProcess.spawnSync("icacls", [path, "/remove:d", "*S-1-1-0"], { encoding: "utf8" });
+  } else {
+    NodeFS.chmodSync(path, 0o700);
+  }
+};
+const symlinkFile = (target: string, path: string): void =>
+  NodeFS.symlinkSync(target, path, process.platform === "win32" ? "file" : undefined);
+const symlinkDir = (target: string, path: string): void =>
+  NodeFS.symlinkSync(target, path, process.platform === "win32" ? "junction" : undefined);
+const displaceFile = (base: string, path: string): void => {
+  const displaced = NodePath.join(
+    base,
+    `displaced-${NodeCrypto.randomUUID().slice(0, 8)}-${NodePath.basename(path)}`,
+  );
+  NodeFS.renameSync(path, displaced);
+  // Mark delete-pending outside the held folder so NTFS drops it as soon as the open handle closes.
+  NodeFS.rmSync(displaced, { force: true });
+};
+
+const removeFolder = (base: string, folder: string): void => {
+  if (process.platform === "win32" && NodeFS.existsSync(folder)) {
+    for (const entry of NodeFS.readdirSync(folder)) {
+      displaceFile(base, NodePath.join(folder, entry));
+    }
+  }
+  NodeFS.rmSync(folder, { recursive: true, force: true });
+};
+
+const replace = (base: string, part: string, make: (path: string) => void): void => {
+  if (process.platform === "win32") {
+    // On Windows an open FILE_SHARE_DELETE handle keeps a deleted name delete-pending, so move it aside first.
+    displaceFile(base, part);
+  } else {
+    NodeFS.rmSync(part);
+  }
   make(part);
 };
 const lstat = (path: string): NodeFS.Stats | undefined =>
   NodeFS.lstatSync(path, { throwIfNoEntry: false });
-const absent = (path: string) => (): boolean => lstat(path) === undefined;
+const absent = (path: string) => (): boolean => {
+  try {
+    return lstat(path) === undefined;
+  } catch (error) {
+    return process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
 const isFifo = (path: string) => (): boolean => lstat(path)?.isFIFO() === true;
+const moveFolder = (base: string, from: string, to: string): void => {
+  if (process.platform !== "win32") {
+    NodeFS.renameSync(from, to);
+    return;
+  }
+  // Windows refuses directory rename while a child file handle is open, so stage entries across the rename.
+  const staged = dir(NodePath.join(base, `staged-${NodeCrypto.randomUUID().slice(0, 8)}`));
+  const entries = NodeFS.readdirSync(from);
+  for (const entry of entries) {
+    NodeFS.renameSync(NodePath.join(from, entry), NodePath.join(staged, entry));
+  }
+  NodeFS.renameSync(from, to);
+  for (const entry of entries) {
+    NodeFS.renameSync(NodePath.join(staged, entry), NodePath.join(to, entry));
+  }
+  NodeFS.rmSync(staged, { recursive: true, force: true });
+};
 /** The folder moved to `<base>/<moved>` and a link to the profile put in its place. */
 const folderToProfile = ({ base, folder, profile }: Place, moved: string): string => {
-  NodeFS.renameSync(folder, `${base}/${moved}`);
-  NodeFS.symlinkSync(profile, folder);
-  return `${base}/${moved}`;
+  const dest = NodePath.join(base, moved);
+  moveFolder(base, folder, dest);
+  symlinkDir(profile, folder);
+  return dest;
 };
 /** The folder moved to `<base>/<moved>`, a link to the profile put in its place, then the folder put back. */
 const folderSwappedAndBack = (at: Place, moved: string): void => {
-  folderToProfile(at, moved);
-  NodeFS.unlinkSync(at.folder);
-  NodeFS.renameSync(`${at.base}/${moved}`, at.folder);
+  const dest = folderToProfile(at, moved);
+  if (process.platform === "win32") NodeFS.rmSync(at.folder, { recursive: true, force: true });
+  else NodeFS.unlinkSync(at.folder);
+  moveFolder(at.base, dest, at.folder);
 };
 /** The descriptors of the browser's unnamed files in `folder`: what /proc names `<folder>/#<inode> (deleted)`. */
 const unnamedIn = (pid: number, folder: string): readonly string[] =>
@@ -183,64 +258,72 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "read-only mount",
     fileName: "ro-mount",
-    folder: (b) => dir(`${b}/ro`),
+    folder: (b) => dir(NodePath.join(b, "ro")),
     mount: { options: "ro,size=1m" },
     expect: failed("read-only"),
   },
   {
     cause: "folder to create on a read-only mount",
     fileName: "ro-create",
-    folder: (b) => `${dir(`${b}/ro-parent`)}/below`,
-    mount: { options: "ro,size=1m", at: (b) => `${b}/ro-parent` },
+    folder: (b) => NodePath.join(dir(NodePath.join(b, "ro-parent")), "below"),
+    mount: { options: "ro,size=1m", at: (b) => NodePath.join(b, "ro-parent") },
     expect: failed("read-only"),
   },
   {
     cause: "folder is a file",
     fileName: "is-file",
     folder: (b) => {
-      NodeFS.writeFileSync(`${b}/afile`, "not a folder");
-      return `${b}/afile`;
+      NodeFS.writeFileSync(NodePath.join(b, "afile"), "not a folder");
+      return NodePath.join(b, "afile");
     },
     expect: failed("not-a-folder"),
   },
   {
     cause: "folder missing at start",
     fileName: "missing",
-    folder: (b) => `${b}/missing/below`,
+    folder: (b) => NodePath.join(b, "missing", "below"),
     expect: doneAs(""),
   },
   {
     cause: "folder deleted mid-export",
     fileName: "deleted",
-    folder: (b) => dir(`${b}/deleted`),
-    during: ({ folder }) => NodeFS.rmSync(folder, { recursive: true, force: true }),
+    folder: (b) => dir(NodePath.join(b, "deleted")),
+    during: ({ base, folder }) => removeFolder(base, folder),
     expect: failed("folder-missing"),
   },
   {
     cause: "no permission",
     fileName: "no-permission",
-    folder: (b) => locked(`${b}/no-permission`),
-    after: ({ folder }) => NodeFS.chmodSync(folder, 0o700),
+    folder: (b) => locked(NodePath.join(b, "no-permission")),
+    after: ({ folder }) => unlock(folder),
     expect: failed("access-denied"),
   },
   {
     cause: "folder to create where this user may not write",
     fileName: "no-permission-create",
-    folder: (b) => `${locked(`${b}/locked-parent`)}/below`,
-    after: ({ base }) => NodeFS.chmodSync(`${base}/locked-parent`, 0o700),
+    folder: (b) => NodePath.join(locked(NodePath.join(b, "locked-parent")), "below"),
+    after: ({ base }) => unlock(NodePath.join(base, "locked-parent")),
     expect: failed("access-denied"),
   },
   {
     cause: "part made read-only mid-export (its open handle keeps writing)",
     fileName: "part-read-only",
-    folder: (b) => dir(`${b}/part-read-only`),
+    folder: (b) => dir(NodePath.join(b, "part-read-only")),
     during: ({ part }) => NodeFS.chmodSync(part, 0o400),
+    after: ({ folder }) => {
+      if (process.platform === "win32") {
+        for (const candidate of ["part-read-only.har", "part-read-only.har.part"]) {
+          const target = NodePath.join(folder, candidate);
+          if (NodeFS.existsSync(target)) NodeFS.chmodSync(target, 0o600);
+        }
+      }
+    },
     expect: doneAs(""),
   },
   {
     cause: "full disk",
     fileName: "full",
-    folder: (b) => dir(`${b}/full`),
+    folder: (b) => dir(NodePath.join(b, "full")),
     mount: { options: "size=8m" },
     expect: failed("disk-full"),
   },
@@ -248,9 +331,9 @@ const NAMED_ROWS: readonly Row[] = [
     cause: "part names taken by a stale part and a dangling link",
     fileName: "part-taken",
     folder: (b) => {
-      const folder = dir(`${b}/part-taken`);
-      NodeFS.writeFileSync(`${folder}/part-taken.har.part`, THEIRS);
-      NodeFS.symlinkSync(NOWHERE, `${folder}/part-taken (2).har.part`);
+      const folder = dir(NodePath.join(b, "part-taken"));
+      NodeFS.writeFileSync(NodePath.join(folder, "part-taken.har.part"), THEIRS);
+      symlinkFile(NOWHERE, NodePath.join(folder, "part-taken (2).har.part"));
       return folder;
     },
     theirs: ["part-taken.har.part", "part-taken (2).har.part"],
@@ -259,8 +342,8 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "name collision at the rename",
     fileName: "collision",
-    folder: (b) => dir(`${b}/collision`),
-    during: ({ folder }) => NodeFS.writeFileSync(`${folder}/collision.har`, THEIRS),
+    folder: (b) => dir(NodePath.join(b, "collision")),
+    during: ({ folder }) => NodeFS.writeFileSync(NodePath.join(folder, "collision.har"), THEIRS),
     theirs: ["collision.har"],
     expect: doneAs(" (2)"),
   },
@@ -268,33 +351,35 @@ const NAMED_ROWS: readonly Row[] = [
     cause: "folder is a link to the profile",
     fileName: "linked-folder",
     folder: (b, profile) => {
-      NodeFS.symlinkSync(profile, `${b}/linked`);
-      return `${b}/linked`;
+      symlinkDir(profile, NodePath.join(b, "linked"));
+      return NodePath.join(b, "linked");
     },
     expect: failed("folder-refused"),
   },
   {
     cause: "part replaced by a link to prefs.js",
     fileName: "part-link",
-    folder: (b) => dir(`${b}/part-link`),
-    during: ({ part, profile }) =>
-      replace(part, (p) => NodeFS.symlinkSync(`${profile}/prefs.js`, p)),
+    folder: (b) => dir(NodePath.join(b, "part-link")),
+    during: ({ base, part, profile }) =>
+      replace(base, part, (p) => symlinkFile(NodePath.join(profile, "prefs.js"), p)),
     theirs: ["part-link.har.part"],
     expect: failed("file-replaced"),
   },
   {
     cause: "part replaced by a regular file",
     fileName: "part-file",
-    folder: (b) => dir(`${b}/part-file`),
-    during: ({ part }) => replace(part, (p) => NodeFS.writeFileSync(p, "the attacker's own file")),
+    folder: (b) => dir(NodePath.join(b, "part-file")),
+    during: ({ base, part }) =>
+      replace(base, part, (p) => NodeFS.writeFileSync(p, "the attacker's own file")),
     theirs: ["part-file.har.part"],
     expect: failed("file-replaced"),
   },
   {
     cause: "part replaced by a hard link to prefs.js",
     fileName: "part-hard-link",
-    folder: (b) => dir(`${b}/part-hard-link`),
-    during: ({ part, profile }) => replace(part, (p) => NodeFS.linkSync(`${profile}/prefs.js`, p)),
+    folder: (b) => dir(NodePath.join(b, "part-hard-link")),
+    during: ({ base, part, profile }) =>
+      replace(base, part, (p) => NodeFS.linkSync(NodePath.join(profile, "prefs.js"), p)),
     theirs: ["part-hard-link.har.part"],
     expect: failed("file-replaced"),
   },
@@ -302,10 +387,10 @@ const NAMED_ROWS: readonly Row[] = [
     cause:
       "part replaced by a regular file with its first 4 KiB (the export's id) and another size",
     fileName: "part-same-head",
-    folder: (b) => dir(`${b}/part-same-head`),
-    during: ({ part }) => {
+    folder: (b) => dir(NodePath.join(b, "part-same-head")),
+    during: ({ base, part }) => {
       const head = NodeFS.readFileSync(part).subarray(0, 4096);
-      replace(part, (p) => NodeFS.writeFileSync(p, head));
+      replace(base, part, (p) => NodeFS.writeFileSync(p, head));
     },
     theirs: ["part-same-head.har.part"],
     expect: failed("file-replaced"),
@@ -313,7 +398,7 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "part's first bytes overwritten in place (same file, same size)",
     fileName: "part-overwritten",
-    folder: (b) => dir(`${b}/part-overwritten`),
+    folder: (b) => dir(NodePath.join(b, "part-overwritten")),
     during: ({ part }) => {
       const fd = NodeFS.openSync(part, "r+");
       try {
@@ -327,26 +412,27 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "part replaced by a folder",
     fileName: "part-folder",
-    folder: (b) => dir(`${b}/part-folder`),
-    during: ({ part }) => replace(part, (p) => NodeFS.mkdirSync(p)),
+    folder: (b) => dir(NodePath.join(b, "part-folder")),
+    during: ({ base, part }) => replace(base, part, (p) => NodeFS.mkdirSync(p)),
     theirs: ["part-folder.har.part"],
     expect: failed("file-replaced"),
   },
   {
     cause: "part replaced by a FIFO (never opened)",
     fileName: "part-fifo",
-    folder: (b) => dir(`${b}/part-fifo`),
-    during: ({ part }) => replace(part, mkfifo),
+    folder: (b) => dir(NodePath.join(b, "part-fifo")),
+    during: ({ base, part }) => replace(base, part, mkfifo),
     theirs: ["part-fifo.har.part"],
     expect: failed("file-replaced"),
   },
   {
     cause: "a FIFO takes the part's name while the rename waits (put back, never opened)",
     fileName: "held-fifo",
-    folder: (b) => dir(`${b}/held-fifo`),
-    hold: {
-      act: ({ part }) => {
-        replace(part, mkfifo);
+    folder: (b) => dir(NodePath.join(b, "held-fifo")),
+    pause: {
+      at: "before-link",
+      act: ({ base, part }) => {
+        replace(base, part, mkfifo);
         return isFifo(part);
       },
       withinMs: PROMPTLY_MS,
@@ -355,12 +441,17 @@ const NAMED_ROWS: readonly Row[] = [
     expect: failed("file-replaced"),
   },
   {
-    cause: "cancel while the rename waits, a FIFO at the part's name",
+    cause: "cancel while the rename waits, a replacement at the part's name",
     fileName: "held-cancel",
-    folder: (b) => dir(`${b}/held-cancel`),
-    hold: {
-      act: ({ part }) => {
-        replace(part, mkfifo);
+    folder: (b) => dir(NodePath.join(b, "held-cancel")),
+    pause: {
+      at: "before-link",
+      act: ({ base, part }) => {
+        if (process.platform === "win32") {
+          replace(base, part, (p) => NodeFS.writeFileSync(p, THEIRS));
+          return () => lstat(part)?.size === THEIRS.length;
+        }
+        replace(base, part, mkfifo);
         return isFifo(part);
       },
       cancel: true,
@@ -372,20 +463,26 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "the rename still waiting at the step limit (the late rename cleaned up)",
     fileName: "held-late",
-    folder: (b) => dir(`${b}/held-late`),
-    hold: { act: () => () => true, keep: true, withinMs: STEP_MS + PROMPTLY_MS },
+    folder: (b) => dir(NodePath.join(b, "held-late")),
+    pause: {
+      at: "before-link",
+      act: () => () => true,
+      keep: true,
+      withinMs: STEP_MS + PROMPTLY_MS,
+    },
     expect: failed("timed-out"),
   },
   {
     cause:
       "a copy of the part, its size and bytes at another inode, takes its name while the rename waits (put back)",
     fileName: "held-copy",
-    folder: (b) => dir(`${b}/held-copy`),
-    hold: {
+    folder: (b) => dir(NodePath.join(b, "held-copy")),
+    pause: {
+      at: "before-link",
       act: ({ base, part }) => {
         const own = lstat(part)?.ino;
-        NodeFS.copyFileSync(part, `${base}/held-copy.tmp`);
-        NodeFS.renameSync(`${base}/held-copy.tmp`, part);
+        NodeFS.copyFileSync(part, NodePath.join(base, "held-copy.tmp"));
+        replace(base, part, (p) => NodeFS.renameSync(NodePath.join(base, "held-copy.tmp"), p));
         return () => lstat(part)?.isFile() === true && lstat(part)?.ino !== own;
       },
       withinMs: PROMPTLY_MS,
@@ -396,8 +493,9 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "folder replaced by a link to the profile while the rename waits",
     fileName: "held-folder-link",
-    folder: (b) => dir(`${b}/held-folder-link`),
-    hold: {
+    folder: (b) => dir(NodePath.join(b, "held-folder-link")),
+    pause: {
+      at: "before-link",
       act: (at) => {
         folderToProfile(at, "held-folder-moved");
         return () => lstat(at.folder)?.isSymbolicLink() === true;
@@ -410,15 +508,17 @@ const NAMED_ROWS: readonly Row[] = [
     cause:
       "folder replaced by a link to the profile while the rename waits, the part hard-linked there under its name",
     fileName: "held-folder-plant",
-    folder: (b) => dir(`${b}/held-folder-plant`),
-    hold: {
+    folder: (b) => dir(NodePath.join(b, "held-folder-plant")),
+    pause: {
+      at: "before-link",
       act: (at) => {
         const moved = folderToProfile(at, "held-plant-moved");
         const name = NodePath.basename(at.part);
-        NodeFS.linkSync(`${moved}/${name}`, `${at.profile}/${name}`);
+        NodeFS.linkSync(NodePath.join(moved, `${name}`), NodePath.join(at.profile, `${name}`));
         return () =>
           lstat(at.folder)?.isSymbolicLink() === true &&
-          lstat(`${at.profile}/${name}`)?.ino === lstat(`${moved}/${name}`)?.ino;
+          lstat(NodePath.join(at.profile, `${name}`))?.ino ===
+            lstat(NodePath.join(moved, `${name}`))?.ino;
       },
       withinMs: PROMPTLY_MS,
     },
@@ -428,10 +528,11 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "folder deleted while the rename waits",
     fileName: "held-folder-gone",
-    folder: (b) => dir(`${b}/held-folder-gone`),
-    hold: {
-      act: ({ folder }) => {
-        NodeFS.rmSync(folder, { recursive: true, force: true });
+    folder: (b) => dir(NodePath.join(b, "held-folder-gone")),
+    pause: {
+      at: "before-link",
+      act: ({ base, folder }) => {
+        removeFolder(base, folder);
         return absent(folder);
       },
       withinMs: PROMPTLY_MS,
@@ -441,10 +542,12 @@ const NAMED_ROWS: readonly Row[] = [
   {
     cause: "part deleted while the rename waits",
     fileName: "held-part-gone",
-    folder: (b) => dir(`${b}/held-part-gone`),
-    hold: {
-      act: ({ part }) => {
-        NodeFS.rmSync(part);
+    folder: (b) => dir(NodePath.join(b, "held-part-gone")),
+    pause: {
+      at: "before-link",
+      act: ({ base, part }) => {
+        if (process.platform === "win32") displaceFile(base, part);
+        else NodeFS.rmSync(part);
         return absent(part);
       },
       withinMs: PROMPTLY_MS,
@@ -452,9 +555,71 @@ const NAMED_ROWS: readonly Row[] = [
     expect: failed("file-replaced"),
   },
   {
+    cause: "folder replaced by a link to the profile between the folder check and the rename",
+    fileName: "swap-before-rename",
+    folder: (b) => dir(NodePath.join(b, "swap-before-rename")),
+    pause: {
+      at: "before-rename",
+      act: (at) => {
+        folderToProfile(at, "swap-before-rename-moved");
+        return () => lstat(at.folder)?.isSymbolicLink() === true;
+      },
+      withinMs: PROMPTLY_MS,
+    },
+    expect: failed("folder-refused"),
+  },
+  {
+    cause:
+      "part cannot be stat'd relative to the held folder before cancel; handle delete removes it",
+    fileName: "discard-locked",
+    folder: (b) => dir(NodePath.join(b, "discard-locked")),
+    pause: {
+      at: "before-link",
+      act: ({ folder, part }) => {
+        if (process.platform === "win32") {
+          for (const [target, perms] of [
+            [folder, "*S-1-1-0:(RD,RA,REA,X)"],
+            [part, "*S-1-1-0:(R,RA,REA,W,WD,AD,WEA,WA,X)"],
+          ] as const) {
+            const deny = NodeChildProcess.spawnSync("icacls", [target, "/deny", perms], {
+              encoding: "utf8",
+            });
+            if (deny.status !== 0)
+              throw new Error(`icacls deny ${target}: ${deny.stderr || deny.stdout}`);
+          }
+          return () => {
+            try {
+              NodeFS.lstatSync(part);
+              return false;
+            } catch {
+              return true;
+            }
+          };
+        }
+        NodeFS.chmodSync(part, 0o000);
+        return () => true;
+      },
+      cancel: true,
+      withinMs: PROMPTLY_MS,
+    },
+    after: ({ folder }) => {
+      if (process.platform === "win32") {
+        const part = NodePath.join(folder, "discard-locked.har.part");
+        for (const args of [
+          [folder, "/remove:d", "*S-1-1-0"],
+          [part, "/remove:d", "*S-1-1-0"],
+          [folder, "/remove:d", "*S-1-1-0", "/T"],
+        ]) {
+          NodeChildProcess.spawnSync("icacls", args, { encoding: "utf8" });
+        }
+      }
+    },
+    expect: cancelled,
+  },
+  {
     cause: "name too long",
     fileName: "n".repeat(300),
-    folder: (b) => dir(`${b}/long`),
+    folder: (b) => dir(NodePath.join(b, "long")),
     expect: failed("name-too-long"),
   },
 ];
@@ -484,57 +649,57 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "read-only mount",
     fileName: "ro-mount",
-    folder: (b) => dir(`${b}/ro`),
+    folder: (b) => dir(NodePath.join(b, "ro")),
     mount: { options: "ro,size=1m" },
     expect: failed("read-only"),
   },
   {
     cause: "folder to create on a read-only mount",
     fileName: "ro-create",
-    folder: (b) => `${dir(`${b}/ro-parent`)}/below`,
-    mount: { options: "ro,size=1m", at: (b) => `${b}/ro-parent` },
+    folder: (b) => NodePath.join(dir(NodePath.join(b, "ro-parent")), "below"),
+    mount: { options: "ro,size=1m", at: (b) => NodePath.join(b, "ro-parent") },
     expect: failed("read-only"),
   },
   {
     cause: "folder is a file",
     fileName: "is-file",
     folder: (b) => {
-      NodeFS.writeFileSync(`${b}/afile`, "not a folder");
-      return `${b}/afile`;
+      NodeFS.writeFileSync(NodePath.join(b, "afile"), "not a folder");
+      return NodePath.join(b, "afile");
     },
     expect: failed("not-a-folder"),
   },
   {
     cause: "folder missing at start",
     fileName: "missing",
-    folder: (b) => `${b}/missing/below`,
+    folder: (b) => NodePath.join(b, "missing", "below"),
     expect: doneAs(""),
   },
   {
     cause: "folder deleted mid-export",
     fileName: "deleted",
-    folder: (b) => dir(`${b}/deleted`),
-    during: ({ folder }) => NodeFS.rmSync(folder, { recursive: true, force: true }),
+    folder: (b) => dir(NodePath.join(b, "deleted")),
+    during: ({ base, folder }) => removeFolder(base, folder),
     expect: failed("folder-missing"),
   },
   {
     cause: "no permission",
     fileName: "no-permission",
-    folder: (b) => locked(`${b}/no-permission`),
-    after: ({ folder }) => NodeFS.chmodSync(folder, 0o700),
+    folder: (b) => locked(NodePath.join(b, "no-permission")),
+    after: ({ folder }) => unlock(folder),
     expect: failed("access-denied"),
   },
   {
     cause: "folder to create where this user may not write",
     fileName: "no-permission-create",
-    folder: (b) => `${locked(`${b}/locked-parent`)}/below`,
-    after: ({ base }) => NodeFS.chmodSync(`${base}/locked-parent`, 0o700),
+    folder: (b) => NodePath.join(locked(NodePath.join(b, "locked-parent")), "below"),
+    after: ({ base }) => unlock(NodePath.join(base, "locked-parent")),
     expect: failed("access-denied"),
   },
   {
     cause: "full disk",
     fileName: "full",
-    folder: (b) => dir(`${b}/full`),
+    folder: (b) => dir(NodePath.join(b, "full")),
     mount: { options: "size=8m" },
     expect: failed("disk-full"),
   },
@@ -542,9 +707,9 @@ const UNNAMED_ROWS: readonly Row[] = [
     cause: "a stale part and a dangling link at the part names (never used)",
     fileName: "part-taken",
     folder: (b) => {
-      const folder = dir(`${b}/part-taken`);
-      NodeFS.writeFileSync(`${folder}/part-taken.har.part`, THEIRS);
-      NodeFS.symlinkSync(NOWHERE, `${folder}/part-taken (2).har.part`);
+      const folder = dir(NodePath.join(b, "part-taken"));
+      NodeFS.writeFileSync(NodePath.join(folder, "part-taken.har.part"), THEIRS);
+      symlinkFile(NOWHERE, NodePath.join(folder, "part-taken (2).har.part"));
       return folder;
     },
     theirs: ["part-taken.har.part", "part-taken (2).har.part"],
@@ -553,7 +718,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "name collision mid-export",
     fileName: "collision",
-    folder: (b) => dir(`${b}/collision`),
+    folder: (b) => dir(NodePath.join(b, "collision")),
     during: ({ name }) => plant(name),
     theirs: ["collision.har"],
     expect: doneAs(" (2)"),
@@ -562,22 +727,22 @@ const UNNAMED_ROWS: readonly Row[] = [
     cause: "folder is a link to the profile",
     fileName: "linked-folder",
     folder: (b, profile) => {
-      NodeFS.symlinkSync(profile, `${b}/linked`);
-      return `${b}/linked`;
+      symlinkDir(profile, NodePath.join(b, "linked"));
+      return NodePath.join(b, "linked");
     },
     expect: failed("folder-refused"),
   },
   {
     cause: "the unnamed file's first bytes overwritten through the browser's own descriptor",
     fileName: "overwritten",
-    folder: (b) => dir(`${b}/overwritten`),
+    folder: (b) => dir(NodePath.join(b, "overwritten")),
     during: ({ pid, folder }) => overwriteUnnamed(pid, folder),
     expect: failed("file-replaced"),
   },
   {
     cause: "a foreign file written at the finished name while the link waits",
     fileName: "raced-finish",
-    folder: (b) => dir(`${b}/raced-finish`),
+    folder: (b) => dir(NodePath.join(b, "raced-finish")),
     pause: {
       at: "before-link",
       act: ({ name }) => {
@@ -592,11 +757,11 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "a link to prefs.js put at the finished name while the link waits",
     fileName: "raced-link",
-    folder: (b) => dir(`${b}/raced-link`),
+    folder: (b) => dir(NodePath.join(b, "raced-link")),
     pause: {
       at: "before-link",
       act: ({ name, profile }) => {
-        NodeFS.symlinkSync(`${profile}/prefs.js`, name);
+        symlinkFile(NodePath.join(profile, "prefs.js"), name);
         return () => lstat(name)?.isSymbolicLink() === true;
       },
       withinMs: PROMPTLY_MS,
@@ -607,7 +772,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "a FIFO put at the finished name while the link waits (never opened)",
     fileName: "raced-fifo",
-    folder: (b) => dir(`${b}/raced-fifo`),
+    folder: (b) => dir(NodePath.join(b, "raced-fifo")),
     pause: {
       at: "before-link",
       act: ({ name }) => {
@@ -622,7 +787,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "a file put at the part's name while the link waits (never touched)",
     fileName: "raced-part",
-    folder: (b) => dir(`${b}/raced-part`),
+    folder: (b) => dir(NodePath.join(b, "raced-part")),
     pause: {
       at: "before-link",
       act: ({ part }) => {
@@ -637,7 +802,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "folder replaced by a link to the profile while the link waits",
     fileName: "link-folder",
-    folder: (b) => dir(`${b}/link-folder`),
+    folder: (b) => dir(NodePath.join(b, "link-folder")),
     pause: {
       at: "before-link",
       act: (at) => {
@@ -652,13 +817,13 @@ const UNNAMED_ROWS: readonly Row[] = [
     cause:
       "folder replaced by a link to the profile while the link waits, files planted there at the part and finished names",
     fileName: "plant-folder",
-    folder: (b) => dir(`${b}/plant-folder`),
+    folder: (b) => dir(NodePath.join(b, "plant-folder")),
     pause: {
       at: "before-link",
       act: (at) => {
         folderToProfile(at, "plant-folder-moved");
-        plant(`${at.profile}/plant-folder.har.part`);
-        plant(`${at.profile}/plant-folder.har`);
+        plant(NodePath.join(at.profile, "plant-folder.har.part"));
+        plant(NodePath.join(at.profile, "plant-folder.har"));
         return () => lstat(at.folder)?.isSymbolicLink() === true;
       },
       withinMs: PROMPTLY_MS,
@@ -669,7 +834,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "folder replaced by a link to the profile and put back while the link waits",
     fileName: "plant-restore",
-    folder: (b) => dir(`${b}/plant-restore`),
+    folder: (b) => dir(NodePath.join(b, "plant-restore")),
     pause: {
       at: "before-link",
       act: (at) => {
@@ -683,7 +848,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "folder deleted while the link waits",
     fileName: "gone-folder",
-    folder: (b) => dir(`${b}/gone-folder`),
+    folder: (b) => dir(NodePath.join(b, "gone-folder")),
     pause: {
       at: "before-link",
       act: ({ folder }) => {
@@ -697,14 +862,14 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "cancel while the link waits",
     fileName: "cancel-link",
-    folder: (b) => dir(`${b}/cancel-link`),
+    folder: (b) => dir(NodePath.join(b, "cancel-link")),
     pause: { at: "before-link", act: () => () => true, cancel: true, withinMs: PROMPTLY_MS },
     expect: cancelled,
   },
   {
     cause: "the link still waiting at the step limit",
     fileName: "late-link",
-    folder: (b) => dir(`${b}/late-link`),
+    folder: (b) => dir(NodePath.join(b, "late-link")),
     pause: {
       at: "before-link",
       act: () => () => true,
@@ -716,11 +881,12 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "the finished name removed after the link",
     fileName: "removed-finish",
-    folder: (b) => dir(`${b}/removed-finish`),
+    folder: (b) => dir(NodePath.join(b, "removed-finish")),
     pause: {
       at: "after-link",
-      act: ({ name }) => {
-        NodeFS.rmSync(name);
+      act: ({ base, name }) => {
+        if (process.platform === "win32") displaceFile(base, name);
+        else NodeFS.rmSync(name);
         return absent(name);
       },
       withinMs: PROMPTLY_MS,
@@ -730,12 +896,14 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "a foreign file renamed over the finished name after the link",
     fileName: "replaced-finish",
-    folder: (b) => dir(`${b}/replaced-finish`),
+    folder: (b) => dir(NodePath.join(b, "replaced-finish")),
     pause: {
       at: "after-link",
       act: ({ base, name }) => {
-        plant(`${base}/replaced-finish.tmp`);
-        NodeFS.renameSync(`${base}/replaced-finish.tmp`, name);
+        plant(NodePath.join(base, "replaced-finish.tmp"));
+        replace(base, name, (p) =>
+          NodeFS.renameSync(NodePath.join(base, "replaced-finish.tmp"), p),
+        );
         return () => lstat(name)?.size === THEIRS.length;
       },
       withinMs: PROMPTLY_MS,
@@ -747,12 +915,12 @@ const UNNAMED_ROWS: readonly Row[] = [
     cause:
       "folder replaced by a link to the profile after the link, a file planted there at the finished name",
     fileName: "after-folder",
-    folder: (b) => dir(`${b}/after-folder`),
+    folder: (b) => dir(NodePath.join(b, "after-folder")),
     pause: {
       at: "after-link",
       act: (at) => {
         folderToProfile(at, "after-folder-moved");
-        plant(`${at.profile}/after-folder.har`);
+        plant(NodePath.join(at.profile, "after-folder.har"));
         return () => lstat(at.folder)?.isSymbolicLink() === true;
       },
       withinMs: PROMPTLY_MS,
@@ -764,14 +932,14 @@ const UNNAMED_ROWS: readonly Row[] = [
     cause:
       "/proc/<pid>/fd masked before the export starts: no file can be linked, so a part is named",
     fileName: "proc-at-start",
-    folder: (b) => dir(`${b}/proc-at-start`),
+    folder: (b) => dir(NodePath.join(b, "proc-at-start")),
     atStart: ({ maskProcFd }) => maskProcFd(),
     expect: doneNamed("fd-link-unavailable"),
   },
   {
     cause: "/proc/<pid>/fd masked while the link waits: the whole file is copied to a named part",
     fileName: "proc-before-link",
-    folder: (b) => dir(`${b}/proc-before-link`),
+    folder: (b) => dir(NodePath.join(b, "proc-before-link")),
     pause: {
       at: "before-link",
       act: ({ maskProcFd }) => {
@@ -787,13 +955,13 @@ const UNNAMED_ROWS: readonly Row[] = [
       "/proc/<pid>/fd masked while the link waits and 8 KiB left free: the copy's first write meets a full disk",
     fileName: "copy-full",
     page: "/r/json/0",
-    mount: { options: "size=4m", at: (b) => `${b}/copy-full` },
-    folder: (b) => `${dir(`${b}/copy-full`)}/out`,
+    mount: { options: "size=4m", at: (b) => NodePath.join(b, "copy-full") },
+    folder: (b) => NodePath.join(dir(NodePath.join(b, "copy-full")), "out"),
     pause: {
       at: "before-link",
       act: ({ base, maskProcFd, fill }) => {
         maskProcFd();
-        fill(`${base}/copy-full`, 8192);
+        fill(NodePath.join(base, "copy-full"), 8192);
         return () => true;
       },
       withinMs: COPY_MS,
@@ -803,7 +971,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "/proc/<pid>/fd masked after the link: the folder is proved through its path instead",
     fileName: "proc-after-link",
-    folder: (b) => dir(`${b}/proc-after-link`),
+    folder: (b) => dir(NodePath.join(b, "proc-after-link")),
     pause: {
       at: "after-link",
       act: ({ maskProcFd }) => {
@@ -817,7 +985,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   {
     cause: "O_TMPFILE refused (simulated: the create answers EOPNOTSUPP), so a part is named",
     fileName: "no-tmpfile",
-    folder: (b) => dir(`${b}/no-tmpfile`),
+    folder: (b) => dir(NodePath.join(b, "no-tmpfile")),
     fault: { op: "create", errno: "EOPNOTSUPP" },
     expect: doneNamed("unnamed-refused"),
   },
@@ -825,7 +993,7 @@ const UNNAMED_ROWS: readonly Row[] = [
     cause: "retention eviction during a long export leaves pinned packs byte-exact",
     fileName: "retention-evict",
     retentionCapBytes: 200 * MIB,
-    folder: (b) => dir(`${b}/retention-evict`),
+    folder: (b) => dir(NodePath.join(b, "retention-evict")),
     pause: {
       at: "before-bodies",
       actAsync: async ({ session, serverOrigin }) => {
@@ -867,7 +1035,7 @@ const UNNAMED_ROWS: readonly Row[] = [
   ...(["EXDEV", "EMLINK", "EPERM"] as const).map((errno): Row => ({
     cause: `the link refused with ${errno} (simulated): the whole file is copied to a named part`,
     fileName: `link-${errno.toLowerCase()}`,
-    folder: (b) => dir(`${b}/link-${errno.toLowerCase()}`),
+    folder: (b) => dir(NodePath.join(b, `link-${errno.toLowerCase()}`)),
     fault: { op: "link", errno },
     // Held where the link waits only so the unnamed file can be read before the copy; nothing changes there.
     pause: { at: "before-link", act: () => () => true, withinMs: COPY_MS },
@@ -887,59 +1055,162 @@ const UNNAMED_ROWS: readonly Row[] = [
   ).map(([op, errno, kind]): Row => ({
     cause: `the ${op} answered ${errno} (simulated)`,
     fileName: `${op}-${errno.toLowerCase()}`,
-    folder: (b) => dir(`${b}/${op}-${errno.toLowerCase()}`),
+    folder: (b) => dir(NodePath.join(b, `${op}-${errno.toLowerCase()}`)),
     fault: { op, errno },
     expect: failed(kind),
   })),
   {
     cause: "a name of 255 bytes with .har (the part suffix no longer counts)",
     fileName: "n".repeat(251),
-    folder: (b) => dir(`${b}/longest`),
+    folder: (b) => dir(NodePath.join(b, "longest")),
     expect: doneAs(""),
   },
   {
     cause: "name too long",
     fileName: "n".repeat(300),
-    folder: (b) => dir(`${b}/long`),
+    folder: (b) => dir(NodePath.join(b, "long")),
     expect: failed("name-too-long"),
   },
 ];
 
-/** A row's outcome; a done row that names no route was written on its table's own: the link, or the pref's part. */
+/** A row's outcome; a done row that names no route was written on its table's own: the link, or the named route. */
 const expected = (row: Row): RowOutcome => {
   const outcome = row.expect(row.fileName);
   if (outcome.kind !== "done" || outcome.route !== undefined) return outcome;
+  if (process.platform !== "linux") return { ...outcome, route: "named", because: "platform" };
   return row.named === true
     ? { ...outcome, route: "named", because: "harness-pref" }
     : { ...outcome, route: "link" };
 };
 
-const ROWS: readonly Row[] = [
-  ...UNNAMED_ROWS,
-  ...NAMED_ROWS.map((row) => ({ ...row, named: true as const, cause: `named part: ${row.cause}` })),
+const LINUX_ONLY_UNNAMED = new Set([
+  "overwritten",
+  "proc-at-start",
+  "proc-before-link",
+  "copy-full",
+  "proc-after-link",
+  "no-tmpfile",
+]);
+// Windows NTFS has no FIFOs.
+const POSIX_ONLY_NAMES = new Set(["raced-fifo", "part-fifo", "held-fifo"]);
+const NON_LINUX_NAMED_EXTRAS = new Set([
+  "part-read-only",
+  "part-link",
+  "part-file",
+  "part-hard-link",
+  "part-same-head",
+  "part-overwritten",
+  "part-folder",
+  "part-fifo",
+  "held-fifo",
+  "held-cancel",
+  "held-late",
+  "held-copy",
+  "held-folder-link",
+  "held-folder-plant",
+  "held-folder-gone",
+  "held-part-gone",
+  "swap-before-rename",
+  "discard-locked",
+]);
+
+const NAMED_FAULT_ROWS: readonly Row[] = [
+  {
+    cause: "atomic rename refused with ENOTSUP (simulated) under a taken name",
+    fileName: "no-atomic-rename",
+    folder: (b) => {
+      const folder = dir(NodePath.join(b, "no-atomic-rename"));
+      plant(NodePath.join(folder, "no-atomic-rename.har"));
+      return folder;
+    },
+    theirs: ["no-atomic-rename.har"],
+    fault: { op: "rename-part", errno: "ENOTSUP" },
+    expect: failed("no-atomic-rename"),
+  },
+  ...(
+    [
+      ["rename-part", "ENOSPC", "disk-full"],
+      ["rename-part", "EDQUOT", "disk-full"],
+      ["rename-part", "ENOENT", "folder-missing"],
+      ["rename-part", "ENOTDIR", "not-a-folder"],
+      ["rename-part", "EIO", "io-error"],
+      ["write", "EIO", "io-error"],
+      ["write", "EDQUOT", "disk-full"],
+      ["hold-folder", "ELOOP", "folder-refused"],
+    ] as const
+  ).map(([op, errno, kind]): Row => ({
+    cause: `the ${op} answered ${errno} (simulated)`,
+    fileName: `${op}-${errno.toLowerCase()}`,
+    folder: (b) => dir(NodePath.join(b, `${op}-${errno.toLowerCase()}`)),
+    fault: { op, errno },
+    expect: failed(kind),
+  })),
 ];
+
+const adaptForNamedRoute = (row: Row): Row => {
+  if (row.fileName === "n".repeat(251)) return { ...row, expect: failed("name-too-long") };
+  if (row.fileName === "raced-part" && row.pause !== undefined) {
+    return {
+      ...row,
+      pause: {
+        ...row.pause,
+        act: ({ base, part }) => {
+          replace(base, part, plant);
+          return () => lstat(part)?.size === THEIRS.length;
+        },
+      },
+      expect: failed("file-replaced"),
+    };
+  }
+  const outcome = row.expect(row.fileName);
+  if (outcome.kind === "write-failed" && outcome.unconfirmed === true) {
+    return { ...row, expect: failed(outcome.failure) };
+  }
+  return row;
+};
+
+const platformRows = (platform: NodeJS.Platform): readonly Row[] => {
+  if (platform === "linux") {
+    return [
+      ...UNNAMED_ROWS,
+      ...NAMED_ROWS.map((row) => ({
+        ...row,
+        named: true as const,
+        cause: `named part: ${row.cause}`,
+      })),
+    ];
+  }
+  const isAllowed = (row: Row): boolean =>
+    row.mount === undefined &&
+    !LINUX_ONLY_UNNAMED.has(row.fileName) &&
+    row.fault === undefined &&
+    (platform !== "win32" || !POSIX_ONLY_NAMES.has(row.fileName));
+  return [
+    ...UNNAMED_ROWS.filter(isAllowed).map((row) => ({
+      ...adaptForNamedRoute(row),
+      named: true as const,
+    })),
+    ...NAMED_ROWS.filter((row) => NON_LINUX_NAMED_EXTRAS.has(row.fileName) && isAllowed(row)).map(
+      (row) => ({ ...row, named: true as const, cause: `named part: ${row.cause}` }),
+    ),
+    ...NAMED_FAULT_ROWS.map((row) => ({ ...row, named: true as const })),
+  ];
+};
+
+const ROWS: readonly Row[] = platformRows(process.platform);
 
 /**
  * The browser in its own user and mount namespace: root there to mount the row's tmpfs, then this user again in a
  * nested namespace, so file permissions apply to it as they do to the user. Every step execs, so the process the
  * harness started and stops is the browser itself.
  */
-const launcher = (
-  binary: string,
-  mountAt: string | null,
-  options: string | null,
-  hold: { readonly library: string; readonly dir: string } | null,
-): string => {
+const launcher = (binary: string, mountAt: string | null, options: string | null): string => {
   const mountStep =
     mountAt === null || options === null
       ? ":"
       : `mount -t tmpfs -o ${options} one-click-har-row ${JSON.stringify(mountAt)}`;
-  const preload =
-    hold === null
-      ? ""
-      : `export LD_PRELOAD=${JSON.stringify(hold.library)} OCH_HOLD_DIR=${JSON.stringify(hold.dir)}\n`;
   return `#!/bin/sh
-${preload}exec unshare --user --map-root-user --mount -- /bin/sh -c '${mountStep} && exec unshare --user --map-user=${String(process.getuid?.())} --map-group=${String(process.getgid?.())} -- "$@"' sh ${JSON.stringify(binary)} "$@"
+exec unshare --user --map-root-user --mount -- /bin/sh -c '${mountStep} && exec unshare --user --map-user=${String(process.getuid?.())} --map-group=${String(process.getgid?.())} -- "$@"' sh ${JSON.stringify(binary)} "$@"
 `;
 };
 
@@ -1046,12 +1317,30 @@ const exportBytesIn = (path: string): string => {
 
 /** What is at a path, never following a link there: a file by its hash, a link by its target. */
 const fingerprint = (path: string): string => {
-  const stat = NodeFS.lstatSync(path, { throwIfNoEntry: false });
+  let stat: NodeFS.Stats | undefined;
+  try {
+    stat = NodeFS.lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    if (process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EPERM")
+      return "absent";
+    throw error;
+  }
   if (stat === undefined) return "absent";
   if (stat.isSymbolicLink()) return `link to ${NodeFS.readlinkSync(path)}`;
   if (stat.isFIFO()) return "fifo";
   if (stat.isDirectory()) return "folder";
   return stat.isFile() ? `file ${sha256(path)}` : "other";
+};
+
+const dirInode = (path: string): bigint | null => {
+  try {
+    const stat = NodeFS.lstatSync(path, { bigint: true, throwIfNoEntry: false });
+    return stat?.isDirectory() === true && stat.ino !== 0n ? stat.ino : null;
+  } catch (error) {
+    if (process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EPERM")
+      return null;
+    throw error;
+  }
 };
 
 /**
@@ -1064,12 +1353,12 @@ const changedOutside = (
   root: string,
   before: ReadonlyMap<string, string>,
   theirs: ReadonlySet<string>,
-  folderInode: number | null,
+  folderInode: bigint | null,
 ): RowObservation["outside"] => {
   const changed: { path: string; exportBytes: boolean }[] = [];
   for (const [path, print] of filesUnder(root, [])) {
     if (before.get(path) === print || theirs.has(path)) continue;
-    if (folderInode !== null && lstat(NodePath.dirname(path))?.ino === folderInode) continue;
+    if (folderInode !== null && dirInode(NodePath.dirname(path)) === folderInode) continue;
     changed.push({ path, exportBytes: exportBytesIn(path) === "holds export bytes" });
   }
   return changed;
@@ -1113,7 +1402,6 @@ const namespacesRefused = (): string | null => {
   return probe.status === 0 ? null : (probe.stderr || String(probe.error)).trim();
 };
 
-const HOLD_SOURCE = NodePath.join(import.meta.dirname, "..", "native", "hold-part-call.c");
 const MASK_SOURCE = NodePath.join(import.meta.dirname, "..", "native", "mask-proc-fd.c");
 
 /** mask-proc-fd.c, built into `folder`, run on `pid`'s mount namespace with `args`; what it printed. */
@@ -1132,17 +1420,6 @@ const inMountNamespace =
       throw new Error(`mask-proc-fd ${[pid, ...args].join(" ")}: ${ran.stderr}`);
     return ran.stdout;
   };
-
-/** Builds hold-part-call.c into `folder`; the error text when no C compiler can. */
-const buildHold = (folder: string): string | { readonly error: string } => {
-  const library = NodePath.join(folder, "hold-part-call.so");
-  const built = NodeChildProcess.spawnSync(
-    "cc",
-    ["-shared", "-fPIC", "-O2", "-o", library, HOLD_SOURCE, "-ldl"],
-    { encoding: "utf8" },
-  );
-  return built.status === 0 ? library : { error: (built.stderr || String(built.error)).trim() };
-};
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1184,26 +1461,16 @@ async function runRow(
     user: seededUser,
     exportFolder: { kind: "chosen", path: folder, label: "Export" },
   });
-  const binary = NodePath.join(base, "browser-in-namespace.sh");
-  const mountAt = row.mount === undefined ? null : (row.mount.at?.(base) ?? folder);
-  const holdDir = row.hold === undefined ? null : dir(NodePath.join(base, "hold"));
-  const library = holdDir === null ? null : buildHold(base);
-  if (typeof library === "object" && library !== null)
-    return {
-      problems: [`no C compiler for hold-part-call.c: ${library.error}`],
-      state: null,
-      timing: null,
-    };
-  NodeFS.writeFileSync(
-    binary,
-    launcher(
-      context.binaryPath,
-      mountAt,
-      row.mount?.options ?? null,
-      holdDir === null || library === null ? null : { library, dir: holdDir },
-    ),
-    { mode: 0o700 },
-  );
+  const linux = process.platform === "linux";
+  const binary = linux ? NodePath.join(base, "browser-in-namespace.sh") : context.binaryPath;
+  if (linux) {
+    const mountAt = row.mount === undefined ? null : (row.mount.at?.(base) ?? folder);
+    NodeFS.writeFileSync(
+      binary,
+      launcher(context.binaryPath, mountAt, row.mount?.options ?? null),
+      { mode: 0o700 },
+    );
+  }
   const theirs = (row.theirs ?? []).map((name) => NodePath.join(folder, name));
   /** The real paths of the row's own files once it acted: a file it planted outside the folder is judged as its. */
   const theirsReal = new Set<string>();
@@ -1220,7 +1487,7 @@ async function runRow(
   /** Every file there before the export, then what the row put in place: none may change, now or at the next start. */
   const kept = filesUnder(base, [profile, workspace.dataHome]);
   const theirsBefore = theirs.filter((path) => fingerprint(path) !== "absent");
-  const prefs = `${profile}/prefs.js`;
+  const prefs = NodePath.join(profile, "prefs.js");
   const place: Place = { base, folder, profile };
   let state: unknown;
   let timing: RowObservation["timing"] = null;
@@ -1234,7 +1501,9 @@ async function runRow(
       display: context.display,
       protocol: "marionette",
       signal: context.signal,
-      ...(row.named === true ? { extraPrefs: [{ name: NAMED_PARTS_PREF, value: true }] } : {}),
+      ...(linux && row.named === true
+        ? { extraPrefs: [{ name: NAMED_PARTS_PREF, value: true }] }
+        : {}),
     });
     const page = await openExtensionPage(session, extensionPath);
     const tab = await session.openTab(`${server.origin}${row.page ?? FIXTURES_PAGE_PATH}`);
@@ -1246,17 +1515,16 @@ async function runRow(
     const before = exportBytesIn(prefs);
     const outsideBefore = filesUnder(base, []);
     /** The folder the export holds, by inode, wherever a row moves it; read again at the end if the export made it. */
-    let folderInode = lstat(folder)?.isDirectory() === true ? (lstat(folder)?.ino ?? null) : null;
-    if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "arm"), "");
+    let folderInode = dirInode(folder);
     if (row.pause !== undefined)
       await callHook(session, { kind: "export-pause", point: row.pause.at, action: "arm" });
     if (row.fault !== undefined) await callHook(session, { kind: "export-fault", ...row.fault });
-    const name = `${folder}/${row.fileName}.har`;
-    const helper = inMountNamespace(base, session.browserPid);
+    const name = NodePath.join(folder, `${row.fileName}.har`);
+    const helper = linux ? inMountNamespace(base, session.browserPid) : null;
     /** Gecko aborts when it next makes shared memory without /proc/self/fd, so a mask lasts only for the export. */
     let masked = false;
     const unmask = (): void => {
-      if (masked) helper("unmask");
+      if (masked && helper !== null) helper("unmask");
       masked = false;
     };
     const at: During = {
@@ -1267,10 +1535,12 @@ async function runRow(
       session,
       serverOrigin: server.origin,
       maskProcFd: () => {
+        if (helper === null) throw new Error("maskProcFd requires a Linux mount namespace");
         helper();
         masked = true;
       },
       fill: (filled, bytes) => {
+        if (helper === null) throw new Error("fill requires a Linux mount namespace");
         const free = Number(helper("fill", filled, String(bytes)));
         if (free > bytes) throw new Error(`${filled} still has ${String(free)} bytes free`);
       },
@@ -1296,17 +1566,19 @@ async function runRow(
         if (writing.state.kind === "writing") row.during(at);
       }
       if (row.pause !== undefined) {
-        const paused = await pauseAndAct(session, page, job.id, row.pause, at, keepTheirs);
+        const paused = await pauseAndAct(
+          session,
+          page,
+          job.id,
+          row.pause,
+          at,
+          keepTheirs,
+          linux && row.named !== true,
+        );
         timing = paused.timing;
         state = paused.state;
         source = paused.source;
         holdProblems.push(...paused.problems);
-      }
-      if (row.hold !== undefined && holdDir !== null) {
-        const held = await holdAndAct(page, job.id, holdDir, row.hold, at, keepTheirs);
-        timing = held.timing;
-        state = held.state;
-        holdProblems.push(...held.problems);
       }
       keepTheirs();
       // A held row's export that never ended is judged as it is, so the next rows still run.
@@ -1334,14 +1606,13 @@ async function runRow(
       journal = await journalSettled(NodePath.join(workspace.root(), "exports.jsonl"));
       route = await callHook(session, { kind: "export-route", id: job.id });
     } finally {
-      if (holdDir !== null) NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
       if (row.pause !== undefined)
         await callHook(session, { kind: "export-pause", point: row.pause.at, action: "release" });
       unmask();
-      wakeFifoReaders(base);
+      if (process.platform !== "win32") wakeFifoReaders(base);
       row.after?.(place);
     }
-    folderInode ??= lstat(folder)?.isDirectory() === true ? (lstat(folder)?.ino ?? null) : null;
+    folderInode ??= dirInode(folder);
     const served = JSON.stringify({
       state,
       list: await value(page, "browser.oneClickHar.listExports()"),
@@ -1407,72 +1678,6 @@ async function runRow(
 }
 
 /**
- * Waits for the export's held call, armed before the export started so it cannot be missed. Only a held rename is
- * acted on; the row's change must be in place before the call is let go. Times how long the export then takes to end.
- */
-async function holdAndAct(
-  page: Parameters<typeof waitForJob>[0],
-  id: string,
-  holdDir: string,
-  hold: Hold,
-  at: During,
-  acted: () => void,
-): Promise<{
-  readonly timing: RowObservation["timing"];
-  readonly problems: readonly string[];
-  readonly state: unknown;
-}> {
-  const reached = NodePath.join(holdDir, "at");
-  const go = (): void => NodeFS.writeFileSync(NodePath.join(holdDir, "go"), "");
-  /** The held call's kind once the shim has written its whole line. */
-  const heldCall = (): string | null => {
-    const line = NodeFS.existsSync(reached) ? NodeFS.readFileSync(reached, "utf8") : "";
-    return line.endsWith("\n") ? (line.split(" ")[0] ?? "") : null;
-  };
-  const reachBy = Date.now() + 120_000;
-  let held = heldCall();
-  while (held === null) {
-    const job = await waitForJob(page, id, () => true);
-    if (ended(job) || Date.now() > reachBy) {
-      go();
-      return {
-        timing: null,
-        problems: [`the held call was never reached: ${JSON.stringify(job.state)}`],
-        state: job.state,
-      };
-    }
-    await sleep(20);
-    held = heldCall();
-  }
-  if (held !== "rename") {
-    go();
-    return {
-      timing: null,
-      problems: [`the held call was ${held}, not the rename`],
-      state: undefined,
-    };
-  }
-  const inPlace = hold.act?.(at) ?? (() => true);
-  const observeBy = Date.now() + 10_000;
-  while (!inPlace() && Date.now() < observeBy) await sleep(20);
-  const problems = inPlace() ? [] : ["the row's change was not in place before the release"];
-  acted();
-  if (hold.cancel === true)
-    await value(page, `browser.oneClickHar.cancelExport(${JSON.stringify(id)}).then(String)`);
-  else if (hold.keep !== true) go();
-  const from = Date.now();
-  const endBy = from + hold.withinMs + 30_000;
-  let job = await waitForJob(page, id, () => true);
-  while (!ended(job) && Date.now() < endBy) {
-    await sleep(50);
-    job = await waitForJob(page, id, () => true);
-  }
-  const timing = { tookMs: Date.now() - from, withinMs: hold.withinMs };
-  go();
-  return { timing, problems, state: job.state };
-}
-
-/**
  * Waits for the export at its pause, armed through the harness topic before the export started, acts, and lets it go
  * once the row's change is in place: or cancels, or keeps it held until the export has ended. Times the end.
  */
@@ -1483,6 +1688,7 @@ async function pauseAndAct(
   pause: NonNullable<Row["pause"]>,
   at: During,
   acted: () => void,
+  hasUnnamed: boolean,
 ): Promise<{
   readonly timing: RowObservation["timing"];
   readonly problems: readonly string[];
@@ -1504,7 +1710,7 @@ async function pauseAndAct(
     await sleep(20);
   }
   // What a copy to a named part must equal, read before the row acts and before the link can name the file.
-  const source = pause.at === "before-link" ? unnamedFile(at.pid) : null;
+  const source = hasUnnamed && pause.at === "before-link" ? unnamedFile(at.pid) : null;
   const problems: string[] = [];
   if (pause.act !== undefined) {
     const inPlace = pause.act(at);
@@ -1513,7 +1719,7 @@ async function pauseAndAct(
     if (!inPlace()) problems.push("the row's change was not in place before the release");
   }
   if (pause.actAsync !== undefined) problems.push(...(await pause.actAsync(at)));
-  if (pause.at === "before-link" && source === null)
+  if (hasUnnamed && pause.at === "before-link" && source === null)
     problems.push("the unnamed file could not be read while the link waited");
   acted();
   if (pause.cancel === true)
@@ -1548,6 +1754,30 @@ async function journalSettled(journal: string): Promise<string> {
   }
 }
 
+const errorText = (error: unknown, depth = 0): string => {
+  if (depth > 4) return "...";
+  if (typeof SuppressedError === "function" && error instanceof SuppressedError) {
+    return `${errorText(error.error, depth + 1)}; suppressed during disposal: ${errorText(error.suppressed, depth + 1)}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+};
+
+async function runRowForPlatform(
+  context: CheckContext,
+  row: Row,
+  extensionPath: string,
+): Promise<{
+  readonly problems: readonly string[];
+  readonly state: unknown;
+  readonly timing: RowObservation["timing"];
+}> {
+  try {
+    return await runRow(context, row, extensionPath);
+  } catch (error) {
+    throw new Error(`${row.cause}: ${errorText(error)}`, { cause: error });
+  }
+}
+
 /**
  * Every cause in ROWS, made to happen for real on the browser, ends as its row says: its named kind and no file, or
  * done under the name it says. No path reaches the page, prefs.js holds no export byte and the row's own files are as it left
@@ -1567,16 +1797,18 @@ const check: HarnessCheck = {
       data,
     });
     if (context.extensionPath === null) return finish(["needs --extension"], "");
-    const refused = namespacesRefused();
-    if (refused !== null) {
-      if (process.env.CI)
-        return finish([`a user and mount namespace is needed and was refused: ${refused}`], "");
-      return finish([], `skipped: this machine refused a user and mount namespace (${refused})`);
+    if (process.platform === "linux") {
+      const refused = namespacesRefused();
+      if (refused !== null) {
+        if (process.env.CI)
+          return finish([`a user and mount namespace is needed and was refused: ${refused}`], "");
+        return finish([], `skipped: this machine refused a user and mount namespace (${refused})`);
+      }
     }
     const problems: string[] = [];
     const seen: string[] = [];
     for (const row of ROWS) {
-      const outcome = await runRow(context, row, context.extensionPath);
+      const outcome = await runRowForPlatform(context, row, context.extensionPath);
       problems.push(...outcome.problems.map((p) => `${row.cause}: ${p}`));
       const state = outcome.state as { kind?: string; fileName?: string; failure?: unknown };
       const took =

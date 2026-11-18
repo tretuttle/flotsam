@@ -43,7 +43,7 @@ export type HookRequest =
   | { readonly kind: "export-fault"; readonly op: string; readonly errno: string }
   | {
       readonly kind: "export-pause";
-      readonly point: "before-bodies" | "before-link" | "after-link";
+      readonly point: "before-bodies" | "before-link" | "before-rename" | "after-link";
       readonly action: "arm" | "reached" | "release";
     };
 
@@ -64,6 +64,27 @@ export async function callHook(
   return answer.result;
 }
 
+function clearReadOnlyTree(root: string): void {
+  let entries: NodeFS.Dirent[];
+  try {
+    entries = NodeFS.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const path = NodePath.join(root, entry.name);
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) clearReadOnlyTree(path);
+    else {
+      try {
+        NodeFS.chmodSync(path, 0o600);
+      } catch {
+        // Best-effort attribute cleanup before removing the temp workspace.
+      }
+    }
+  }
+}
+
 /** A folder for one check: its profile, its data home and its downloads, removed at dispose. */
 export type RecordingWorkspace = AsyncDisposable & {
   readonly profileDir: string;
@@ -82,7 +103,9 @@ export type RecordingWorkspace = AsyncDisposable & {
 };
 
 export function recordingWorkspace(name: string): RecordingWorkspace {
-  const base = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), `one-click-har-${name}-`));
+  const base = NodeFS.realpathSync(
+    NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), `one-click-har-${name}-`)),
+  );
   const profileDir = NodePath.join(base, "profile");
   const dataHome = NodePath.join(base, "data");
   const downloads = NodePath.join(base, "downloads");
@@ -96,14 +119,21 @@ export function recordingWorkspace(name: string): RecordingWorkspace {
     profileDir,
     dataHome,
     downloads,
-    launch: (request) =>
-      launchBrowser({
+    launch: (request) => {
+      const targetDataHome = request.dataHome ?? dataHome;
+      return launchBrowser({
         ...request,
         profileDir,
-        dataHome: request.dataHome ?? dataHome,
+        dataHome: targetDataHome,
         allowSystemAccess: true,
-        extraPrefs: [...HARNESS_PREFS, ...downloadPrefs(downloads), ...(request.extraPrefs ?? [])],
-      }),
+        extraPrefs: [
+          ...HARNESS_PREFS,
+          { name: "extensions.oneClickHar.harness.dataHome", value: targetDataHome },
+          ...downloadPrefs(downloads),
+          ...(request.extraPrefs ?? []),
+        ],
+      });
+    },
     lines: () => readLines(location().root),
     root: () => location().root,
     appFolder: () => location().appFolder,
@@ -119,7 +149,8 @@ export function recordingWorkspace(name: string): RecordingWorkspace {
     },
     entries: () => listArchive(location().appFolder),
     [Symbol.asyncDispose]: async () => {
-      NodeFS.rmSync(base, { recursive: true, force: true });
+      if (process.platform === "win32") clearReadOnlyTree(base);
+      NodeFS.rmSync(base, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 });
     },
   };
 }

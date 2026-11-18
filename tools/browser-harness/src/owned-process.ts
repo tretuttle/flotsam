@@ -201,6 +201,7 @@ export function watchChildExit(
       done = true;
       if (graceTimer !== null) clearTimeout(graceTimer);
       settledStatus = exitInfo.status;
+      child.stderr?.destroy?.();
       resolve({
         code: exitInfo.code,
         signal: exitInfo.signal,
@@ -263,6 +264,14 @@ export async function removeDirectoryBounded(io: ProcessIo, directory: string): 
   if (NodeFS.existsSync(directory)) throw new Error(`profile still present at ${directory}`);
 }
 
+export function isTaskkillGone(status: number | null, detail: string): boolean {
+  return status === 128 || /not found|no running instance of the task/iu.test(detail);
+}
+
+export function isTaskkillForceRequired(args: readonly string[], detail: string): boolean {
+  return !args.includes("/F") && /can only be terminated forcefully/iu.test(detail);
+}
+
 function runTaskkill(args: readonly string[]): void {
   const result = NodeChildProcess.spawnSync("taskkill.exe", args, {
     encoding: "utf8",
@@ -270,7 +279,7 @@ function runTaskkill(args: readonly string[]): void {
   });
   if (result.status === 0) return;
   const detail = `${result.stdout}${result.stderr}`;
-  if (result.status === 128 || /not found/iu.test(detail)) return;
+  if (isTaskkillGone(result.status, detail) || isTaskkillForceRequired(args, detail)) return;
   throw new Error(`taskkill ${args.join(" ")} failed: ${detail.trim()}`);
 }
 

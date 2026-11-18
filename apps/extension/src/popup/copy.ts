@@ -269,6 +269,11 @@ export const WRITE_FAILURE_COPY: {
     settings: null,
   },
   "timed-out": { text: () => "The disk did not answer in time.", settings: null },
+  "no-atomic-rename": {
+    text: () =>
+      "This folder cannot finish exports safely without replacing existing files, so the export was stopped.",
+    settings: "folder",
+  },
   other: { text: () => "The browser reported an error it did not name.", settings: null },
 };
 

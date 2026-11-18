@@ -385,10 +385,10 @@ export async function launchBrowser(
   const launchMode: BrowserLaunchMode = request.launchMode ?? "recommended";
   const io = hostProcessIo();
   await reapOrphanedLaunches(io, assertSafeProfileDirectory);
-  await using stack = new AsyncDisposableStack();
   const cachePrefs = request.cache === true ? CACHE_ENABLED_PREFS : [];
 
   if (launchMode === "none") {
+    await using stack = new AsyncDisposableStack();
     const untouchedRequest = request as UntouchedLaunchRequest;
     const prefs = [...cachePrefs, ...(untouchedRequest.extraPrefs ?? [])];
     const directory = await resolveProfileDir(
@@ -436,90 +436,119 @@ export async function launchBrowser(
 
   const remoteRequest = request as RemoteLaunchRequest;
   const protocol = remoteRequest.protocol ?? "bidi";
-  const port = await freePort();
-  const remoteLaunch = REMOTE_LAUNCH[protocol](port);
   const modePrefs: readonly Pref[] =
     launchMode === "real-defaults" ? [{ name: "remote.prefs.recommended", value: false }] : [];
-  const prefs = [
-    ...remoteLaunch.prefs,
-    ...modePrefs,
-    ...cachePrefs,
-    ...(remoteRequest.extraPrefs ?? []),
-  ];
-  const directory = await resolveProfileDir(
-    io,
-    stack,
-    remoteRequest.profileDir,
-    remoteRequest.extensionPath,
-    prefs,
-    LAUNCH_PREFS,
-  );
-  const dataHome = await resolveDataHome(io, stack, remoteRequest.dataHome);
-  const lease = await createLaunchLease(directory);
-  stack.defer(() => lease.remove());
-  const args = [
-    ...(remoteRequest.display === "headless" ? ["-headless"] : []),
-    "-no-remote",
-    "-profile",
-    directory,
-    ...remoteLaunch.args,
-    ...BROWSER_PLATFORMS[currentPlatformName()].launcherArgs,
-  ];
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    MOZ_CRASHREPORTER_DISABLE: "1",
-    MOZ_DISABLE_AUTO_UPDATE: "1",
-    XDG_DATA_HOME: dataHome,
-    ...(remoteRequest.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
+  let attached = false;
+  const attempt = async (): Promise<BrowserSession> => {
+    attached = false;
+    await using stack = new AsyncDisposableStack();
+    const port = await freePort();
+    const remoteLaunch = REMOTE_LAUNCH[protocol](port);
+    const prefs = [
+      ...remoteLaunch.prefs,
+      ...modePrefs,
+      ...cachePrefs,
+      ...(remoteRequest.extraPrefs ?? []),
+    ];
+    const directory = await resolveProfileDir(
+      io,
+      stack,
+      remoteRequest.profileDir,
+      remoteRequest.extensionPath,
+      prefs,
+      LAUNCH_PREFS,
+    );
+    const dataHome = await resolveDataHome(io, stack, remoteRequest.dataHome);
+    const lease = await createLaunchLease(directory);
+    stack.defer(() => lease.remove());
+    const args = [
+      ...(remoteRequest.display === "headless" ? ["-headless"] : []),
+      "-no-remote",
+      "-profile",
+      directory,
+      ...remoteLaunch.args,
+      ...BROWSER_PLATFORMS[currentPlatformName()].launcherArgs,
+    ];
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      MOZ_CRASHREPORTER_DISABLE: "1",
+      MOZ_DISABLE_AUTO_UPDATE: "1",
+      XDG_DATA_HOME: dataHome,
+      ...(remoteRequest.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
+    };
+    const { spawned, watcher } = spawnLeasedBrowser(remoteRequest.binaryPath, args, lease, {
+      stdio: ["ignore", "ignore", "pipe"],
+      env,
+      profileDir: directory,
+      suppressCoreDumps: remoteRequest.suppressCoreDumps,
+    });
+    const exitedStatus = watcher.exited.then((result) => result.status);
+    stack.defer(() => stopOwnedTree(io, spawned.ownership));
+    const remote = await connectRemote({
+      protocol,
+      port,
+      exitStatus: watcher.status,
+      waitForExit: () => exitedStatus,
+      stderr: watcher.stderr,
+      signal: remoteRequest.signal,
+    });
+    attached = true;
+    stack.defer(() => remote.dispose());
+    assertOwnedBrowser(remote.browserPid, spawned.pid);
+    const owned = stack.move();
+    return {
+      spawnedPid: spawned.pid,
+      browserPid: remote.browserPid,
+      profileDir: directory,
+      dataHome,
+      kill: () => killOwnedTree(io, spawned.ownership),
+      launchMode,
+      identity: {
+        binaryPath: remoteRequest.binaryPath,
+        name: remote.browserName,
+        version: remote.version,
+        buildId: remote.buildId,
+        userAgent: remote.userAgent,
+        remoteProtocol: remote.protocol,
+        headless: remoteRequest.display === "headless",
+      },
+      openTab: (url) => remote.openTab(url),
+      navigateTab: (context, url) => remote.navigateTab(context, url),
+      reloadTab: (context) => remote.reloadTab(context),
+      evaluate: (context, expression) => remote.evaluate(context, expression),
+      evaluateChrome: (script, scriptArgs) => remote.evaluateChrome(script, scriptArgs),
+      takeChromeScreenshot: (selector) => remote.takeChromeScreenshot(selector),
+      closeTab: (context) => remote.closeTab(context),
+      quit: async () => {
+        await remote.quit();
+        await raceTimeout(exitedStatus, 10_000);
+      },
+      [Symbol.asyncDispose]: () => owned.disposeAsync(),
+    };
   };
-  const { spawned, watcher } = spawnLeasedBrowser(remoteRequest.binaryPath, args, lease, {
-    stdio: ["ignore", "ignore", "pipe"],
-    env,
-    profileDir: directory,
-    suppressCoreDumps: remoteRequest.suppressCoreDumps,
-  });
-  const exitedStatus = watcher.exited.then((result) => result.status);
-  stack.defer(() => stopOwnedTree(io, spawned.ownership));
-  const remote = await connectRemote({
-    protocol,
-    port,
-    exitStatus: watcher.status,
-    waitForExit: () => exitedStatus,
-    stderr: watcher.stderr,
-    signal: remoteRequest.signal,
-  });
-  stack.defer(() => remote.dispose());
-  assertOwnedBrowser(remote.browserPid, spawned.pid);
-  const owned = stack.move();
-  return {
-    spawnedPid: spawned.pid,
-    browserPid: remote.browserPid,
-    profileDir: directory,
-    dataHome,
-    kill: () => killOwnedTree(io, spawned.ownership),
-    launchMode,
-    identity: {
-      binaryPath: remoteRequest.binaryPath,
-      name: remote.browserName,
-      version: remote.version,
-      buildId: remote.buildId,
-      userAgent: remote.userAgent,
-      remoteProtocol: remote.protocol,
-      headless: remoteRequest.display === "headless",
-    },
-    openTab: (url) => remote.openTab(url),
-    navigateTab: (context, url) => remote.navigateTab(context, url),
-    reloadTab: (context) => remote.reloadTab(context),
-    evaluate: (context, expression) => remote.evaluate(context, expression),
-    evaluateChrome: (script, scriptArgs) => remote.evaluateChrome(script, scriptArgs),
-    takeChromeScreenshot: (selector) => remote.takeChromeScreenshot(selector),
-    closeTab: (context) => remote.closeTab(context),
-    quit: async () => {
-      await remote.quit();
-      await raceTimeout(exitedStatus, 10_000);
-    },
-    [Symbol.asyncDispose]: () => owned.disposeAsync(),
-  };
+  try {
+    return await attempt();
+  } catch (error) {
+    // Only retry when remote control never attached and no product call was made.
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      !attached &&
+      !remoteRequest.signal.aborted &&
+      /Browsing context has been discarded|SB::LA::SpawnTarget|Marionette handshake timed out/i.test(
+        message,
+      )
+    ) {
+      const cause = message
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .slice(0, 3)
+        .join(" | ");
+      console.error(`retrying browser launch once before ${protocol} attached: ${cause}`);
+      return await attempt();
+    }
+    throw error;
+  }
 }
 
 async function resolveProfileDir(

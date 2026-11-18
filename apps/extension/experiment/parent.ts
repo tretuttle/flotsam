@@ -171,7 +171,15 @@ type HarnessRequest =
     };
 
 /** The worker calls a harness profile may make answer an errno, once. */
-const FAULT_OPS = new Set(["hold-folder", "create", "write", "link"]);
+const FAULT_OPS = new Set([
+  "hold-folder",
+  "create",
+  "create-part",
+  "write",
+  "link",
+  "rename-part",
+  "discard-part",
+]);
 
 const isHoldPoint = (value: string): value is HoldPoint =>
   (HOLD_POINTS as readonly string[]).includes(value);
@@ -255,7 +263,12 @@ async function answerHarness(
     }
     case "export-pause": {
       const point = request.point;
-      if (point !== "before-bodies" && point !== "before-link" && point !== "after-link")
+      if (
+        point !== "before-bodies" &&
+        point !== "before-link" &&
+        point !== "before-rename" &&
+        point !== "after-link"
+      )
         throw new Error(`not an export pause: ${point}`);
       return host.pauses[request.action](point) ?? null;
     }

@@ -3,12 +3,15 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
+  isTaskkillForceRequired,
+  isTaskkillGone,
   removeDirectoryBounded,
   signalPerformer,
   spawnOwned,
   killOwnedTree,
   stopOwnedTree,
   taskkillArgs,
+  watchChildExit,
 } from "./owned-process.ts";
 import {
   currentPlatformName,
@@ -81,7 +84,12 @@ describe("process tables", () => {
 
   it("parses whole-table listings from ps on macOS and Win32_Process on Windows", () => {
     const darwin = parseDarwinProcessTable(
-      "  501   1  501 Mon Nov 16 12:00:00 2026     /Applications/Zen.app/zen -profile /tmp/one-click-har-browser-a\n",
+      [
+        "  501   1  501 S   Mon Nov 16 12:00:00 2026     /Applications/Zen.app/zen -profile /tmp/one-click-har-browser-a",
+        "  502   1  502 Z   Mon Nov 16 12:00:00 2026     (zen)",
+        "  503   1  503 SE  Mon Nov 16 12:00:00 2026     /Applications/Zen.app/zen",
+        "  504   1  504 S   Mon Nov 16 12:00:00 2026     (zen)",
+      ].join("\n"),
     );
     expect(darwin.get(501)).toMatchObject({
       parentPid: 1,
@@ -89,6 +97,9 @@ describe("process tables", () => {
       startTime: "Mon Nov 16 12:00:00 2026",
       args: ["/Applications/Zen.app/zen", "-profile", "/tmp/one-click-har-browser-a"],
     });
+    expect(darwin.has(502)).toBe(false);
+    expect(darwin.has(503)).toBe(false);
+    expect(darwin.has(504)).toBe(false);
     const win32 = parseWin32ProcessTable(
       "4100\t900\t638990000000000000\tC:\\zen\\zen.exe -profile C:\\T\\one-click-har-browser-a\r\n12\t4\t1\t\r\n",
     );
@@ -404,6 +415,28 @@ describe("the performer", () => {
   it("on Windows closes the whole tree, forcing it only for SIGKILL", () => {
     expect(taskkillArgs(5000, "SIGTERM")).toEqual(["/PID", "5000", "/T"]);
     expect(taskkillArgs(5000, "SIGKILL")).toEqual(["/PID", "5000", "/T", "/F"]);
+    expect(isTaskkillGone(128, "")).toBe(true);
+    expect(isTaskkillGone(1, 'ERROR: The process "1" not found.')).toBe(true);
+    expect(
+      isTaskkillGone(
+        1,
+        "ERROR: The process with PID 6060 (child process of PID 8668) could not be terminated.\r\nReason: There is no running instance of the task.",
+      ),
+    ).toBe(true);
+    expect(isTaskkillGone(1, "ERROR: Access is denied.")).toBe(false);
+    expect(
+      isTaskkillForceRequired(
+        ["/PID", "5892", "/T"],
+        "Reason: This process can only be terminated forcefully (with /F option).",
+      ),
+    ).toBe(true);
+    expect(
+      isTaskkillForceRequired(
+        ["/PID", "5892", "/T", "/F"],
+        "Reason: This process can only be terminated forcefully (with /F option).",
+      ),
+    ).toBe(false);
+    expect(isTaskkillForceRequired(["/PID", "5892", "/T"], "ERROR: Access is denied.")).toBe(false);
   });
 
   it("does nothing for a child whose start time could not be read", async () => {
@@ -491,4 +524,21 @@ describe("profile directory removal", () => {
       }
     },
   );
+});
+
+describe("child exit stderr cleanup", () => {
+  it("destroys child.stderr once the exit watcher settles even if a descendant holds stderr open", async () => {
+    const owned = spawnOwned(
+      process.execPath,
+      [
+        "-e",
+        'require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"], { stdio: ["ignore", "ignore", 2], detached: true }).unref(); process.stderr.write("gone");',
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    const watcher = watchChildExit(owned.child);
+    const result = await watcher.exited;
+    expect(result.stderr).toBe("gone");
+    expect(owned.child.stderr?.destroyed).toBe(true);
+  });
 });
