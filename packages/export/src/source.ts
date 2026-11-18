@@ -136,11 +136,14 @@ export type BodyCandidates =
   | { readonly kind: "none"; readonly reason: MissingReason }
   | { readonly kind: "empty" };
 
+export type HeadGroup = "request-head" | "response-head" | "timings";
+
 /** Everything one source knows about one request. `entry.response.content.text` and `postData.text` are absent. */
 export interface Material {
   readonly entry: HarEntry;
   readonly body: BodyCandidates;
   readonly upload: BodyCandidates;
+  readonly lostGroups?: { readonly [G in HeadGroup]?: MissingReason } | undefined;
 }
 
 export interface SourceListing {

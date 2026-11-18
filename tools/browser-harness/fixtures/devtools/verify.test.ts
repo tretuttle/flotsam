@@ -236,5 +236,22 @@ describe("devtools fixture server and verifier", () => {
         })
       ).problems.length,
     ).toBeGreaterThan(0);
+    expect(
+      (
+        await verifyDevtoolsHar(DEVTOOLS_PLANTS.stripHeadersAndTimings(clean), {
+          requireHeadersAndTimings: true,
+        })
+      ).problems.length,
+    ).toBeGreaterThan(0);
+    expect(
+      (
+        await verifyDevtoolsHar(
+          DEVTOOLS_PLANTS.stripMetadataFlags(DEVTOOLS_PLANTS.stripHeadersAndTimings(clean)),
+          {
+            checkMetadataFlags: true,
+          },
+        )
+      ).problems.length,
+    ).toBeGreaterThan(0);
   });
 });

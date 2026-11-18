@@ -41,6 +41,7 @@ export interface DevtoolsHarDocument {
 export interface DevtoolsHarEntry {
   readonly pageref?: string;
   readonly startedDateTime: string;
+  readonly comment?: string;
   readonly request: {
     readonly method: string;
     readonly url: string;
@@ -62,6 +63,15 @@ export interface DevtoolsHarEntry {
       readonly comment?: string;
     };
   };
+  readonly timings?: {
+    readonly blocked?: number;
+    readonly dns?: number;
+    readonly connect?: number;
+    readonly ssl?: number;
+    readonly send?: number;
+    readonly wait?: number;
+    readonly receive?: number;
+  };
   readonly _initiator?: {
     readonly type: string;
     readonly url?: string;
@@ -78,6 +88,8 @@ export interface DevtoolsHarEntry {
     readonly source?: string;
     readonly bodyState?: string;
     readonly bodyMissing?: string;
+    readonly headersMissing?: string;
+    readonly timingsMissing?: string;
   };
 }
 
@@ -98,6 +110,9 @@ export interface DevtoolsVerifyExpectation {
   readonly allowMissingUrlIncludes?: string;
   readonly allowMissingReasons?: readonly string[];
   readonly stubs?: { readonly minCount: number };
+  readonly requireHeadersAndTimings?: boolean;
+  readonly checkMetadataFlags?: boolean;
+  readonly allowReloadExtraEntries?: boolean;
   readonly stackUrlIncludes?: string;
   readonly expectedFrames?: readonly string[];
   readonly notNetworkDataMin?: number;
@@ -114,6 +129,10 @@ export interface DevtoolsVerifyExpectation {
 export interface DevtoolsVerifyResult {
   readonly entries: number;
   readonly exactBodies: number;
+  readonly emptyHeaders: number;
+  readonly emptyTimings: number;
+  readonly unflaggedEmptyHeaders: number;
+  readonly unflaggedEmptyTimings: number;
   readonly problems: readonly string[];
 }
 
@@ -143,12 +162,30 @@ export async function verifyDevtoolsHar(
   expect: DevtoolsVerifyExpectation,
 ): Promise<DevtoolsVerifyResult> {
   const problems: string[] = [];
-  if (harText.length === 0) return { entries: 0, exactBodies: 0, problems: ["0-byte HAR file"] };
+  if (harText.length === 0) {
+    return {
+      entries: 0,
+      exactBodies: 0,
+      emptyHeaders: 0,
+      emptyTimings: 0,
+      unflaggedEmptyHeaders: 0,
+      unflaggedEmptyTimings: 0,
+      problems: ["0-byte HAR file"],
+    };
+  }
   let doc: DevtoolsHarDocument;
   try {
     doc = JSON.parse(harText) as DevtoolsHarDocument;
   } catch (error) {
-    return { entries: 0, exactBodies: 0, problems: [`HAR is not valid JSON: ${String(error)}`] };
+    return {
+      entries: 0,
+      exactBodies: 0,
+      emptyHeaders: 0,
+      emptyTimings: 0,
+      unflaggedEmptyHeaders: 0,
+      unflaggedEmptyTimings: 0,
+      problems: [`HAR is not valid JSON: ${String(error)}`],
+    };
   }
 
   const invalid = await validateHar(harText);
@@ -174,9 +211,35 @@ export async function verifyDevtoolsHar(
 
   let exactBodies = 0;
   let stubCount = 0;
+  let unflaggedEmptyHeaders = 0;
+  let unflaggedEmptyTimings = 0;
+  let emptyHeadersCount = 0;
+  let emptyTimingsCount = 0;
+  let bothEmptyHeadersCount = 0;
+  let bothEmptyTimingsCount = 0;
   const seenSeqs = new Set<number>();
 
+  const hasValidTiming = (t: DevtoolsHarEntry["timings"]): boolean => {
+    if (t === undefined) return false;
+    return [t.blocked, t.dns, t.connect, t.ssl, t.send, t.wait, t.receive].some(
+      (v) => typeof v === "number" && Number.isFinite(v) && v >= 0,
+    );
+  };
+
   for (const entry of entries) {
+    const reqEmpty = entry.request.headers.length === 0;
+    const resEmpty = entry.response.status > 0 && entry.response.headers.length === 0;
+    const timingsEmpty = !hasValidTiming(entry.timings);
+    if (reqEmpty || resEmpty) {
+      emptyHeadersCount += 1;
+      if (entry._harExport?.source === "both") bothEmptyHeadersCount += 1;
+      if (entry._harExport?.headersMissing === undefined) unflaggedEmptyHeaders += 1;
+    }
+    if (timingsEmpty) {
+      emptyTimingsCount += 1;
+      if (entry._harExport?.source === "both") bothEmptyTimingsCount += 1;
+      if (entry._harExport?.timingsMissing === undefined) unflaggedEmptyTimings += 1;
+    }
     const url = entry.request.url;
     if (url.startsWith("data:")) {
       problems.push(`non-network data: URL written into entries: ${url.slice(0, 60)}`);
@@ -212,6 +275,14 @@ export async function verifyDevtoolsHar(
     }
 
     if (expect.stubs !== undefined && isStub) {
+      continue;
+    }
+
+    if (
+      expect.allowReloadExtraEntries === true &&
+      entry._harExport?.source === "recording-only" &&
+      (entry.response.status === 0 || entry._harExport?.bodyMissing !== undefined)
+    ) {
       continue;
     }
 
@@ -278,12 +349,19 @@ export async function verifyDevtoolsHar(
       expect.stubs === undefined &&
       entry._harExport?.source !== "recording-only"
     ) {
-      const params = entry.request.postData?.params ?? [];
-      if (
-        !params.some((p) => p.name === "a" && p.value === "1") ||
-        !params.some((p) => p.name === "b" && p.value === "two")
-      ) {
-        problems.push(`/form missing parsed form params: ${JSON.stringify(params)}`);
+      if (expect.allowReloadExtraEntries === true) {
+        const postText = entry.request.postData?.text ?? "";
+        if (!postText.includes("a=1") || !postText.includes("b=two")) {
+          problems.push(`/form missing body text: ${JSON.stringify(postText)}`);
+        }
+      } else {
+        const params = entry.request.postData?.params ?? [];
+        if (
+          !params.some((p) => p.name === "a" && p.value === "1") ||
+          !params.some((p) => p.name === "b" && p.value === "two")
+        ) {
+          problems.push(`/form missing parsed form params: ${JSON.stringify(params)}`);
+        }
       }
     }
   }
@@ -344,6 +422,27 @@ export async function verifyDevtoolsHar(
     problems.push(`stubs ${String(stubCount)} < ${String(expect.stubs.minCount)}`);
   }
 
+  if (expect.requireHeadersAndTimings === true) {
+    const missingHeaders =
+      expect.allowReloadExtraEntries === true ? bothEmptyHeadersCount : emptyHeadersCount;
+    const missingTimings =
+      expect.allowReloadExtraEntries === true ? bothEmptyTimingsCount : emptyTimingsCount;
+    if (missingHeaders > 0) {
+      problems.push(`entries with empty headers: ${String(missingHeaders)} (expected 0)`);
+    }
+    if (missingTimings > 0) {
+      problems.push(`entries with empty timings: ${String(missingTimings)} (expected 0)`);
+    }
+  }
+  if (expect.checkMetadataFlags === true || expect.requireHeadersAndTimings === true) {
+    if (unflaggedEmptyHeaders > 0) {
+      problems.push(`unflagged entries with empty headers: ${String(unflaggedEmptyHeaders)}`);
+    }
+    if (unflaggedEmptyTimings > 0) {
+      problems.push(`unflagged entries with empty timings: ${String(unflaggedEmptyTimings)}`);
+    }
+  }
+
   if (expect.stackUrlIncludes !== undefined) {
     const wantedFrames = expect.expectedFrames ?? DEVTOOLS_STACK_FRAMES;
     const match = entries.find((e) => e.request.url.includes(expect.stackUrlIncludes!));
@@ -396,7 +495,15 @@ export async function verifyDevtoolsHar(
     }
   }
 
-  return { entries: entries.length, exactBodies, problems };
+  return {
+    entries: entries.length,
+    exactBodies,
+    emptyHeaders: emptyHeadersCount,
+    emptyTimings: emptyTimingsCount,
+    unflaggedEmptyHeaders,
+    unflaggedEmptyTimings,
+    problems,
+  };
 }
 
 /** Validate using har-validator directly (re-exported for planted-failure tests). */
@@ -527,5 +634,24 @@ export const DEVTOOLS_PLANTS = {
         },
       },
     });
+  },
+  stripHeadersAndTimings: (harText: string): string => {
+    const doc = JSON.parse(harText) as DevtoolsHarDocument;
+    const entries = doc.log.entries.map((e) => ({
+      ...e,
+      request: { ...e.request, headers: [] },
+      response: { ...e.response, headers: [] },
+      timings: { send: -1, wait: -1, receive: -1 },
+    }));
+    return JSON.stringify({ log: { ...doc.log, entries } });
+  },
+  stripMetadataFlags: (harText: string): string => {
+    const doc = JSON.parse(harText) as DevtoolsHarDocument;
+    const entries = doc.log.entries.map((e) => {
+      if (e._harExport === undefined) return e;
+      const { headersMissing: _hm, timingsMissing: _tm, ...restHx } = e._harExport;
+      return { ...e, _harExport: restHx };
+    });
+    return JSON.stringify({ log: { ...doc.log, entries } });
   },
 } as const;

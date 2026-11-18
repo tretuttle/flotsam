@@ -123,11 +123,15 @@ const check: HarnessCheck = {
       launchMode: "recommended" as const,
     };
 
-    // Run 1: record requests and shut down cleanly
+    // Run 1: open extension page cleanly (matching Run 2 startup so content process channelIds overlap),
+    // record requests across restarts, and shut down cleanly.
     server.takeRequests();
     await using session1 = await workspace.launch(baseLaunch);
-    const tab1 = await session1.openTab(`${server.origin}/page.html?n=3&big=0&key=run1`);
+    await openExtensionPage(session1, context.extensionPath);
+    const tab1 = await session1.openTab(`${server.origin}/page.html?n=15&big=0&key=run1`);
     await session1.evaluate(tab1, "window.__devtoolsPageReady");
+    const tab1b = await session1.openTab(`${server.origin}/page.html?n=10&big=0&key=run1b`);
+    await session1.evaluate(tab1b, "window.__devtoolsPageReady");
     await new Promise((r) => setTimeout(r, 400));
     await callHook(session1, { kind: "flush" });
     await evalChromeAsync<{ readonly id: string }>(
@@ -181,10 +185,19 @@ const check: HarnessCheck = {
        return true;`,
       [preUrl],
     );
-    await session2.navigateTab(tabAHandle, `${server.origin}/page.html?n=3&big=0&key=run2both`);
+    await session2.navigateTab(tabAHandle, `${server.origin}/page.html?n=15&big=0&key=run2both`);
     await session2.evaluate(tabAHandle, "window.__devtoolsPageReady");
     await new Promise((r) => setTimeout(r, 500));
     const bothLog = server.takeRequests();
+    const tabAResourceIds = await evalChromeAsync<readonly (number | null)[]>(
+      session2,
+      `const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+       const win = Services.wm.getMostRecentWindow("navigator:browser");
+       const t = win.gBrowser.tabs.find((x) => String(x.linkedBrowser?.currentURI?.spec ?? "").includes("key=run2both"));
+       if (!t) return [];
+       const api = await gDevTools.getToolboxForTab(t).getNetMonitorAPI();
+       return Array.from(api.store.getState().requests.requests.values()).map((r) => r.resourceId ?? null);`,
+    );
     await callHook(session2, { kind: "flush" });
 
     const popupA = await value<PopupPreview>(
@@ -305,6 +318,15 @@ const check: HarnessCheck = {
     };
     assertClean("run2-private-devtools-only", (await verifyDevtoolsHar(harB, expectB)).problems);
 
+    const overlap = [...tabAResourceIds, ...privInfo.resourceIds].filter(
+      (id) => id !== null && run1Ids.has(String(id)),
+    );
+    if (overlap.length === 0) {
+      throw new Error(
+        `Expected real cross-restart numeric channelId collision (>0) between Run 1 (${String(run1Ids.size)} ids) and Run 2, got 0`,
+      );
+    }
+
     // Export everything across Run 1 + Run 2 and prove Run 1 items stay recordingOnly (never pair across runs)
     const jobAll = await startExport(page2, {
       selection: { scope: "everything", range: { kind: "everything" }, include: "all" },
@@ -327,6 +349,10 @@ const check: HarnessCheck = {
         recordingOnly: run1Log.length + preLog.length,
         devtoolsOnly: privLog.length,
       },
+      expectedSourceTagForUrl: [
+        { urlIncludes: "k=run1", source: "recording-only" },
+        { urlIncludes: "k=run2both", source: "both" },
+      ],
       disallowBothFromPrefix: "k=run1",
       requireK6: false,
     };
@@ -340,7 +366,6 @@ const check: HarnessCheck = {
       expectAll,
     );
 
-    const overlap = privInfo.resourceIds.filter((id) => id !== null && run1Ids.has(String(id)));
     await session2.quit();
 
     return {

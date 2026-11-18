@@ -579,6 +579,103 @@ const check: HarnessCheck = {
       await session.closeTab(tabHandle);
     }
 
+    // 4e. Persist Logs across one navigation (2,000 requests from gone page) exports under 30s
+    let persist2kMs = 0;
+    {
+      await evalChromeAsync<void>(
+        session,
+        `Services.prefs.setBoolPref("devtools.netmonitor.persistlog", true);`,
+      );
+      try {
+        server.takeRequests();
+        const firstUrl = "/page.html?n=2000&big=0&stack=1&key=persist2k";
+        const { tabHandle, tabId } = await openToolboxAndWaitReady(
+          session,
+          page,
+          firstUrl,
+          server.origin,
+          "netmonitor",
+        );
+        await evalChromeAsync<void>(
+          session,
+          `const [url] = arguments;
+           const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+           const browserWin = Services.wm.getMostRecentWindow("navigator:browser");
+           const targetTab = browserWin.gBrowser.tabs.find((t) =>
+             t.linkedBrowser?.currentURI?.spec?.startsWith(url)
+           );
+           const api = await gDevTools.getToolboxForTab(targetTab).getNetMonitorAPI();
+           for (let i = 0; i < 200; i += 1) {
+             const reqs = Array.from(api.store.getState().requests.requests.values());
+             if (reqs.some((r) => typeof r.url === "string" && r.url.includes("/s/1999") && r.totalTime !== undefined)) break;
+             await new Promise((r) => setTimeout(r, 100));
+           }`,
+          [`${server.origin}${firstUrl}`],
+        );
+        await session.navigateTab(tabHandle, `${server.origin}/page.html?n=5&big=0&key=persistnav`);
+        await session.evaluate(tabHandle, "window.__devtoolsPageReady");
+        await evalChromeAsync<void>(
+          session,
+          `const [tabId] = arguments;
+           const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+           const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+           const targetTab = ExtensionParent.apiManager.global.tabTracker.getTab(tabId);
+           const api = await gDevTools.getToolboxForTab(targetTab).getNetMonitorAPI();
+           for (let i = 0; i < 150; i += 1) {
+             const reqs = Array.from(api.store.getState().requests.requests.values());
+             if (
+               reqs.some(
+                 (r) =>
+                   typeof r.url === "string" &&
+                   r.url.includes("/s/4?k=persistnav") &&
+                   r.totalTime !== undefined,
+               ) &&
+               reqs.filter((r) => typeof r.url === "string" && r.url.includes("persistnav")).length >=
+                 9 &&
+               reqs
+                 .filter((r) => typeof r.url === "string" && r.url.includes("persistnav"))
+                 .every((r) => r.totalTime !== undefined)
+             ) {
+               break;
+             }
+             await new Promise((r) => setTimeout(r, 100));
+           }
+           await new Promise((r) => setTimeout(r, 300));`,
+          [tabId],
+        );
+        const taken = server.takeRequests();
+        const exported = await exportTabAndReadHar(
+          page,
+          workspace.downloads,
+          tabId,
+          "devtools-persistlog-2000",
+        );
+        persist2kMs = exported.exportMs;
+        if (persist2kMs >= 30_000) {
+          throw new Error(
+            `2,000-request Persist Logs export took ${String(persist2kMs)}ms (>= 30000ms)`,
+          );
+        }
+        const res = await verifyDevtoolsHar(exported.harText, {
+          server,
+          expectedLog: taken,
+          entries: taken.length,
+          key: "persist2k",
+          sources: { both: taken.length, recordingOnly: 0, devtoolsOnly: 0 },
+          requireHeadersAndTimings: true,
+          requireDevtoolsSources: true,
+          requireK6: false,
+        });
+        assertClean("persistlog-2000", res.problems);
+        await session.closeTab(tabHandle);
+      } finally {
+        await evalChromeAsync<void>(
+          session,
+          `Services.prefs.clearUserPref("devtools.netmonitor.persistlog");`,
+        );
+      }
+    }
+
     // 4d. Mid-download large body in non-private window: never zero-pads, completed bodies byte-exact
     {
       server.takeRequests();
@@ -647,6 +744,80 @@ const check: HarnessCheck = {
         "dropNotNetworkCount",
         DEVTOOLS_PLANTS.dropNotNetworkCount(harText),
         expectData,
+      );
+      await session.closeTab(tabHandle);
+    }
+
+    // 5b. Normal-window reload race at 0ms, 100ms, 400ms: headers & timings filled from recording (0 empty)
+    const normalRaceSummary: string[] = [];
+    for (const delay of [0, 100, 400]) {
+      server.takeRequests();
+      const raceKey = `nrace${String(delay)}`;
+      const { tabHandle, tabId } = await openToolboxAndWaitReady(
+        session,
+        page,
+        `/page.html?n=300&big=0&key=${raceKey}`,
+        server.origin,
+        "netmonitor",
+      );
+      await evalChromeAsync<void>(
+        session,
+        `const [tabId] = arguments;
+         const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+         const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+         const api = await gDevTools.getToolboxForTab(ExtensionParent.apiManager.global.tabTracker.getTab(tabId)).getNetMonitorAPI();
+         for (let i = 0; i < 200; i += 1) {
+           const reqs = Array.from(api.store.getState().requests.requests.values());
+           if (reqs.some((r) => typeof r.url === "string" && r.url.includes("/s/299") && r.totalTime !== undefined)) break;
+           await new Promise((r) => setTimeout(r, 100));
+         }
+         await new Promise((r) => setTimeout(r, 300));`,
+        [tabId],
+      );
+      const takenRace = server.takeRequests();
+      const fileName = `devtools-nrace-${String(delay)}ms`;
+      const job = await startExport(page, {
+        selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
+        bodies: "include",
+        redaction: "standard",
+        packaging: "har",
+        fileName,
+      });
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      await evalChromeAsync<void>(
+        session,
+        `const [tabId] = arguments;
+         const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+         const targetTab = ExtensionParent.apiManager.global.tabTracker.getTab(tabId);
+         if (!targetTab) throw new Error("normal race tab missing");
+         targetTab.linkedBrowser.reload();`,
+        [tabId],
+      );
+      const doneRace = await waitForJob(page, job.id, ended);
+      if (doneRace.state.kind !== "done") {
+        throw new Error(`Normal race ${String(delay)}ms failed: ${JSON.stringify(doneRace.state)}`);
+      }
+      const raceHar = readDownloadedHar(workspace.downloads, fileName);
+      const expectNormalRace: DevtoolsVerifyExpectation = {
+        server,
+        expectedLog: takenRace,
+        entriesMin: takenRace.length,
+        key: raceKey,
+        sources: { both: takenRace.length, devtoolsOnly: 0 },
+        requireHeadersAndTimings: true,
+        allowReloadExtraEntries: true,
+        requireDevtoolsSources: true,
+        requireK6: false,
+      };
+      const raceRes = await verifyDevtoolsHar(raceHar, expectNormalRace);
+      assertClean(`normal-reload-race-${String(delay)}ms`, raceRes.problems, raceHar);
+      await assertPlantFails(
+        `stripHeadersAndTimings-${String(delay)}ms`,
+        DEVTOOLS_PLANTS.stripHeadersAndTimings(raceHar),
+        expectNormalRace,
+      );
+      normalRaceSummary.push(
+        `${String(delay)}ms=${String(raceRes.entries)}/${String(takenRace.length)} (unflagged=${String(raceRes.unflaggedEmptyHeaders)}/${String(raceRes.unflaggedEmptyTimings)})`,
       );
       await session.closeTab(tabHandle);
     }
@@ -953,15 +1124,24 @@ const check: HarnessCheck = {
         throw new Error(`Race export ${String(delay)}ms failed: ${JSON.stringify(doneRace.state)}`);
       }
       const raceHar = readDownloadedHar(workspace.downloads, fileName);
-      const raceRes = await verifyDevtoolsHar(raceHar, {
+      const expectPrivRace: DevtoolsVerifyExpectation = {
         entriesMin: takenRace.length,
         key: raceKey,
         stubs: { minCount: 1 },
+        checkMetadataFlags: true,
         requireDevtoolsSources: true,
         requireK6: false,
-      });
+      };
+      const raceRes = await verifyDevtoolsHar(raceHar, expectPrivRace);
       assertClean(`reload-race-${String(delay)}ms`, raceRes.problems, raceHar);
-      raceSummary.push(`${String(delay)}ms=${String(raceRes.entries)}/${String(takenRace.length)}`);
+      await assertPlantFails(
+        `stripMetadataFlags-${String(delay)}ms`,
+        DEVTOOLS_PLANTS.stripMetadataFlags(raceHar),
+        expectPrivRace,
+      );
+      raceSummary.push(
+        `${String(delay)}ms=${String(raceRes.entries)}/${String(takenRace.length)} (unflagged=${String(raceRes.unflaggedEmptyHeaders)}/${String(raceRes.unflaggedEmptyTimings)})`,
+      );
     }
 
     // 7b. Destroyed/discarded actors produce devtools-discarded stubs, not a 0-byte HAR
@@ -1019,6 +1199,7 @@ const check: HarnessCheck = {
       server,
       key: "dead",
       stubs: { minCount: 1 },
+      checkMetadataFlags: true,
       requireDevtoolsSources: true,
       workDir,
     };
@@ -1034,7 +1215,7 @@ const check: HarnessCheck = {
       name: this.name,
       ok: true,
       durationMs: Date.now() - startedAt,
-      detail: `Passed sorted-by-size, inspector priming, 50MB recording fill, M3 built-in recovery, 2k panel in ${String(export2kMs)}ms, mid-download slow body (normal+private), reload race (${raceSummary.join(", ")}), private DevTools-only + slicing, dead-actor stubs, 2x stack frames, and data: counting.`,
+      detail: `Passed sorted-by-size, inspector priming, 50MB recording fill, M3 built-in recovery, 2k panel in ${String(export2kMs)}ms, persistlog-2k in ${String(persist2kMs)}ms, mid-download slow body (normal+private), normal reload race (${normalRaceSummary.join(", ")}), private reload race (${raceSummary.join(", ")}), private DevTools-only + slicing, dead-actor stubs, 2x stack frames, and data: counting.`,
     };
   },
 };

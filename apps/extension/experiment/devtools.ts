@@ -19,12 +19,14 @@ import {
   type HarUrl,
 } from "@one-click-har/har/model";
 import { inSelection, type ResolvedSelection } from "@one-click-har/export/selection";
+import type { MissingReason } from "@one-click-har/export/missing";
 import {
   classifyUrl,
   type BodyCandidates,
   type BodyReader,
   type DevtoolsBodyRef,
   type ExchangeSource,
+  type HeadGroup,
   type Material,
   type SourceItem,
   type SourceListing,
@@ -282,6 +284,7 @@ const fromCacheOf = (fromCache: boolean | string | undefined): string | undefine
 const wsMessagesFor = async (
   api: NetMonitorApi,
   request: DevToolsRequestItem,
+  allowRemote = true,
 ): Promise<readonly ChromeWebSocketMessage[] | undefined> => {
   if (request.resourceId === undefined || request.resourceId === null) return undefined;
   const map = api.store.getState().messages?.messages;
@@ -293,9 +296,13 @@ const wsMessagesFor = async (
     if (typeof frame.payload === "string") {
       data = frame.payload;
     } else if (isLongStringGrip(frame.payload)) {
-      try {
-        data = await api.connector.getLongString(frame.payload);
-      } catch {
+      if (allowRemote) {
+        try {
+          data = await api.connector.getLongString(frame.payload);
+        } catch {
+          data = frame.payload.initial;
+        }
+      } else {
         data = frame.payload.initial;
       }
     } else {
@@ -311,28 +318,11 @@ const wsMessagesFor = async (
   return out.length > 0 ? out : undefined;
 };
 
-const initiatorFor = async (
-  api: NetMonitorApi,
+const initiatorFromFrames = (
   request: DevToolsRequestItem,
-): Promise<ChromeInitiator | undefined> => {
-  const latest = api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
-  let frames: readonly DevToolsStackFrame[] | undefined =
-    Array.isArray(latest.stacktrace) && latest.stacktrace.length > 0
-      ? latest.stacktrace
-      : undefined;
-  if (frames === undefined && latest.cause?.stacktraceAvailable === true) {
-    try {
-      // Actions must stay enabled: with actions off, requestData deletes the lookup without storing the stack.
-      api.connector.enableActions(true);
-      const fetched = await api.connector.requestData(latest.id, "stackTrace");
-      if (Array.isArray(fetched) && fetched.length > 0) {
-        frames = fetched as readonly DevToolsStackFrame[];
-      }
-    } catch {
-      // Actor may already be gone; continue with cause metadata alone.
-    }
-  }
-  const cause = latest.cause ?? request.cause;
+  frames: readonly DevToolsStackFrame[] | undefined,
+): ChromeInitiator | undefined => {
+  const cause = request.cause;
   if (cause === undefined && (frames === undefined || frames.length === 0)) return undefined;
   const callFrames: ChromeInitiatorCallFrame[] = (frames ?? []).map((frame) => ({
     functionName: typeof frame.functionName === "string" ? frame.functionName : "",
@@ -352,6 +342,14 @@ const initiatorFor = async (
     ...(callFrames.length > 0 ? { stack: { callFrames } } : {}),
   };
 };
+
+const VALID_TIMING_KEYS = ["blocked", "dns", "connect", "ssl", "send", "wait", "receive"] as const;
+
+const hasValidHarTimings = (timings: HarEntry["timings"]): boolean =>
+  VALID_TIMING_KEYS.some((key) => {
+    const val = timings[key];
+    return typeof val === "number" && Number.isFinite(val) && val >= 0;
+  });
 
 /**
  * Wraps the connector passed to HarBuilder so it never resolves responseContent via getLongStringFullText.
@@ -395,7 +393,47 @@ export function createDevtoolsSource(options: {
   const bodyRefs = new WeakMap<DevtoolsBodyRef, DevtoolsBodyHandle>();
   const held: HeldDevtoolsItem[] = [];
   const prefetchedApis = new WeakSet<NetMonitorApi>();
+  const deadApis = new WeakSet<NetMonitorApi>();
+  const destroyedTargets = new WeakSet<object>();
+  const attemptedStackIds = new Set<string>();
+  const requestMapCache = new WeakMap<
+    readonly DevToolsRequestItem[],
+    Map<string, DevToolsRequestItem>
+  >();
   let capturedSnapshots: CapturedToolbox[] | null = null;
+
+  const liveMapFor = (api: NetMonitorApi): ReadonlyMap<string, DevToolsRequestItem> => {
+    const list = api.store.getState().requests.requests;
+    let map = requestMapCache.get(list);
+    if (map === undefined) {
+      map = new Map<string, DevToolsRequestItem>();
+      for (const req of list) map.set(req.id, req);
+      requestMapCache.set(list, map);
+    }
+    return map;
+  };
+
+  const canFetchStack = (api: NetMonitorApi, item: DevToolsRequestItem): boolean => {
+    if (deadApis.has(api) || attemptedStackIds.has(item.id)) return false;
+    if (item.cause?.stacktraceAvailable !== true) return false;
+    const infoMap = api.connector.dataProvider?.stackTraceRequestInfoByActorID;
+    if (infoMap === undefined) return true;
+    const info = infoMap.get(item.id.replace("-clone", ""));
+    if (info === undefined) {
+      attemptedStackIds.add(item.id);
+      return false;
+    }
+    const targetFront = info.targetFront;
+    if (
+      targetFront !== undefined &&
+      (destroyedTargets.has(targetFront) || targetFront.isDestroyed?.() === true)
+    ) {
+      destroyedTargets.add(targetFront);
+      attemptedStackIds.add(item.id);
+      return false;
+    }
+    return true;
+  };
 
   const registerHandle = (handle: DevtoolsBodyHandle): DevtoolsBodyRef => {
     const ref = {} as DevtoolsBodyRef;
@@ -474,9 +512,9 @@ export function createDevtoolsSource(options: {
     request: DevToolsRequestItem,
     includeBody: boolean,
     status: number,
+    liveInStore = true,
   ): Promise<BodyCandidates> => {
-    const latest =
-      api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
+    const latest = liveMapFor(api).get(request.id) ?? request;
     const liveStatus = Number(latest.status) || status;
 
     if (latest.truncated === true || request.truncated === true) {
@@ -491,6 +529,9 @@ export function createDevtoolsSource(options: {
 
     let packet: DevToolsResponseContentPacket | undefined = latest.responseContent;
     if (packet === undefined) {
+      if (!liveInStore || deadApis.has(api)) {
+        return { kind: "none", reason: "devtools-discarded" };
+      }
       const client = api.connector.commands?.client;
       if (client === undefined) return { kind: "none", reason: "devtools-discarded" };
       const actorId = latest.id.replace("-clone", "");
@@ -499,7 +540,8 @@ export function createDevtoolsSource(options: {
           to: actorId,
           type: "getResponseContent",
         })) as DevToolsResponseContentPacket;
-      } catch {
+      } catch (err) {
+        if (String(err).includes("Connection closed")) deadApis.add(api);
         return {
           kind: "none",
           reason: isInProgress(latest) ? "in-progress" : "devtools-discarded",
@@ -507,7 +549,7 @@ export function createDevtoolsSource(options: {
       }
     }
 
-    const after = api.store.getState().requests.requests.find((r) => r.id === request.id);
+    const after = liveMapFor(api).get(request.id);
     if (after?.truncated === true) return { kind: "none", reason: "devtools-truncated" };
     if (after !== undefined && isInProgress(after)) return { kind: "none", reason: "in-progress" };
     if (packet.contentDiscarded === true) return { kind: "none", reason: "devtools-discarded" };
@@ -536,6 +578,9 @@ export function createDevtoolsSource(options: {
       };
     }
     if (isLongStringGrip(text)) {
+      if (!liveInStore || deadApis.has(api)) {
+        return { kind: "none", reason: "devtools-discarded" };
+      }
       const client = api.connector.commands?.client;
       if (client === undefined) return { kind: "none", reason: "devtools-discarded" };
       if (text.length === 0) return { kind: "empty" };
@@ -558,33 +603,42 @@ export function createDevtoolsSource(options: {
     api: NetMonitorApi,
     request: DevToolsRequestItem,
     includeBody: boolean,
+    opts: {
+      readonly initiator: ChromeInitiator | undefined;
+      readonly wsMessages: readonly ChromeWebSocketMessage[] | undefined;
+      readonly liveInStore: boolean;
+      readonly actorFailed?: boolean;
+    },
   ): Promise<Material> => {
     const status = Number(request.status) || 0;
-    const initiator = await initiatorFor(api, request);
-    const wsMessages = await wsMessagesFor(api, request);
     const fromCache = fromCacheOf(request.fromCache);
     const resourceType = resourceTypeOf(request);
+    const reqHeaders = mapPairs(request.requestHeaders?.headers);
+    const resHeaders = mapPairs(request.responseHeaders?.headers);
+    const timings = mapTimings(request.eventTimings?.timings);
     const entry = buildHarEntry({
       startedDateTime: isoDateTimeFromEpochMs(Math.floor(request.startedMs)),
       request: {
         method: request.method,
         url: toHarUrl(request.url) ?? (request.url as HarUrl),
         httpVersion: request.httpVersion ?? "",
-        headersSize: -1,
+        headers: reqHeaders,
+        headersSize: request.requestHeaders?.headersSize ?? -1,
         bodySize: -1,
       },
       response: {
         status,
         statusText: request.statusText ?? "",
         httpVersion: request.httpVersion ?? "",
+        headers: resHeaders,
         content: { size: -1, mimeType: request.mimeType ?? "" },
-        headersSize: -1,
+        headersSize: request.responseHeaders?.headersSize ?? -1,
         bodySize: typeof request.transferredSize === "number" ? request.transferredSize : -1,
         ...(typeof request.transferredSize === "number"
           ? { _transferSize: request.transferredSize }
           : {}),
       },
-      timings: { send: -1, wait: -1, receive: -1 },
+      timings,
       ...(typeof request.remoteAddress === "string" && request.remoteAddress !== ""
         ? { serverIPAddress: request.remoteAddress }
         : {}),
@@ -594,10 +648,10 @@ export function createDevtoolsSource(options: {
       ...(typeof request.securityState === "string"
         ? { _securityState: request.securityState }
         : {}),
-      ...(initiator !== undefined ? { _initiator: initiator } : {}),
+      ...(opts.initiator !== undefined ? { _initiator: opts.initiator } : {}),
       ...(resourceType !== undefined ? { _resourceType: resourceType } : {}),
       ...(fromCache !== undefined ? { _fromCache: fromCache } : {}),
-      ...(wsMessages !== undefined ? { _webSocketMessages: wsMessages } : {}),
+      ...(opts.wsMessages !== undefined ? { _webSocketMessages: opts.wsMessages } : {}),
     });
     const hasPost =
       request.requestPostDataAvailable === true ||
@@ -605,23 +659,43 @@ export function createDevtoolsSource(options: {
       request.method === "POST" ||
       request.method === "PUT" ||
       request.method === "PATCH";
-    const latest =
-      api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
+    const latest = liveMapFor(api).get(request.id) ?? request;
+    const body =
+      opts.liveInStore && opts.actorFailed !== true
+        ? await resolveResponseBody(api, latest, includeBody, status, true)
+        : latest.truncated === true || request.truncated === true
+          ? ({ kind: "none", reason: "devtools-truncated" } as const)
+          : !includeBody
+            ? ({ kind: "none", reason: "omitted-by-choice" } as const)
+            : isBlocked(latest) || isBlocked(request)
+              ? ({ kind: "none", reason: "no-response" } as const)
+              : isInProgress(latest) && opts.actorFailed !== true
+                ? ({ kind: "none", reason: "in-progress" } as const)
+                : status === 0
+                  ? ({ kind: "none", reason: "no-response" } as const)
+                  : await resolveResponseBody(api, latest, includeBody, status, false);
+
+    const headReason: MissingReason =
+      isInProgress(latest) && opts.liveInStore
+        ? "in-progress"
+        : opts.actorFailed === true
+          ? "devtools-discarded"
+          : opts.liveInStore
+            ? "source-error"
+            : "devtools-discarded";
+    const resHeadReason: MissingReason =
+      isBlocked(latest) || isBlocked(request) || status === 0 ? "no-response" : headReason;
+    const lostGroups: { [G in HeadGroup]?: MissingReason } = {
+      ...(reqHeaders.length === 0 ? { "request-head": headReason } : {}),
+      ...(resHeaders.length === 0 ? { "response-head": resHeadReason } : {}),
+      ...(!hasValidHarTimings(entry.timings) ? { timings: headReason } : {}),
+    };
+
     return {
       entry,
-      body:
-        latest.truncated === true || request.truncated === true
-          ? { kind: "none", reason: "devtools-truncated" }
-          : !includeBody
-            ? { kind: "none", reason: "omitted-by-choice" }
-            : isBlocked(latest) || isBlocked(request)
-              ? { kind: "none", reason: "no-response" }
-              : isInProgress(latest)
-                ? { kind: "none", reason: "in-progress" }
-                : status === 0
-                  ? { kind: "none", reason: "no-response" }
-                  : { kind: "none", reason: "devtools-discarded" },
+      body,
       upload: hasPost ? { kind: "none", reason: "devtools-discarded" } : { kind: "empty" },
+      ...(Object.keys(lostGroups).length > 0 ? { lostGroups } : {}),
     };
   };
 
@@ -734,22 +808,56 @@ export function createDevtoolsSource(options: {
   const prefetchMissingStacks = async (api: NetMonitorApi): Promise<void> => {
     if (prefetchedApis.has(api)) return;
     prefetchedApis.add(api);
-    // Keep actions on while resolving stacks so FirefoxDataProvider caches frames in Redux (row D6)
-    // even if a prior built-in HAR export left actionsEnabled false (M3).
-    api.connector.enableActions(true);
+    const liveMap = liveMapFor(api);
     const targets: DevToolsRequestItem[] = [];
     for (const entry of held) {
       if (entry.api !== api) continue;
-      const latest =
-        api.store.getState().requests.requests.find((r) => r.id === entry.request.id) ??
-        entry.request;
+      const latest = liveMap.get(entry.request.id);
+      if (latest === undefined) continue;
       const hasFrames = Array.isArray(latest.stacktrace) && latest.stacktrace.length > 0;
-      if (!hasFrames && latest.cause?.stacktraceAvailable === true) targets.push(latest);
+      if (!hasFrames && canFetchStack(api, latest)) {
+        attemptedStackIds.add(latest.id);
+        targets.push(latest);
+      }
     }
-    for (let i = 0; i < targets.length; i += STACK_PREFETCH_CHUNK) {
-      const chunk = targets.slice(i, i + STACK_PREFETCH_CHUNK);
-      await Promise.allSettled(chunk.map((req) => api.connector.requestData(req.id, "stackTrace")));
+    if (targets.length > 0) {
+      // Keep actions on while resolving stacks so FirefoxDataProvider caches frames in Redux (row D6)
+      // even if a prior built-in HAR export left actionsEnabled false (M3).
+      api.connector.enableActions(true);
+      for (let i = 0; i < targets.length; i += STACK_PREFETCH_CHUNK) {
+        const chunk = targets.slice(i, i + STACK_PREFETCH_CHUNK);
+        await Promise.allSettled(
+          chunk.map((req) => api.connector.requestData(req.id, "stackTrace")),
+        );
+      }
+    } else if (api.connector.dataProvider?.actionsEnabled === false) {
+      api.connector.enableActions(true);
     }
+  };
+
+  const resolveInitiator = async (
+    api: NetMonitorApi,
+    current: DevToolsRequestItem,
+  ): Promise<ChromeInitiator | undefined> => {
+    let frames: readonly DevToolsStackFrame[] | undefined =
+      Array.isArray(current.stacktrace) && current.stacktrace.length > 0
+        ? current.stacktrace
+        : undefined;
+    if (frames === undefined && canFetchStack(api, current)) {
+      attemptedStackIds.add(current.id);
+      try {
+        if (api.connector.dataProvider?.actionsEnabled === false) {
+          api.connector.enableActions(true);
+        }
+        const fetched = await api.connector.requestData(current.id, "stackTrace");
+        if (Array.isArray(fetched) && fetched.length > 0) {
+          frames = fetched as readonly DevToolsStackFrame[];
+        }
+      } catch {
+        // Actor may already be gone; continue with cause metadata alone.
+      }
+    }
+    return initiatorFromFrames(current, frames);
   };
 
   const source: ExchangeSource = {
@@ -846,44 +954,93 @@ export function createDevtoolsSource(options: {
       const found = held[item.ref as unknown as number];
       if (found === undefined) throw new Error("not an item of this DevTools listing");
       const { api, request } = found;
+      const liveBeforePrefetch = liveMapFor(api).get(request.id);
+      if (liveBeforePrefetch === undefined || deadApis.has(api)) {
+        const wsMessages = await wsMessagesFor(api, request, false);
+        const frames =
+          Array.isArray(request.stacktrace) && request.stacktrace.length > 0
+            ? request.stacktrace
+            : undefined;
+        return stubMaterial(api, request, opts.body, {
+          initiator: initiatorFromFrames(request, frames),
+          wsMessages,
+          liveInStore: false,
+        });
+      }
       await prefetchMissingStacks(api);
-      const current =
-        api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
+      const current = liveMapFor(api).get(request.id);
+      if (current === undefined || deadApis.has(api)) {
+        const wsMessages = await wsMessagesFor(api, request, false);
+        const frames =
+          Array.isArray(request.stacktrace) && request.stacktrace.length > 0
+            ? request.stacktrace
+            : undefined;
+        return stubMaterial(api, request, opts.body, {
+          initiator: initiatorFromFrames(request, frames),
+          wsMessages,
+          liveInStore: false,
+        });
+      }
       const [initiator, wsMessages] = await Promise.all([
-        initiatorFor(api, current),
-        wsMessagesFor(api, current),
+        resolveInitiator(api, current),
+        wsMessagesFor(api, current, true),
       ]);
       const { HarBuilder } = devtoolsModules();
 
       let builtEntry: Record<string, unknown> | undefined;
-      // Pause Redux actions while HarBuilder reads metadata so each requestData avoids a 50 ms batch flush.
-      api.connector.enableActions(false);
-      try {
-        const { responseContent: _ignoredContent, ...metadataItem } = current;
-        const builder = new HarBuilder({
-          connector: metadataConnector(api.connector),
-          id: 1,
-          includeResponseBodies: false,
-          items: [metadataItem],
-          supportsMultiplePages: false,
-        });
-        const built = await builder.build();
-        builtEntry = built.log.entries[0];
-      } catch {
-        builtEntry = undefined;
-      } finally {
-        api.connector.enableActions(true);
+      if (api.connector.currentTarget !== undefined && api.connector.currentTarget !== null) {
+        // Pause Redux actions while HarBuilder reads metadata so each requestData avoids a 50 ms batch flush.
+        api.connector.enableActions(false);
+        try {
+          const { responseContent: _ignoredContent, ...metadataItem } = current;
+          const builder = new HarBuilder({
+            connector: metadataConnector(api.connector),
+            id: 1,
+            includeResponseBodies: false,
+            items: [metadataItem],
+            supportsMultiplePages: false,
+          });
+          const built = await builder.build();
+          builtEntry = built.log.entries[0];
+        } catch (err) {
+          if (String(err).includes("Connection closed")) deadApis.add(api);
+          builtEntry = undefined;
+        } finally {
+          api.connector.enableActions(true);
+        }
       }
 
       if (builtEntry === undefined) {
-        return stubMaterial(api, current, opts.body);
+        return stubMaterial(api, current, opts.body, {
+          initiator,
+          wsMessages,
+          liveInStore: liveMapFor(api).has(request.id) && !deadApis.has(api),
+          actorFailed: true,
+        });
       }
 
       const entry = entryFromBuilt(builtEntry, current, initiator, wsMessages);
-      const body = await resolveResponseBody(api, current, opts.body, entry.response.status);
+      const stillLive = liveMapFor(api).has(request.id) && !deadApis.has(api);
+      const body = await resolveResponseBody(
+        api,
+        current,
+        opts.body,
+        entry.response.status,
+        stillLive,
+      );
 
-      const latest =
-        api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
+      const latest = liveMapFor(api).get(request.id) ?? current;
+      const lostReason: MissingReason = isInProgress(latest) ? "in-progress" : "devtools-discarded";
+      const lostGroups: { [G in HeadGroup]?: MissingReason } = {
+        ...(entry.request.headers.length === 0 ? { "request-head": lostReason } : {}),
+        ...(entry.response.headers.length === 0
+          ? {
+              "response-head":
+                isBlocked(latest) || entry.response.status === 0 ? "no-response" : lostReason,
+            }
+          : {}),
+        ...(!hasValidHarTimings(entry.timings) ? { timings: lostReason } : {}),
+      };
       const rawReq = (builtEntry["request"] ?? {}) as Record<string, unknown>;
       const rawPost = rawReq["postData"] as Record<string, unknown> | undefined;
       let upload: BodyCandidates = { kind: "empty" };
@@ -906,7 +1063,12 @@ export function createDevtoolsSource(options: {
         }
       }
 
-      return { entry, body, upload };
+      return {
+        entry,
+        body,
+        upload,
+        ...(Object.keys(lostGroups).length > 0 ? { lostGroups } : {}),
+      };
     },
   };
 

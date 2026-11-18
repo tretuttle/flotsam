@@ -1,6 +1,7 @@
 import type { HarEntry } from "@one-click-har/har/model";
 import { exchangeId, type ChannelKey, type EpochMs } from "@one-click-har/recording/ids";
 import { describe, expect, it } from "vite-plus/test";
+import { buildEntry } from "../src/entry-writer.ts";
 import {
   FIELD_GROUPS,
   FIELD_RULES,
@@ -244,6 +245,77 @@ describe("mergeEntry and FIELD_RULES", () => {
 
     expect(Object.keys(FIELD_GROUPS)).toEqual(["request-head", "response-head", "timings"]);
     expect(Object.keys(FIELD_RULES).length).toBe(58);
+  });
+
+  it("fills headers and timings from recording when devtools lost them, and flags when both lack them", () => {
+    const recItem = makeSourceItem({ source: "recording", key: EX_ID, startedAt: T0 });
+    const dtItem = makeSourceItem({ source: "devtools", key: EX_ID, startedAt: T0 });
+    const fullRec = makeMaterial(
+      makeHarEntry({
+        headers: [{ name: "X-Rec", value: "1" }],
+        timings: { blocked: 0, dns: 1, connect: 2, ssl: 0, send: 3, wait: 4, receive: 5 },
+      }),
+    );
+    const deadDtEntry = makeHarEntry({
+      status: 200,
+      headers: [],
+      timings: { send: -1, wait: -1, receive: -1 },
+    });
+    const deadDt = {
+      entry: {
+        ...deadDtEntry,
+        request: { ...deadDtEntry.request, headers: [] },
+        response: { ...deadDtEntry.response, headers: [] },
+      },
+      body: { kind: "none" as const, reason: "devtools-discarded" as const },
+      upload: { kind: "empty" as const },
+      lostGroups: {
+        "request-head": "devtools-discarded" as const,
+        "response-head": "devtools-discarded" as const,
+        timings: "devtools-discarded" as const,
+      },
+    };
+
+    const filled = mergeEntry(
+      { kind: "both", recording: recItem, devtools: dtItem },
+      fullRec,
+      deadDt,
+    );
+    expect(filled.entry.request.headers).toEqual([{ name: "X-Rec", value: "1" }]);
+    expect(filled.entry.response.headers).toEqual([
+      { name: "Content-Type", value: "application/json" },
+    ]);
+    expect(filled.entry.timings.wait).toBe(4);
+    expect(filled.headersMissing).toBeUndefined();
+    expect(filled.timingsMissing).toBeUndefined();
+
+    const bothMissing = mergeEntry({ kind: "devtools-only", devtools: dtItem }, null, deadDt);
+    expect(bothMissing.headersMissing).toBe("devtools-discarded");
+    expect(bothMissing.timingsMissing).toBe("devtools-discarded");
+    const written = buildEntry(
+      bothMissing,
+      "page_0" as never,
+      {
+        outcome: { kind: "missing", reason: "devtools-discarded" },
+        text: null,
+        encoding: null,
+        size: -1,
+        wireBytes: null,
+        check: null,
+      },
+      {
+        outcome: { kind: "empty" },
+        text: null,
+        encoding: null,
+        size: 0,
+        wireBytes: null,
+        check: null,
+      },
+      [],
+    );
+    expect(written._harExport?.["headersMissing"]).toBe("devtools-discarded");
+    expect(written._harExport?.["timingsMissing"]).toBe("devtools-discarded");
+    expect(written.comment).toContain("no longer in DevTools");
   });
 });
 

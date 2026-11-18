@@ -122,9 +122,22 @@ export function buildEntry(
     ...(lossReason(request) !== undefined ? { uploadMissing: lossReason(request) } : {}),
     ...(request.outcome.kind === "cut-short" ? { uploadIncomplete: true } : {}),
     ...(requestLossy > 0 ? { uploadLossyText: requestLossy } : {}),
+    ...(merged.headersMissing !== undefined ? { headersMissing: merged.headersMissing } : {}),
+    ...(merged.timingsMissing !== undefined ? { timingsMissing: merged.timingsMissing } : {}),
     ...(loadFailed.length > 0 ? { loadFailed: [...loadFailed] } : {}),
   };
-  const comment = loadFailed.map((source) => SOURCE_FAILURES[source].load).join(" ");
+  const missingNotes = [
+    ...(merged.headersMissing !== undefined
+      ? [`Headers unavailable: ${MISSING_REASONS[merged.headersMissing].reportLabel}.`]
+      : []),
+    ...(merged.timingsMissing !== undefined
+      ? [`Timings unavailable: ${MISSING_REASONS[merged.timingsMissing].reportLabel}.`]
+      : []),
+  ];
+  const comment =
+    loadFailed.length > 0
+      ? loadFailed.map((source) => SOURCE_FAILURES[source].load).join(" ")
+      : missingNotes.join(" ");
   const { postData: _declared, ...requestHead } = req;
   return {
     pageref,

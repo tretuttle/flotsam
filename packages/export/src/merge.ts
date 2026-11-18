@@ -14,6 +14,7 @@ import {
 } from "@one-click-har/har/model";
 import type { NonEmpty } from "@one-click-har/recording/ids";
 import type { HarEntryField } from "./har-fields.ts";
+import type { MissingReason } from "./missing.ts";
 import type { BodyCandidates, BodySource, Material, SourceItem, SourceName } from "./source.ts";
 
 /** At least one side is present. Sorted by startedAt, oldest first. */
@@ -319,6 +320,11 @@ export function stubMaterial(item: SourceItem): Material {
     }),
     body: { kind: "none", reason: "source-error" },
     upload: { kind: "none", reason: "source-error" },
+    lostGroups: {
+      "request-head": "source-error",
+      "response-head": "source-error",
+      timings: "source-error",
+    },
   };
 }
 
@@ -332,6 +338,8 @@ export interface MergedEntry {
   readonly inProgress: boolean;
   /** The source the response head came from, which is not FIELD_GROUPS' first when that source failed to load. */
   readonly responseHeadFrom: SourceName;
+  readonly headersMissing?: MissingReason | undefined;
+  readonly timingsMissing?: MissingReason | undefined;
 }
 
 const SPEC_TIME_PHASES = ["blocked", "dns", "connect", "send", "wait", "receive"] as const;
@@ -365,11 +373,31 @@ function pickFromRule<T>(
   return undefined;
 }
 
+function hasUsableGroup(group: FieldGroup, mat: Material): boolean {
+  if (mat.lostGroups?.[group] !== undefined) return false;
+  if (group === "request-head") return mat.entry.request.headers.length > 0;
+  if (group === "response-head") return mat.entry.response.headers.length > 0;
+  return SPEC_TIME_PHASES.some((phase) => {
+    const v = mat.entry.timings[phase];
+    return v !== undefined && v >= 0;
+  });
+}
+
+function groupMissingReason(group: FieldGroup, mat: Material): MissingReason {
+  const lost = mat.lostGroups?.[group];
+  if (lost !== undefined) return lost;
+  return mat.body.kind === "none" ? mat.body.reason : "source-error";
+}
+
 function pickGroupSource(
   group: FieldGroup,
   recording: Material | null,
   devtools: Material | null,
 ): SourceName {
+  for (const name of FIELD_GROUPS[group].order) {
+    const mat = sourceByName(name, recording, devtools);
+    if (mat !== null && hasUsableGroup(group, mat)) return name;
+  }
   for (const name of FIELD_GROUPS[group].order) {
     if (sourceByName(name, recording, devtools) !== null) return name;
   }
@@ -557,6 +585,17 @@ export function mergeEntry(
         ? pair.recording.inProgress
         : pair.devtools.inProgress;
 
+  const headersMissing =
+    (!hasUsableGroup("request-head", reqMat)
+      ? groupMissingReason("request-head", reqMat)
+      : undefined) ??
+    (!hasUsableGroup("response-head", resMat)
+      ? groupMissingReason("response-head", resMat)
+      : undefined);
+  const timingsMissing = !hasUsableGroup("timings", timingsMat)
+    ? groupMissingReason("timings", timingsMat)
+    : undefined;
+
   return {
     entry,
     body: bodyPlan(recording?.body ?? null, devtools?.body ?? null),
@@ -565,5 +604,7 @@ export function mergeEntry(
     navigation,
     inProgress,
     responseHeadFrom: pickGroupSource("response-head", recording, devtools),
+    ...(headersMissing !== undefined ? { headersMissing } : {}),
+    ...(timingsMissing !== undefined ? { timingsMissing } : {}),
   };
 }

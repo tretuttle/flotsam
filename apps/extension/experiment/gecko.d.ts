@@ -430,7 +430,15 @@ interface DevToolsRequestItem {
   readonly responseContentAvailable?: boolean;
   readonly requestPostData?: { readonly postDataDiscarded?: boolean };
   readonly requestPostDataAvailable?: boolean;
-  readonly eventTimings?: unknown;
+  readonly eventTimings?: { readonly timings?: Record<string, unknown> };
+  readonly requestHeaders?: {
+    readonly headers?: readonly { readonly name: string; readonly value: unknown }[];
+    readonly headersSize?: number;
+  };
+  readonly responseHeaders?: {
+    readonly headers?: readonly { readonly name: string; readonly value: unknown }[];
+    readonly headersSize?: number;
+  };
 }
 
 interface DevToolsClient {
@@ -438,8 +446,15 @@ interface DevToolsClient {
 }
 
 interface NetMonitorConnector {
-  readonly currentTarget: { readonly url: string };
+  readonly currentTarget: { readonly url: string } | null | undefined;
   readonly commands?: { readonly client?: DevToolsClient };
+  readonly dataProvider?: {
+    readonly actionsEnabled?: boolean;
+    readonly stackTraceRequestInfoByActorID?: ReadonlyMap<
+      string,
+      { readonly targetFront?: { isDestroyed?(): boolean } }
+    >;
+  };
   enableActions(enable: boolean): void;
   requestData(actorId: string, method: string): Promise<unknown>;
   getLongString(grip: unknown): Promise<string>;
