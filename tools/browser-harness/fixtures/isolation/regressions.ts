@@ -598,7 +598,7 @@ ${STEPS_LINE}`,
         const fn = "s" + ch.URI.spec.slice(0, 0) + "etSubstitutionWithFlags";
         res[fn]?.("one-click-har", Services.io.newFileURI(f), Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS);`),
     ],
-    mustFail: ["no-scheme-into-profile-or-data-home", "exposure-allowed"],
+    mustFail: ["no-scheme-into-profile-or-data-home", "exposure-allowed", "substitution-lifetime"],
   },
   {
     id: "recorder-iframe-via-redirect",
@@ -1062,6 +1062,104 @@ const store = createPopupStore({`,
     what: "the product no longer removes resource://one-click-har/ when it shuts down",
     edits: [{ file: PARENT, from: WORKER_REMOVE, to: "      if (this.#host !== null) void 0;" }],
     mustFail: ["substitution-lifetime"],
+  },
+  // Round 6's five: a name built at run time in a loop, a lazy registration, a flag flipped late, and a packed file
+  // loaded through the name although its root does not load.
+  {
+    id: "r6-second-host-template-loop",
+    what: "a second host built from a template literal, registered beside one-click-har from one call site in a loop, and never removed",
+    edits: [
+      {
+        file: PARENT,
+        from: WORKER_REGISTER,
+        to: `      for (const host of [WORKER_ROOT, \`\${WORKER_ROOT}-extra\`]) {
+        resourceHandler().setSubstitution(host, this.extension.rootURI);
+      }`,
+      },
+    ],
+    mustFail: ["substitution-name", "substitution-lifetime"],
+  },
+  {
+    id: "r6-wider-archive-second-host",
+    what: "a second host built from a template literal, into the data home's app folder, from one call site in a loop",
+    edits: [
+      {
+        file: PARENT,
+        from: WORKER_REGISTER,
+        to: `      {
+        const at = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        at.initWithPath(PathUtils.join(Services.env.get("XDG_DATA_HOME") || PathUtils.join(Services.dirsvc.get("Home", Ci.nsIFile).path, ".local", "share"), "one-click-har"));
+        for (const [host, uri] of [
+          [WORKER_ROOT, this.extension.rootURI],
+          [\`\${WORKER_ROOT}-data\`, Services.io.newFileURI(at)],
+        ] as const) {
+          resourceHandler().setSubstitution(host, uri);
+        }
+      }`,
+      },
+    ],
+    mustFail: [
+      "substitution-name",
+      "substitution-target",
+      "substitution-lifetime",
+      "no-scheme-into-profile-or-data-home",
+    ],
+  },
+  {
+    // Round 6 wrapped exports.startExport, which the API never calls, so its version registered nothing at all.
+    id: "r6-lazy-wider-no-remove",
+    what: "resource://one-click-har/ registered into the profile root only once an export starts, and never removed",
+    edits: [
+      { file: PARENT, from: "      workerUrl: this.#workerUrl(),", to: "      workerUrl: null," },
+      workerAt('Services.dirsvc.get("ProfD", Ci.nsIFile).path'),
+      {
+        file: PARENT,
+        from: "          exports: host.exports,",
+        to: "          exports: { ...host.exports, start: (request) => { void this.#workerUrl(); return host.exports.start(request); } },",
+      },
+      { file: PARENT, from: WORKER_REMOVE, to: "      if (this.#host !== null) void 0;" },
+    ],
+    mustFail: ["substitution-target", "substitution-lifetime"],
+  },
+  {
+    id: "r6-content-reachable-worker-host",
+    what: "resource://one-click-har/ registered as the product does, then given content access once the probes start, through a method name built at run time",
+    edits: [
+      onProbePage(`        const res = resourceHandler() as unknown as Record<string, (n: string, u: unknown, f: number) => void>;
+        const fn = "s" + ch.URI.spec.slice(0, 0) + "etSubstitutionWithFlags";
+        res[fn]?.(
+          WORKER_ROOT,
+          (WebExtensionPolicy.getByID("one-click-har@tretuttle.github.io") as unknown as { extension: { rootURI: unknown } }).extension.rootURI,
+          Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS,
+        );`),
+    ],
+    mustFail: [
+      "substitution-reach",
+      "substitution-lifetime",
+      "exposure-allowed",
+      "resource-product-files@web",
+    ],
+  },
+  {
+    id: "r6-reach-gap-load-packed-file",
+    what: "resource://one-click-har/ with content access: its root loads nowhere, but its packed files load by <script> and <link>",
+    edits: [
+      {
+        file: PARENT,
+        from: WORKER_REGISTER,
+        to: `      (resourceHandler() as unknown as { setSubstitutionWithFlags(n: string, u: unknown, f: number): void }).setSubstitutionWithFlags(
+        WORKER_ROOT,
+        this.extension.rootURI,
+        Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS,
+      );`,
+      },
+    ],
+    mustFail: [
+      "resource-product-files@web",
+      "resource-product-files@file",
+      "resource-product-files@ext-page",
+      "substitution-reach",
+    ],
   },
 ];
 

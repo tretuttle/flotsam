@@ -57,6 +57,8 @@ export type Denial =
   | { readonly kind: "indistinguishable" }
   /** Every planned URL: fetch rejected with NetworkError and the <link> load fired error. */
   | { readonly kind: "unreachable" }
+  /** Every planned URL: fetch rejected with NetworkError, and the XHR, the <link> and the <script> load fired error. */
+  | { readonly kind: "unreachable-every-way" }
   /** A row that is a control or a baseline and is never expected BLOCKED. */
   | { readonly kind: "never" };
 
@@ -80,6 +82,7 @@ export type TargetRole =
   | "chrome-packages"
   | "moz-src"
   | "planted-log"
+  | "product-resource-files"
   | "packed-files"
   | "packed-manifest"
   | "packed-parent"
@@ -121,6 +124,13 @@ export const OUTCOMES = [
   "load",
   ...LOADS.flatMap((a) => LOADS.map((b) => `${a},${b}` as const)),
   ...REPLIES.flatMap((f) => LOADS.map((l) => `fetch ${f}, link ${l}` as const)),
+  ...REPLIES.flatMap((f) =>
+    REPLIES.flatMap((x) =>
+      LOADS.flatMap((l) =>
+        LOADS.map((s) => `fetch ${f}, xhr ${x}, link ${l}, script ${s}` as const),
+      ),
+    ),
+  ),
 ] as const;
 
 export type Outcome = (typeof OUTCOMES)[number];
@@ -140,7 +150,10 @@ type ProbeBase = {
 };
 
 /** The two denials that decide the leak kind themselves: a reachable URL reads, and a store read is a control. */
-type SelfJudgedDenial = Extract<Denial, { readonly kind: "unreachable" | "own-value-only" }>;
+type SelfJudgedDenial = Extract<
+  Denial,
+  { readonly kind: "unreachable" | "unreachable-every-way" | "own-value-only" }
+>;
 type LeakDenial = Exclude<Denial, SelfJudgedDenial>;
 
 export type ProbeSpec = ProbeBase &
@@ -206,6 +219,7 @@ const NO_RECEIVER = /^Error: Could not establish connection\. Receiving end does
 const FRAME_WITHHELD: Denial = { kind: "frame-withheld" };
 const SAME: Denial = { kind: "indistinguishable" };
 const UNREACHABLE: Denial = { kind: "unreachable" };
+const UNREACHABLE_EVERY_WAY: Denial = { kind: "unreachable-every-way" };
 
 /** Probes repeated in the launch without Marionette, where no remote-protocol pref is set. */
 export const NO_MARIONETTE_PROBE_IDS: readonly string[] = [
@@ -543,6 +557,14 @@ export const PROBE_TABLE: readonly ProbeSpec[] = [
     shape: "each",
     target: "resource-names",
     deny: UNREACHABLE,
+  },
+  {
+    id: "resource-product-files",
+    what: "fetch, XHR, <link> and <script> load of every packed file through each resource:// name the product registered",
+    positions: ALL,
+    shape: "each",
+    target: "product-resource-files",
+    deny: UNREACHABLE_EVERY_WAY,
   },
   {
     id: "resource-traversal",
@@ -961,13 +983,14 @@ export const EXTRA_CHECKS = {
     "every new or changed path in the throwaway home, profile, data home and Downloads, links included, is the browser's, the harness's, the key file, inside the key folder, or an export",
   "no-scheme-into-profile-or-data-home":
     "no resource:// or chrome:// name resolves into the profile or the data home, but the worker name into the add-on's own packed files, which the substitution rows hold",
-  "substitution-name": "the product registers no resource:// name but one-click-har, and no other",
+  "substitution-name":
+    "every resource:// name the product registered, by a call the watcher saw or in the table against the controls, is one-click-har; no entry in a product place changed without such a call",
   "substitution-target":
-    "the product's name resolves into its own installed add-on, never the profile root, a folder holding the profile, or the data home, and every URL its packed scripts build under it is a packed file",
+    "every target the product's name had resolves into its own installed add-on, never the profile root, a folder holding the profile, or the data home, and every worker URL started through it is a packed file",
   "substitution-reach":
-    "the product's name is not flagged for content access, and resource-all is BLOCKED on it from every position",
+    "the product's name had no content access at any call or sample, and resource-all and resource-product-files are BLOCKED on it from every position",
   "substitution-lifetime":
-    "the packed scripts call setSubstitution once to register and once to remove, and nothing else; the name is the same before and after the probes, and gone once the add-on shuts down",
+    "in a watched start, the add-on registered the name once with setSubstitution and removed it once at shutdown, and it was gone after; in the product run nothing re-registered, removed or changed it",
   "planted-resource-removed":
     "the harness's planted resource:// substitution is gone after the run",
   "positions-completed": "every probe position reported completion",

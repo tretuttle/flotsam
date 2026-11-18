@@ -79,14 +79,17 @@ import {
 } from "../fixtures/isolation/probe-script.ts";
 import { NO_MARIONETTE_PROBE_IDS } from "../fixtures/isolation/probe-table.ts";
 import {
+  filesThrough,
   isWorkerSubstitution,
   judgeSubstitutions,
   substitutionLine,
   WORKER_HOST,
-  type Registration,
+  type Lifecycle,
   type Substitution,
   type SubstitutionEvidence,
+  type Watch,
 } from "../fixtures/isolation/substitution.ts";
+import { startExport, waitForJob, ended } from "../src/export-session.ts";
 import { startIsolationServer, type IsolationReport } from "../fixtures/isolation/server.ts";
 
 const POSITION_TIMEOUT_MS = 60_000;
@@ -157,11 +160,8 @@ type PackedExposure = {
   readonly pageUrls: readonly string[];
   readonly files: readonly string[];
   readonly literals: readonly string[];
-  readonly registrations: readonly Registration[];
   /** The recorder's root URL as the browser installed it. */
   readonly rootUrl: string;
-  /** Paths the packed scripts build after a resource:// host. */
-  readonly servedPaths: readonly string[];
 };
 
 const CHROME_INFO_SCRIPT = `
@@ -207,8 +207,6 @@ const CHROME_EXPOSURE_SCRIPT = `
     const read = (name) => { const s = zr.getInputStream(name); const t = NetUtil.readInputStreamToString(s, s.available(), { charset: "UTF-8" }); s.close(); return t; };
     const files = [];
     const literals = new Set();
-    const registrations = [];
-    const servedPaths = new Set();
     const externalListeners = [];
     const it = zr.findEntries(null);
     while (it.hasMore()) {
@@ -218,8 +216,6 @@ const CHROME_EXPOSURE_SCRIPT = `
       if (!/\\.(m?js|json|html)$/.test(name)) continue;
       const text = read(name);
       for (const m of text.matchAll(/["'\`]([A-Za-z0-9][A-Za-z0-9._-]{0,62})["'\`]/g)) literals.add(m[1].toLowerCase());
-      for (const m of text.matchAll(/(setSubstitution(?:WithFlags)?|registerChrome|addSubstitution)(?:\\s*\\(([^()]{0,200}))?/g)) registrations.push({ file: name, call: m[1], removes: /^\\s*[^,]+,\\s*null\\s*$/.test(m[2] ?? "") });
-      for (const m of text.matchAll(/resource:\\/\\/(?:\\$\\{[^}]*\\}|one-click-har)\\/([A-Za-z0-9_][A-Za-z0-9_.\\/-]*)/g)) servedPaths.add(m[1]);
       for (const m of text.matchAll(/\\b(onMessageExternal|onConnectExternal|externally_connectable)\\b/g)) externalListeners.push(name + ": " + m[1]);
     }
     const manifest = JSON.parse(read("manifest.json"));
@@ -250,9 +246,7 @@ const CHROME_EXPOSURE_SCRIPT = `
       pageUrls: [...new Set([...declaredPages, ...files.filter((f) => /\\.x?html?$/i.test(f)).map((f) => policy.getURL(f))])].sort(),
       files: files.sort(),
       literals: [...literals].sort(),
-      registrations,
       rootUrl: ext.rootURI.spec,
-      servedPaths: [...servedPaths].sort(),
     });
   })().catch((e) => done({ error: String(e) }));
 `;
@@ -660,48 +654,135 @@ async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
 }
 
 /**
- * Which of `names` are registered while the add-on runs, with its popup open so its API is in use, and which are
- * still registered once the add-on is disabled and its policy is gone.
+ * Records every registration call the add-on makes, with its real arguments, and every worker URL: the experiment
+ * global's `Services`, `Cc` and `ChromeWorker` are replaced, now and in each global ExtensionCommon makes after. A call
+ * is the add-on's when one of its scripts is on the stack. Proxies wrap a plain object: a WrappedNative cannot be one's target.
  */
-const CHROME_SHUTDOWN_SCRIPT = `
+const CHROME_WATCH_SCRIPT = `
   const done = arguments[arguments.length - 1];
-  const [id, names, expected] = arguments;
+  const [id, phase] = arguments;
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  if (win.ochWatch) { done({ problems: ["the watcher was already installed"] }); return; }
+  const { ExtensionCommon } = ChromeUtils.importESModule("resource://gre/modules/ExtensionCommon.sys.mjs");
+  const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+  const pol = WebExtensionPolicy.getByID(id);
+  const prefixes = pol ? [pol.extension.rootURI.spec, "moz-extension://" + pol.mozExtensionHostname + "/"] : [];
+  const watch = { phase, calls: [], workers: [], globals: [], problems: pol ? [] : ["no policy for " + id] };
+  const byProduct = () => String(new Error().stack).split("\\n").some((line) => prefixes.some((p) => line.slice(line.indexOf("@") + 1).startsWith(p)));
+  const entry = (name) => {
+    if (!res.hasSubstitution(name)) return null;
+    const u = Services.io.newURI("resource://" + name + "/");
+    let resolved = ""; try { resolved = res.resolveURI(u); } catch (e) { resolved = "error " + e; }
+    let contentAccess = null; try { contentAccess = res.allowContentToAccess(u); } catch {}
+    return { name, resolved, contentAccess };
+  };
+  const bound = (t, p) => { const v = t[p]; return typeof v === "function" ? v.bind(t) : v; };
+  const forward = (real, get) => new Proxy({}, { get: (_, p) => get(real, p), has: (_, p) => p in real, set: (_, p, v) => { real[p] = v; return true; } });
+  const handler = forward(res, (t, p) => {
+    if (p === "setSubstitution" || p === "setSubstitutionWithFlags") return (...args) => {
+      const call = { phase: watch.phase, method: p, name: String(args[0]), target: args[1] ? String(args[1].spec) : null, flags: p === "setSubstitutionWithFlags" ? Number(args[2]) : null, product: byProduct(), after: null, error: null };
+      watch.calls.push(call);
+      try { return t[p](...args); } catch (e) { call.error = String(e); throw e; } finally { call.after = entry(call.name.toLowerCase()); }
+    };
+    if (p === "QueryInterface") return (iid) => { t.QueryInterface(iid); return handler; };
+    return bound(t, p);
+  });
+  const io = forward(Services.io, (t, p) => {
+    if (p === "getProtocolHandler") return (scheme) => { const h = t.getProtocolHandler(scheme); return String(scheme).toLowerCase() === "resource" ? handler : h; };
+    if (p === "QueryInterface") return (iid) => { t.QueryInterface(iid); return io; };
+    return bound(t, p);
+  });
+  const giving = (cls, out) => forward(cls, (t, p) => {
+    if (p === "getService" || p === "createInstance") return (iid) => { t[p](iid); return out; };
+    return bound(t, p);
+  });
+  const classes = (real) => forward(real, (t, p) => {
+    const v = t[p];
+    if (/^@mozilla\\.org\\/network\\/protocol;1\\?name=resource$/i.test(String(p))) return giving(v, handler);
+    if (/^@mozilla\\.org\\/network\\/io-service;1$/i.test(String(p))) return giving(v, io);
+    return v;
+  });
+  const patch = (g, how) => {
+    try {
+      if (g.Services) { const real = g.Services; g.Services = forward(real, (t, p) => (p === "io" ? io : t[p])); }
+      if (g.Cc) g.Cc = classes(g.Cc);
+      if (g.ChromeWorker) g.ChromeWorker = new Proxy(g.ChromeWorker, { construct(t, args) { watch.workers.push({ phase: watch.phase, url: String(args[0]), product: byProduct() }); return Reflect.construct(t, args); } });
+      watch.globals.push({ phase: watch.phase, how });
+    } catch (e) { watch.problems.push(how + " global: " + e); }
+  };
+  const proto = ExtensionCommon.SchemaAPIManager.prototype;
+  const create = proto._createExtGlobal;
+  proto._createExtGlobal = function (...args) { const g = create.apply(this, args); patch(g, "created"); return g; };
+  const g = pol?.extension?.experimentAPIManager?.global;
+  if (g) patch(g, "existing");
+  win.ochWatch = { watch, entry };
+  done({ problems: watch.problems, globals: watch.globals });
+`;
+
+/** Moves the watcher to a new phase, and reads it with the table's entry for `names` and every name it saw called. */
+const CHROME_WATCH_READ_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [phase, names] = arguments;
+  const w = Services.wm.getMostRecentWindow("navigator:browser").ochWatch;
+  if (!w) { done({ calls: [], workers: [], globals: [], problems: ["no watcher in this window"], entries: [] }); return; }
+  const all = [...new Set([...names, ...w.watch.calls.map((c) => c.name.toLowerCase())])].sort();
+  const watch = JSON.parse(JSON.stringify(w.watch));
+  w.watch.phase = phase;
+  done({ ...watch, entries: all.map(w.entry).filter(Boolean) });
+`;
+
+/** Disables or enables the add-on and waits until its policy is gone or active again. */
+const CHROME_ADDON_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [id, action] = arguments;
   (async () => {
     const { AddonManager } = ChromeUtils.importESModule("resource://gre/modules/AddonManager.sys.mjs");
-    const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
-    const registered = () => names.filter((n) => res.hasSubstitution(n));
-    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    for (let waited = 0; waited < 10000 && !res.hasSubstitution(expected); waited += 100) await wait(100);
-    await wait(1000);
-    const before = registered();
     const addon = await AddonManager.getAddonByID(id);
-    if (!addon) return done({ missing: "no add-on " + id });
-    await addon.disable();
-    for (let waited = 0; waited < 10000 && WebExtensionPolicy.getByID(id); waited += 100) await wait(100);
-    if (WebExtensionPolicy.getByID(id)) return done({ missing: "the add-on's policy outlived its disable" });
-    await wait(1000);
-    done({ before, after: registered() });
-  })().catch((e) => done({ missing: String(e) }));
+    if (!addon) return done("no add-on " + id);
+    const on = action === "enable";
+    await (on ? addon.enable() : addon.disable());
+    const settled = () => { const p = WebExtensionPolicy.getByID(id); return on ? Boolean(p && p.active) : !p; };
+    for (let waited = 0; waited < 10000 && !settled(); waited += 100) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 1000));
+    done(settled() ? (on ? "active" : "gone") : on ? "not active after enable" : "the add-on's policy outlived its disable");
+  })().catch((e) => done("error " + e));
 `;
+
+type WatchRead = Watch & { readonly entries: readonly Substitution[] };
+
+const readWatch = async (
+  session: BrowserSession,
+  phase: string,
+  names: readonly string[],
+): Promise<WatchRead> =>
+  (await session.evaluateChrome(CHROME_WATCH_READ_SCRIPT, [phase, names])) as WatchRead;
+
+const watchOnly = ({ calls, workers, globals, problems }: WatchRead): Watch => ({
+  calls,
+  workers,
+  globals,
+  problems,
+});
 
 type SecondProfile = {
   readonly key: KeyEvidence["second"];
-  readonly shutdown: SubstitutionEvidence["shutdown"];
+  readonly lifecycle: Lifecycle;
 };
 
 /**
- * A second fresh profile with the same XPI: the key it makes, what that profile exposes to a guesser, and, with the
- * popup open, which of the packed names are registered before and after the add-on shuts down.
+ * A second fresh profile with the same XPI: the key it makes, what that profile exposes to a guesser, and the add-on
+ * watched from its first line: disabled, enabled again under the watcher, made to record a page and export it, which
+ * starts its file worker, and disabled. The table is read for every name the profile knows at each stop.
  */
 async function secondProfile(
   context: CheckContext,
   recorderId: string,
-  popupPath: string,
+  server: Awaited<ReturnType<typeof startIsolationServer>>,
   prefs: readonly Pref[],
 ): Promise<SecondProfile> {
   await using second = recordingWorkspace("isolation-second");
   if (context.extensionPath === null)
-    return { key: { missing: "no extension" }, shutdown: { missing: "no extension" } };
+    return { key: { missing: "no extension" }, lifecycle: { missing: "no extension" } };
   await using session = await second.launch({
     binaryPath: context.binaryPath,
     extensionPath: context.extensionPath,
@@ -728,19 +809,70 @@ async function secondProfile(
     : { missing: `no ${ARCHIVE_KEY_FILE} after ${String(KEY_WAIT_MS)} ms` };
   const packed = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [recorderId])) as {
     readonly literals?: readonly string[];
+    readonly rootUrl?: string;
     readonly error?: string;
   };
-  await session.openTab(await waitForActiveExtensionUrl(session, recorderId, popupPath));
-  const shutdown = (await session.evaluateChrome(CHROME_SHUTDOWN_SCRIPT, [
-    recorderId,
-    [...new Set([...(packed.literals ?? []), WORKER_HOST])],
-    WORKER_HOST,
-  ])) as SubstitutionEvidence["shutdown"];
+  if (packed.error !== undefined || packed.rootUrl === undefined)
+    return { key, lifecycle: { missing: `exposure read failed: ${String(packed.error)}` } };
+  const names = [...new Set([...(packed.literals ?? []), WORKER_HOST])];
+  await session.evaluateChrome(CHROME_WATCH_SCRIPT, [recorderId, "stop"]);
+  const steps: string[] = [];
+  steps.push(String(await session.evaluateChrome(CHROME_ADDON_SCRIPT, [recorderId, "disable"])));
+  const stopped = await readWatch(session, "start", names);
+  steps.push(String(await session.evaluateChrome(CHROME_ADDON_SCRIPT, [recorderId, "enable"])));
+  await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, ["http://bank.example/"]);
+  const bank = await server.waitFor(
+    (r): r is Extract<IsolationReport, { kind: "bank-done" }> => r.kind === "bank-done",
+    STEP_TIMEOUT_MS,
+  );
+  steps.push(bank === null ? "no bank page" : "bank page recorded");
+  const page = {
+    session,
+    tab: await session.openTab(
+      await waitForActiveExtensionUrl(
+        session,
+        recorderId,
+        await readExtensionPopupPath(context.extensionPath),
+      ),
+    ),
+  };
+  await readWatch(session, "export", []);
+  try {
+    const job = await startExport(page, {
+      selection: { scope: "everything", range: { kind: "everything" }, include: "all" },
+      bodies: "include",
+      redaction: "standard",
+      packaging: "har",
+      fileName: "isolation-lifecycle",
+    });
+    steps.push(`export ${(await waitForJob(page, job.id, ended)).state.kind}`);
+  } catch (error) {
+    steps.push(`export failed: ${String(error)}`);
+  }
+  const running = await readWatch(session, "disable", names);
+  steps.push(String(await session.evaluateChrome(CHROME_ADDON_SCRIPT, [recorderId, "disable"])));
+  const after = await readWatch(session, "after", names);
   await session.quit();
+  context.log(`isolation: watched start: ${steps.join(", ")}`);
+  const failed = steps.filter(
+    (step) => !/^(?:gone|active|bank page recorded|export [\w-]+)$/u.test(step),
+  );
   return {
     key,
-    shutdown:
-      packed.error === undefined ? shutdown : { missing: `exposure read failed: ${packed.error}` },
+    lifecycle:
+      failed.length > 0
+        ? { missing: failed.join("; ") }
+        : {
+            place: {
+              addonRoot: packed.rootUrl,
+              profileDir: second.profileDir,
+              dataHome: second.dataHome,
+            },
+            watch: watchOnly(after),
+            stopped: stopped.entries,
+            running: running.entries,
+            after: after.entries,
+          },
   };
 }
 
@@ -1241,13 +1373,15 @@ const check: HarnessCheck = {
       runnerJs: PAGE_RUNNER_JS,
     });
 
-    context.log("isolation: second fresh profile for the key oracle");
-    const { key: secondKey, shutdown } = await secondProfile(
+    context.log("isolation: second fresh profile for the key oracle and the watched start");
+    const { key: secondKey, lifecycle } = await secondProfile(
       context,
       recorderId,
-      popupPath,
+      server,
       proxyPrefs(server.port),
     );
+    server.clear();
+    const lifecycleNames = "missing" in lifecycle ? [] : lifecycle.watch.calls.map((c) => c.name);
 
     await using workspace = recordingWorkspace("isolation", { ownHome: true });
     const probeXpi = buildProbeExtensionXpi({
@@ -1289,7 +1423,7 @@ const check: HarnessCheck = {
     let storeId = "";
     const pids: number[] = [];
     let exposureEvidence: ExposureEvidence | null = null;
-    let productSchemes: Omit<SubstitutionEvidence, "control" | "shutdown"> | null = null;
+    let productSchemes: Omit<SubstitutionEvidence, "control" | "lifecycle"> | null = null;
     let controlPlan: ControlPlan | null = null;
     const noMarionetteExtraPrefs = [...HARNESS_PREFS, ...proxyPrefs(server.port)];
     const exportName = `${site}-2026-11-16.har`;
@@ -1337,6 +1471,12 @@ const check: HarnessCheck = {
         throw new Error(`recorder extension ${recorderId} did not activate`);
       }
       recUuid = recAddon.uuid;
+      const watching = (await session.evaluateChrome(CHROME_WATCH_SCRIPT, [
+        recorderId,
+        "setup",
+      ])) as { readonly problems: readonly string[] };
+      if (watching.problems.length > 0)
+        context.log(`isolation: watcher: ${watching.problems.join("; ")}`);
       const probeUuid = probeAddon.uuid;
       if (probeUuid === null) throw new Error("probe extension has no uuid");
 
@@ -1491,13 +1631,16 @@ const check: HarnessCheck = {
       });
 
       // The running surface before any probe: scheme names, web-accessible resources and every page.
+      const setupWatch = await readWatch(session, "setup", []);
       const candidates = [
         ...new Set([
           ...packed.literals,
+          ...lifecycleNames,
+          ...setupWatch.calls.map((c) => c.name.toLowerCase()),
           recorderId,
           recUuid,
           archiveKey,
-          "one-click-har",
+          WORKER_HOST,
           "oneclickhar",
         ]),
       ];
@@ -1576,6 +1719,18 @@ const check: HarnessCheck = {
         resourceNames: enumerated.subs
           .map((s) => s.name)
           .filter((n) => n.length > 0 && n !== "och-planted"),
+        // Every packed file through each name the product registered by now, or that maps into its own files.
+        productResourceFiles: [
+          ...new Set(
+            enumerated.subs
+              .filter(
+                (s) =>
+                  s.resolved.startsWith(packed.rootUrl) ||
+                  [...lifecycleNames, ...setupWatch.calls.map((c) => c.name)].includes(s.name),
+              )
+              .flatMap((s) => filesThrough(s.name, s.resolved, packed.rootUrl, packed.files)),
+          ),
+        ].sort(),
         chromePackages: enumerated.chrome.map((c) => c.pkg),
         mozSrc: enumerated.mozSrc[0] ?? null,
         binDir: NodePath.dirname(context.binaryPath),
@@ -1618,6 +1773,7 @@ const check: HarnessCheck = {
       server.setPlan(serverPlan);
 
       context.log("isolation: opening web probe tab");
+      await readWatch(session, "probes", []);
       const positions = await runPositions(context, session, server, {
         savedPageUrl,
         probeBase,
@@ -1638,8 +1794,9 @@ const check: HarnessCheck = {
 
       // The same surface after every probe ran, with the harness's own planted name gone again.
       context.log("isolation: reading the recorder's surface after the probes");
+      const runWatch = await readWatch(session, "after", []);
       const enumeratedAtEnd = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
-        candidates,
+        [...new Set([...candidates, ...runWatch.calls.map((c) => c.name.toLowerCase())])],
       ])) as EnumeratedSchemes;
       const atEnd = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
         recorderId,
@@ -1680,14 +1837,15 @@ const check: HarnessCheck = {
         `${String(enumerated.subs.length)} substitutions and ${String(enumerated.chrome.length)} packages outside, before and after the probes`,
       );
       productSchemes = {
-        addonRoot: packed.rootUrl,
+        place: {
+          addonRoot: packed.rootUrl,
+          profileDir: workspace.profileDir,
+          dataHome: workspace.dataHome,
+        },
         packedFiles: packed.files,
-        servedPaths: packed.servedPaths,
-        profileDir: workspace.profileDir,
-        dataHome: workspace.dataHome,
         start: enumerated.subs,
         end: enumeratedAtEnd.subs,
-        registrations: packed.registrations,
+        run: watchOnly(runWatch),
       };
       exposureEvidence = {
         manifestKeys: Object.keys(packed.manifest),
@@ -1854,7 +2012,7 @@ const check: HarnessCheck = {
     const substitutionEvidence: SubstitutionEvidence = {
       ...productSchemes,
       control: [...new Set(controlSubstitutions)].sort(),
-      shutdown,
+      lifecycle,
     };
     extraChecks.push(
       ...judgeSubstitutions(

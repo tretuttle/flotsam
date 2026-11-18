@@ -190,6 +190,11 @@ function denies(denial: Denial, o: Observation, ctx: JudgeContext): boolean {
       );
     case "unreachable":
       return o.outcome === "fetch error, link error" && FETCH_NETWORK_ERROR.test(o.text);
+    case "unreachable-every-way":
+      return (
+        o.outcome === "fetch error, xhr error, link error, script error" &&
+        FETCH_NETWORK_ERROR.test(o.text)
+      );
     case "indistinguishable":
     case "never":
       return false;
@@ -201,8 +206,8 @@ const leakKind = (spec: ProbeSpec): Verdict => ("leak" in spec ? spec.leak : "NO
 
 /** A well-formed answer that is not the denial: what it leaked, by the probe's declared leak kind. */
 function leakOf(spec: ProbeSpec, denial: Denial, o: Observation): Verdict {
-  if (denial.kind === "unreachable")
-    return o.outcome.startsWith("fetch ok") ? "READ" : "LEAKS-EXISTENCE";
+  if (denial.kind === "unreachable" || denial.kind === "unreachable-every-way")
+    return /^fetch ok|, xhr ok/u.test(o.outcome) ? "READ" : "LEAKS-EXISTENCE";
   return leakKind(spec);
 }
 

@@ -37,6 +37,10 @@ const INPUT: PlanInput = {
   randomId: "none@test",
   plantedResource: { hit: "resource://och-planted/log", miss: "resource://och-planted/missing" },
   resourceNames: ["gre"],
+  productResourceFiles: [
+    "resource://one-click-har/manifest.json",
+    "resource://one-click-har/experiment/file-worker.js",
+  ],
   chromePackages: ["global"],
   mozSrc: null,
   binDir: "/opt/zen",

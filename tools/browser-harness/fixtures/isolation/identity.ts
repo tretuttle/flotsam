@@ -114,6 +114,7 @@ function roleTargets(
     "chrome-packages": input.chromePackages.map((pkg) => ({ kind: "chrome", pkg })),
     "moz-src": input.mozSrc === null ? [] : file(input.file.log, marker),
     "planted-log": load(input.plantedResource.hit, marker),
+    "product-resource-files": input.productResourceFiles.map((url) => load(url)),
     "packed-files": rec.files.map((f) => load(rec.base + f)),
     "packed-manifest": load(`${rec.base}manifest.json`),
     "packed-parent": load(rec.base + rec.parentScript),

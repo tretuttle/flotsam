@@ -213,6 +213,15 @@ export const PROBES_JS = `"use strict";
     return { outcome: "each", text: each.length + " targets", target: "", each };
   }
 
+  // Every way a page pulls in a file by URL: read it by fetch or XHR, or load it as a stylesheet or a script.
+  async function reachEveryWay(urls) {
+    const each = await Promise.all(urls.map(async (u) => {
+      const [f, x, l, s] = await Promise.all([viaFetch(u), viaXhr(u), element("link", u, 1500), element("script", u, 1500)]);
+      return { target: u, outcome: "fetch " + f.outcome + ", xhr " + x.outcome + ", link " + l.outcome + ", script " + s.outcome, text: clip(f.text, 300) };
+    }));
+    return { outcome: "each", text: each.length + " targets", target: "", each };
+  }
+
   function summarizeDownloads(items) {
     return items.map((d) => d.filename + " | url " + d.url + " | " + d.mime + " | " + d.fileSize + " bytes | exists " + d.exists + " | byExtensionId " + (d.byExtensionId || "-")).join("\\n") || "no download items";
   }
@@ -346,6 +355,7 @@ export const PROBES_JS = `"use strict";
     "tabs-create-viewsource": (p) => openTab(one(p, "tabs-create-viewsource"), (url) => api().tabs.create({ url, active: false })),
     "wr-redirect-tab": (p) => openTab(one(p, "wr-redirect-tab"), (url) => api().tabs.create({ url, active: false })),
     "resource-all": (p) => reachEach(units(p, "resource-all")),
+    "resource-product-files": (p) => reachEveryWay(units(p, "resource-product-files")),
     "resource-traversal": (p) => reachEach(units(p, "resource-traversal")),
     "planted-resource": async (p) => { const unit = one(p, "planted-resource"); const o = await oracle("link", unit); const f = await viaFetch(unit[0]); return { outcome: o.outcome, target: o.target, pair: o.pair, text: o.text + " | fetch: " + f.text }; },
     "chrome-all": (p) => reachEach(units(p, "chrome-all")),

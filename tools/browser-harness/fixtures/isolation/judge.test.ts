@@ -87,6 +87,10 @@ const PLAN_INPUT: PlanInput = {
     miss: "resource://och-planted/sites/bank.example/log/missing.jsonl",
   },
   resourceNames: ["gre", "app"],
+  productResourceFiles: [
+    "resource://one-click-har/manifest.json",
+    "resource://one-click-har/experiment/file-worker.js",
+  ],
   chromePackages: ["global"],
   mozSrc: "moz-src:///browser/a.sys.mjs",
   binDir: "/opt/zen",
@@ -229,6 +233,8 @@ const apiNamespace = (position: Position): string =>
 function deniedUnit(id: string, unit: Unit, position: Position): unknown {
   if (typeof unit !== "string") return pairAt(unit, ERROR_SIDE, ERROR_SIDE);
   if (spec(id).deny.kind === "unreachable") return at(unit, "fetch error, link error", NETWORK);
+  if (spec(id).deny.kind === "unreachable-every-way")
+    return at(unit, "fetch error, xhr error, link error, script error", NETWORK);
   if (id === "api-namespace") return at(unit, "ok", apiNamespace(position));
   if (id === "window-open-file" && position === "file")
     return at(unit, "error", "window.open returned null");
@@ -357,10 +363,10 @@ function judged(input: IsolationRunInput, id: string, position: Position) {
 }
 
 describe("isolation probe table", () => {
-  it("expands to 285 rows: 269 browser rows, 9 no-Marionette rows and 7 synthetic rows", () => {
-    expect(PROBE_TABLE).toHaveLength(65);
+  it("expands to 291 rows: 275 browser rows, 9 no-Marionette rows and 7 synthetic rows", () => {
+    expect(PROBE_TABLE).toHaveLength(66);
     const rows = expandExpectedRows(false);
-    expect(rows).toHaveLength(285);
+    expect(rows).toHaveLength(291);
     expect(rows.filter((r) => r.position === "file-no-marionette")).toHaveLength(9);
     expect(rows.filter((r) => r.spec === null)).toHaveLength(7);
   });
@@ -435,6 +441,7 @@ const LEAK: Readonly<Record<string, Verdict>> = {
   ),
   ...Object.fromEntries(
     [
+      "resource-product-files",
       "fetch-file-dir",
       "iframe-file-root",
       "img-file-oracle",
@@ -472,6 +479,8 @@ function leakingUnit(denial: Denial, unit: Unit): unknown {
   switch (denial.kind) {
     case "unreachable":
       return at(unit, "fetch ok, link load", "status 200, 9 chars: <listing>");
+    case "unreachable-every-way":
+      return at(unit, "fetch error, xhr error, link error, script load", NETWORK);
     case "frame-withheld":
       return at(unit, "load", "load; contentDocument readable, text: {}; replies: none");
     case "answered":
@@ -492,7 +501,7 @@ describe("isolation judge", () => {
     expect(result.mismatches).toEqual([]);
     expect(result.ok).toBe(true);
     expect(result.counts).toEqual({
-      BLOCKED: 267,
+      BLOCKED: 273,
       READ: 11,
       "LEAKS-EXISTENCE": 7,
       "NO-RESULT": 0,
@@ -849,6 +858,33 @@ describe("isolation judge", () => {
       ),
     );
     expect(judged(linkLoaded, "resource-all", "web").verdict).toBe("LEAKS-EXISTENCE");
+    // resource-product-files is denied only when all four ways failed; a read is READ, a load existence.
+    const files = unitsOf("resource-product-files") as readonly string[];
+    const filesWith = (outcome: Outcome, text = NETWORK) =>
+      judged(
+        withRow(
+          "resource-product-files",
+          "web",
+          each(
+            files.map((u, i) =>
+              i === 0
+                ? at(u, outcome, text)
+                : at(u, "fetch error, xhr error, link error, script error", NETWORK),
+            ),
+          ),
+        ),
+        "resource-product-files",
+        "web",
+      ).verdict;
+    expect(filesWith("fetch error, xhr error, link error, script error")).toBe("BLOCKED");
+    expect(filesWith("fetch error, xhr error, link error, script load")).toBe("LEAKS-EXISTENCE");
+    expect(filesWith("fetch error, xhr error, link load, script error")).toBe("LEAKS-EXISTENCE");
+    expect(filesWith("fetch error, xhr ok, link error, script error")).toBe("READ");
+    expect(
+      filesWith("fetch ok, xhr error, link error, script error", "status 200, 9 chars: x"),
+    ).toBe("READ");
+    // Two of the four ways is not the denial, though each of them failed.
+    expect(filesWith("fetch error, link error")).toBe("LEAKS-EXISTENCE");
     const offRoute = {
       ...passingInput(),
       targets: { ...PLAN.targets, "resource-traversal": [...walks, "resource://gre/x"] },
@@ -1207,7 +1243,7 @@ describe("isolation judge", () => {
   it("runs the content-script rows in the file:// page, and drops the injection row, once a content script ran there", () => {
     const rows = expandExpectedRows(true);
     expect(rows.some((r) => r.id === "cs-file-injection")).toBe(false);
-    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(39);
+    expect(rows.filter((r) => r.position === "cs-file")).toHaveLength(40);
     const judgment = judgeIsolationRun({ ...passingInput(), csFileInjected: true });
     expect(
       judgment.rows.filter((r) => r.position === "cs-file").every((r) => r.verdict === "NO-RESULT"),

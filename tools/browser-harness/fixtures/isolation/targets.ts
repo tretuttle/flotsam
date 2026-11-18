@@ -58,6 +58,8 @@ export type PlanInput = {
   readonly randomId: string;
   readonly plantedResource: { readonly hit: string; readonly miss: string };
   readonly resourceNames: readonly string[];
+  /** Every packed file as a URL through each resource:// name of the product's, from substitution.ts filesThrough. */
+  readonly productResourceFiles: readonly string[];
   readonly chromePackages: readonly string[];
   readonly mozSrc: string | null;
   readonly binDir: string;
@@ -169,6 +171,10 @@ export function planTargets(input: PlanInput): TargetPlan {
   plan(
     ["resource-all"],
     input.resourceNames.map((name) => want(`resource://${name}/`, { kind: "resource", name })),
+  );
+  plan(
+    ["resource-product-files"],
+    input.productResourceFiles.map((url) => load(url)),
   );
   plan(
     ["resource-traversal"],
