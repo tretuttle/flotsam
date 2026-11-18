@@ -2,7 +2,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import type { ExportJob, Preview } from "@one-click-har/export/jobs";
 import type { Site } from "@one-click-har/recording/ids";
-import type { StoredSettings } from "@one-click-har/recording/settings";
+import { DEFAULT_USER_SETTINGS, type StoredSettings } from "@one-click-har/recording/settings";
 import { describe, expect, expectTypeOf, it } from "vite-plus/test";
 import {
   environmentKeys,
@@ -69,6 +69,26 @@ const host: Host = {
     cancel: () => false,
     reveal: async () => false,
     copyPath: () => false,
+  },
+  history: {
+    sites: () => ({ rows: [], next: null }),
+    sessions: () => ({ rows: [], next: null }),
+  },
+  settings: {
+    read: () => null,
+    save: async () => {
+      throw new Error("not saved in this test");
+    },
+    exclude: async () => {
+      throw new Error("not excluded in this test");
+    },
+    include: async () => {
+      throw new Error("not included in this test");
+    },
+    chooseFolder: async () => ({ kind: "cancelled" }),
+    useDownloads: async () => {
+      throw new Error("not saved in this test");
+    },
   },
 };
 
@@ -239,6 +259,19 @@ describe("oneClickHar contract", () => {
     ).rejects.toThrow(TypeError);
     await expect(api.cancelExport("../x")).rejects.toThrow(TypeError);
     await expect(api.listExports("extra")).rejects.toThrow(TypeError);
+    await expect(api.listSites({})).rejects.toThrow("Invalid query for oneClickHar.listSites.");
+    await expect(api.listSites({ cursor: "n:soon" })).rejects.toThrow(TypeError);
+    await expect(api.listSessions({ site: "a b", cursor: null })).rejects.toThrow(TypeError);
+    await expect(api.setSettings({ ...DEFAULT_USER_SETTINGS, version: 2 })).rejects.toThrow(
+      TypeError,
+    );
+    await expect(api.excludeSite("/home")).rejects.toThrow(TypeError);
+    await expect(api.includeSite(42)).rejects.toThrow(TypeError);
+    expect(await api.listSites({ cursor: null })).toEqual({ rows: [], next: null });
+    expect(await api.listSessions({ site: "a.example", cursor: "n:60000" })).toEqual({
+      rows: [],
+      next: null,
+    });
   });
 
   it("answers tab 0, an unknown tab and no tab with states, never an error", async () => {

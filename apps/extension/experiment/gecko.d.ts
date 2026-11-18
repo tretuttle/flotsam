@@ -234,6 +234,14 @@ interface XpcomClasses {
   "@mozilla.org/binaryinputstream;1": BinaryInputStream;
   "@mozilla.org/intl/converter-output-stream;1": ConverterOutputStream;
   "@mozilla.org/security/hash;1": CryptoHash;
+  "@mozilla.org/filepicker;1": FilePicker;
+}
+
+/** nsIFilePicker in folder mode. `open` calls back with returnOK, returnCancel or returnReplace. */
+interface FilePicker {
+  init(parent: unknown, title: string, mode: number): void;
+  open(done: (result: number) => void): void;
+  readonly file: LocalFile;
 }
 
 interface ConverterOutputStream {
@@ -321,6 +329,10 @@ declare const Ci: {
     readonly TYPE_REPEATING_SLACK: number;
   };
   readonly nsIChannel: XpcomInterface & { readonly DISPOSITION_ATTACHMENT: number };
+  readonly nsIFilePicker: XpcomInterface & {
+    readonly modeGetFolder: number;
+    readonly returnOK: number;
+  };
 };
 
 declare const Components: {
@@ -365,6 +377,10 @@ declare const Services: {
   };
   readonly dirsvc: FileDirectoryService;
   readonly tm: { dispatchToMainThread(run: () => void): void };
+  readonly wm: {
+    /** A browser window's own browsing context is what nsIFilePicker.init takes as its parent. */
+    getMostRecentWindow(type: "navigator:browser"): { readonly browsingContext: unknown } | null;
+  };
   readonly eTLD: {
     getBaseDomainFromHost(host: string): string;
   };

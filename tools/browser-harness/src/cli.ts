@@ -33,7 +33,7 @@ const USAGE = [
   `  browser-harness measure --binary <path> [--runs <n>] [--extension <path>] [--protocol bidi|marionette] [--show-window]`,
   `  browser-harness baseline --binary <path> [--runs <n>] [--out-dir <dir>] [--protocol bidi|marionette] [--show-window]`,
   `  browser-harness cost --binary <path> --extension <path> [--scenario <${COST_SCENARIO_NAMES.join("|")}|all>] [--rounds <n>] [--short] [--record-baselines] [--out-dir <dir>] [--show-window]`,
-  `  browser-harness check --binary <path> [--extension <path>] [--check <name>] [--short] [--out-dir <dir>] [--show-window]`,
+  `  browser-harness check --binary <path> [--extension <path>] [--check <name>] [--skip <name>] [--short] [--out-dir <dir>] [--show-window]`,
   `  browser-harness har-check --scenario <${SCENARIO_NAMES.join("|")}> <file.har>`,
   `The binary may come from ${BINARY_ENV} or ${GECKO_BINARY_ENV} instead of --binary. Browsers run headless unless --show-window is passed.`,
 ].join("\n");
@@ -75,6 +75,8 @@ type Command =
       readonly extensionPath: string | null;
       readonly display: BrowserDisplay;
       readonly filter: readonly string[];
+      /** Checks another job runs, left out of this run. */
+      readonly skip: readonly string[];
       readonly short: boolean;
       readonly outDir: string | null;
     };
@@ -159,16 +161,19 @@ export function parseCommand(argv: readonly string[], env: NodeJS.ProcessEnv): C
     };
   }
   if (command === "check") {
-    allowed(["binary", "extension", "check", "short", "out-dir", "show-window"], 0);
+    allowed(["binary", "extension", "check", "skip", "short", "out-dir", "show-window"], 0);
     const binaryPath = requireBinary(values.binary ?? env[BINARY_ENV] ?? env[GECKO_BINARY_ENV]);
     const display: BrowserDisplay = values["show-window"] === true ? "window" : "headless";
     const filter = values.check === undefined ? [] : values.check.split(",").filter(Boolean);
+    const skip = values.skip === undefined ? [] : values.skip.split(",").filter(Boolean);
+    if (filter.length > 0 && skip.length > 0) usage("check takes --check or --skip, not both");
     return {
       kind: "check",
       binaryPath,
       extensionPath: values.extension ?? null,
       display,
       filter,
+      skip,
       short: values.short === true,
       outDir: values["out-dir"] ?? null,
     };
@@ -189,6 +194,7 @@ function parse(args: readonly string[]) {
       "out-dir": { type: "string" },
       scenario: { type: "string" },
       check: { type: "string" },
+      skip: { type: "string" },
       short: { type: "boolean" },
       "record-baselines": { type: "boolean" },
       "show-window": { type: "boolean" },
@@ -301,6 +307,7 @@ async function main(argv: readonly string[]): Promise<void> {
   if (command.kind === "check") {
     const run = await runDiscoveredChecks({
       filter: command.filter,
+      skip: command.skip,
       context: {
         binaryPath: command.binaryPath,
         extensionPath: command.extensionPath,

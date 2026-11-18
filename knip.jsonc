@@ -6,8 +6,15 @@
   "tags": ["-discovered-check"],
   "workspaces": {
     "apps/extension": {
-      // extension.js builds the pages src/manifest.json names, and scripts/build-experiment.ts bundles the parent script.
-      "entry": ["src/*/main.tsx", "experiment/parent.ts", "scripts/*.ts", "extension.config.js"],
+      // extension.js builds the pages src/manifest.json names and every page under src/pages/, and
+      // scripts/build-experiment.ts bundles the parent script.
+      "entry": [
+        "src/*/main.tsx",
+        "src/pages/*/main.tsx",
+        "experiment/parent.ts",
+        "scripts/*.ts",
+        "extension.config.js",
+      ],
       // scripts/minify.test.ts bundles these from entry text, so each resolves to its browser build.
       "ignoreDependencies": [
         "acorn",

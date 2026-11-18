@@ -50,7 +50,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
 };
 
 /** The smallest values a parser accepts: a lower value is raised to these, so a typo cannot empty the archive. */
-const SETTINGS_FLOORS = {
+export const SETTINGS_FLOORS = {
   maxBodyBytes: 64 * MiB,
   maxDetailBytes: 16 * MiB,
   maxAgeDays: 1,

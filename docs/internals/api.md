@@ -8,6 +8,13 @@ Extension pages call one API, `browser.oneClickHar`, defined by one table in `ap
 - `contract.test.ts` walks every row's parameter and result types and fails typecheck when a key that holds a path, folder, text, content or HAR, or a byte array, appears at any depth. A key under an index signature is walked too: `string` keys swallowed a planted `folder.path` until the walk skipped them.
 - Pages may import only `experiment/contract.ts`; a lint override on `apps/extension/src/**` refuses the rest.
 
+## History and settings rows
+
+- `listSites`, `listSessions`, `getSettings`, `setSettings`, `excludeSite`, `includeSite`, `chooseExportFolder` and `useDownloadsFolder` move settings and site names between the `moz-extension` principal and the system principal, both ways, through the same parsers. They carry no path: the chosen export folder reaches a page as its own name, and a refusal as a fixed word (`inside-profile`, `contains-recording`, ...) from `refusedFolder` in `settings-host.ts`.
+- The folder picker runs in the parent (`nsIFilePicker` in folder mode), so a page never holds the path it chose. The folder is judged by its real path against the roots the export judges it by again when it writes; a link into the profile is refused like the profile.
+- A settings change is applied only after `settings.json` holds it, through its temporary file; a failed write rejects and changes nothing. A lower body limit runs retention at once, so the archive is under it before the next start. The floor the parser raises a value to (64 MiB of bodies) is the page's smallest choice.
+- `excludeSite` always deletes the site's data (coordinator decision), so the pages ask once before they call it. `includeSite` records the site again from its next request.
+
 ## Tab ids are states
 
 `tabManager.get` throws for tab 0, a closed tab, an unknown id and a private tab this add-on may not see. The host looks a tab up once and turns any throw into `no-such-tab`, so `getEnvironment` and `getPopup` answer every parsed id with a state. `{ tabId: null }` is the popup's own "no tab" (Zen's empty tab reports -1).

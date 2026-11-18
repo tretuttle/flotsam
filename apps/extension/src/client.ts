@@ -12,6 +12,11 @@ export async function activeTab(): Promise<TabId | null> {
   return parseTabId(tab?.id);
 }
 
+/** Opens the history page, where recorded sessions of every site can be exported together. */
+export async function openHistory(): Promise<void> {
+  await browser.tabs.create({ url: browser.runtime.getURL("pages/history.html") });
+}
+
 /** Opens the settings page at one of its sections. */
 export async function openSettings(section: string): Promise<void> {
   await browser.tabs.create({ url: browser.runtime.getURL(`options/index.html#${section}`) });

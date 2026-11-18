@@ -28,10 +28,17 @@ import {
   type RootProblem,
 } from "./files.ts";
 import { Timers } from "./gecko-io.ts";
-import { createGeckoHost, type GeckoHost, type RecordingReads } from "./host.ts";
+import {
+  createGeckoHost,
+  realPathOf,
+  realRoots,
+  type GeckoHost,
+  type RecordingReads,
+} from "./host.ts";
 import { recover } from "./maintenance.ts";
 import { createOneClickHarApi, type RawApi, type RecordingFacts } from "./parent-api.ts";
 import { startRecorder, type Recorder } from "./recorder.ts";
+import { settingsHost } from "./settings-host.ts";
 import { HOLD_POINTS, openStore, type HoldPoint, type Store } from "./store.ts";
 
 /** Set only in a harness profile's user.js. Enables the observer topic below, which only system-principal code reaches. */
@@ -417,6 +424,15 @@ class OneClickHarParent extends ExtensionAPI {
           popup: host.popup,
           preview: host.preview,
           exports: host.exports,
+          ...settingsHost(
+            () => {
+              const state = this.#state;
+              return state.kind === "running"
+                ? { store: state.store, archive: state.archive.root }
+                : null;
+            },
+            { realPath: realPathOf, roots: realRoots, platform: platform() },
+          ),
         },
         refusal,
       ),

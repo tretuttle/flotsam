@@ -184,7 +184,7 @@ const PR_EXCL = 0x80;
  */
 const SHARE_DELETE = 1 << 5;
 
-const realPathOf = (path: string): string => {
+export const realPathOf = (path: string): string => {
   const file = localFile(path);
   file.normalize();
   return file.path;
@@ -307,7 +307,7 @@ const geckoExportPlatform = (
 });
 
 /** Roots an export folder may not be in or contain, links resolved, since a folder is judged by its real path. */
-const realRoots = (archive: string | null): ForbiddenRoots => {
+export const realRoots = (archive: string | null): ForbiddenRoots => {
   const real = (path: string): string => {
     try {
       return realPathOf(path);
@@ -494,7 +494,11 @@ export function createGeckoHost(options: {
 
   const siteOf = (selection: Selection): Site | null => {
     if (selection.scope === "site") return selection.site;
-    if (selection.scope === "sessions") return selection.sessions[0].site;
+    if (selection.scope === "sessions") {
+      // A file of several sites' sessions is not named after one of them.
+      const [first, ...rest] = selection.sessions;
+      return rest.every((s) => s.site === first.site) ? first.site : null;
+    }
     if (selection.scope === "tab") {
       const found = lookup(selection.tabId);
       return found.kind === "tab" ? found.site : null;

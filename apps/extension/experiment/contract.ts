@@ -7,7 +7,21 @@ import {
   type Preview,
 } from "@one-click-har/export/jobs";
 import { parseSelection } from "@one-click-har/export/selection";
-import { parseTabId, type TabId } from "@one-click-har/recording/ids";
+import {
+  parseHistoryCursor,
+  type HistoryCursor,
+  type Page,
+  type Session,
+  type SiteSummary,
+} from "@one-click-har/recording/activity";
+import {
+  parseSite,
+  parseTabId,
+  type ByteCount,
+  type Site,
+  type TabId,
+} from "@one-click-har/recording/ids";
+import { parseEditableSettings, type UserSettings } from "@one-click-har/recording/settings";
 import { any, asyncFunction, integer, returns, type ApiFunctions } from "./gecko-schema.ts";
 
 /** The experiment namespace: `browser.oneClickHar` in extension pages, `experiment_apis.oneClickHar` in the manifest. */
@@ -67,6 +81,41 @@ export type PopupView = Omit<PopupState, "problems"> & {
   readonly problems: readonly RecordingProblem[];
 };
 
+/** Where exports are written, as a page sees it: the chosen folder's own name, never its path. */
+export type ExportTo =
+  | { readonly kind: "downloads" }
+  | { readonly kind: "chosen"; readonly label: string };
+
+/** What the options page reads. The site list is the user's own exclusions; no site's data comes with it. */
+export interface SettingsView {
+  readonly user: UserSettings;
+  readonly exportTo: ExportTo;
+  readonly usage: { readonly bodyBytes: ByteCount; readonly detailBytes: ByteCount };
+}
+
+/** Why a chosen export folder was refused, by the kind of folder it is in or holds. Never the folder's path. */
+export type RefusedFolder =
+  | "inside-profile"
+  | "contains-profile"
+  | "inside-browser"
+  | "contains-browser"
+  | "inside-recording"
+  | "contains-recording"
+  | "not-absolute";
+
+export type FolderChoice =
+  | { readonly kind: "cancelled" }
+  | { readonly kind: "chosen"; readonly settings: SettingsView }
+  | { readonly kind: "refused"; readonly reason: RefusedFolder };
+
+/** A page of the history list. The cursor is the `next` of the page before, or null for the first page. */
+export interface HistoryQuery {
+  readonly cursor: HistoryCursor | null;
+}
+export interface SessionsQuery extends HistoryQuery {
+  readonly site: Site;
+}
+
 const isRecord = (raw: unknown): raw is Record<string, unknown> =>
   typeof raw === "object" && raw !== null && !Array.isArray(raw);
 
@@ -75,6 +124,19 @@ const parsePopupTab = (raw: unknown): PopupTabArgument | null => {
   if (raw["tabId"] === null) return { tabId: null };
   const tabId = parseTabId(raw["tabId"]);
   return tabId === null ? null : { tabId };
+};
+
+const parseHistoryQuery = (raw: unknown): HistoryQuery | null => {
+  if (!isRecord(raw) || !Object.hasOwn(raw, "cursor")) return null;
+  if (raw["cursor"] === null) return { cursor: null };
+  const cursor = parseHistoryCursor(raw["cursor"]);
+  return cursor === null ? null : { cursor };
+};
+
+const parseSessionsQuery = (raw: unknown): SessionsQuery | null => {
+  const query = parseHistoryQuery(raw);
+  const site = isRecord(raw) ? parseSite(raw["site"]) : null;
+  return query === null || site === null ? null : { ...query, site };
 };
 
 /**
@@ -98,6 +160,20 @@ export const oneClickHarApi = {
   revealExport: asyncFunction([any("id", parseExportId)], returns<boolean>()),
   /** Puts a finished file's path on the clipboard from the host, so the page never holds it. */
   copyExportPath: asyncFunction([any("id", parseExportId)], returns<boolean>()),
+  /** Sites with recorded activity, most recent first, a page at a time. */
+  listSites: asyncFunction([any("query", parseHistoryQuery)], returns<Page<SiteSummary>>()),
+  /** One site's sessions, most recent first, a page at a time. */
+  listSessions: asyncFunction([any("query", parseSessionsQuery)], returns<Page<Session>>()),
+  /** null while the recording is not running: settings live beside the archive. */
+  getSettings: asyncFunction([], returns<SettingsView | null>()),
+  /** Saves every editable setting at once. The excluded sites and the export folder have their own rows. */
+  setSettings: asyncFunction([any("settings", parseEditableSettings)], returns<SettingsView>()),
+  /** Stops recording the site and deletes everything recorded for it. Idempotent. */
+  excludeSite: asyncFunction([any("site", parseSite)], returns<SettingsView>()),
+  includeSite: asyncFunction([any("site", parseSite)], returns<SettingsView>()),
+  /** Opens the folder picker in the parent. The path stays there; the page gets the folder's name or the refusal. */
+  chooseExportFolder: asyncFunction([], returns<FolderChoice>()),
+  useDownloadsFolder: asyncFunction([], returns<SettingsView>()),
 };
 
 export type OneClickHarApi = ApiFunctions<typeof oneClickHarApi>;

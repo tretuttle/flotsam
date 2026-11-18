@@ -35,7 +35,15 @@ export interface Choices {
 }
 
 /** Where a link in the popup opens the settings page. */
-export type SettingsSection = "storage" | "media" | "secrets" | "folder" | "sites";
+/** A section of the settings page that a popup link opens. The page has one element per value, with that id. */
+export type SettingsSection =
+  | "storage"
+  | "export-holding"
+  | "unreadable-files"
+  | "media"
+  | "secrets"
+  | "folder"
+  | "sites";
 
 export type Writing = Extract<ExportState, { readonly kind: "writing" }>;
 export type Saved = Extract<ExportState, { readonly kind: "done" }>;
@@ -120,7 +128,8 @@ export type PopupEvent =
   | { readonly kind: "reveal" }
   | { readonly kind: "copy-path" }
   | { readonly kind: "notice"; readonly notice: Notice }
-  | { readonly kind: "settings"; readonly section: SettingsSection };
+  | { readonly kind: "settings"; readonly section: SettingsSection }
+  | { readonly kind: "history" };
 
 export type PopupCommand =
   | { readonly kind: "load" }
@@ -130,7 +139,8 @@ export type PopupCommand =
   | { readonly kind: "preview"; readonly selection: Selection }
   | { readonly kind: "reveal"; readonly id: ExportId }
   | { readonly kind: "copy-path"; readonly id: ExportId }
-  | { readonly kind: "settings"; readonly section: SettingsSection };
+  | { readonly kind: "settings"; readonly section: SettingsSection }
+  | { readonly kind: "history" };
 
 export interface Step {
   readonly view: PopupView;
@@ -390,6 +400,8 @@ export function reducePopup(view: PopupView, event: PopupEvent): Step {
       return view.kind === "done" ? stay({ ...view, notice: event.notice }) : stay(view);
     case "settings":
       return { view, command: { kind: "settings", section: event.section } };
+    case "history":
+      return { view, command: { kind: "history" } };
   }
 }
 

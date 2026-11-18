@@ -763,6 +763,17 @@ export const Popup = ({
           <button
             type="button"
             className="iconbtn"
+            aria-label={COPY.history}
+            title={COPY.history}
+            onClick={() => dispatch({ kind: "history" })}
+          >
+            <Icon name="history" size={18} />
+          </button>
+        )}
+        {view.kind !== "api-missing" && (
+          <button
+            type="button"
+            className="iconbtn"
             aria-label={COPY.settings}
             title={COPY.settings}
             onClick={() => dispatch({ kind: "settings", section: "storage" })}

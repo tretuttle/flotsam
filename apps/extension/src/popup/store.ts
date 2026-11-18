@@ -18,6 +18,7 @@ export interface PopupPorts {
   readonly api: OneClickHarApi | null;
   readonly tab: () => Promise<TabId | null>;
   readonly settings: (section: SettingsSection) => Promise<void>;
+  readonly history: () => Promise<void>;
   /** How often a running export's progress is read. */
   readonly pollMs: number;
 }
@@ -90,6 +91,8 @@ export function createPopupStore(ports: PopupPorts): PopupStore {
         });
       case "settings":
         return ports.settings(command.section);
+      case "history":
+        return ports.history();
     }
   };
 

@@ -1,12 +1,20 @@
+import { useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
+import { oneClickHar } from "../client.ts";
+import { ApiMissing } from "../ui/page.tsx";
+import { Options, OPTIONS_TITLE } from "./Options.tsx";
+import { createOptionsStore, type OptionsStore } from "./store.ts";
 import "../styles.css";
+import "../ui/controls.css";
+import "../ui/page.css";
 import "./options.css";
 
-const Options = () => (
-  <main className="options">
-    <h1>One-Click HAR settings</h1>
-    <p className="muted">There are no settings yet.</p>
-  </main>
-);
+const Root = ({ store }: { readonly store: OptionsStore }) => {
+  const state = useSyncExternalStore(store.subscribe, store.state);
+  return <Options state={state} store={store} />;
+};
 
-createRoot(document.getElementById("root")!).render(<Options />);
+const api = oneClickHar();
+createRoot(document.getElementById("root")!).render(
+  api === null ? <ApiMissing title={OPTIONS_TITLE} /> : <Root store={createOptionsStore(api)} />,
+);

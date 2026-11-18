@@ -38,7 +38,16 @@ describe("command line", () => {
       binaryPath: executable,
       display: "headless",
       short: false,
+      skip: [],
     });
+    expect(
+      parseCommand(["check", "--skip", "pages-history,pages-options"], {
+        [GECKO_BINARY_ENV]: executable,
+      }),
+    ).toMatchObject({ kind: "check", filter: [], skip: ["pages-history", "pages-options"] });
+    expect(() =>
+      parseCommand(["check", "--check", "a", "--skip", "b"], { [GECKO_BINARY_ENV]: executable }),
+    ).toThrow(/--check or --skip/);
     expect(
       parseCommand(["--", "cost", "--extension", "a.xpi", "--short"], {
         [GECKO_BINARY_ENV]: executable,

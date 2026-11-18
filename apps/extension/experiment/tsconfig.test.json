@@ -12,6 +12,8 @@
     "maintenance.test.ts",
     "recorder.ts",
     "recorder.test.ts",
+    "settings-host.ts",
+    "settings-host.test.ts",
     "store.ts",
     "store.test.ts"
   ]

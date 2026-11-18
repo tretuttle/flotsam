@@ -1,11 +1,17 @@
 import type { ExportId, ExportJob, Preview } from "@one-click-har/export/jobs";
 import type { ExportRequest } from "@one-click-har/export/jobs";
 import type { Selection } from "@one-click-har/export/selection";
-import type { TabId } from "@one-click-har/recording/ids";
+import type { Page, Session, SiteSummary } from "@one-click-har/recording/activity";
+import type { Site, TabId } from "@one-click-har/recording/ids";
+import type { EditableSettings } from "@one-click-har/recording/settings";
 import {
   namespace,
   oneClickHarApi,
   type Environment,
+  type FolderChoice,
+  type HistoryQuery,
+  type SessionsQuery,
+  type SettingsView,
   type OneClickHarApi,
   type PopupTabArgument,
   type PopupView,
@@ -64,6 +70,20 @@ export interface Host {
     readonly reveal: (id: ExportId) => Promise<boolean>;
     readonly copyPath: (id: ExportId) => boolean;
   };
+  /** Empty pages while the recording is not running. */
+  readonly history: {
+    readonly sites: (query: HistoryQuery) => Page<SiteSummary>;
+    readonly sessions: (query: SessionsQuery) => Page<Session>;
+  };
+  /** Every write rejects while the recording is not running, and when settings.json cannot be written. */
+  readonly settings: {
+    readonly read: () => SettingsView | null;
+    readonly save: (user: EditableSettings) => Promise<SettingsView>;
+    readonly exclude: (site: Site) => Promise<SettingsView>;
+    readonly include: (site: Site) => Promise<SettingsView>;
+    readonly chooseFolder: () => Promise<FolderChoice>;
+    readonly useDownloads: () => Promise<SettingsView>;
+  };
 }
 
 /**
@@ -92,6 +112,14 @@ const handlers = (host: Host): OneClickHarApi => ({
   cancelExport: async (id) => host.exports.cancel(id),
   revealExport: (id) => host.exports.reveal(id),
   copyExportPath: async (id) => host.exports.copyPath(id),
+  listSites: async (query) => host.history.sites(query),
+  listSessions: async (query) => host.history.sessions(query),
+  getSettings: async () => host.settings.read(),
+  setSettings: (user) => host.settings.save(user),
+  excludeSite: (site) => host.settings.exclude(site),
+  includeSite: (site) => host.settings.include(site),
+  chooseExportFolder: () => host.settings.chooseFolder(),
+  useDownloadsFolder: () => host.settings.useDownloads(),
 });
 
 /** The API as a page's caller reaches it: raw arguments in, each one parsed before its handler runs. */
