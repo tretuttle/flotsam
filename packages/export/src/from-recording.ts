@@ -237,6 +237,11 @@ export function materialFromRecording(
       entry,
       body: { kind: "none", reason: "in-progress" },
       upload: liveUpload(request.headers),
+      lostGroups: {
+        ...(request.headers.length === 0 ? { "request-head": "in-progress" as const } : {}),
+        ...(response === null ? { "response-head": "in-progress" as const } : {}),
+        timings: "in-progress",
+      },
     };
   }
 
@@ -298,10 +303,27 @@ export function materialFromRecording(
       : {}),
   });
 
+  const missingReason =
+    settled.kind === "unanswered"
+      ? ("no-response" as const)
+      : settled.kind === "abandoned"
+        ? ("network-aborted" as const)
+        : ("not-recorded" as const);
+  const lostGroups = {
+    ...(request.headers.length === 0 ? { "request-head": missingReason } : {}),
+    ...(settled.kind === "unanswered"
+      ? { "response-head": "no-response" as const }
+      : response === null
+        ? { "response-head": "network-aborted" as const }
+        : {}),
+    ...(stop === null ? { timings: "network-aborted" as const } : {}),
+  };
+
   return {
     entry,
     body:
       settled.kind === "unanswered" ? { kind: "none", reason: "no-response" } : toCandidates(body),
     upload: uploadCandidates(settled.upload, upload),
+    ...(Object.keys(lostGroups).length > 0 ? { lostGroups } : {}),
   };
 }
