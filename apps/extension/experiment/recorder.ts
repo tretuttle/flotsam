@@ -577,7 +577,7 @@ export function startRecorder(options: {
           watched.delete(sink);
           if (stopped) return;
           const bytes = optional(() => localFile(part).fileSize) ?? projectedRef.value;
-          store.updatePart(id, bytes);
+          store.updatePart(id, bytes, true);
           sink.result = {
             kind: "closed",
             bytes: bytes as ByteCount,
@@ -607,7 +607,7 @@ export function startRecorder(options: {
         } else {
           optional(() => flushOverflowOut?.close());
           optional(() => sink.output?.close());
-          if (phase === "file") store.updatePart(id, size);
+          if (phase === "file") store.updatePart(id, size, true);
         }
         sink.cappedAt = size;
         watched.delete(sink);
@@ -719,10 +719,12 @@ export function startRecorder(options: {
         );
         tee2.init(original, output, fileObserver);
         fileTee = tee2;
-        store.openPart(id, part, buffered);
+        const knownExpected =
+          expectedBytes !== null && expectedBytes > 0 ? Math.min(expectedBytes, sink.cap) : 0;
+        store.openPart(id, part, Math.max(buffered, knownExpected));
         releaseFlushReserve();
         if (budget === 0) {
-          store.updatePart(id, 0);
+          store.updatePart(id, 0, true);
           projectedRef.value = 0;
           cappedRef.value = true;
           sink.cappedAt = 0;
@@ -1000,7 +1002,11 @@ export function startRecorder(options: {
         cappedAt: null,
       };
     }
-    store.openPart(id, part, expectedBytes ?? undefined);
+    store.openPart(
+      id,
+      part,
+      expectedBytes !== null ? Math.min(expectedBytes, route.cap) : undefined,
+    );
     const sink: Sink = {
       result: null,
       bytes: null,
@@ -1016,7 +1022,7 @@ export function startRecorder(options: {
       optional(() => output.close());
       sink.cappedAt = size;
       watched.delete(sink);
-      store.updatePart(id, size);
+      store.updatePart(id, size, true);
     };
     const observer: RequestObserver = {
       onStartRequest: () => undefined,
@@ -1025,7 +1031,7 @@ export function startRecorder(options: {
         watched.delete(sink);
         if (stopped) return;
         const bytes = optional(() => localFile(part).fileSize) ?? 0;
-        store.updatePart(id, bytes);
+        store.updatePart(id, bytes, true);
         sink.result = {
           kind: "closed",
           bytes: bytes as ByteCount,

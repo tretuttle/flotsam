@@ -1,6 +1,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import type { RunId, Site } from "@one-click-har/recording/ids";
 import {
@@ -228,36 +229,40 @@ const rewindArchiveDirMtimes = (root: string, sec: number): void => {
   NodeFS.utimesSync(sitesDir, sec, sec);
 };
 
-const duBytes = (directory: string): number | null => {
-  if (!NodeFS.existsSync(directory)) return 0;
-  try {
-    const out = NodeChildProcess.execFileSync("du", ["-sb", directory], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+const duBytesAsync = (directory: string): Promise<number | null> => {
+  if (!NodeFS.existsSync(directory)) return Promise.resolve(0);
+  return new Promise((resolve) => {
+    NodeChildProcess.execFile("du", ["-sb", directory], { encoding: "utf8" }, (err, stdout) => {
+      if (err !== null) {
+        resolve(null);
+        return;
+      }
+      const bytes = Number(stdout.trim().split(/\s+/u)[0]);
+      resolve(Number.isFinite(bytes) ? bytes : null);
     });
-    const bytes = Number(out.trim().split(/\s+/u)[0]);
-    return Number.isFinite(bytes) ? bytes : null;
-  } catch {
-    return null;
-  }
+  });
 };
 
-const startRootSampler = (root: string, samples: number[]): (() => void) => {
-  let sampling = false;
+const startRootSampler = (root: string, samples: number[]): (() => Promise<void>) => {
+  let inFlight: Promise<void> | null = null;
+  const sampleOnce = (): Promise<void> => {
+    const next = duBytesAsync(root)
+      .then((value) => {
+        if (value !== null) samples.push(value);
+      })
+      .finally(() => {
+        if (inFlight === next) inFlight = null;
+      });
+    inFlight = next;
+    return next;
+  };
   const timer = setInterval(() => {
-    if (sampling) return;
-    sampling = true;
-    try {
-      const value = duBytes(root);
-      if (value !== null) samples.push(value);
-    } finally {
-      sampling = false;
-    }
+    if (inFlight === null) void sampleOnce();
   }, DU_SAMPLE_MS);
-  return () => {
+  return async () => {
     clearInterval(timer);
-    const value = duBytes(root);
-    if (value !== null) samples.push(value);
+    if (inFlight !== null) await inFlight;
+    await sampleOnce();
   };
 };
 
@@ -273,10 +278,13 @@ const seedPackSlice = (
     const siteHost = `st${String(i % SITE_COUNT)}.localhost` as Site;
     const file = NodePath.join(root, ...packPath(packId(siteHost, runBase, i)));
     const fd = NodeFS.openSync(file, "w", 0o600);
-    NodeFS.ftruncateSync(fd, packBytes);
-    NodeFS.closeSync(fd);
     const mtime = baseSec + i * 0.01;
-    NodeFS.utimesSync(file, mtime, mtime);
+    try {
+      NodeFS.ftruncateSync(fd, packBytes);
+      NodeFS.futimesSync(fd, mtime, mtime);
+    } finally {
+      NodeFS.closeSync(fd);
+    }
   }
   return count * packBytes;
 };
@@ -413,7 +421,8 @@ const verifyStartupBodies = (
   const blobLines = lines.filter(
     (l) =>
       l.exchange.kind === "answered" &&
-      new URL(l.exchange.request.url).pathname === "/retention/blob",
+      new URL(l.exchange.request.url).pathname === "/retention/blob" &&
+      (new URL(l.exchange.request.url).searchParams.get("tag") ?? "").startsWith(`${arm.name}-`),
   );
   if (blobLines.length < 32) {
     problems.push(`${arm.name}: expected >= 32 recorded blobs, got ${String(blobLines.length)}`);
@@ -562,35 +571,37 @@ const verifyStartupBodies = (
   };
 };
 
-/**
- * Launches onto at-cap, over-cap, and unreadable-entry archives and streams immediate parallel file-tee (including
- * lengthless chunked responses) and memory-tee traffic before calling flush, verifying startup disk headroom, gate
- * opening, unreadable entry reporting, and SHA-256 body fidelity across every recorded response.
- */
-const check: HarnessCheck = {
-  name: "retention-startup",
-  description:
-    "immediate recording on at-cap, over-cap, and unreadable-entry archives holds disk cap, opens gate, and keeps exact bodies",
-  run: async (context: CheckContext): Promise<CheckResult> => {
-    const started = Date.now();
-    if (context.extensionPath === null || !NodeFS.existsSync(context.extensionPath)) {
-      return {
-        name: "retention-startup",
-        ok: false,
-        durationMs: Date.now() - started,
-        detail: "needs existing --extension path",
-      };
-    }
-    const addonId = await readExtensionId(context.extensionPath);
-    const popupPath = await readExtensionPopupPath(context.extensionPath);
-    await using server = await startFixtureServer();
+type RestartSeed = {
+  readonly ws: ReturnType<typeof recordingWorkspace>;
+  readonly expectedRestartUsage: {
+    readonly run: string;
+    readonly bodyBytes: number;
+    readonly detailBytes: number;
+  };
+};
 
-    const problems: string[] = [];
-    const summaries: string[] = [];
-    const armData: Record<string, unknown> = {};
+type ArmOutcome = {
+  readonly summary: string;
+  readonly data: unknown;
+  readonly restartSeed: RestartSeed | null;
+};
 
-    for (const arm of ARMS) {
-      await using ws = recordingWorkspace(`retention-startup-${arm.name}`);
+async function runStartupArm(options: {
+  readonly arm: StartupArm;
+  readonly context: CheckContext;
+  readonly extensionPath: string;
+  readonly addonId: string;
+  readonly popupPath: string;
+  readonly server: FixtureServer;
+  readonly problems: string[];
+  readonly reused?: RestartSeed;
+  readonly keepWorkspaceForRestart?: boolean;
+}): Promise<ArmOutcome> {
+  const { arm, context, extensionPath, addonId, popupPath, server, problems, reused } = options;
+  const ws = reused?.ws ?? recordingWorkspace(`retention-startup-${arm.name}`);
+  let keepWs = options.keepWorkspaceForRestart === true;
+  try {
+    if (reused === undefined) {
       ws.seed("d".repeat(32), {
         user: {
           version: 1,
@@ -606,22 +617,20 @@ const check: HarnessCheck = {
         },
         exportFolder: { kind: "downloads" },
       });
-      const root = ws.root();
+    }
+    const root = ws.root();
+    let seededBytes = reused?.expectedRestartUsage.bodyBytes ?? 0;
+    const launchPrefs =
+      arm.scanDelayMs !== undefined && arm.scanDelayMs > 0
+        ? [{ name: "extensions.oneClickHar.harnessScanDelayMs", value: arm.scanDelayMs }]
+        : [];
+    if (reused === undefined) {
       const seeded = seedPacksNearCap(root, arm);
-      let seededBytes = seeded.seededBytes;
-      const launchPrefs =
-        arm.scanDelayMs !== undefined && arm.scanDelayMs > 0
-          ? [{ name: "extensions.oneClickHar.harnessScanDelayMs", value: arm.scanDelayMs }]
-          : [];
-      let expectedRestartUsage: {
-        readonly run: string;
-        readonly bodyBytes: number;
-        readonly detailBytes: number;
-      } | null = null;
+      seededBytes = seeded.seededBytes;
       if (arm.ledger === "crash-skew") {
         await using firstSession = await ws.launch({
           binaryPath: context.binaryPath,
-          extensionPath: context.extensionPath,
+          extensionPath,
           display: context.display,
           protocol: "marionette",
           signal: context.signal,
@@ -642,121 +651,98 @@ const check: HarnessCheck = {
           baseSec,
         );
         rewindArchiveDirMtimes(root, Math.floor(ledgerSec) - 60);
-      } else if (arm.ledger === "clean-restart") {
-        await using firstSession = await ws.launch({
-          binaryPath: context.binaryPath,
-          extensionPath: context.extensionPath,
-          display: context.display,
-          protocol: "marionette",
-          signal: context.signal,
-          extraPrefs: launchPrefs,
-        });
-        await waitForActiveExtensionUrl(firstSession, addonId, popupPath);
-        await callHook(firstSession, { kind: "flush" });
-        await callHook(firstSession, { kind: "seal" });
-        const st1 = (await callHook(firstSession, { kind: "status" })) as {
-          readonly run: string;
-          readonly usage: { readonly bodyBytes: number; readonly detailBytes: number };
-        };
-        expectedRestartUsage = {
-          run: st1.run,
-          bodyBytes: st1.usage.bodyBytes,
-          detailBytes: st1.usage.detailBytes,
-        };
-        await firstSession.quit();
-        const persisted = JSON.parse(
-          NodeFS.readFileSync(NodePath.join(root, LAYOUT.ledger), "utf8"),
-        ) as Record<string, unknown>;
-        if (
-          persisted["clean"] !== true ||
-          persisted["run"] !== expectedRestartUsage.run ||
-          persisted["bodyBytes"] !== expectedRestartUsage.bodyBytes ||
-          persisted["detailBytes"] !== expectedRestartUsage.detailBytes
-        ) {
-          problems.push(
-            `${arm.name}: clean-quit ledger ${JSON.stringify(persisted)} != expected ${JSON.stringify(expectedRestartUsage)}`,
-          );
-        }
       }
-
-      let deniedDir: string | null = null;
-      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
-      if (arm.unreadable === true) {
-        const brokenSite = `st0.localhost` as Site;
-        const deadLink = NodePath.join(
-          root,
-          LAYOUT.sitesDir,
-          siteDirName(brokenSite),
-          LAYOUT.packDir,
-          "dead01-99.pack",
+    } else {
+      const persisted = JSON.parse(
+        NodeFS.readFileSync(NodePath.join(root, LAYOUT.ledger), "utf8"),
+      ) as Record<string, unknown>;
+      if (
+        persisted["clean"] !== true ||
+        persisted["run"] !== reused.expectedRestartUsage.run ||
+        persisted["bodyBytes"] !== reused.expectedRestartUsage.bodyBytes ||
+        persisted["detailBytes"] !== reused.expectedRestartUsage.detailBytes
+      ) {
+        problems.push(
+          `${arm.name}: clean-quit ledger ${JSON.stringify(persisted)} != expected ${JSON.stringify(reused.expectedRestartUsage)}`,
         );
-        NodeFS.symlinkSync("/nonexistent/missing.pack", deadLink);
-        deniedDir = NodePath.join(root, LAYOUT.sitesDir, "denied.localhost");
-        NodeFS.mkdirSync(NodePath.join(deniedDir, LAYOUT.packDir), {
-          recursive: true,
-          mode: 0o700,
-        });
-        NodeFS.chmodSync(deniedDir, 0o000);
       }
+    }
 
-      const duSamples: number[] = [duBytes(root) ?? seededBytes];
-      const stopSampler = startRootSampler(root, duSamples);
+    let deniedDir: string | null = null;
+    const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+    if (arm.unreadable === true) {
+      const brokenSite = `st0.localhost` as Site;
+      const deadLink = NodePath.join(
+        root,
+        LAYOUT.sitesDir,
+        siteDirName(brokenSite),
+        LAYOUT.packDir,
+        "dead01-99.pack",
+      );
+      NodeFS.symlinkSync("/nonexistent/missing.pack", deadLink);
+      deniedDir = NodePath.join(root, LAYOUT.sitesDir, "denied.localhost");
+      NodeFS.mkdirSync(NodePath.join(deniedDir, LAYOUT.packDir), {
+        recursive: true,
+        mode: 0o700,
+      });
+      NodeFS.chmodSync(deniedDir, 0o000);
+    }
 
-      try {
-        await using session = await ws.launch({
-          binaryPath: context.binaryPath,
-          extensionPath:
-            arm.ledger === "clean-restart" || arm.ledger === "crash-skew"
-              ? null
-              : context.extensionPath,
-          display: context.display,
-          protocol: "marionette",
-          signal: context.signal,
-          extraPrefs: launchPrefs,
-        });
-        await waitForActiveExtensionUrl(session, addonId, popupPath);
+    const duSamples: number[] = [(await duBytesAsync(root)) ?? seededBytes];
+    const stopSampler = startRootSampler(root, duSamples);
+    let restartSeed: RestartSeed | null = null;
 
-        // Intentionally skip flush here so recording races loadFromDisk right after browser launch.
-        const suspendTab =
-          arm.testSuspend === true
-            ? await session.openTab(
-                `http://suspend.localhost:${String(server.port)}/retention/page`,
-              )
-            : null;
-        if (suspendTab !== null) {
-          await session.evaluate(
-            suspendTab,
-            `window.__suspendDownloads = Promise.all([0, 1, 2, 3, 4].map((n) =>
+    try {
+      await using session = await ws.launch({
+        binaryPath: context.binaryPath,
+        extensionPath:
+          arm.ledger === "clean-restart" || arm.ledger === "crash-skew" ? null : extensionPath,
+        display: context.display,
+        protocol: "marionette",
+        signal: context.signal,
+        extraPrefs: launchPrefs,
+      });
+      await waitForActiveExtensionUrl(session, addonId, popupPath);
+
+      // Intentionally skip flush here so recording races loadFromDisk right after browser launch.
+      const suspendTab =
+        arm.testSuspend === true
+          ? await session.openTab(`http://suspend.localhost:${String(server.port)}/retention/page`)
+          : null;
+      if (suspendTab !== null) {
+        await session.evaluate(
+          suspendTab,
+          `window.__suspendDownloads = Promise.all([0, 1, 2, 3, 4].map((n) =>
               fetch("/retention/blob?bytes=4500000&tag=${arm.name}-sus-" + n).then((r) => r.arrayBuffer()).then((b) => b.byteLength),
             )); "started"`,
-          );
-        }
-        const tab = await session.openTab(
-          `http://burst0.localhost:${String(server.port)}/retention/page`,
         );
-        if (arm.burstBytes !== undefined) {
-          await session.evaluate(
-            tab,
-            `window.__earlyBurst = Promise.all([0, 1, 2, 3, 4, 5, 6, 7].map((i) =>
+      }
+      const tab = await session.openTab(
+        `http://burst0.localhost:${String(server.port)}/retention/page`,
+      );
+      if (arm.burstBytes !== undefined) {
+        await session.evaluate(
+          tab,
+          `window.__earlyBurst = Promise.all([0, 1, 2, 3, 4, 5, 6, 7].map((i) =>
               fetch("/retention/blob?bytes=${String(arm.burstBytes)}&tag=${arm.name}-early-" + i).then((r) => r.arrayBuffer()).then((b) => b.byteLength),
             )); "started"`,
+        );
+      }
+      if (arm.waitBeforeWavesMs !== undefined && arm.waitBeforeWavesMs > 0) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, arm.waitBeforeWavesMs);
+        });
+      }
+      for (let wave = 0; wave < 4; wave += 1) {
+        if (wave > 0) {
+          await session.navigateTab(
+            tab,
+            `http://burst${String(wave)}.localhost:${String(server.port)}/retention/page`,
           );
         }
-        if (arm.waitBeforeWavesMs !== undefined && arm.waitBeforeWavesMs > 0) {
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, arm.waitBeforeWavesMs);
-          });
-        }
-        for (let wave = 0; wave < 4; wave += 1) {
-          if (wave > 0) {
-            await session.navigateTab(
-              tab,
-              `http://burst${String(wave)}.localhost:${String(server.port)}/retention/page`,
-            );
-          }
-          const ok = await session.evaluate(
-            tab,
-            `Promise.all([
+        const ok = await session.evaluate(
+          tab,
+          `Promise.all([
               ...[0, 1, 2, 3, 4, 5].map((i) =>
                 fetch("/retention/blob?bytes=1200000&tag=${arm.name}-${String(wave)}-f-" + i).then((r) => r.arrayBuffer()),
               ),
@@ -765,208 +751,347 @@ const check: HarnessCheck = {
               ),
               fetch("/retention/blob?bytes=30000&chunked=1&tag=${arm.name}-${String(wave)}-c").then((r) => r.arrayBuffer()),
             ]).then(() => "ok")`,
-          );
-          if (ok !== "ok") problems.push(`${arm.name} wave ${String(wave)} failed: ${String(ok)}`);
-          if (wave === 0 && arm.expectZeroDirectWhileShut === true) {
-            const incomingBytes = dirBytes(NodePath.join(root, LAYOUT.incomingDir));
-            const midStatus = (await callHook(session, { kind: "status" })) as {
-              readonly ready: boolean;
-            };
-            if (midStatus.ready) {
-              problems.push(`${arm.name}: gate opened before zero-direct probe after wave 0`);
-            } else if (incomingBytes > 0) {
-              problems.push(
-                `${arm.name}: wrote ${String(incomingBytes)} B directly to incoming/ while startup gate shut`,
-              );
-            }
-          }
-          if (wave === 0 && arm.burstBytes !== undefined) {
-            const burstGot = (await session.evaluate(
-              tab,
-              `window.__earlyBurst.then(JSON.stringify)`,
-            )) as string;
-            const sizes = JSON.parse(burstGot) as readonly number[];
-            if (sizes.length !== 8 || sizes.some((size) => size !== arm.burstBytes)) {
-              problems.push(`${arm.name} early burst got ${burstGot}`);
-            }
-          }
-        }
-
-        if (arm.fetchLargeBinary === true) {
-          const gotBytes = Number(
-            await session.evaluate(
-              tab,
-              `fetch("/fixtures/binary?n=${arm.name}").then((r) => r.arrayBuffer()).then((b) => String(b.byteLength))`,
-            ),
-          );
-          if (gotBytes !== BINARY_BYTE_LENGTH) {
-            problems.push(`${arm.name} /fixtures/binary got ${String(gotBytes)} B`);
-          }
-        }
-
-        if (suspendTab !== null) {
-          const gotSizes = (await session.evaluate(
-            suspendTab,
-            `window.__suspendDownloads.then(JSON.stringify)`,
-          )) as string;
-          const parsedSizes = JSON.parse(gotSizes) as readonly number[];
-          if (parsedSizes.length !== 5 || parsedSizes.some((size) => size !== 4_500_000)) {
-            problems.push(`${arm.name} suspended downloads got ${gotSizes}`);
-          }
-          await session.closeTab(suspendTab);
-        }
-        await callHook(session, { kind: "flush" });
-        await callHook(session, { kind: "seal" });
-        stopSampler();
-
-        const status = (await callHook(session, { kind: "status" })) as {
-          readonly ready: boolean;
-          readonly unreadableEntries: number;
-          readonly startupSuspends: number;
-          readonly startupBufferedPeak: number;
-          readonly startupGate: {
-            readonly gateStartedShut: boolean;
-            readonly scanCompleted: boolean;
-            readonly scanTimedOut: boolean;
-            readonly initiallyTrusted: boolean;
-            readonly downgraded: boolean;
-            readonly preScanFileBytes: number;
-            readonly preScanOpenParts: number;
-            readonly postDowngradeFileBytes: number;
-            readonly postDowngradeOpenParts: number;
-          };
-          readonly problems: readonly { readonly kind: string; readonly detail: string }[];
-          readonly observerErrors: readonly string[];
-          readonly usage: { readonly bodyBytes: number; readonly detailBytes: number };
-        };
-        if (arm.expectUntrustedStartup === true) {
-          if (!status.startupGate.gateStartedShut) {
-            problems.push(`${arm.name}: startup gate did not start shut`);
-          }
-          if (status.startupGate.initiallyTrusted) {
-            problems.push(`${arm.name}: untrusted ledger was trusted on startup`);
-          }
-          if (status.startupGate.preScanOpenParts > 0 || status.startupGate.preScanFileBytes > 0) {
-            problems.push(
-              `${arm.name}: direct pre-scan file writes exceeded 0 (${String(status.startupGate.preScanFileBytes)} B, ${String(status.startupGate.preScanOpenParts)} parts)`,
-            );
-          }
-        }
-        if (arm.expectDowngradedStartup === true) {
-          if (!status.startupGate.gateStartedShut || !status.startupGate.downgraded) {
-            problems.push(
-              `${arm.name}: expected understated ledger downgrade during scan (gateStartedShut=${String(status.startupGate.gateStartedShut)}, downgraded=${String(status.startupGate.downgraded)})`,
-            );
-          }
-          if (status.startupGate.preScanFileBytes > FLUSH_BATCH_BYTES) {
-            problems.push(
-              `${arm.name}: pre-scan file writes ${String(status.startupGate.preScanFileBytes)} B > one batch ${String(FLUSH_BATCH_BYTES)} B`,
-            );
-          }
-          if (
-            status.startupGate.postDowngradeOpenParts > 0 ||
-            status.startupGate.postDowngradeFileBytes > 0
-          ) {
-            problems.push(
-              `${arm.name}: post-downgrade pre-scan writes ${String(status.startupGate.postDowngradeFileBytes)} B (${String(status.startupGate.postDowngradeOpenParts)} parts)`,
-            );
-          }
-        }
-        if (arm.testSuspend === true) {
-          if (status.startupSuspends <= 0) {
-            problems.push(
-              `${arm.name} startupSuspends=${String(status.startupSuspends)} (expected > 0)`,
-            );
-          }
-          if (status.startupBufferedPeak > 24 * MIB) {
-            problems.push(
-              `${arm.name} startupBufferedPeak=${String(status.startupBufferedPeak)} > ${String(24 * MIB)}`,
-            );
-          }
-        }
-        if (!status.ready) problems.push(`${arm.name} gate remained shut after flush/seal`);
-        const expectedUnreadable = arm.unreadable === true ? (isRoot ? 1 : 2) : 0;
-        if (arm.unreadable === true) {
-          if (status.unreadableEntries !== expectedUnreadable) {
-            problems.push(
-              `${arm.name} unreadableEntries ${String(status.unreadableEntries)} != ${String(expectedUnreadable)}`,
-            );
-          }
-          if (!status.problems.some((p) => p.kind === "unreadable-entries")) {
-            problems.push(
-              `${arm.name} missing unreadable-entries problem: ${JSON.stringify(status.problems)}`,
-            );
-          }
-          if (status.problems.some((p) => p.kind === "write-failed")) {
-            problems.push(
-              `${arm.name} unexpected write-failed: ${JSON.stringify(status.problems)}`,
-            );
-          }
-        } else if (status.problems.length > 0) {
-          problems.push(`${arm.name} store problems: ${JSON.stringify(status.problems)}`);
-        }
-        if (status.observerErrors.length > 0) {
-          problems.push(`${arm.name} observer errors: ${status.observerErrors.join(", ")}`);
-        }
-
-        if (arm.unreadable !== true) {
-          problems.push(
-            ...checkArchiveOracle({
-              root,
-              step: `${arm.name}-after-seal`,
-              usage: status.usage,
-              expectZeroParts: true,
-              maxBodyBytes: arm.bodyCap,
-              requireAllSummarized: true,
-            }).problems,
-          );
-        } else if (status.usage.bodyBytes > arm.bodyCap) {
-          problems.push(
-            `${arm.name} usage.bodyBytes ${String(status.usage.bodyBytes)} > ${String(arm.bodyCap)}`,
-          );
-        }
-
-        const bodyStats = verifyStartupBodies(arm, root, server, ws.lines(), problems);
-        const ceiling = Math.max(arm.bodyCap, seededBytes) + FLUSH_BATCH_BYTES;
-        const maxDu = Math.max(...duSamples);
-        if (maxDu > ceiling) {
-          problems.push(
-            `${arm.name} startup du ${String(maxDu)} B > ${String(ceiling)} B (cap ${String(arm.bodyCap)} + batch ${String(FLUSH_BATCH_BYTES)})`,
-          );
-        }
-        summaries.push(
-          `${arm.name}: maxDu=${String(maxDu)}/${String(ceiling)} exact=${String(bodyStats.exactCount)}`,
         );
-        armData[arm.name] = {
-          seededBytes,
-          bodyCap: arm.bodyCap,
-          ceilingBytes: ceiling,
-          maxDuBytes: maxDu,
-          sampleCount: duSamples.length,
-          ready: status.ready,
-          startupGate: status.startupGate,
-          unreadableEntries: status.unreadableEntries,
-          exactBodies: bodyStats.exactCount,
-          cutBodies: bodyStats.cutCount,
-          timeoutStored: bodyStats.timeoutStored,
-          timeoutIncomplete: bodyStats.timeoutIncomplete,
-          falseFirstPart: bodyStats.falseFirstPart,
-          zeroLengthStored: bodyStats.zeroLengthStored,
-          finalUsage: status.usage,
-        };
-      } finally {
-        stopSampler();
-        if (deniedDir !== null && NodeFS.existsSync(deniedDir)) {
-          NodeFS.chmodSync(deniedDir, 0o700);
+        if (ok !== "ok") problems.push(`${arm.name} wave ${String(wave)} failed: ${String(ok)}`);
+        if (wave === 0 && arm.expectZeroDirectWhileShut === true) {
+          const incomingBytes = dirBytes(NodePath.join(root, LAYOUT.incomingDir));
+          const midStatus = (await callHook(session, { kind: "status" })) as {
+            readonly ready: boolean;
+          };
+          if (midStatus.ready) {
+            problems.push(`${arm.name}: gate opened before zero-direct probe after wave 0`);
+          } else if (incomingBytes > 0) {
+            problems.push(
+              `${arm.name}: wrote ${String(incomingBytes)} B directly to incoming/ while startup gate shut`,
+            );
+          }
+        }
+        if (wave === 0 && arm.burstBytes !== undefined) {
+          const burstGot = (await session.evaluate(
+            tab,
+            `window.__earlyBurst.then(JSON.stringify)`,
+          )) as string;
+          const sizes = JSON.parse(burstGot) as readonly number[];
+          if (sizes.length !== 8 || sizes.some((size) => size !== arm.burstBytes)) {
+            problems.push(`${arm.name} early burst got ${burstGot}`);
+          }
         }
       }
+
+      if (arm.fetchLargeBinary === true) {
+        const gotBytes = Number(
+          await session.evaluate(
+            tab,
+            `fetch("/fixtures/binary?n=${arm.name}").then((r) => r.arrayBuffer()).then((b) => String(b.byteLength))`,
+          ),
+        );
+        if (gotBytes !== BINARY_BYTE_LENGTH) {
+          problems.push(`${arm.name} /fixtures/binary got ${String(gotBytes)} B`);
+        }
+      }
+
+      if (suspendTab !== null) {
+        const gotSizes = (await session.evaluate(
+          suspendTab,
+          `window.__suspendDownloads.then(JSON.stringify)`,
+        )) as string;
+        const parsedSizes = JSON.parse(gotSizes) as readonly number[];
+        if (parsedSizes.length !== 5 || parsedSizes.some((size) => size !== 4_500_000)) {
+          problems.push(`${arm.name} suspended downloads got ${gotSizes}`);
+        }
+        await session.closeTab(suspendTab);
+      }
+      await callHook(session, { kind: "flush" });
+      await callHook(session, { kind: "seal" });
+      await stopSampler();
+
+      const status = (await callHook(session, { kind: "status" })) as {
+        readonly run: string;
+        readonly ready: boolean;
+        readonly unreadableEntries: number;
+        readonly startupSuspends: number;
+        readonly startupBufferedPeak: number;
+        readonly startupGate: {
+          readonly gateStartedShut: boolean;
+          readonly scanCompleted: boolean;
+          readonly scanTimedOut: boolean;
+          readonly initiallyTrusted: boolean;
+          readonly downgraded: boolean;
+          readonly preScanFileBytes: number;
+          readonly preScanOpenParts: number;
+          readonly postDowngradeFileBytes: number;
+          readonly postDowngradeOpenParts: number;
+        };
+        readonly problems: readonly { readonly kind: string; readonly detail: string }[];
+        readonly observerErrors: readonly string[];
+        readonly usage: { readonly bodyBytes: number; readonly detailBytes: number };
+      };
+      if (arm.expectUntrustedStartup === true) {
+        if (!status.startupGate.gateStartedShut) {
+          problems.push(`${arm.name}: startup gate did not start shut`);
+        }
+        if (status.startupGate.initiallyTrusted) {
+          problems.push(`${arm.name}: untrusted ledger was trusted on startup`);
+        }
+        if (status.startupGate.preScanOpenParts > 0 || status.startupGate.preScanFileBytes > 0) {
+          problems.push(
+            `${arm.name}: direct pre-scan file writes exceeded 0 (${String(status.startupGate.preScanFileBytes)} B, ${String(status.startupGate.preScanOpenParts)} parts)`,
+          );
+        }
+      }
+      if (arm.expectDowngradedStartup === true) {
+        if (!status.startupGate.gateStartedShut || !status.startupGate.downgraded) {
+          problems.push(
+            `${arm.name}: expected understated ledger downgrade during scan (gateStartedShut=${String(status.startupGate.gateStartedShut)}, downgraded=${String(status.startupGate.downgraded)})`,
+          );
+        }
+        if (status.startupGate.preScanFileBytes > FLUSH_BATCH_BYTES) {
+          problems.push(
+            `${arm.name}: pre-scan file writes ${String(status.startupGate.preScanFileBytes)} B > one batch ${String(FLUSH_BATCH_BYTES)} B`,
+          );
+        }
+        if (
+          status.startupGate.postDowngradeOpenParts > 0 ||
+          status.startupGate.postDowngradeFileBytes > 0
+        ) {
+          problems.push(
+            `${arm.name}: post-downgrade pre-scan writes ${String(status.startupGate.postDowngradeFileBytes)} B (${String(status.startupGate.postDowngradeOpenParts)} parts)`,
+          );
+        }
+      }
+      if (arm.testSuspend === true) {
+        if (status.startupSuspends <= 0) {
+          problems.push(
+            `${arm.name} startupSuspends=${String(status.startupSuspends)} (expected > 0)`,
+          );
+        }
+        if (status.startupBufferedPeak > 24 * MIB) {
+          problems.push(
+            `${arm.name} startupBufferedPeak=${String(status.startupBufferedPeak)} > ${String(24 * MIB)}`,
+          );
+        }
+      }
+      if (!status.ready) problems.push(`${arm.name} gate remained shut after flush/seal`);
+      const expectedUnreadable = arm.unreadable === true ? (isRoot ? 1 : 2) : 0;
+      if (arm.unreadable === true) {
+        if (status.unreadableEntries !== expectedUnreadable) {
+          problems.push(
+            `${arm.name} unreadableEntries ${String(status.unreadableEntries)} != ${String(expectedUnreadable)}`,
+          );
+        }
+        if (!status.problems.some((p) => p.kind === "unreadable-entries")) {
+          problems.push(
+            `${arm.name} missing unreadable-entries problem: ${JSON.stringify(status.problems)}`,
+          );
+        }
+        if (status.problems.some((p) => p.kind === "write-failed")) {
+          problems.push(`${arm.name} unexpected write-failed: ${JSON.stringify(status.problems)}`);
+        }
+      } else if (status.problems.length > 0) {
+        problems.push(`${arm.name} store problems: ${JSON.stringify(status.problems)}`);
+      }
+      if (status.observerErrors.length > 0) {
+        problems.push(`${arm.name} observer errors: ${status.observerErrors.join(", ")}`);
+      }
+
+      if (arm.unreadable !== true) {
+        problems.push(
+          ...checkArchiveOracle({
+            root,
+            step: `${arm.name}-after-seal`,
+            usage: status.usage,
+            expectZeroParts: true,
+            maxBodyBytes: arm.bodyCap,
+            requireAllSummarized: true,
+          }).problems,
+        );
+      } else if (status.usage.bodyBytes > arm.bodyCap) {
+        problems.push(
+          `${arm.name} usage.bodyBytes ${String(status.usage.bodyBytes)} > ${String(arm.bodyCap)}`,
+        );
+      }
+
+      const bodyStats = verifyStartupBodies(arm, root, server, ws.lines(), problems);
+      const ceiling = Math.max(arm.bodyCap, seededBytes) + FLUSH_BATCH_BYTES;
+      const maxDu = Math.max(...duSamples);
+      if (maxDu > ceiling) {
+        problems.push(
+          `${arm.name} startup du ${String(maxDu)} B > ${String(ceiling)} B (cap ${String(arm.bodyCap)} + batch ${String(FLUSH_BATCH_BYTES)})`,
+        );
+      }
+      const summary = `${arm.name}: maxDu=${String(maxDu)}/${String(ceiling)} exact=${String(bodyStats.exactCount)}`;
+      const data = {
+        seededBytes,
+        bodyCap: arm.bodyCap,
+        ceilingBytes: ceiling,
+        maxDuBytes: maxDu,
+        sampleCount: duSamples.length,
+        ready: status.ready,
+        startupGate: status.startupGate,
+        unreadableEntries: status.unreadableEntries,
+        exactBodies: bodyStats.exactCount,
+        cutBodies: bodyStats.cutCount,
+        timeoutStored: bodyStats.timeoutStored,
+        timeoutIncomplete: bodyStats.timeoutIncomplete,
+        falseFirstPart: bodyStats.falseFirstPart,
+        zeroLengthStored: bodyStats.zeroLengthStored,
+        finalUsage: status.usage,
+      };
+      if (keepWs) {
+        await session.quit();
+        restartSeed = {
+          ws,
+          expectedRestartUsage: {
+            run: status.run,
+            bodyBytes: status.usage.bodyBytes,
+            detailBytes: status.usage.detailBytes,
+          },
+        };
+      }
+      return { summary, data, restartSeed };
+    } finally {
+      await stopSampler();
+      if (deniedDir !== null && NodeFS.existsSync(deniedDir)) {
+        NodeFS.chmodSync(deniedDir, 0o700);
+      }
+    }
+  } catch (error) {
+    keepWs = false;
+    throw error;
+  } finally {
+    if (!keepWs) {
+      await ws[Symbol.asyncDispose]();
+    }
+  }
+}
+
+/**
+ * Launches onto at-cap, over-cap, and unreadable-entry archives and streams immediate parallel file-tee (including
+ * lengthless chunked responses) and memory-tee traffic before calling flush, verifying startup disk headroom, gate
+ * opening, unreadable entry reporting, and SHA-256 body fidelity across every recorded response.
+ */
+const check: HarnessCheck = {
+  name: "retention-startup",
+  description:
+    "immediate recording on at-cap, over-cap, and unreadable-entry archives holds disk cap, opens gate, and keeps exact bodies",
+  run: async (context: CheckContext): Promise<CheckResult> => {
+    const started = Date.now();
+    const extensionPath = context.extensionPath;
+    if (extensionPath === null || !NodeFS.existsSync(extensionPath)) {
+      return {
+        name: "retention-startup",
+        ok: false,
+        durationMs: Date.now() - started,
+        detail: "needs existing --extension path",
+      };
+    }
+    const addonId = await readExtensionId(extensionPath);
+    const popupPath = await readExtensionPopupPath(extensionPath);
+
+    const armProblems = Array.from({ length: ARMS.length }, (): string[] => []);
+    const armSummaries = Array.from({ length: ARMS.length }, () => "");
+    const armEntries = Array.from({ length: ARMS.length }, (): unknown => undefined);
+
+    const baseIndex = ARMS.findIndex((a) => a.name === "64mib-100-packs");
+    const restartIndex = ARMS.findIndex((a) => a.name === "64mib-clean-restart");
+    const baseArm = baseIndex >= 0 ? ARMS[baseIndex] : undefined;
+    const restartArm = restartIndex >= 0 ? ARMS[restartIndex] : undefined;
+    const baseProblems = armProblems[baseIndex];
+    const restartProblems = armProblems[restartIndex];
+    type Task = { readonly weight: number; readonly run: (server: FixtureServer) => Promise<void> };
+    const tasks: Task[] = [];
+
+    if (
+      baseArm !== undefined &&
+      restartArm !== undefined &&
+      baseProblems !== undefined &&
+      restartProblems !== undefined
+    ) {
+      tasks.push({
+        weight: 10_000,
+        run: async (server) => {
+          const baseOutcome = await runStartupArm({
+            arm: baseArm,
+            context,
+            extensionPath,
+            addonId,
+            popupPath,
+            server,
+            problems: baseProblems,
+            keepWorkspaceForRestart: true,
+          });
+          armSummaries[baseIndex] = baseOutcome.summary;
+          armEntries[baseIndex] = baseOutcome.data;
+          const seed = baseOutcome.restartSeed;
+          if (seed === null) {
+            restartProblems.push("64mib-clean-restart: missing base workspace");
+            return;
+          }
+          await using _reusedWs = seed.ws;
+          const restartOutcome = await runStartupArm({
+            arm: restartArm,
+            context,
+            extensionPath,
+            addonId,
+            popupPath,
+            server,
+            problems: restartProblems,
+            reused: seed,
+          });
+          armSummaries[restartIndex] = restartOutcome.summary;
+          armEntries[restartIndex] = restartOutcome.data;
+        },
+      });
     }
 
+    for (const [index, arm] of ARMS.entries()) {
+      if (index === baseIndex || index === restartIndex) continue;
+      const entryProblems = armProblems[index];
+      if (entryProblems === undefined) continue;
+      tasks.push({
+        weight: arm.scanDelayMs ?? 0,
+        run: async (server) => {
+          const outcome = await runStartupArm({
+            arm,
+            context,
+            extensionPath,
+            addonId,
+            popupPath,
+            server,
+            problems: entryProblems,
+          });
+          armSummaries[index] = outcome.summary;
+          armEntries[index] = outcome.data;
+        },
+      });
+    }
+
+    // Run longest-delay 150k arms first so workers stay balanced without starving later startups.
+    tasks.sort((a, b) => b.weight - a.weight);
+    const concurrency = Math.min(3, Math.max(2, NodeOS.availableParallelism() - 1));
+    let nextTask = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
+        await using server = await startFixtureServer();
+        for (;;) {
+          context.signal.throwIfAborted();
+          const task = tasks[nextTask++];
+          if (task === undefined) return;
+          await task.run(server);
+        }
+      }),
+    );
+
+    const problems = armProblems.flat();
+    const armData: Record<string, unknown> = {};
+    for (const [index, arm] of ARMS.entries()) {
+      armData[arm.name] = armEntries[index];
+    }
     return {
       name: "retention-startup",
       ok: problems.length === 0,
       durationMs: Date.now() - started,
-      detail: problems.length === 0 ? summaries.join(", ") : problems.join("; "),
+      detail: problems.length === 0 ? armSummaries.join(", ") : problems.join("; "),
       data: armData,
     };
   },

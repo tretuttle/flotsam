@@ -644,7 +644,7 @@ export interface Maintenance {
   ): void;
   markPackClosed(pack: PackId): boolean;
   trackPart(id: ExchangeId, path: string, expectedBytes?: number): void;
-  updatePart(id: ExchangeId, bytes: number, settings: UserSettings): boolean;
+  updatePart(id: ExchangeId, bytes: number, settings: UserSettings, capped?: boolean): boolean;
   untrackPart(id: ExchangeId): void;
   partBudget(id: ExchangeId, routeCap: number, settings: UserSettings): number;
   recordBodyFile(site: Site, id: ExchangeId, path: string, bytes: number, now: EpochMs): void;
@@ -719,6 +719,7 @@ export function createMaintenance(options: {
   const bodyHeap = new IndexedMinHeap<TrackedBody>(counting ? tickOp : undefined);
   const parts = new Map<ExchangeId, TrackedPart>();
   const preScanReserved = new Map<ExchangeId, number>();
+  const partExpectedReserved = new Map<ExchangeId, number>();
   const details = counting
     ? new CountingMap<string, TrackedDetail>(tickOp)
     : new Map<string, TrackedDetail>();
@@ -739,6 +740,7 @@ export function createMaintenance(options: {
   let timedOut = false;
   let directPreScanBytes = 0;
   let preScanPartReservedBytes = 0;
+  let partExpectedBytes = 0;
   let preScanFileBytes = 0;
   let preScanOpenParts = 0;
   let postDowngradeFileBytes = 0;
@@ -884,6 +886,22 @@ export function createMaintenance(options: {
     }
   };
 
+  const adjustReserved = (
+    map: Map<ExchangeId, number>,
+    currentTotal: number,
+    id: ExchangeId,
+    oldBytes: number,
+    newBytes: number,
+    remove: boolean,
+  ): number => {
+    const reserved = map.get(id);
+    if (reserved === undefined) return currentTotal;
+    if (remove) map.delete(id);
+    const prevLeft = Math.max(0, reserved - oldBytes);
+    const nextLeft = remove ? 0 : Math.max(0, reserved - newBytes);
+    return Math.max(0, currentTotal - prevLeft + nextLeft);
+  };
+
   const recomputeTotals = (): void => {
     let b = 0;
     for (const item of bodies.values()) b += item.bytes;
@@ -937,7 +955,7 @@ export function createMaintenance(options: {
         bodyHeap,
         (item) => item.bytes,
         Math.max(0, bodyBytes - partBytes),
-        Math.max(0, settings.retention.maxBodyBytes - partBytes - reserveBytes),
+        Math.max(0, settings.retention.maxBodyBytes - partBytes - partExpectedBytes - reserveBytes),
         settings.retention.maxAgeDays,
         now,
         isPinned,
@@ -1348,14 +1366,19 @@ export function createMaintenance(options: {
           preScanOpenParts += 1;
           if (downgraded) postDowngradeOpenParts += 1;
         }
-        if (!scanCompleted && expectedBytes !== undefined && expectedBytes > 0) {
-          preScanReserved.set(id, expectedBytes);
-          preScanPartReservedBytes += expectedBytes;
+        if (expectedBytes !== undefined && expectedBytes > 0) {
+          if (!scanCompleted) {
+            preScanReserved.set(id, expectedBytes);
+            preScanPartReservedBytes += expectedBytes;
+          } else {
+            partExpectedReserved.set(id, expectedBytes);
+            partExpectedBytes += expectedBytes;
+          }
         }
       }
     },
 
-    updatePart: (id, bytes, settings) => {
+    updatePart: (id, bytes, settings, capped = false) => {
       chunkCalls += 1;
       const syncStart = opsCount;
       try {
@@ -1370,17 +1393,25 @@ export function createMaintenance(options: {
           preScanFileBytes += delta;
           if (downgraded) postDowngradeFileBytes += delta;
         }
-        const reserved = preScanReserved.get(id);
-        if (reserved !== undefined) {
-          preScanPartReservedBytes = Math.max(
-            0,
-            preScanPartReservedBytes -
-              Math.max(0, reserved - oldBytes) +
-              Math.max(0, reserved - bytes),
-          );
-        }
+        preScanPartReservedBytes = adjustReserved(
+          preScanReserved,
+          preScanPartReservedBytes,
+          id,
+          oldBytes,
+          bytes,
+          false,
+        );
+        const expected = partExpectedReserved.get(id);
+        partExpectedBytes = adjustReserved(
+          partExpectedReserved,
+          partExpectedBytes,
+          id,
+          oldBytes,
+          bytes,
+          capped || (expected !== undefined && bytes >= expected),
+        );
         return (
-          bodyBytes > settings.retention.maxBodyBytes ||
+          bodyBytes + partExpectedBytes > settings.retention.maxBodyBytes ||
           detailBytes > settings.retention.maxDetailBytes
         );
       } finally {
@@ -1397,14 +1428,22 @@ export function createMaintenance(options: {
       const part = parts.get(id);
       if (part === undefined) return;
       parts.delete(id);
-      const reserved = preScanReserved.get(id);
-      if (reserved !== undefined) {
-        preScanReserved.delete(id);
-        preScanPartReservedBytes = Math.max(
-          0,
-          preScanPartReservedBytes - Math.max(0, reserved - part.bytes),
-        );
-      }
+      preScanPartReservedBytes = adjustReserved(
+        preScanReserved,
+        preScanPartReservedBytes,
+        id,
+        part.bytes,
+        0,
+        true,
+      );
+      partExpectedBytes = adjustReserved(
+        partExpectedReserved,
+        partExpectedBytes,
+        id,
+        part.bytes,
+        0,
+        true,
+      );
       partBytes = Math.max(0, partBytes - part.bytes);
       bodyBytes = Math.max(0, bodyBytes - part.bytes);
     },
@@ -1461,14 +1500,22 @@ export function createMaintenance(options: {
       const part = parts.get(id);
       if (part !== undefined) {
         parts.delete(id);
-        const reserved = preScanReserved.get(id);
-        if (reserved !== undefined) {
-          preScanReserved.delete(id);
-          preScanPartReservedBytes = Math.max(
-            0,
-            preScanPartReservedBytes - Math.max(0, reserved - part.bytes),
-          );
-        }
+        preScanPartReservedBytes = adjustReserved(
+          preScanReserved,
+          preScanPartReservedBytes,
+          id,
+          part.bytes,
+          0,
+          true,
+        );
+        partExpectedBytes = adjustReserved(
+          partExpectedReserved,
+          partExpectedBytes,
+          id,
+          part.bytes,
+          0,
+          true,
+        );
         partBytes = Math.max(0, partBytes - part.bytes);
         bodyBytes = Math.max(0, bodyBytes - part.bytes);
       }
@@ -1563,12 +1610,14 @@ export function createMaintenance(options: {
     },
 
     isOverCap: (settings, reserveBytes = 0) =>
-      bodyBytes + reserveBytes > settings.retention.maxBodyBytes ||
+      bodyBytes + partExpectedBytes + reserveBytes > settings.retention.maxBodyBytes ||
       detailBytes > settings.retention.maxDetailBytes,
 
     needsRetentionDrain: (settings) => {
       if (!scanCompleted || !ready) return false;
-      if (bodyBytes <= settings.retention.maxBodyBytes + DRAIN_MARGIN_BYTES) return false;
+      if (bodyBytes + partExpectedBytes <= settings.retention.maxBodyBytes + DRAIN_MARGIN_BYTES) {
+        return false;
+      }
       if (partBytes + lockedBytes + pendingWriteBytes > settings.retention.maxBodyBytes)
         return false;
       const oldest = bodyHeap.peek();

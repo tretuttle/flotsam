@@ -1325,4 +1325,47 @@ describe("createMaintenance heap and retention oracle", () => {
     expect(sut.usage().bodyBytes).toBe(350);
     expect(sut.ledgerSnapshot().bodyBytes).toBe(250);
   });
+
+  it("reserves post-scan expected part bytes in drain and retain until written or capped", async () => {
+    const site = asSite("post-scan-expected.example");
+    const pack1 = [TEST_ROOT, ...packPath(packId(site, testRun, 1))].join("/");
+    const pack2 = [TEST_ROOT, ...packPath(packId(site, testRun, 2))].join("/");
+    fs.write(pack1, 400_000, fakeNow - 2_000);
+    fs.write(pack2, 400_000, fakeNow - 1_000);
+
+    const sut = createMaintenance({
+      root: TEST_ROOT as unknown as Parameters<typeof createMaintenance>[0]["root"],
+      onSegmentRemoved: () => undefined,
+    });
+    const settings = makeSettings(1_000_000, 1_000_000, 14);
+    await sut.loadFromDisk(emptyActivity(testRun), settings, async () => false);
+    expect(sut.needsRetentionDrain(settings)).toBe(false);
+
+    // Parallel file-tee streams whose Content-Length exceeds remaining headroom trigger drain before chunk 1.
+    const part1 = exchangeId(testRun, parseChannelKey("81")!);
+    const part2 = exchangeId(testRun, parseChannelKey("82")!);
+    sut.trackPart(part1, `${TEST_ROOT}/parts/81.part`, 300_000);
+    sut.trackPart(part2, `${TEST_ROOT}/parts/82.part`, 300_000);
+    expect(sut.isOverCap(settings)).toBe(true);
+    expect(sut.needsRetentionDrain(settings)).toBe(true);
+
+    // retain evicts pack1 (400 KB) upfront so 400 KB pack2 + 600 KB expected parts <= 1 MB cap.
+    await sut.retain(settings, async () => false);
+    expect(fs.files.has(pack1)).toBe(false);
+    expect(fs.files.has(pack2)).toBe(true);
+    expect(sut.needsRetentionDrain(settings)).toBe(false);
+
+    // As part1 streams 150 KB and is capped early, remaining expected reserve releases immediately.
+    sut.updatePart(part1, 150_000, settings, true);
+    sut.updatePart(part2, 100_000, settings);
+    expect(sut.usage().bodyBytes).toBe(650_000);
+
+    // Without capped=true, part2 still holds 200 KB expected reserve until untrack/recordBodyFile.
+    const part3 = exchangeId(testRun, parseChannelKey("83")!);
+    sut.trackPart(part3, `${TEST_ROOT}/parts/83.part`, 300_000);
+    // packs(400k) + parts(250k) + expected(part2:200k + part3:300k) = 1.15M > 1M + 128 KiB.
+    expect(sut.needsRetentionDrain(settings)).toBe(true);
+    sut.untrackPart(part3);
+    expect(sut.needsRetentionDrain(settings)).toBe(false);
+  });
 });

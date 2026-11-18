@@ -168,7 +168,7 @@ export interface Store {
   unreadableEntries(): number;
   retain(): Promise<readonly RetentionStep[]>;
   openPart(id: ExchangeId, path: string, expectedBytes?: number): void;
-  updatePart(id: ExchangeId, bytes: number): void;
+  updatePart(id: ExchangeId, bytes: number, capped?: boolean): void;
   partBudget(id: ExchangeId, routeCap: number): number;
   reserveWrite(bytes: number): () => void;
   needsRetentionDrain(): boolean;
@@ -695,15 +695,12 @@ export function openStore(options: {
     },
     openPart: (id, path, expectedBytes) => {
       maintenance.trackPart(id, path, expectedBytes);
-      if (
-        maintenance.isScanCompleted() &&
-        maintenance.isOverCap(settings.user, expectedBytes ?? 0)
-      ) {
+      if (maintenance.isScanCompleted() && maintenance.isOverCap(settings.user)) {
         scheduleRetention();
       }
     },
-    updatePart: (id, bytes) => {
-      if (maintenance.updatePart(id, bytes, settings.user)) scheduleRetention();
+    updatePart: (id, bytes, capped) => {
+      if (maintenance.updatePart(id, bytes, settings.user, capped)) scheduleRetention();
     },
     partBudget: (id, routeCap) => maintenance.partBudget(id, routeCap, settings.user),
     reserveWrite: (bytes) => maintenance.reserveWrite(bytes),
