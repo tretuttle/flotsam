@@ -338,6 +338,7 @@ export function createGeckoHost(options: {
   const faults = exportFaults();
   const { run: currentRun, reads, creator } = options;
   const finished = new Map<ExportId, string>();
+  const pendingDevtools = new Map<ExportId, ReturnType<typeof makeDevtools>>();
 
   const lookup = (tabId: TabId): TabLookup => lookupTab(options.extension, tabId);
   const canAccessTab = (tab: NativeTab): boolean =>
@@ -554,7 +555,8 @@ export function createGeckoHost(options: {
       written = await folder.createPart(planned, partJournal);
       const { part } = written;
       const sink = createPartSink(part.append, (bytes) => control.progress({ ...last, bytes }));
-      const devtools = makeDevtools();
+      const devtools = pendingDevtools.get(job.id) ?? makeDevtools();
+      pendingDevtools.delete(job.id);
       const resolved = resolveSelection(
         job.request.selection,
         await selectionContext(rec, job.request.selection, devtools),
@@ -632,7 +634,13 @@ export function createGeckoHost(options: {
     popup,
     preview,
     exports: {
-      start: (request: ExportRequest): ExportJob => jobs.start(request),
+      start: (request: ExportRequest): ExportJob => {
+        const devtools = makeDevtools();
+        devtools.snapshot(request.selection.scope === "tab" ? request.selection.tabId : null);
+        const job = jobs.start(request);
+        pendingDevtools.set(job.id, devtools);
+        return job;
+      },
       list: () => jobs.list(),
       cancel: (id: ExportId) => jobs.cancel(id),
       reveal: async (id: ExportId): Promise<boolean> => {

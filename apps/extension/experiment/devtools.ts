@@ -1,6 +1,6 @@
-// DevTools as an ExchangeSource: priming via DevToolsShim, tab lookup via gDevTools, metadata via one
-// HarBuilder per item with actions kept enabled, and response bodies streamed from LongStringActor slices.
-// Nothing here loads Loader.sys.mjs while DevToolsShim.isInitialized() is false.
+// DevTools as an ExchangeSource: priming via DevToolsShim, synchronous snapshots at export start,
+// batched stack-trace reads with actions enabled, HarBuilder metadata with actions paused, and
+// response bodies streamed from LongStringActor slices. Nothing loads Loader while uninitialized.
 
 import { buildHarEntry } from "@one-click-har/har/build";
 import {
@@ -101,6 +101,30 @@ export const toolboxOf = (tab: NativeTab): ToolboxState => {
     : { open: true, host: toolbox.hostType };
 };
 
+const STACK_PREFETCH_CHUNK = 128;
+
+const cachedApis = new WeakMap<DevToolsToolbox, NetMonitorApi>();
+
+const syncApiOf = (toolbox: DevToolsToolbox): NetMonitorApi | null => {
+  const panelApi = toolbox.getPanel?.("netmonitor")?.panelWin?.Netmonitor?.api;
+  if (panelApi !== undefined) {
+    cachedApis.set(toolbox, panelApi);
+    return panelApi;
+  }
+  return cachedApis.get(toolbox) ?? null;
+};
+
+const apiOf = async (toolbox: DevToolsToolbox): Promise<NetMonitorApi> => {
+  const live = toolbox.getPanel?.("netmonitor")?.panelWin?.Netmonitor?.api;
+  if (live !== undefined) {
+    cachedApis.set(toolbox, live);
+    return live;
+  }
+  const api = await toolbox.getNetMonitorAPI();
+  cachedApis.set(toolbox, api);
+  return api;
+};
+
 /**
  * Registers through DevToolsShim without loading DevTools. When a toolbox opens on Inspector or Console, calls
  * `getNetMonitorAPI()` so network capture starts before the user ever visits the Network panel (row D3).
@@ -108,7 +132,12 @@ export const toolboxOf = (tab: NativeTab): ToolboxState => {
 export function primeToolboxes(): { dispose(): void } {
   const dtShim = shim();
   const prime = (toolbox: DevToolsToolbox): void => {
-    void toolbox.getNetMonitorAPI().catch(() => undefined);
+    void toolbox
+      .getNetMonitorAPI()
+      .then((api) => {
+        cachedApis.set(toolbox, api);
+      })
+      .catch(() => undefined);
   };
   dtShim.on("toolbox-ready", prime);
   if (dtShim.isInitialized()) {
@@ -143,8 +172,8 @@ const isLongStringGrip = (value: unknown): value is DevToolsLongStringGrip =>
 
 const isBlocked = (request: DevToolsRequestItem): boolean => Boolean(request.blockedReason);
 
-const isBlockedOrNoResponse = (request: DevToolsRequestItem, status: number): boolean =>
-  status === 0 || isBlocked(request);
+const isInProgress = (request: DevToolsRequestItem): boolean =>
+  request.totalTime === undefined && !isBlocked(request);
 
 const mapPairs = (raw: unknown): readonly HarNameValue[] =>
   Array.isArray(raw)
@@ -342,6 +371,15 @@ const metadataConnector = (connector: NetMonitorConnector): NetMonitorConnector 
   ...(connector.getHarData !== undefined ? { getHarData: () => connector.getHarData!() } : {}),
 });
 
+interface CapturedToolbox {
+  readonly toolbox: DevToolsToolbox;
+  readonly localTab: NativeTab;
+  readonly tabKey: TabKey;
+  readonly fallbackSite: Site | null;
+  readonly api: NetMonitorApi | null;
+  readonly requests: readonly DevToolsRequestItem[] | null;
+}
+
 export function createDevtoolsSource(options: {
   readonly run: RunId;
   readonly tabOf: (tabId: TabId) => NativeTab | null;
@@ -350,11 +388,14 @@ export function createDevtoolsSource(options: {
   readonly source: ExchangeSource;
   readonly bodies: BodyReader;
   readonly firstMinute: (tabId: TabId) => Promise<Minute | null>;
+  readonly snapshot: (tabId: TabId | null) => void;
 } {
   const { run, tabOf } = options;
   const canAccess = options.canAccessTab ?? (() => true);
   const bodyRefs = new WeakMap<DevtoolsBodyRef, DevtoolsBodyHandle>();
   const held: HeldDevtoolsItem[] = [];
+  const prefetchedApis = new WeakSet<NetMonitorApi>();
+  let capturedSnapshots: CapturedToolbox[] | null = null;
 
   const registerHandle = (handle: DevtoolsBodyHandle): DevtoolsBodyRef => {
     const ref = {} as DevtoolsBodyRef;
@@ -378,17 +419,54 @@ export function createDevtoolsSource(options: {
     });
   };
 
-  const firstMinute = async (tabId: TabId): Promise<Minute | null> => {
+  const sortedRequests = (api: NetMonitorApi): readonly DevToolsRequestItem[] =>
+    // Sort by startedMs regardless of the panel's UI sort (row D2: size sort broke HarExporter).
+    [...api.store.getState().requests.requests].sort((a, b) => a.startedMs - b.startedMs);
+
+  const snapshot = (tabId: TabId | null): void => {
     const toolboxes = toolboxesForSelection(tabId);
-    const toolbox = toolboxes[0];
-    if (toolbox === undefined) return null;
-    const api = await toolbox.getNetMonitorAPI();
+    const out: CapturedToolbox[] = [];
+    for (const toolbox of toolboxes) {
+      const localTab = toolbox.commands?.descriptorFront?.localTab;
+      if (localTab === undefined) continue;
+      const api = syncApiOf(toolbox);
+      out.push({
+        toolbox,
+        localTab,
+        tabKey: { run, browserId: localTab.linkedBrowser.browserId },
+        fallbackSite: siteOfUri(localTab.linkedBrowser.currentURI),
+        api,
+        requests: api === null ? null : sortedRequests(api),
+      });
+    }
+    capturedSnapshots = out;
+  };
+
+  const firstMinute = async (tabId: TabId): Promise<Minute | null> => {
+    let requests: readonly DevToolsRequestItem[] | null = null;
+    if (capturedSnapshots !== null) {
+      const snap = capturedSnapshots[0];
+      if (snap === undefined) return null;
+      requests = snap.requests ?? sortedRequests(await apiOf(snap.toolbox));
+    } else {
+      const toolbox = toolboxesForSelection(tabId)[0];
+      if (toolbox === undefined) return null;
+      requests = sortedRequests(await apiOf(toolbox));
+    }
     let earliest: number | null = null;
-    for (const request of api.store.getState().requests.requests) {
+    for (const request of requests) {
       if (classifyUrl(request.url).kind !== "network") continue;
       if (earliest === null || request.startedMs < earliest) earliest = request.startedMs;
     }
     return earliest === null ? null : toMinute(Math.floor(earliest) as EpochMs);
+  };
+
+  const missingContent = (
+    packet: DevToolsResponseContentPacket,
+    latest: DevToolsRequestItem,
+  ): boolean => {
+    const declared = packet.content?.size ?? latest.contentSize ?? 0;
+    return packet.content?.text === undefined || packet.content?.text === null || declared > 0;
   };
 
   const resolveResponseBody = async (
@@ -397,12 +475,20 @@ export function createDevtoolsSource(options: {
     includeBody: boolean,
     status: number,
   ): Promise<BodyCandidates> => {
-    if (request.truncated === true) return { kind: "none", reason: "devtools-truncated" };
-    if (!includeBody) return { kind: "none", reason: "omitted-by-choice" };
-    if (isBlockedOrNoResponse(request, status)) return { kind: "none", reason: "no-response" };
-
     const latest =
       api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
+    const liveStatus = Number(latest.status) || status;
+
+    if (latest.truncated === true || request.truncated === true) {
+      return { kind: "none", reason: "devtools-truncated" };
+    }
+    if (!includeBody) return { kind: "none", reason: "omitted-by-choice" };
+    if (isBlocked(latest) || isBlocked(request)) return { kind: "none", reason: "no-response" };
+    // Never fetch getResponseContent while still downloading: Gecko emits partial chunks and does not set truncated until completion.
+    if (isInProgress(latest)) return { kind: "none", reason: "in-progress" };
+    if (liveStatus === 204 || liveStatus === 304) return { kind: "empty" };
+    if (liveStatus === 0) return { kind: "none", reason: "no-response" };
+
     let packet: DevToolsResponseContentPacket | undefined = latest.responseContent;
     if (packet === undefined) {
       const client = api.connector.commands?.client;
@@ -414,14 +500,28 @@ export function createDevtoolsSource(options: {
           type: "getResponseContent",
         })) as DevToolsResponseContentPacket;
       } catch {
-        return { kind: "none", reason: "devtools-discarded" };
+        return {
+          kind: "none",
+          reason: isInProgress(latest) ? "in-progress" : "devtools-discarded",
+        };
       }
     }
 
+    const after = api.store.getState().requests.requests.find((r) => r.id === request.id);
+    if (after?.truncated === true) return { kind: "none", reason: "devtools-truncated" };
+    if (after !== undefined && isInProgress(after)) return { kind: "none", reason: "in-progress" };
     if (packet.contentDiscarded === true) return { kind: "none", reason: "devtools-discarded" };
     const text = packet.content?.text;
     const encoding: "base64" | null = packet.content?.encoding === "base64" ? "base64" : null;
-    if (text === undefined || text === null || text === "") return { kind: "empty" };
+    if (text === undefined || text === null || text === "") {
+      if (missingContent(packet, after ?? latest)) {
+        return {
+          kind: "none",
+          reason: isInProgress(after ?? latest) ? "in-progress" : "devtools-discarded",
+        };
+      }
+      return { kind: "empty" };
+    }
     if (typeof text === "string") {
       return {
         kind: "candidates",
@@ -505,16 +605,22 @@ export function createDevtoolsSource(options: {
       request.method === "POST" ||
       request.method === "PUT" ||
       request.method === "PATCH";
+    const latest =
+      api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
     return {
       entry,
       body:
-        request.truncated === true
+        latest.truncated === true || request.truncated === true
           ? { kind: "none", reason: "devtools-truncated" }
           : !includeBody
             ? { kind: "none", reason: "omitted-by-choice" }
-            : isBlockedOrNoResponse(request, status)
+            : isBlocked(latest) || isBlocked(request)
               ? { kind: "none", reason: "no-response" }
-              : { kind: "none", reason: "devtools-discarded" },
+              : isInProgress(latest)
+                ? { kind: "none", reason: "in-progress" }
+                : status === 0
+                  ? { kind: "none", reason: "no-response" }
+                  : { kind: "none", reason: "devtools-discarded" },
       upload: hasPost ? { kind: "none", reason: "devtools-discarded" } : { kind: "empty" },
     };
   };
@@ -625,27 +731,60 @@ export function createDevtoolsSource(options: {
     });
   };
 
+  const prefetchMissingStacks = async (api: NetMonitorApi): Promise<void> => {
+    if (prefetchedApis.has(api)) return;
+    prefetchedApis.add(api);
+    // Keep actions on while resolving stacks so FirefoxDataProvider caches frames in Redux (row D6)
+    // even if a prior built-in HAR export left actionsEnabled false (M3).
+    api.connector.enableActions(true);
+    const targets: DevToolsRequestItem[] = [];
+    for (const entry of held) {
+      if (entry.api !== api) continue;
+      const latest =
+        api.store.getState().requests.requests.find((r) => r.id === entry.request.id) ??
+        entry.request;
+      const hasFrames = Array.isArray(latest.stacktrace) && latest.stacktrace.length > 0;
+      if (!hasFrames && latest.cause?.stacktraceAvailable === true) targets.push(latest);
+    }
+    for (let i = 0; i < targets.length; i += STACK_PREFETCH_CHUNK) {
+      const chunk = targets.slice(i, i + STACK_PREFETCH_CHUNK);
+      await Promise.allSettled(chunk.map((req) => api.connector.requestData(req.id, "stackTrace")));
+    }
+  };
+
   const source: ExchangeSource = {
     name: "devtools",
     list: async (selection: ResolvedSelection): Promise<SourceListing> => {
       held.length = 0;
-      const toolboxes = toolboxesForSelection(selection.tabId);
-      if (toolboxes.length === 0) return { items: [], notNetwork: {} };
+      const snapshots = capturedSnapshots;
+      capturedSnapshots = null;
+      const entries: CapturedToolbox[] =
+        snapshots !== null
+          ? snapshots
+          : toolboxesForSelection(selection.tabId).flatMap((toolbox) => {
+              const localTab = toolbox.commands?.descriptorFront?.localTab;
+              if (localTab === undefined) return [];
+              return [
+                {
+                  toolbox,
+                  localTab,
+                  tabKey: { run, browserId: localTab.linkedBrowser.browserId },
+                  fallbackSite: siteOfUri(localTab.linkedBrowser.currentURI),
+                  api: null,
+                  requests: null,
+                },
+              ];
+            });
+      if (entries.length === 0) return { items: [], notNetwork: {} };
 
       const items: SourceItem[] = [];
       const notNetwork: Record<string, number> = {};
       const nonNetworkSelection: ResolvedSelection = { ...selection, include: "all" };
 
-      for (const toolbox of toolboxes) {
-        const localTab = toolbox.commands?.descriptorFront?.localTab;
-        if (localTab === undefined) continue;
-        const tabKey: TabKey = { run, browserId: localTab.linkedBrowser.browserId };
-        const fallbackSite = siteOfUri(localTab.linkedBrowser.currentURI);
-        const api = await toolbox.getNetMonitorAPI();
-        // Sort by startedMs regardless of the panel's UI sort (row D2: size sort broke HarExporter).
-        const requests = [...api.store.getState().requests.requests].sort(
-          (a, b) => a.startedMs - b.startedMs,
-        );
+      for (const entry of entries) {
+        const api = entry.api ?? (await apiOf(entry.toolbox));
+        const requests = entry.requests ?? sortedRequests(api);
+        const { tabKey, fallbackSite } = entry;
 
         let currentTopSite: Site | null = null;
         for (const request of requests) {
@@ -707,13 +846,20 @@ export function createDevtoolsSource(options: {
       const found = held[item.ref as unknown as number];
       if (found === undefined) throw new Error("not an item of this DevTools listing");
       const { api, request } = found;
-      // Built-in panel exports leave actionsEnabled false on failure; keep actions on for stackTrace caching.
-      api.connector.enableActions(true);
+      await prefetchMissingStacks(api);
+      const current =
+        api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
+      const [initiator, wsMessages] = await Promise.all([
+        initiatorFor(api, current),
+        wsMessagesFor(api, current),
+      ]);
       const { HarBuilder } = devtoolsModules();
 
       let builtEntry: Record<string, unknown> | undefined;
+      // Pause Redux actions while HarBuilder reads metadata so each requestData avoids a 50 ms batch flush.
+      api.connector.enableActions(false);
       try {
-        const { responseContent: _ignoredContent, ...metadataItem } = request;
+        const { responseContent: _ignoredContent, ...metadataItem } = current;
         const builder = new HarBuilder({
           connector: metadataConnector(api.connector),
           id: 1,
@@ -725,18 +871,16 @@ export function createDevtoolsSource(options: {
         builtEntry = built.log.entries[0];
       } catch {
         builtEntry = undefined;
+      } finally {
+        api.connector.enableActions(true);
       }
 
       if (builtEntry === undefined) {
-        return stubMaterial(api, request, opts.body);
+        return stubMaterial(api, current, opts.body);
       }
 
-      const [initiator, wsMessages] = await Promise.all([
-        initiatorFor(api, request),
-        wsMessagesFor(api, request),
-      ]);
-      const entry = entryFromBuilt(builtEntry, request, initiator, wsMessages);
-      const body = await resolveResponseBody(api, request, opts.body, entry.response.status);
+      const entry = entryFromBuilt(builtEntry, current, initiator, wsMessages);
+      const body = await resolveResponseBody(api, current, opts.body, entry.response.status);
 
       const latest =
         api.store.getState().requests.requests.find((r) => r.id === request.id) ?? request;
@@ -841,5 +985,5 @@ export function createDevtoolsSource(options: {
     },
   };
 
-  return { source, bodies, firstMinute };
+  return { source, bodies, firstMinute, snapshot };
 }

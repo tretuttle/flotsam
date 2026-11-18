@@ -88,6 +88,7 @@ export type DevtoolsFixtureServer = AsyncDisposable & {
   readonly getRequestLog: () => readonly DevtoolsServedRequest[];
   readonly takeRequests: () => readonly DevtoolsServedRequest[];
   readonly getSequenceTruth: (seq: number) => DevtoolsSequenceTruth | undefined;
+  readonly waitForPath: (substring: string) => Promise<void>;
 };
 
 function wsAccept(key: string): string {
@@ -114,6 +115,8 @@ window.__devtoolsPageReady = (async () => {
   const ws = q.get("ws") === "1";
   const data = q.get("data") === "1";
   const stack = q.get("stack") === "1";
+  const slow = +(q.get("slow") || 0);
+  const slowms = +(q.get("slowms") || 3000);
   const out = { key, ok: true };
   if (data) {
     await new Promise((resolve) => {
@@ -157,6 +160,12 @@ window.__devtoolsPageReady = (async () => {
       s.onerror = rej;
     });
   }
+  if (slow > 0) {
+    window.__slowPromise = fetch("/slow/" + slow + "?ms=" + slowms + "&k=" + encodeURIComponent(key), { cache: "no-store" })
+      .then((r) => r.arrayBuffer())
+      .then((b) => String(b.byteLength))
+      .catch(() => "aborted");
+  }
   return JSON.stringify(out);
 })();
 `;
@@ -166,13 +175,19 @@ export async function startDevtoolsFixtureServer(): Promise<DevtoolsFixtureServe
   let taken: DevtoolsServedRequest[] = [];
   const truthBySeq = new Map<number, DevtoolsSequenceTruth>();
   let nextSeq = 0;
+  const waiters: { readonly pred: () => boolean; readonly resolve: () => void }[] = [];
 
-  const send = (
-    req: NodeHttp.IncomingMessage,
-    res: NodeHttp.ServerResponse,
-    buf: Buffer,
-    type: string,
-  ): void => {
+  const notifyWaiters = (): void => {
+    for (let i = waiters.length - 1; i >= 0; i -= 1) {
+      const w = waiters[i]!;
+      if (w.pred()) {
+        waiters.splice(i, 1);
+        w.resolve();
+      }
+    }
+  };
+
+  const record = (req: NodeHttp.IncomingMessage, buf: Buffer): number => {
     const seq = ++nextSeq;
     const url = req.url ?? "/";
     const pathname = new URL(url, "http://127.0.0.1").pathname;
@@ -194,6 +209,17 @@ export async function startDevtoolsFixtureServer(): Promise<DevtoolsFixtureServe
       decodedLength: buf.length,
       decodedSha256: sha256(buf),
     });
+    notifyWaiters();
+    return seq;
+  };
+
+  const send = (
+    req: NodeHttp.IncomingMessage,
+    res: NodeHttp.ServerResponse,
+    buf: Buffer,
+    type: string,
+  ): void => {
+    const seq = record(req, buf);
     res.writeHead(200, {
       "Content-Type": type,
       "Content-Length": String(buf.length),
@@ -234,6 +260,38 @@ export async function startDevtoolsFixtureServer(): Promise<DevtoolsFixtureServe
         send(req, res, smallSlice(index), "application/octet-stream");
         return;
       }
+    }
+    if (p.startsWith("/slow/")) {
+      const size = Math.min(BIG.length, Math.max(1, Number(p.slice(6)) || 0));
+      const ms = Math.max(100, Number(u.searchParams.get("ms") ?? "3000"));
+      const buf = BIG.subarray(0, size);
+      const seq = record(req, buf);
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(buf.length),
+        "Cache-Control": "no-store",
+        "X-Seq": String(seq),
+      });
+      const parts = 40;
+      const step = Math.ceil(buf.length / parts);
+      let chunk = 0;
+      let closed = false;
+      res.on("close", () => {
+        closed = true;
+      });
+      const tick = () => {
+        if (closed) return;
+        const start = chunk * step;
+        if (start >= buf.length) {
+          res.end();
+          return;
+        }
+        res.write(buf.subarray(start, Math.min(buf.length, start + step)));
+        chunk += 1;
+        setTimeout(tick, Math.max(10, Math.floor(ms / parts)));
+      };
+      tick();
+      return;
     }
     if (p === "/blank.html") {
       send(
@@ -297,6 +355,17 @@ export async function startDevtoolsFixtureServer(): Promise<DevtoolsFixtureServe
       return out;
     },
     getSequenceTruth: (seq) => truthBySeq.get(seq),
+    waitForPath: (substring) =>
+      new Promise<void>((resolve) => {
+        if (taken.some((e) => e.url.includes(substring))) {
+          resolve();
+          return;
+        }
+        waiters.push({
+          pred: () => taken.some((e) => e.url.includes(substring)),
+          resolve,
+        });
+      }),
     [Symbol.asyncDispose]: () =>
       new Promise((resolve, reject) => {
         server.closeAllConnections();

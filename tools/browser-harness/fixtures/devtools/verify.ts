@@ -85,6 +85,7 @@ export interface DevtoolsVerifyExpectation {
   readonly server?: Pick<DevtoolsFixtureServer, "getSequenceTruth" | "getRequestLog">;
   readonly expectedLog?: readonly DevtoolsServedRequest[];
   readonly entries?: number;
+  readonly entriesMin?: number;
   readonly key?: string;
   readonly otherKey?: string;
   readonly sources?: {
@@ -94,6 +95,8 @@ export interface DevtoolsVerifyExpectation {
   };
   readonly filledInMin?: number;
   readonly expectTruncatedBig?: boolean;
+  readonly allowMissingUrlIncludes?: string;
+  readonly allowMissingReasons?: readonly string[];
   readonly stubs?: { readonly minCount: number };
   readonly stackUrlIncludes?: string;
   readonly expectedFrames?: readonly string[];
@@ -118,6 +121,14 @@ function bodyOfEntry(entry: DevtoolsHarEntry): Buffer | null {
   const { text, encoding } = entry.response.content;
   if (text === undefined) return null;
   return encoding === "base64" ? Buffer.from(text, "base64") : Buffer.from(text, "utf8");
+}
+
+function hasZeroTail(bytes: Buffer): boolean {
+  if (bytes.length < 1024) return false;
+  for (let i = bytes.length - 1024; i < bytes.length; i += 1) {
+    if (bytes[i] !== 0) return false;
+  }
+  return true;
 }
 
 function seqOfEntry(entry: DevtoolsHarEntry): number | null {
@@ -148,6 +159,9 @@ export async function verifyDevtoolsHar(
 
   if (expect.entries !== undefined && entries.length !== expect.entries) {
     problems.push(`entries ${String(entries.length)} != expected ${String(expect.entries)}`);
+  }
+  if (expect.entriesMin !== undefined && entries.length < expect.entriesMin) {
+    problems.push(`entries ${String(entries.length)} < minimum ${String(expect.entriesMin)}`);
   }
 
   if (expect.requireK6 !== false && expect.workDir !== undefined) {
@@ -208,13 +222,27 @@ export async function verifyDevtoolsHar(
         continue;
       }
       if (body === null && truth.decodedLength > 0) {
-        problems.push(
-          `${url} #${String(seq)}: body missing (${JSON.stringify(entry._harExport ?? null)})`,
-        );
+        const missingReason = entry._harExport?.bodyMissing;
+        const missingAllowed =
+          expect.allowMissingReasons !== undefined &&
+          missingReason !== undefined &&
+          expect.allowMissingReasons.includes(missingReason) &&
+          (expect.allowMissingUrlIncludes === undefined ||
+            url.includes(expect.allowMissingUrlIncludes));
+        if (!missingAllowed) {
+          problems.push(
+            `${url} #${String(seq)}: body missing (${JSON.stringify(entry._harExport ?? null)})`,
+          );
+        }
       } else {
         const got = body ?? Buffer.alloc(0);
+        if (hasZeroTail(got)) {
+          problems.push(`${url} #${String(seq)}: zero-padded tail (len=${String(got.length)})`);
+        }
         if (sha256(got) !== truth.decodedSha256 || got.length !== truth.decodedLength) {
-          problems.push(`${url} #${String(seq)}: body SHA/length mismatch`);
+          problems.push(
+            `${url} #${String(seq)}: body SHA/length mismatch (got=${String(got.length)} want=${String(truth.decodedLength)} size=${String(entry.response.content.size)} hx=${JSON.stringify(entry._harExport ?? null)})`,
+          );
         } else if (entry.response.content.size !== truth.decodedLength) {
           problems.push(
             `${url} #${String(seq)}: content.size ${String(entry.response.content.size)} != ${String(truth.decodedLength)}`,

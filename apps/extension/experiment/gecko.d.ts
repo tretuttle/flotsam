@@ -463,6 +463,9 @@ interface DevToolsToolbox {
   readonly hostType: string;
   readonly commands?: { readonly descriptorFront?: { readonly localTab?: NativeTab } };
   getNetMonitorAPI(): Promise<NetMonitorApi>;
+  getPanel?(
+    id: string,
+  ): { readonly panelWin?: { readonly Netmonitor?: { readonly api?: NetMonitorApi } } } | undefined;
 }
 
 interface HarBuilderModule {

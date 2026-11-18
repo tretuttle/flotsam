@@ -105,12 +105,29 @@ async function evalChromeAsync<T>(
   return envelope.res as T;
 }
 
+function readDownloadedHar(downloadsDir: string, fileName: string): string {
+  const expectedPath = NodePath.join(downloadsDir, `${fileName}.har`);
+  if (NodeFS.existsSync(expectedPath)) return NodeFS.readFileSync(expectedPath, "utf8");
+  const files = NodeFS.readdirSync(downloadsDir)
+    .filter((f) => f.startsWith(fileName) && f.endsWith(".har"))
+    .map((f) => {
+      const full = NodePath.join(downloadsDir, f);
+      return { full, mtimeMs: NodeFS.statSync(full).mtimeMs };
+    })
+    .toSorted((a, b) => b.mtimeMs - a.mtimeMs);
+  const newest = files[0];
+  if (newest === undefined) {
+    throw new Error(`No .har file written in ${downloadsDir} matching ${fileName}`);
+  }
+  return NodeFS.readFileSync(newest.full, "utf8");
+}
+
 async function exportTabAndReadHar(
   page: ExtensionPage,
   downloadsDir: string,
   tabId: number,
   fileName: string,
-): Promise<{ readonly harText: string; readonly popup: PopupPreview }> {
+): Promise<{ readonly harText: string; readonly popup: PopupPreview; readonly exportMs: number }> {
   let stage = "ping-page";
   try {
     await value<string>(page, "Promise.resolve('ok')");
@@ -123,6 +140,7 @@ async function exportTabAndReadHar(
       ])`,
     );
     stage = "startExport";
+    const t0 = Date.now();
     const job = await startExport(page, {
       selection: { scope: "tab", tabId, range: { kind: "since-tab-opened" }, include: "all" },
       bodies: "include",
@@ -132,25 +150,11 @@ async function exportTabAndReadHar(
     });
     stage = `waitForJob(${job.id})`;
     const done = await waitForJob(page, job.id, ended);
+    const exportMs = Date.now() - t0;
     if (done.state.kind !== "done") {
       throw new Error(`Export job ${job.id} did not finish cleanly: ${JSON.stringify(done.state)}`);
     }
-    const expectedPath = NodePath.join(downloadsDir, `${fileName}.har`);
-    if (NodeFS.existsSync(expectedPath)) {
-      return { harText: NodeFS.readFileSync(expectedPath, "utf8"), popup };
-    }
-    const files = NodeFS.readdirSync(downloadsDir)
-      .filter((f) => f.startsWith(fileName) && f.endsWith(".har"))
-      .map((f) => {
-        const full = NodePath.join(downloadsDir, f);
-        return { full, mtimeMs: NodeFS.statSync(full).mtimeMs };
-      })
-      .toSorted((a, b) => b.mtimeMs - a.mtimeMs);
-    const newest = files[0];
-    if (newest === undefined) {
-      throw new Error(`No .har file written in ${downloadsDir} matching ${fileName}`);
-    }
-    return { harText: NodeFS.readFileSync(newest.full, "utf8"), popup };
+    return { harText: readDownloadedHar(downloadsDir, fileName), popup, exportMs };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     throw new Error(`${fileName} at ${stage}: ${msg}`, { cause: error });
@@ -422,6 +426,192 @@ const check: HarnessCheck = {
       await session.closeTab(tabHandle);
     }
 
+    // 4b. Built-in sorted Save All As HAR first (leaves actions disabled), then One-Click HAR recovers stacks
+    {
+      server.takeRequests();
+      const { tabHandle, tabId } = await openToolboxAndWaitReady(
+        session,
+        page,
+        "/page.html?n=2&big=0&stack=1&key=builtinm3",
+        server.origin,
+        "netmonitor",
+        "contentSize",
+      );
+      const taken = server.takeRequests();
+      const builtIn = await evalChromeAsync<{
+        readonly harLen: number;
+        readonly actionsEnabled: boolean | null;
+      }>(
+        session,
+        `const [url] = arguments;
+         const loader = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs");
+         const { gDevTools } = loader.require("resource://devtools/client/framework/devtools.js");
+         const { HarExporter } = loader.require("resource://devtools/client/netmonitor/src/har/har-exporter.js");
+         const { HarMenuUtils } = loader.require("resource://devtools/client/netmonitor/src/har/har-menu-utils.js");
+         const { getDisplayedRequests } = loader.require("resource://devtools/client/netmonitor/src/selectors/requests.js");
+         const browserWin = Services.wm.getMostRecentWindow("navigator:browser");
+         const targetTab = browserWin.gBrowser.tabs.find((t) =>
+           t.linkedBrowser?.currentURI?.spec?.startsWith(url)
+         );
+         const api = await gDevTools.getToolboxForTab(targetTab).getNetMonitorAPI();
+         const items = getDisplayedRequests(api.store.getState());
+         const raw = await HarExporter.fetchHarData(HarMenuUtils.getDefaultHarOptions(items, api.connector)).catch(() => null);
+         return {
+           harLen: typeof raw === "string" ? raw.length : 0,
+           actionsEnabled: api?.connector?.dataProvider?.actionsEnabled ?? null,
+         };`,
+        [`${server.origin}/page.html?n=2&big=0&stack=1&key=builtinm3`],
+      );
+      if (builtIn.actionsEnabled !== false) {
+        throw new Error(
+          `Expected built-in sorted HAR export to leave actionsEnabled=false, got ${JSON.stringify(builtIn)}`,
+        );
+      }
+      const expectBuiltin: DevtoolsVerifyExpectation = {
+        server,
+        expectedLog: taken,
+        entries: taken.length,
+        key: "builtinm3",
+        sources: { both: taken.length, recordingOnly: 0, devtoolsOnly: 0 },
+        stackUrlIncludes: "/text.txt?stack=builtinm3",
+        expectedFrames: DEVTOOLS_STACK_FRAMES,
+        requireDevtoolsSources: true,
+        workDir,
+      };
+      const first = await exportTabAndReadHar(
+        page,
+        workspace.downloads,
+        tabId,
+        "devtools-builtin-1",
+      );
+      assertClean(
+        "builtin-first",
+        (await verifyDevtoolsHar(first.harText, expectBuiltin)).problems,
+      );
+      const second = await exportTabAndReadHar(
+        page,
+        workspace.downloads,
+        tabId,
+        "devtools-builtin-2",
+      );
+      assertClean(
+        "builtin-second",
+        (await verifyDevtoolsHar(second.harText, expectBuiltin)).problems,
+      );
+      const restored = await evalChromeAsync<{
+        readonly actionsEnabled: boolean | null;
+        readonly frameCount: number;
+      }>(
+        session,
+        `const [url] = arguments;
+         const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+         const browserWin = Services.wm.getMostRecentWindow("navigator:browser");
+         const targetTab = browserWin.gBrowser.tabs.find((t) =>
+           t.linkedBrowser?.currentURI?.spec?.startsWith(url)
+         );
+         const api = await gDevTools.getToolboxForTab(targetTab)?.getNetMonitorAPI();
+         const reqs = Array.from(api?.store?.getState()?.requests?.requests?.values?.() ?? []);
+         const stackReq = reqs.find((r) => typeof r.url === "string" && r.url.includes("stack=builtinm3"));
+         return {
+           actionsEnabled: api?.connector?.dataProvider?.actionsEnabled ?? null,
+           frameCount: stackReq?.stacktrace?.length ?? 0,
+         };`,
+        [`${server.origin}/page.html?n=2&big=0&stack=1&key=builtinm3`],
+      );
+      if (restored.actionsEnabled !== true || restored.frameCount < DEVTOOLS_STACK_FRAMES.length) {
+        throw new Error(
+          `One-Click HAR did not restore panel actions/frames after built-in failure: ${JSON.stringify(restored)}`,
+        );
+      }
+      await session.closeTab(tabHandle);
+    }
+
+    // 4c. Large panel (2,000 requests) exports under 30s with every body and stack intact
+    let export2kMs = 0;
+    {
+      server.takeRequests();
+      const { tabHandle, tabId } = await openToolboxAndWaitReady(
+        session,
+        page,
+        "/page.html?n=2000&big=0&stack=1&key=panel2k",
+        server.origin,
+        "netmonitor",
+      );
+      await evalChromeAsync<void>(
+        session,
+        `const [url] = arguments;
+         const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+         const browserWin = Services.wm.getMostRecentWindow("navigator:browser");
+         const targetTab = browserWin.gBrowser.tabs.find((t) =>
+           t.linkedBrowser?.currentURI?.spec?.startsWith(url)
+         );
+         const api = await gDevTools.getToolboxForTab(targetTab).getNetMonitorAPI();
+         for (let i = 0; i < 200; i += 1) {
+           const reqs = Array.from(api.store.getState().requests.requests.values());
+           if (reqs.some((r) => typeof r.url === "string" && r.url.includes("/s/1999") && r.totalTime !== undefined)) break;
+           await new Promise((r) => setTimeout(r, 100));
+         }`,
+        [`${server.origin}/page.html?n=2000&big=0&stack=1&key=panel2k`],
+      );
+      const taken = server.takeRequests();
+      const exported = await exportTabAndReadHar(
+        page,
+        workspace.downloads,
+        tabId,
+        "devtools-panel-2000",
+      );
+      export2kMs = exported.exportMs;
+      if (export2kMs >= 30_000) {
+        throw new Error(`2,000-request panel export took ${String(export2kMs)}ms (>= 30000ms)`);
+      }
+      const res = await verifyDevtoolsHar(exported.harText, {
+        server,
+        expectedLog: taken,
+        entries: taken.length,
+        key: "panel2k",
+        sources: { both: taken.length, recordingOnly: 0, devtoolsOnly: 0 },
+        stackUrlIncludes: "/text.txt?stack=panel2k",
+        expectedFrames: DEVTOOLS_STACK_FRAMES,
+        requireDevtoolsSources: true,
+        requireK6: false,
+      });
+      assertClean("panel-2000", res.problems);
+      await session.closeTab(tabHandle);
+    }
+
+    // 4d. Mid-download large body in non-private window: never zero-pads, completed bodies byte-exact
+    {
+      server.takeRequests();
+      const { tabHandle, tabId } = await openToolboxAndWaitReady(
+        session,
+        page,
+        "/page.html?n=8&big=0&slow=4000000&slowms=4000&key=midslow",
+        server.origin,
+        "netmonitor",
+      );
+      await server.waitForPath("/slow/4000000");
+      const taken = server.takeRequests();
+      const { harText } = await exportTabAndReadHar(
+        page,
+        workspace.downloads,
+        tabId,
+        "devtools-mid-slow",
+      );
+      await session.evaluate(tabHandle, "window.__slowPromise");
+      const res = await verifyDevtoolsHar(harText, {
+        server,
+        expectedLog: taken,
+        entries: taken.length,
+        key: "midslow",
+        allowMissingUrlIncludes: "/slow/",
+        allowMissingReasons: ["in-progress", "devtools-truncated"],
+        requireDevtoolsSources: true,
+        requireK6: false,
+      });
+      assertClean("mid-download-nonprivate", res.problems, harText);
+      await session.closeTab(tabHandle);
+    }
+
     // 5. data: image excluded from entries, counted in notNetwork["data:"], k6 converts cleanly
     {
       server.takeRequests();
@@ -652,7 +842,129 @@ const check: HarnessCheck = {
       throw new Error("Private stream 50MB big.bin entry missing or wrong size");
     }
 
-    // 7. Destroyed/discarded actors produce devtools-discarded stubs, not a 0-byte HAR
+    // 6c. Mid-download large body in private window: never zero-pads or marks present with bad SHA
+    server.takeRequests();
+    const privSlowRes = await evalChromeAsync<{ readonly tabId: number }>(
+      privSession,
+      `const [blankUrl, pageUrl] = arguments;
+       const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+       const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+       const { PrivateBrowsingUtils } = ChromeUtils.importESModule("resource://gre/modules/PrivateBrowsingUtils.sys.mjs");
+       Services.prefs.clearUserPref("devtools.netmonitor.bodyLimit");
+       const win = Array.from(Services.wm.getEnumerator("navigator:browser")).find((w) =>
+         PrivateBrowsingUtils.isWindowPrivate(w)
+       );
+       const tab = win.gBrowser.addTab(blankUrl, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
+       win.gBrowser.selectedTab = tab;
+       await new Promise((r) => win.setTimeout(r, 200));
+       await gDevTools.showToolboxForTab(tab, { toolId: "netmonitor" });
+       await gDevTools.getToolboxForTab(tab).getNetMonitorAPI();
+       win.gBrowser.fixupAndLoadURIString(pageUrl, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
+       for (let i = 0; i < 150; i += 1) {
+         const api = await gDevTools.getToolboxForTab(tab)?.getNetMonitorAPI();
+         const reqs = Array.from(api?.store?.getState()?.requests?.requests?.values?.() ?? []);
+         if (reqs.some((r) => typeof r.url === "string" && r.url.includes("/slow/4000000"))) break;
+         await new Promise((r) => win.setTimeout(r, 50));
+       }
+       return { tabId: ExtensionParent.apiManager.global.tabTracker.getId(tab) };`,
+      ["about:blank", `${server.origin}/page.html?n=4&big=0&slow=4000000&slowms=3000&key=privslow`],
+    );
+    await server.waitForPath("/slow/4000000");
+    const takenPrivSlow = server.takeRequests();
+    const { harText: privSlowHar } = await exportTabAndReadHar(
+      privPage,
+      workspace.downloads,
+      privSlowRes.tabId,
+      "devtools-priv-mid-slow",
+    );
+    assertClean(
+      "private-mid-download-slow",
+      (
+        await verifyDevtoolsHar(privSlowHar, {
+          server,
+          expectedLog: takenPrivSlow,
+          entries: takenPrivSlow.length,
+          key: "privslow",
+          sources: { both: 0, recordingOnly: 0, devtoolsOnly: takenPrivSlow.length },
+          allowMissingUrlIncludes: "/slow/",
+          allowMissingReasons: ["in-progress", "devtools-truncated"],
+          requireDevtoolsSources: true,
+          requireK6: false,
+        })
+      ).problems,
+      privSlowHar,
+    );
+
+    // 7. Real reload race at 0ms, 100ms, 400ms (row 2) plus dead-actor stubs
+    const raceSummary: string[] = [];
+    for (const delay of [0, 100, 400]) {
+      server.takeRequests();
+      const raceKey = `race${String(delay)}`;
+      const raceTab = await evalChromeAsync<{ readonly tabId: number }>(
+        privSession,
+        `const [blankUrl, pageUrl] = arguments;
+         const { gDevTools } = ChromeUtils.importESModule("resource://devtools/shared/loader/Loader.sys.mjs").require("resource://devtools/client/framework/devtools.js");
+         const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+         const { PrivateBrowsingUtils } = ChromeUtils.importESModule("resource://gre/modules/PrivateBrowsingUtils.sys.mjs");
+         const win = Array.from(Services.wm.getEnumerator("navigator:browser")).find((w) =>
+           PrivateBrowsingUtils.isWindowPrivate(w)
+         );
+         const tab = win.gBrowser.addTab(blankUrl, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
+         win.gBrowser.selectedTab = tab;
+         await new Promise((r) => win.setTimeout(r, 200));
+         await gDevTools.showToolboxForTab(tab, { toolId: "netmonitor" });
+         const api = await gDevTools.getToolboxForTab(tab).getNetMonitorAPI();
+         win.gBrowser.fixupAndLoadURIString(pageUrl, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
+         for (let i = 0; i < 200; i += 1) {
+           const reqs = Array.from(api.store.getState().requests.requests.values());
+           if (reqs.some((r) => typeof r.url === "string" && r.url.includes("/s/299") && r.totalTime !== undefined)) break;
+           await new Promise((r) => win.setTimeout(r, 100));
+         }
+         await new Promise((r) => win.setTimeout(r, 300));
+         return { tabId: ExtensionParent.apiManager.global.tabTracker.getId(tab) };`,
+        ["about:blank", `${server.origin}/page.html?n=300&big=0&key=${raceKey}`],
+      );
+      const takenRace = server.takeRequests();
+      const fileName = `devtools-race-${String(delay)}ms`;
+      const job = await startExport(privPage, {
+        selection: {
+          scope: "tab",
+          tabId: raceTab.tabId,
+          range: { kind: "since-tab-opened" },
+          include: "all",
+        },
+        bodies: "include",
+        redaction: "standard",
+        packaging: "har",
+        fileName,
+      });
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      await evalChromeAsync<void>(
+        privSession,
+        `const [tabId] = arguments;
+         const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+         const targetTab = ExtensionParent.apiManager.global.tabTracker.getTab(tabId);
+         if (!targetTab) throw new Error("race tab missing");
+         targetTab.linkedBrowser.reload();`,
+        [raceTab.tabId],
+      );
+      const doneRace = await waitForJob(privPage, job.id, ended);
+      if (doneRace.state.kind !== "done") {
+        throw new Error(`Race export ${String(delay)}ms failed: ${JSON.stringify(doneRace.state)}`);
+      }
+      const raceHar = readDownloadedHar(workspace.downloads, fileName);
+      const raceRes = await verifyDevtoolsHar(raceHar, {
+        entriesMin: takenRace.length,
+        key: raceKey,
+        stubs: { minCount: 1 },
+        requireDevtoolsSources: true,
+        requireK6: false,
+      });
+      assertClean(`reload-race-${String(delay)}ms`, raceRes.problems, raceHar);
+      raceSummary.push(`${String(delay)}ms=${String(raceRes.entries)}/${String(takenRace.length)}`);
+    }
+
+    // 7b. Destroyed/discarded actors produce devtools-discarded stubs, not a 0-byte HAR
     server.takeRequests();
     const deadActorRes = await evalChromeAsync<{
       readonly tabId: number;
@@ -722,8 +1034,7 @@ const check: HarnessCheck = {
       name: this.name,
       ok: true,
       durationMs: Date.now() - startedAt,
-      detail:
-        "Passed sorted-by-size, inspector priming, 50MB recording fill, private DevTools-only + LongStringActor slice streaming, dead-actor stubs, 2x stack frames, data: counting, and all planted failures.",
+      detail: `Passed sorted-by-size, inspector priming, 50MB recording fill, M3 built-in recovery, 2k panel in ${String(export2kMs)}ms, mid-download slow body (normal+private), reload race (${raceSummary.join(", ")}), private DevTools-only + slicing, dead-actor stubs, 2x stack frames, and data: counting.`,
     };
   },
 };
