@@ -27,3 +27,9 @@ export function localMinute(ms: number): string {
   const two = (v: number) => String(v).padStart(2, "0");
   return `${String(d.getFullYear())}-${two(d.getMonth() + 1)}-${two(d.getDate())}T${two(d.getHours())}:${two(d.getMinutes())}`;
 }
+
+const MIB = 1_048_576;
+
+/** A storage limit, counted in 1024s as limits are set: whole GB, else MB. */
+export const limitLabel = (n: number): string =>
+  n % (1024 * MIB) === 0 ? `${String(n / (1024 * MIB))} GB` : `${String(Math.round(n / MIB))} MB`;

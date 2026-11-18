@@ -48,6 +48,11 @@ const PATHS = {
   ],
   refresh: ["M20 12a8 8 0 1 1-2.5-5.8", "M20 4v5h-5"],
   plug: ["M9 3v5", "M15 3v5", "M6 8h12v3a6 6 0 0 1-12 0z", "M12 17v4"],
+  history: ["M3 12a9 9 0 1 0 3-6.7", "M3 4v5h5", "M12 7v5l3 2"],
+  x: ["M6 6l12 12", "M18 6L6 18"],
+  plus: ["M12 5v14", "M5 12h14"],
+  trash: ["M4 7h16", "M9 7V4h6v3", "M6 7l1 13h10l1-13"],
+  play: ["M8 5v14l11-7z"],
 } as const;
 
 export type IconName = keyof typeof PATHS;

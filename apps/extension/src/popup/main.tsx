@@ -1,15 +1,17 @@
 import { useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
-import { activeTab, oneClickHar, openSettings } from "../client.ts";
+import { activeTab, oneClickHar, openHistory, openSettings } from "../client.ts";
 import { Popup } from "./Popup.tsx";
 import { createPopupStore } from "./store.ts";
 import "../styles.css";
+import "../ui/controls.css";
 import "./popup.css";
 
 const store = createPopupStore({
   api: oneClickHar(),
   tab: activeTab,
   settings: openSettings,
+  history: openHistory,
   pollMs: 250,
 });
 

@@ -98,6 +98,7 @@ export const COPY = {
   secretsKept: "The file may contain login tokens. Do not share it.",
   custom: "Choose range, scope and file name",
   settings: "Open settings",
+  history: "Open history",
   back: "Back",
   noTabTitle: "This tab has no page yet",
   noTabText: "Open a page in this tab to export it. The export of everything recorded still works.",
@@ -177,6 +178,8 @@ export const RANGE_COPY: { readonly [R in RangeId]: string } = {
 
 export const SETTINGS_LINKS: { readonly [S in SettingsSection]: string } = {
   storage: "Change storage settings",
+  "export-holding": "What to do while an export finishes",
+  "unreadable-files": "What to do about skipped files",
   media: "Change audio and video setting",
   secrets: "Change how secrets are stored",
   folder: "Change export folder",
@@ -212,11 +215,11 @@ export const PROBLEM_COPY: {
   },
   "over-cap-while-exporting": {
     text: "The recording is temporarily over its size limit while an export is finishing.",
-    settings: "storage",
+    settings: "export-holding",
   },
   "archive-entries-unreadable": {
     text: "Some files in the recording could not be read on startup, so they were skipped.",
-    settings: "storage",
+    settings: "unreadable-files",
   },
 };
 

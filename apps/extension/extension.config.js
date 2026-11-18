@@ -5,7 +5,7 @@ const geckoBinary = process.env.GECKO_BINARY;
 
 export default {
   // scripts/ holds this repo's tooling. By default extension.js bundles any script in it that imports no Node builtin.
-  folders: { scripts: false },
+  folders: { scripts: false, pages: "src/pages" },
   browser: {
     zen: {
       ...(geckoBinary !== undefined && geckoBinary.length > 0 ? { geckoBinary } : {}),
