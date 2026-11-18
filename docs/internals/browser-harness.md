@@ -38,6 +38,16 @@ By default (`suppressCoreDumps` enabled), Linux launches wrap the browser with `
 
 Before each launch, `reapOrphanedLaunches` scans a `0700` per-user lease directory (`one-click-har-leases-<uid>`) of `0600` version-2 leases recording PID, process start time (Linux `/proc/<pid>/stat` field 22), and exact profile path. A lease only authorizes a stop when its harness is gone and its browser still has the recorded start time and profile path; otherwise the stale lease and profile are cleared without a signal. A failed reap keeps the lease, records `reapFailures` and `lastReapFailure`, and retries on the next launch, so a transient failure never leaks a browser for good. Any profile inside a live Zen, Firefox, LibreWolf, Floorp, or Waterfox profile root is refused before creation.
 
+## Driving the real popup
+
+`checks/popup-states.ts` opens the toolbar popup itself, not the popup page in a tab, because the popup reads the window's active tab when it loads. Each of these was observed in headless Zen 1.24.2b:
+
+- `browserActionFor(extension).openPopup(window)` from chrome opens it, but only for the focused window, and only once the button has a node there; a new private window needs `CustomizableUI.addWidgetToArea` first.
+- Every Marionette content call re-selects the tab it runs in, some time after the call returns. The open script therefore waits until the popup has drawn before it returns, or the popup reads the helper page's tab.
+- The popup's DOM is reached from a page of the add-on with `browser.extension.getViews({ type: "popup" })`. That lists only views whose principal the caller's subsumes, so a private popup needs a page of the add-on in the private window.
+- A chrome screenshot of the window does not include the popup panel; `drawSnapshot` on the popup's `<browser>` does.
+- Zen draws a private window and its popups dark whatever `ui.systemUsesDarkTheme` and `browser.theme.dark-private-windows` say, so the private state has a dark screenshot only.
+
 ## Tests that can send a signal
 
 `scripts/signal-reach.ts` parses the repository and follows static imports from every function to `process.kill`, a `.kill()` call, or a spawned kill command; a dynamic import it cannot follow counts as reaching any module of its own package. `pnpm run check` fails, printing the path, when a test outside a `*.namespace.test.ts` file can reach one, or when a namespaced file does not call `requireIsolatedPidNamespace()` first.

@@ -255,7 +255,7 @@ describe("check discovery", () => {
           navigateTab: async () => undefined,
           reloadTab: async () => undefined,
           evaluate: async (_ctx: string, expr: string) => {
-            if (expr.includes("querySelector")) return "zen\nNot opened since the browser started";
+            if (expr.includes("querySelector")) return "empty-tab";
             if (expr.includes("browser.tabs.query")) {
               if (mode === "bad-restart-toolbox") {
                 return JSON.stringify({
