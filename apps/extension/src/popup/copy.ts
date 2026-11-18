@@ -210,6 +210,14 @@ export const PROBLEM_COPY: {
     text: "Some requests were not recorded because too many ran at once.",
     settings: null,
   },
+  "over-cap-while-exporting": {
+    text: "The recording is temporarily over its size limit while an export is finishing.",
+    settings: "storage",
+  },
+  "archive-entries-unreadable": {
+    text: "Some files in the recording could not be read on startup, so they were skipped.",
+    settings: "storage",
+  },
 };
 
 export const WRITE_FAILURE_COPY: {

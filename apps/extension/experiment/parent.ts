@@ -2,17 +2,18 @@
 // the manifest's experiment entry lists "events": ["startup"], so onStartup starts the recorder before any page
 // loads (row L1), and no API function starts or stops it.
 
+import { pageSites } from "@one-click-har/recording/activity";
 import {
-  applyActivity,
-  emptyActivity,
-  type ActivityIndex,
-} from "@one-click-har/recording/activity";
-import { parseSite, runIdAt, type EpochMs, type RunId } from "@one-click-har/recording/ids";
+  parseSite,
+  runIdAt,
+  toMinute,
+  type EpochMs,
+  type RunId,
+} from "@one-click-har/recording/ids";
 import { guardFolder, LAYOUT } from "@one-click-har/recording/layout";
 import type { ReconcileStep } from "@one-click-har/recording/reconcile";
 import { compileRoutes } from "@one-click-har/recording/routes";
 import type { StoredSettings } from "@one-click-har/recording/settings";
-import { loadActivity } from "./archive-source.ts";
 import { FILE_WORKER, namespace } from "./contract.ts";
 import { primeToolboxes, toolboxOf } from "./devtools.ts";
 import { unfinishedExports } from "./export-file.ts";
@@ -21,6 +22,7 @@ import {
   forbiddenRoots,
   loadSettings,
   openArchive,
+  openPersistedLedger,
   platform,
   type Archive,
   type RootProblem,
@@ -48,7 +50,6 @@ interface Running {
   readonly timers: Timers;
   readonly settingsRejected: boolean;
   readonly recovery: Promise<readonly ReconcileStep[]>;
-  readonly activity: ActivityIndex;
 }
 
 type Lifecycle =
@@ -72,8 +73,12 @@ function start(): Lifecycle {
   if (!opened.ok) return { kind: "unavailable", problem: opened.problem };
   const { archive } = opened;
   const { settings, rejected } = loadSettings(archive.root);
+  const harness = Services.prefs.getBoolPref(HARNESS_PREF, false);
+  const persistedUsage = openPersistedLedger(archive.root, archive.modes, run);
+  const scanDelayMs = harness
+    ? Math.max(0, Services.prefs.getIntPref("extensions.oneClickHar.harnessScanDelayMs", 0))
+    : 0;
   const timers = new Timers();
-  const activity = emptyActivity(run);
   let recorder: Recorder | null = null;
   const store = openStore({
     run,
@@ -82,11 +87,9 @@ function start(): Lifecycle {
     settings,
     timers,
     onSettings: (next) => recorder?.setRoutes(compile(next, archive)),
-    onLines: (segment, exchanges) => {
-      for (const exchange of exchanges)
-        applyActivity(activity, { kind: "settled", segment, exchange });
-    },
-    onForgotten: (site) => applyActivity(activity, { kind: "site-forgotten", site }),
+    persistedUsage,
+    ...(scanDelayMs > 0 ? { scanDelayMs } : {}),
+    countWork: harness,
   });
   recorder = startRecorder({
     run,
@@ -96,20 +99,24 @@ function start(): Lifecycle {
     modes: archive.modes,
     timers,
   });
+  store.beginStartup();
   let steps: readonly ReconcileStep[] = [];
   const journal = PathUtils.join(archive.root, LAYOUT.exportsJournal);
   const recovery = store
     .enqueue(async () => {
-      const started = await IOUtils.readUTF8(journal).catch(() => "");
-      steps = await recover(
-        archive.root,
-        archive.modes,
-        run,
-        settings.user.excludedSites,
-        unfinishedExports(started),
-      );
-      await IOUtils.remove(journal, { ignoreAbsent: true });
-      await loadActivity(archive.root, activity);
+      try {
+        const started = await IOUtils.readUTF8(journal).catch(() => "");
+        steps = await recover(
+          archive.root,
+          archive.modes,
+          run,
+          settings.user.excludedSites,
+          unfinishedExports(started),
+        );
+        await IOUtils.remove(journal, { ignoreAbsent: true });
+      } finally {
+        await store.initRetention();
+      }
     })
     .then(() => steps);
   return {
@@ -121,7 +128,6 @@ function start(): Lifecycle {
     timers,
     settingsRejected: rejected,
     recovery,
-    activity,
   };
 }
 
@@ -141,8 +147,19 @@ function blockShutdown(closing: Promise<void>): void {
 }
 
 type HarnessRequest =
-  | { readonly kind: "flush" | "seal" | "recovery" | "status" }
+  | {
+      readonly kind:
+        | "flush"
+        | "seal"
+        | "recovery"
+        | "status"
+        | "retain"
+        | "reset-work"
+        | "pin-oldest-pack"
+        | "sites";
+    }
   | { readonly kind: "exclude"; readonly site: string }
+  | { readonly kind: "unpin"; readonly pinId: string }
   | { readonly kind: "arm" | "reached"; readonly point: string }
   | { readonly kind: "guard"; readonly path: string }
   | { readonly kind: "export-audit" | "export-route"; readonly id: string }
@@ -180,9 +197,29 @@ async function answerHarness(
         run: state.run,
         root: state.archive.root,
         keyCreated: state.archive.keyCreated,
+        ready: state.store.isReady(),
+        unreadableEntries: state.store.unreadableEntries(),
         problems: state.store.problems(),
+        usage: state.store.usage(),
+        overCapWhileExporting: state.store.overCapWhileExporting(),
+        work: state.store.workMetrics(),
+        startupGate: state.store.startupGateMetrics(),
         ...state.recorder.counts(),
       };
+    case "retain":
+      return state.store.retain();
+    case "reset-work":
+      state.store.resetWorkMetrics();
+      state.recorder.resetGuardCounts();
+      return { ok: true };
+    case "pin-oldest-pack":
+      return state.store.pinOldestPack();
+    case "unpin":
+      return state.store.unpin(request.pinId);
+    case "sites":
+      return pageSites(state.store.activity(), null, 500, toMinute(Date.now() as EpochMs)).rows.map(
+        (row) => row.site,
+      );
     case "exclude": {
       const site = parseSite(request.site);
       if (site === null) throw new Error(`not a site: ${request.site}`);
@@ -218,7 +255,7 @@ async function answerHarness(
     }
     case "export-pause": {
       const point = request.point;
-      if (point !== "before-link" && point !== "after-link")
+      if (point !== "before-bodies" && point !== "before-link" && point !== "after-link")
         throw new Error(`not an export pause: ${point}`);
       return host.pauses[request.action](point) ?? null;
     }
@@ -233,13 +270,15 @@ const recordingReads = (state: Lifecycle): RecordingReads | null =>
         run: state.run,
         root: state.archive.root,
         modes: state.archive.modes,
-        activity: state.activity,
+        activity: state.store.activity(),
         settings: state.store.settings,
         settle: async () => {
           // A file body's line joins a batch only after its rename, which runs on the chain; the second flush writes it.
           await state.store.flush();
           await state.store.flush();
         },
+        enqueue: state.store.enqueue,
+        pin: state.store.pin,
         live: () => state.recorder.snapshot(),
         recovered: state.recovery,
       };
@@ -351,8 +390,10 @@ class OneClickHarParent extends ExtensionAPI {
       archive: null,
       strictOriginPolicy,
       settingsRejected: state.settingsRejected,
-      writeFailures: state.store.problems().length,
+      writeFailures: state.store.problems().filter((p) => p.kind === "write-failed").length,
+      unreadableEntries: state.store.unreadableEntries(),
       liveOverflow: state.recorder.counts().overflow,
+      overCapWhileExporting: state.store.overCapWhileExporting(),
     };
   }
 

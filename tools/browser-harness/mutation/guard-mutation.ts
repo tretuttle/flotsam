@@ -11,6 +11,7 @@ import {
   requireIsolatedPidNamespace,
   spawnIsolated,
 } from "../src/namespace-isolation.ts";
+import { removeOwnedTempTree } from "../src/temp-tree.ts";
 import { applyMutant, generateMutants, type Mutant, type Scope } from "./operators.ts";
 
 // Mutation testing for the guard: every mutant of the signal decisions, the performer and the
@@ -379,7 +380,7 @@ async function main(): Promise<number> {
     }
     return unlisted.length + listedButKilled.length + stale.length + broken.length === 0 ? 0 : 1;
   } finally {
-    await NodeFSP.rm(root, { recursive: true, force: true });
+    await removeOwnedTempTree(root, NodeOS.tmpdir());
   }
 }
 

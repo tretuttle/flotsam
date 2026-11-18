@@ -105,6 +105,7 @@ const BODY_MISSING_TO_REASON: Readonly<Record<string, HarMissingBodyReason>> = {
   "not-recorded": "unavailable",
   "omitted-by-choice": "not-included",
   "source-error": "unavailable",
+  "scan-timeout": "unavailable",
   "upload-too-large": "size-limit",
   "upload-not-rewindable": "unavailable",
   "upload-never-stored": "not-included",

@@ -64,7 +64,7 @@ const SKETCH_MUTATIONS: readonly SourceMutation[] = [
   },
   {
     id: "keeps-tmp-files",
-    from: 'if (e.name.kind === "tmp" && isOld(snapshot, e.name.of === "settings" ? null : e.name.run))',
+    from: 'if (e.name.kind === "tmp" && isOld(snapshot, e.name.of === "summary" ? e.name.run : null))',
     to: "if (false)",
   },
   {

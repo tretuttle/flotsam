@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { readHostProcessTable, readProcessIdentity } from "./process-table.ts";
 import type { ProcessTable } from "./signal-policy.ts";
+import { removeOwnedTempTree } from "./temp-tree.ts";
 
 // Real-signal suites live in `*.namespace.test.ts` files. The root Vite config runs them only when
 // this variable is set, and each of those files proves its isolation before defining a test.
@@ -188,7 +189,14 @@ export function spawnIsolated(
 export async function runNamespacedSuites(
   packageDir: string,
   unavailable: string | null = namespaceUnavailableReason(),
+  isolation: IsolationVerdict = currentIsolation(),
 ): Promise<NamespaceRun> {
+  if (isolation.isolated) {
+    return {
+      outcome: "failed",
+      detail: "refusing to start a nested namespaced run inside an isolated PID namespace",
+    };
+  }
   if (unavailable !== null) return { outcome: "unavailable", reason: unavailable };
   const repoRoot = findRepoRoot(packageDir);
   const tmpdir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "och-ns-tmp-"));
@@ -200,7 +208,7 @@ export async function runNamespacedSuites(
     const result = await collectOutput(child);
     return namespacedOutcome(result.code, result.output);
   } finally {
-    await NodeFSP.rm(tmpdir, { recursive: true, force: true });
+    await removeOwnedTempTree(tmpdir);
   }
 }
 

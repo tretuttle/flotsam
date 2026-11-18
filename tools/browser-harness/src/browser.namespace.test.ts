@@ -5,7 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { launchBrowser, resolveBrowserSpawnCommand } from "./browser.ts";
-import { requireIsolatedPidNamespace } from "./namespace-isolation.ts";
+import { requireIsolatedPidNamespace, runNamespacedSuites } from "./namespace-isolation.ts";
 import { leaseDirectory } from "./orphan-lease.ts";
 import { hostProcessIo, spawnOwned, stopOwnedTree, type OwnedChild } from "./owned-process.ts";
 import { readHostProcessTable, readProcessIdentity } from "./process-table.ts";
@@ -383,7 +383,7 @@ exec '${process.execPath}' -e 'setInterval(() => {}, 1000)' -profile "$2"
     void spawnedPid;
   });
 
-  it("wraps Linux launches with prlimit --core=1:1 -- by default, suppresses coredumpctl on abort, and honors suppressCoreDumps: false", async () => {
+  it("wraps Linux launches with prlimit --core=1:1 -- by default, verifies limits without aborting, and honors suppressCoreDumps: false", async () => {
     const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "one-click-har-core-"));
     directories.push(scratch);
     const fakeBinDir = NodePath.join(scratch, "bin");
@@ -432,36 +432,69 @@ exec '${process.execPath}' -e 'setInterval(() => {}, 1000)' -profile "$2"
     ).toEqual({ command: "C:\\zen\\zen.exe", args: ["-headless"] });
 
     if (process.platform === "linux") {
-      const pidFile = NodePath.join(scratch, "abort-pid");
-      const abortBin = NodePath.join(scratch, "abort-browser");
-      const abortScript = NodePath.join(scratch, "abort-browser.mjs");
+      // Prove prlimit --core=1:1 without calling SIGABRT/process.abort(), which emits kernel aborting-core logs.
+      const ownSpawn = resolveBrowserSpawnCommand(
+        process.execPath,
+        [
+          "-e",
+          'const fs=require("node:fs");console.log(fs.readFileSync("/proc/self/limits","utf8").split("\\n").find((l)=>/core file/i.test(l))??"");setInterval(()=>{},1000);',
+        ],
+        { platform: "linux" },
+      );
+      const child = spawnOwned(ownSpawn.command, ownSpawn.args, {
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+      try {
+        const firstLine = await new Promise<string>((resolve, reject) => {
+          let out = "";
+          child.child.stdout?.on("data", (chunk: Buffer) => {
+            out += chunk.toString("utf8");
+            const nl = out.indexOf("\n");
+            if (nl !== -1) resolve(out.slice(0, nl).trim());
+          });
+          child.child.once("close", (code) => reject(new Error(`child exited ${String(code)}`)));
+        });
+        expect(firstLine).toMatch(/Max core file size\s+1\s+1\s+bytes/);
+        const livePrlimit = NodeChildProcess.execFileSync(
+          "prlimit",
+          ["--pid", String(child.pid), "--core"],
+          { encoding: "utf8" },
+        );
+        expect(livePrlimit).toMatch(/\b1\s+1\b/);
+      } finally {
+        await stopOwnedTree(hostProcessIo(), child.ownership);
+      }
+
+      const pidFile = NodePath.join(scratch, "killed-pid");
+      const signalBin = NodePath.join(scratch, "signal-browser");
+      const signalScript = NodePath.join(scratch, "signal-browser.mjs");
       await NodeFSP.writeFile(
-        abortScript,
+        signalScript,
         `import * as fs from "node:fs";
 const limit = fs.readFileSync("/proc/self/limits", "utf8").split("\\n").find((l) => /core file/i.test(l)) ?? "";
 fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
 console.error("LIMIT:" + limit);
-process.abort();
+process.kill(process.pid, "SIGKILL");
 `,
         "utf8",
       );
       await NodeFSP.writeFile(
-        abortBin,
-        `#!/bin/sh\nexec '${process.execPath}' '${abortScript}' "$@"\n`,
+        signalBin,
+        `#!/bin/sh\nexec '${process.execPath}' '${signalScript}' "$@"\n`,
         { mode: 0o755 },
       );
       const beforeEpochSec = Math.floor(Date.now() / 1000) - 1;
       await expect(
         launchBrowser({
-          binaryPath: abortBin,
+          binaryPath: signalBin,
           extensionPath: null,
           display: "headless",
           protocol: "marionette",
           signal: new AbortController().signal,
         }),
-      ).rejects.toThrow(/SIGABRT[\s\S]*LIMIT:Max core file size\s+1\s+1\s+bytes/);
-      const abortedPid = Number(await NodeFSP.readFile(pidFile, "utf8"));
-      expect(Number.isInteger(abortedPid) && abortedPid > 0).toBe(true);
+      ).rejects.toThrow(/SIGKILL[\s\S]*LIMIT:Max core file size\s+1\s+1\s+bytes/);
+      const killedPid = Number(await NodeFSP.readFile(pidFile, "utf8"));
+      expect(Number.isInteger(killedPid) && killedPid > 0).toBe(true);
 
       const coredumpCheck = NodeChildProcess.spawnSync(
         "coredumpctl",
@@ -470,7 +503,7 @@ process.abort();
       );
       if (coredumpCheck.error === undefined && coredumpCheck.status === 0) {
         const entries = JSON.parse(coredumpCheck.stdout) as readonly { readonly pid?: number }[];
-        expect(entries.some((entry) => entry.pid === abortedPid)).toBe(false);
+        expect(entries.some((entry) => entry.pid === killedPid)).toBe(false);
       }
     }
 
@@ -505,6 +538,21 @@ process.abort();
     if (process.platform === "linux") {
       expect(calls).toHaveLength(1);
       expect(calls[0]).toContain(`--core=1:1 -- ${probeBin}`);
+    }
+  });
+
+  it("refuses nested runNamespacedSuites inside an active isolated namespace even if the run env var is cleared", async () => {
+    const prev = process.env.ONE_CLICK_HAR_NAMESPACE_RUN;
+    try {
+      delete process.env.ONE_CLICK_HAR_NAMESPACE_RUN;
+      const run = await runNamespacedSuites(NodePath.resolve(import.meta.dirname, ".."), null);
+      expect(run).toEqual({
+        outcome: "failed",
+        detail: "refusing to start a nested namespaced run inside an isolated PID namespace",
+      });
+    } finally {
+      if (prev === undefined) delete process.env.ONE_CLICK_HAR_NAMESPACE_RUN;
+      else process.env.ONE_CLICK_HAR_NAMESPACE_RUN = prev;
     }
   });
 });

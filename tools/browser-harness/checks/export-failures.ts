@@ -8,6 +8,7 @@ import {
   readExtensionId,
   readExtensionPopupPath,
   waitForActiveExtensionUrl,
+  type BrowserSession,
 } from "../src/browser.ts";
 import {
   type FileRead,
@@ -48,6 +49,8 @@ type During = Place & {
   readonly part: string;
   readonly name: string;
   readonly pid: number;
+  readonly session: BrowserSession;
+  readonly serverOrigin: string;
   readonly maskProcFd: () => void;
   readonly fill: (folder: string, bytes: number) => void;
 };
@@ -57,6 +60,8 @@ type Row = {
   readonly fileName: string;
   /** The folder settings.json names, made in the state this cause needs. */
   readonly folder: (base: string, profile: string) => string;
+  /** Optional lower body cap in bytes to test retention eviction concurrently with an export. */
+  readonly retentionCapBytes?: number;
   /** The page whose tab is exported; the fixtures page by default. */
   readonly page?: string;
   /** A tmpfs mounted inside the browser's mount namespace, over the folder or one above it. */
@@ -79,7 +84,7 @@ type Row = {
   /** Named parts: the export's rename of its part, held by hold-part-call.c (armed before the export starts). */
   readonly hold?: Hold;
   /** An unnamed file: the export held at a pause through the harness topic (armed before the export starts). */
-  readonly pause?: Hold & { readonly at: "before-link" | "after-link" };
+  readonly pause?: Hold & { readonly at: "before-bodies" | "before-link" | "after-link" };
   /** The export names a `.har.part` and renames it, as where no folder can be held (the harness-only pref). */
   readonly named?: true;
   readonly expect: (fileName: string) => RowOutcome;
@@ -87,7 +92,9 @@ type Row = {
 
 type Hold = {
   /** Changes the files while the call is held, and returns whether the change is in place, checked before the release. */
-  readonly act: (at: During) => () => boolean;
+  readonly act?: (at: During) => () => boolean;
+  /** Async action while paused (e.g., recording extra traffic and invoking retention): returns any problems found. */
+  readonly actAsync?: (at: During) => Promise<readonly string[]>;
   /** Cancel while the call is held, and let it go once the export has ended. */
   readonly cancel?: true;
   /** Let the call go only once the export has ended. */
@@ -814,6 +821,49 @@ const UNNAMED_ROWS: readonly Row[] = [
     fault: { op: "create", errno: "EOPNOTSUPP" },
     expect: doneNamed("unnamed-refused"),
   },
+  {
+    cause: "retention eviction during a long export leaves pinned packs byte-exact",
+    fileName: "retention-evict",
+    retentionCapBytes: 200 * MIB,
+    folder: (b) => dir(`${b}/retention-evict`),
+    pause: {
+      at: "before-bodies",
+      actAsync: async ({ session, serverOrigin }) => {
+        const port = new URL(serverOrigin).port;
+        const otherTab = await session.openTab(`http://localhost:${port}/retention/page`);
+        await session.evaluate(
+          otherTab,
+          `Promise.all([
+            ...[0, 1, 2].map((i) =>
+              fetch("/fixtures/binary?evict=" + i).then((r) => r.arrayBuffer()),
+            ),
+            ...[0, 1].map((i) =>
+              fetch("/retention/blob?bytes=2000000&tag=evict-" + i).then((r) => r.arrayBuffer()),
+            ),
+          ]).then(() => "done")`,
+        );
+        await callHook(session, { kind: "flush" });
+        const steps = (await callHook(session, { kind: "retain" })) as {
+          readonly kind: string;
+        }[];
+        const problems: string[] = [];
+        if (!steps.some((s) => s.kind === "blocked-by-pin")) {
+          problems.push(`retention did not hit pinned export packs: ${JSON.stringify(steps)}`);
+        }
+        const status = (await callHook(session, { kind: "status" })) as {
+          readonly overCapWhileExporting?: boolean;
+        };
+        if (status.overCapWhileExporting !== true) {
+          problems.push(
+            `expected overCapWhileExporting=true while pinned export held archive over cap, got ${JSON.stringify(status.overCapWhileExporting)}`,
+          );
+        }
+        return problems;
+      },
+      withinMs: 60_000,
+    },
+    expect: doneAs(""),
+  },
   ...(["EXDEV", "EMLINK", "EPERM"] as const).map((errno): Row => ({
     cause: `the link refused with ${errno} (simulated): the whole file is copied to a named part`,
     fileName: `link-${errno.toLowerCase()}`,
@@ -1123,8 +1173,15 @@ async function runRow(
   const base = NodePath.dirname(workspace.downloads);
   const profile = workspace.profileDir;
   const folder = row.folder(base, profile);
+  const seededUser =
+    row.retentionCapBytes === undefined
+      ? DEFAULT_USER_SETTINGS
+      : {
+          ...DEFAULT_USER_SETTINGS,
+          retention: { ...DEFAULT_USER_SETTINGS.retention, maxBodyBytes: row.retentionCapBytes },
+        };
   workspace.seed(NodeCrypto.randomBytes(16).toString("hex"), {
-    user: DEFAULT_USER_SETTINGS,
+    user: seededUser,
     exportFolder: { kind: "chosen", path: folder, label: "Export" },
   });
   const binary = NodePath.join(base, "browser-in-namespace.sh");
@@ -1207,6 +1264,8 @@ async function runRow(
       part: `${name}.part`,
       name,
       pid: session.browserPid,
+      session,
+      serverOrigin: server.origin,
       maskProcFd: () => {
         helper();
         masked = true;
@@ -1216,6 +1275,7 @@ async function runRow(
         if (free > bytes) throw new Error(`${filled} still has ${String(free)} bytes free`);
       },
     };
+    if (row.retentionCapBytes !== undefined) await callHook(session, { kind: "seal" });
     row.atStart?.(at);
     let route: unknown = null;
     let source: RowObservation["source"] = null;
@@ -1252,6 +1312,24 @@ async function runRow(
       // A held row's export that never ended is judged as it is, so the next rows still run.
       if (state === undefined || ended({ state } as Parameters<typeof ended>[0]))
         state = (await waitForJob(page, job.id, ended)).state;
+      if (row.retentionCapBytes !== undefined) {
+        await callHook(session, { kind: "flush" });
+        await callHook(session, { kind: "retain" });
+        const after = (await callHook(session, { kind: "status" })) as {
+          readonly usage: { readonly bodyBytes: number };
+          readonly overCapWhileExporting?: boolean;
+        };
+        if (after.usage.bodyBytes > row.retentionCapBytes) {
+          holdProblems.push(
+            `after unpin, bodyBytes ${String(after.usage.bodyBytes)} > cap ${String(row.retentionCapBytes)}`,
+          );
+        }
+        if (after.overCapWhileExporting !== false) {
+          holdProblems.push(
+            `after unpin, overCapWhileExporting=${String(after.overCapWhileExporting)}`,
+          );
+        }
+      }
       unmask();
       journal = await journalSettled(NodePath.join(workspace.root(), "exports.jsonl"));
       route = await callHook(session, { kind: "export-route", id: job.id });
@@ -1374,7 +1452,7 @@ async function holdAndAct(
       state: undefined,
     };
   }
-  const inPlace = hold.act(at);
+  const inPlace = hold.act?.(at) ?? (() => true);
   const observeBy = Date.now() + 10_000;
   while (!inPlace() && Date.now() < observeBy) await sleep(20);
   const problems = inPlace() ? [] : ["the row's change was not in place before the release"];
@@ -1427,10 +1505,14 @@ async function pauseAndAct(
   }
   // What a copy to a named part must equal, read before the row acts and before the link can name the file.
   const source = pause.at === "before-link" ? unnamedFile(at.pid) : null;
-  const inPlace = pause.act(at);
-  const observeBy = Date.now() + 10_000;
-  while (!inPlace() && Date.now() < observeBy) await sleep(20);
-  const problems = inPlace() ? [] : ["the row's change was not in place before the release"];
+  const problems: string[] = [];
+  if (pause.act !== undefined) {
+    const inPlace = pause.act(at);
+    const observeBy = Date.now() + 10_000;
+    while (!inPlace() && Date.now() < observeBy) await sleep(20);
+    if (!inPlace()) problems.push("the row's change was not in place before the release");
+  }
+  if (pause.actAsync !== undefined) problems.push(...(await pause.actAsync(at)));
   if (pause.at === "before-link" && source === null)
     problems.push("the unnamed file could not be read while the link waited");
   acted();

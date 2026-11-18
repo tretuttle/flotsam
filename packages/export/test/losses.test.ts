@@ -70,6 +70,12 @@ function casesFor(place: BodyPlace): Case[] {
     },
     {
       place,
+      name: "stored scan-timeout prefix",
+      field: { kind: "bytes", data: BODY, check: "scan-timeout" },
+      expected: { kind: "cut-short", reason: "scan-timeout", bytes: BODY },
+    },
+    {
+      place,
       name: "first candidate fails, the next opens",
       field: [
         { kind: "open-fails", reason: "removed-by-retention" },

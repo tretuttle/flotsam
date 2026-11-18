@@ -113,6 +113,8 @@ interface HttpChannel {
   getRequestVersion(major: { value?: number }, minor: { value?: number }): void;
   getResponseVersion(major: { value?: number }, minor: { value?: number }): void;
   setNewListener(listener: StreamListener): StreamListener;
+  suspend(): void;
+  resume(): void;
   QueryInterface(iface: XpcomInterface): HttpChannel;
 }
 
@@ -120,9 +122,10 @@ interface RequestObserver {
   onStartRequest(request: unknown): void;
   onStopRequest(request: unknown, status: number): void;
 }
-/** Opaque: a listener is only handed back to the tee. */
 interface StreamListener {
-  readonly __streamListener: true;
+  onStartRequest(request: unknown): void;
+  onDataAvailable(request: unknown, stream: InputStream, offset: number, count: number): void;
+  onStopRequest(request: unknown, status: number): void;
 }
 
 interface InputStream {
@@ -167,21 +170,28 @@ interface LocalFile {
   readonly fileSize: number;
   /** The link's own size, the length of its target. */
   readonly fileSizeOfLink: number;
+  readonly lastModifiedTime?: number;
+  readonly directoryEntries?: {
+    hasMoreElements(): boolean;
+    getNext(): LocalFile;
+    close?(): void;
+  };
   permissions: number;
   initWithPath(path: string): void;
   exists(): boolean;
+  isDirectory(): boolean;
   create(type: number, permissions: number): void;
   moveTo(parent: LocalFile | null, name: string): void;
   readonly diskSpaceAvailable: number;
   /** lstat: true for a link, dangling or not. Throws when nothing is at the path. */
   isSymlink(): boolean;
-  isDirectory(): boolean;
   isFile(): boolean;
   /** Resolves every link (realpath). A path that does not exist is left as it is. */
   normalize(): void;
   /** Throws where the platform's file manager cannot select a file (row P4). */
   reveal(): void;
   launch(): void;
+  remove(recursive: boolean): void;
 }
 interface FileInputStream extends InputStream {
   init(file: LocalFile, ioFlags: number, perm: number, behaviorFlags: number): void;
@@ -347,6 +357,7 @@ declare const Services: {
   };
   readonly prefs: {
     getBoolPref(name: string, fallback: boolean): boolean;
+    getIntPref(name: string, fallback: number): number;
   };
   readonly env: {
     get(name: string): string;
@@ -550,6 +561,7 @@ interface IOUtilsStat {
   readonly type: "regular" | "directory" | "other";
   readonly size: number;
   readonly permissions: number;
+  readonly lastModified?: number;
 }
 
 declare const IOUtils: {

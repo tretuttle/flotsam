@@ -3,6 +3,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { runNamespacedSuites } from "./namespace-isolation.ts";
+import { removeOwnedTempTree } from "./temp-tree.ts";
 
 describe("namespaced real-signal suites", () => {
   it("run in a fresh PID and user namespace, pass, and leave no private TMPDIR behind", async (ctx) => {
@@ -12,11 +13,11 @@ describe("namespaced real-signal suites", () => {
     process.env.TMPDIR = outer;
     let leftover: string[] = [];
     const run = await runNamespacedSuites(NodePath.resolve(import.meta.dirname, "..")).finally(
-      () => {
+      async () => {
         if (previous === undefined) delete process.env.TMPDIR;
         else process.env.TMPDIR = previous;
         leftover = NodeFS.readdirSync(outer);
-        NodeFS.rmSync(outer, { recursive: true, force: true });
+        await removeOwnedTempTree(outer);
       },
     );
     if (run.outcome === "unavailable") {

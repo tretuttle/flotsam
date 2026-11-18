@@ -3,6 +3,11 @@
 // body's part is renamed into bodies/ before its line joins a batch. No line points at bytes not yet written.
 
 import {
+  applyActivity,
+  emptyActivity,
+  type ActivityIndex,
+} from "@one-click-har/recording/activity";
+import {
   settle,
   type AbandonedExchange,
   type BodyLocation,
@@ -13,6 +18,7 @@ import {
 } from "@one-click-har/recording/exchange";
 import type {
   ByteCount,
+  EpochMs,
   ExchangeId,
   LogSegmentId,
   PackId,
@@ -26,6 +32,7 @@ import {
   logSegmentId,
   logSegmentPath,
   logSummaryPath,
+  PACK_PENDING_MAX,
   PACK_SEAL_BYTES,
   packId,
   packPath,
@@ -35,6 +42,7 @@ import {
   type SafeFolder,
 } from "@one-click-har/recording/layout";
 import { encodeLine, encodeSummary, summarize } from "@one-click-har/recording/log";
+import type { RetentionRef, RetentionStep } from "@one-click-har/recording/retention";
 import type { StoredSettings } from "@one-click-har/recording/settings";
 import {
   appendStreams,
@@ -44,10 +52,18 @@ import {
   type Timers,
   writeAtomic,
 } from "./gecko-io.ts";
+import {
+  createMaintenance,
+  RETENTION_EVERY_MS,
+  type MaintenanceWorkMetrics,
+  type PersistedUsage,
+  type PinHandle,
+  type PinTargets,
+  type StartupGateMetrics,
+} from "./maintenance.ts";
 
 /** Flush every second, or at once when a site's pending pack bytes reach the memory tee cutoff. */
 const FLUSH_MS = 1_000;
-const PACK_PENDING_MAX = 1_048_576;
 
 /** Points the harness can park the write chain at, to kill the browser there (crash rows 3, 6, 14, 16). */
 export const HOLD_POINTS = [
@@ -57,10 +73,16 @@ export const HOLD_POINTS = [
 ] as const;
 export type HoldPoint = (typeof HOLD_POINTS)[number];
 
-/** What a copy left when its sink closed: a memory tee's storage stream, or a file tee's closed part. */
+/** What a copy left when its sink closed: a memory tee, a startup-buffered file body, or an on-disk part. */
 export type CopiedBytes =
   | { readonly kind: "memory"; readonly stream: InputStream }
-  | { readonly kind: "part"; readonly id: ExchangeId };
+  | { readonly kind: "part"; readonly id: ExchangeId }
+  | {
+      readonly kind: "buffer";
+      readonly id: ExchangeId;
+      readonly stream: InputStream;
+      readonly length: number;
+    };
 
 /** A request body read at examine, waiting for its range in the site's pack. */
 export interface PendingUpload {
@@ -83,6 +105,12 @@ interface Segment {
   readonly exchanges: SettledExchange[];
 }
 
+interface PackRef {
+  readonly id: PackId;
+  readonly path: string;
+  reserved: number;
+}
+
 interface SiteState {
   readonly site: Site;
   segmentSeq: number;
@@ -90,7 +118,7 @@ interface SiteState {
   segment: Segment | null;
   packSeq: number;
   /** Reserved synchronously at commit, so offsets follow commit order. Null after an idle rotation. */
-  pack: { readonly id: PackId; readonly path: string; reserved: number } | null;
+  pack: PackRef | null;
   streams: InputStream[];
   streamBytes: number;
   lines: string[];
@@ -99,14 +127,22 @@ interface SiteState {
   open: boolean;
 }
 
-export interface StoreProblem {
-  readonly kind: "write-failed";
-  readonly detail: string;
+interface PendingBatch {
+  readonly streams: InputStream[];
+  readonly streamBytes: number;
+  readonly lines: string[];
+  readonly exchanges: SettledExchange[];
+  readonly pack: PackRef | null;
 }
+
+export type StoreProblem =
+  | { readonly kind: "write-failed"; readonly detail: string }
+  | { readonly kind: "unreadable-entries"; readonly detail: string };
 
 export interface Store {
   readonly run: RunId;
   readonly settings: () => StoredSettings;
+  readonly activity: () => ActivityIndex;
   commit(commit: AnsweredCommit): void;
   commitUnanswered(site: Site | null, exchange: UnansweredExchange): void;
   /** Lines for captures still live at shutdown. Their parts stay for recovery to delete (crash row 19). */
@@ -121,6 +157,30 @@ export interface Store {
   sealAll(): Promise<void>;
   /** Runs `step` on the write chain, after everything queued before it. */
   enqueue(step: () => Promise<void>): Promise<void>;
+  /** Loads existing summaries into the activity index and runs the first retention pass. */
+  beginStartup(): void;
+  initRetention(): Promise<readonly RetentionStep[]>;
+  isReady(): boolean;
+  isScanCompleted(): boolean;
+  needsStartupBuffer(expectedBytes?: number | null): boolean;
+  onReady(listener: () => void): () => void;
+  onScanComplete(listener: () => void): () => void;
+  unreadableEntries(): number;
+  retain(): Promise<readonly RetentionStep[]>;
+  openPart(id: ExchangeId, path: string, expectedBytes?: number): void;
+  updatePart(id: ExchangeId, bytes: number, capped?: boolean): void;
+  partBudget(id: ExchangeId, routeCap: number): number;
+  reserveWrite(bytes: number): () => void;
+  needsRetentionDrain(): boolean;
+  onRetentionDrain(listener: () => void): () => void;
+  pin(targets: PinTargets): PinHandle;
+  pinOldestPack(): Promise<{ readonly pinId: string; readonly pack: PackId } | null>;
+  unpin(pinId: string): Promise<boolean>;
+  usage(): { readonly bodyBytes: ByteCount; readonly detailBytes: ByteCount };
+  overCapWhileExporting(): boolean;
+  workMetrics(): MaintenanceWorkMetrics;
+  resetWorkMetrics(): void;
+  startupGateMetrics(): StartupGateMetrics;
   close(): Promise<void>;
   readonly problems: () => readonly StoreProblem[];
   arm(point: HoldPoint): void;
@@ -142,9 +202,10 @@ export function openStore(options: {
   readonly settings: StoredSettings;
   readonly timers: Timers;
   readonly onSettings: (settings: StoredSettings) => void;
-  /** Lines now in a segment on disk, so the activity index counts exactly what an export can read. */
-  readonly onLines: (segment: LogSegmentId, exchanges: readonly SettledExchange[]) => void;
-  readonly onForgotten: (site: Site) => void;
+  readonly persistedUsage?: PersistedUsage | null;
+  readonly scanTimeoutMs?: number;
+  readonly scanDelayMs?: number;
+  readonly countWork?: boolean;
 }): Store {
   const { run, root, modes, timers } = options;
   let settings = options.settings;
@@ -155,7 +216,22 @@ export function openStore(options: {
   const madeDirs = new Set<string>();
   const armed = new Set<HoldPoint>();
   const reachedPoints = new Set<HoldPoint>();
+  const activity = emptyActivity(run);
+  const drainListeners = new Set<() => void>();
+  let retentionQueued = false;
+  const maintenance = createMaintenance({
+    root,
+    onSegmentRemoved: (segment) => applyActivity(activity, { kind: "segment-removed", segment }),
+    waitUntilLoaded: true,
+    ...(options.persistedUsage === undefined ? {} : { persistedUsage: options.persistedUsage }),
+    initialMaxBodyBytes: settings.user.retention.maxBodyBytes,
+    ...(options.scanTimeoutMs === undefined ? {} : { scanTimeoutMs: options.scanTimeoutMs }),
+    ...(options.scanDelayMs === undefined ? {} : { scanDelayMs: options.scanDelayMs }),
+    timers,
+    countWork: options.countWork ?? false,
+  });
   let ticker: { cancel(): void } | null = null;
+  let retentionTicker: { cancel(): void } | null = null;
 
   const at = (segments: readonly string[]): string => PathUtils.join(root, ...segments);
   const dirOf = (segments: readonly string[]): string => at(segments.slice(0, -1));
@@ -201,6 +277,21 @@ export function openStore(options: {
     return created;
   };
 
+  const takeBatch = (state: SiteState): PendingBatch => {
+    const batch: PendingBatch = {
+      streams: state.streams,
+      streamBytes: state.streamBytes,
+      lines: state.lines,
+      exchanges: state.exchanges,
+      pack: state.pack,
+    };
+    state.streams = [];
+    state.streamBytes = 0;
+    state.lines = [];
+    state.exchanges = [];
+    return batch;
+  };
+
   const seal = async (state: SiteState): Promise<void> => {
     const segment = state.segment;
     if (segment === null) return;
@@ -210,43 +301,150 @@ export function openStore(options: {
       segment.exchanges.map((exchange) => ({ v: 2, exchange }) as const),
       segment.bytes as ByteCount,
     );
-    await writeAtomic(at(logSummaryPath(segment.id)), encodeSummary(summary), modes, () =>
+    const encoded = encodeSummary(summary);
+    await writeAtomic(at(logSummaryPath(segment.id)), encoded, modes, () =>
       hold("summary-tmp-written"),
+    );
+    if (!excluded.has(state.site)) {
+      applyActivity(activity, { kind: "segment-summarized", summary });
+    }
+    maintenance.recordSegmentSealed(
+      segment.id,
+      encoded.length,
+      summary.lastStartedAt,
+      Date.now() as EpochMs,
     );
   };
 
-  const flushSite = (state: SiteState): void => {
-    if (state.streams.length === 0 && state.lines.length === 0) return;
-    const streams = state.streams;
-    const lines = state.lines;
-    const exchanges = state.exchanges;
-    const pack = state.pack;
-    state.streams = [];
-    state.streamBytes = 0;
-    state.lines = [];
-    state.exchanges = [];
-    void enqueue(async () => {
-      if (excluded.has(state.site)) return;
-      if (streams.length > 0 && pack !== null) {
-        await ensureDir(dirOf(packPath(pack.id)));
-        await appendStreams(pack.path, streams, modes);
+  const rotateFile = async (ref: RetentionRef): Promise<boolean> => {
+    if (ref.kind === "pack") {
+      for (const state of sites.values()) {
+        if (state.pack?.id !== ref.pack) continue;
+        const batch = takeBatch(state);
+        state.pack = null;
+        state.packSeq += 1;
+        if (batch.streams.length > 0 || batch.lines.length > 0) {
+          await writeBatch(state, batch, false, false);
+        }
+        maintenance.markPackClosed(ref.pack);
+        return true;
       }
-      await hold("before-line-append");
-      if (lines.length === 0) return;
+      return maintenance.markPackClosed(ref.pack);
+    }
+    if (ref.kind === "segment") {
+      for (const state of sites.values()) {
+        if (state.segment?.id !== ref.segment) continue;
+        const batch = takeBatch(state);
+        if (batch.streams.length > 0 || batch.lines.length > 0) {
+          await writeBatch(state, batch, false, false);
+        }
+        await seal(state);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const notifyDrain = (): void => {
+    if (drainListeners.size === 0) return;
+    const listeners = [...drainListeners];
+    drainListeners.clear();
+    for (const listener of listeners) listener();
+  };
+
+  const runRetention = async (reserveBytes = 0): Promise<readonly RetentionStep[]> => {
+    try {
+      return await maintenance.retain(settings.user, rotateFile, reserveBytes);
+    } finally {
+      notifyDrain();
+    }
+  };
+
+  const scheduleRetention = (): void => {
+    if (retentionQueued) return;
+    retentionQueued = true;
+    void enqueue(async () => {
+      retentionQueued = false;
+      await runRetention();
+    });
+  };
+
+  const writeBatch = async (
+    state: SiteState,
+    batch: PendingBatch,
+    allowHold: boolean,
+    allowRetention: boolean,
+  ): Promise<void> => {
+    if (excluded.has(state.site)) return;
+    const now = Date.now() as EpochMs;
+    const hasPackWrite = batch.streams.length > 0 && batch.pack !== null;
+    const releaseWrite = hasPackWrite
+      ? maintenance.reserveWrite(batch.streamBytes)
+      : () => undefined;
+    try {
+      if (hasPackWrite && batch.pack !== null) {
+        await ensureDir(dirOf(packPath(batch.pack.id)));
+        if (allowRetention && maintenance.isOverCap(settings.user)) {
+          await runRetention();
+        }
+        await appendStreams(batch.pack.path, batch.streams, modes);
+        releaseWrite();
+        maintenance.recordPackWrite(
+          batch.pack.id,
+          batch.pack.path,
+          siteDirName(state.site),
+          batch.streamBytes,
+          now,
+          state.pack?.id === batch.pack.id,
+        );
+      }
+    } finally {
+      releaseWrite();
+    }
+    if (allowHold) await hold("before-line-append");
+    let sealed = false;
+    if (batch.lines.length > 0) {
       if (state.segment === null) {
         const id = logSegmentId(state.site, run, state.segmentSeq);
         state.segmentSeq += 1;
         state.segment = { id, path: at(logSegmentPath(id)), bytes: 0, exchanges: [] };
       }
       const segment = state.segment;
-      const text = lines.join("");
+      const text = batch.lines.join("");
       await ensureDir(dirOf(logSegmentPath(segment.id)));
       await appendText(segment.path, text, modes);
       segment.bytes += text.length;
-      segment.exchanges.push(...exchanges);
-      options.onLines(segment.id, exchanges);
-      if (segment.bytes >= LOG_SEAL_BYTES) await seal(state);
-    });
+      segment.exchanges.push(...batch.exchanges);
+      for (const exchange of batch.exchanges) {
+        if (!excluded.has(state.site)) {
+          applyActivity(activity, { kind: "settled", segment: segment.id, exchange });
+        }
+      }
+      maintenance.recordSegmentWrite(
+        segment.id,
+        segment.path,
+        at(logSummaryPath(segment.id)),
+        siteDirName(state.site),
+        text.length,
+        now,
+        true,
+      );
+      if (segment.bytes >= LOG_SEAL_BYTES) {
+        await seal(state);
+        sealed = true;
+      }
+    }
+    if (allowRetention && (sealed || maintenance.isOverCap(settings.user))) {
+      await runRetention();
+    } else {
+      notifyDrain();
+    }
+  };
+
+  const flushSite = (state: SiteState): void => {
+    if (state.streams.length === 0 && state.lines.length === 0) return;
+    const batch = takeBatch(state);
+    void enqueue(() => writeBatch(state, batch, true, true));
   };
 
   const tick = (): void => {
@@ -257,10 +455,15 @@ export function openStore(options: {
         flushSite(state);
         busy = true;
       } else if (state.open && now - state.lastCommitAt >= ROTATE_IDLE_MS) {
+        const closedPack = state.pack?.id ?? null;
         state.open = false;
         state.pack = null;
         state.packSeq += 1;
-        void enqueue(() => seal(state));
+        void enqueue(async () => {
+          if (closedPack !== null) maintenance.markPackClosed(closedPack);
+          await seal(state);
+          await runRetention();
+        });
       } else if (state.open) busy = true;
     }
     if (!busy && ticker !== null) {
@@ -270,6 +473,7 @@ export function openStore(options: {
   };
 
   const queueLine = (state: SiteState, exchange: SettledExchange): void => {
+    if (excluded.has(state.site)) return;
     state.lines.push(encodeLine({ v: 2, exchange }));
     state.exchanges.push(exchange);
     state.lastCommitAt = Date.now();
@@ -284,9 +488,16 @@ export function openStore(options: {
       state.pack.reserved > 0 &&
       state.pack.reserved + length > PACK_SEAL_BYTES
     ) {
+      const closedPack = state.pack.id;
+      const hadPendingStreams = state.streams.length > 0;
       flushSite(state);
       state.pack = null;
       state.packSeq += 1;
+      if (!hadPendingStreams) {
+        void enqueue(async () => {
+          maintenance.markPackClosed(closedPack);
+        });
+      }
     }
     if (state.pack === null) {
       const id = packId(state.site, run, state.packSeq);
@@ -305,8 +516,27 @@ export function openStore(options: {
   };
 
   const removePart = (id: ExchangeId): void => {
-    void enqueue(() => IOUtils.remove(at(partPath(id)), { ignoreAbsent: true }));
+    maintenance.untrackPart(id);
+    notifyDrain();
+    void enqueue(async () => {
+      await IOUtils.remove(at(partPath(id)), { ignoreAbsent: true });
+      notifyDrain();
+    });
   };
+
+  const onPinRelease = (): void => {
+    if (maintenance.isOverCap(settings.user) || maintenance.blockedOverBy() !== null) {
+      void enqueue(async () => {
+        await runRetention();
+      });
+    }
+  };
+
+  retentionTicker = timers.repeat(RETENTION_EVERY_MS, () => {
+    void enqueue(async () => {
+      await runRetention();
+    });
+  });
 
   const commit = ({ site, input, bytes, upload }: AnsweredCommit): void => {
     if (site === null || excluded.has(site)) {
@@ -328,17 +558,49 @@ export function openStore(options: {
       queueLine(state, settle(settling, null));
     } else if (bytes.kind === "memory") {
       queueLine(state, settle(settling, reserve(state, bytes.stream, length)));
+    } else if (bytes.kind === "buffer") {
+      const settled = settle(settling, { kind: "file", site, id: bytes.id, length });
+      void enqueue(async () => {
+        if (excluded.has(site)) return;
+        const releaseWrite = maintenance.reserveWrite(bytes.length);
+        try {
+          const target = bodyFilePath(site, bytes.id);
+          await ensureDir(dirOf(target));
+          if (maintenance.isOverCap(settings.user)) {
+            await runRetention();
+          }
+          await appendStreams(at(target), [bytes.stream], modes);
+          if (excluded.has(site)) {
+            await IOUtils.remove(at(target), { ignoreAbsent: true });
+            return;
+          }
+          releaseWrite();
+          maintenance.recordBodyFile(site, bytes.id, at(target), length, Date.now() as EpochMs);
+          queueLine(state, settled);
+          if (maintenance.isOverCap(settings.user)) await runRetention();
+        } finally {
+          releaseWrite();
+        }
+      });
     } else {
       const settled = settle(settling, { kind: "file", site, id: bytes.id, length });
       void enqueue(async () => {
         if (excluded.has(site)) {
+          maintenance.untrackPart(bytes.id);
           await IOUtils.remove(at(partPath(bytes.id)), { ignoreAbsent: true });
           return;
         }
         const target = bodyFilePath(site, bytes.id);
         await ensureDir(dirOf(target));
         await IOUtils.move(at(partPath(bytes.id)), at(target));
+        if (excluded.has(site)) {
+          maintenance.untrackPart(bytes.id);
+          await IOUtils.remove(at(target), { ignoreAbsent: true });
+          return;
+        }
+        maintenance.recordBodyFile(site, bytes.id, at(target), length, Date.now() as EpochMs);
         queueLine(state, settled);
+        if (maintenance.isOverCap(settings.user)) await runRetention();
       });
     }
     if (state.streamBytes >= PACK_PENDING_MAX) flushSite(state);
@@ -347,6 +609,7 @@ export function openStore(options: {
   const store: Store = {
     run,
     settings: () => settings,
+    activity: () => activity,
     commit,
     commitUnanswered: (site, exchange) => {
       if (site === null || excluded.has(site)) return;
@@ -361,6 +624,7 @@ export function openStore(options: {
       if (excluded.has(site)) return enqueue(async () => undefined);
       excluded.add(site);
       sites.delete(site);
+      applyActivity(activity, { kind: "site-forgotten", site });
       return enqueue(async () => {
         const next: StoredSettings = {
           ...settings,
@@ -369,7 +633,6 @@ export function openStore(options: {
         await writeAtomic(at([LAYOUT.settings]), JSON.stringify(next), modes);
         settings = next;
         options.onSettings(next);
-        options.onForgotten(site);
         const dir = at([LAYOUT.sitesDir, siteDirName(site)]);
         for (const [index, sub] of [LAYOUT.logDir, LAYOUT.packDir, LAYOUT.bodyDir].entries()) {
           await IOUtils.remove(PathUtils.join(dir, sub), { recursive: true, ignoreAbsent: true });
@@ -377,27 +640,125 @@ export function openStore(options: {
         }
         await IOUtils.remove(dir, { recursive: true, ignoreAbsent: true });
         for (const made of madeDirs) if (made.startsWith(dir)) madeDirs.delete(made);
+        maintenance.forgetSite(site);
+        applyActivity(activity, { kind: "site-forgotten", site });
+        notifyDrain();
       });
     },
-    flush: () => {
+    flush: async () => {
       for (const state of sites.values()) flushSite(state);
-      return enqueue(async () => undefined);
+      await enqueue(async () => undefined);
+      for (const state of sites.values()) flushSite(state);
+      await enqueue(async () => undefined);
     },
     sealAll: () => {
       for (const state of sites.values()) {
+        const closedPack = state.pack?.id ?? null;
         flushSite(state);
         state.open = false;
         state.pack = null;
         state.packSeq += 1;
-        void enqueue(() => seal(state));
+        void enqueue(async () => {
+          if (closedPack !== null) maintenance.markPackClosed(closedPack);
+          await seal(state);
+        });
       }
       return enqueue(async () => undefined);
     },
     enqueue,
+    beginStartup: () => maintenance.beginStartup(),
+    initRetention: async () => {
+      const steps = await maintenance.loadFromDisk(activity, settings.user, rotateFile);
+      const skipped = maintenance.unreadableEntries();
+      if (skipped > 0) {
+        problems.push({
+          kind: "unreadable-entries",
+          detail: `${String(skipped)} unreadable archive entries skipped during startup scan`,
+        });
+      }
+      return steps;
+    },
+    isReady: () => maintenance.isReady(),
+    isScanCompleted: () => maintenance.isScanCompleted(),
+    needsStartupBuffer: (expectedBytes) =>
+      maintenance.needsStartupBuffer(settings.user, expectedBytes),
+    onReady: (listener) => maintenance.onReady(listener),
+    onScanComplete: (listener) => maintenance.onScanComplete(listener),
+    unreadableEntries: () => maintenance.unreadableEntries(),
+    retain: async () => {
+      let steps: readonly RetentionStep[] = [];
+      await store.flush();
+      await enqueue(async () => {
+        steps = await runRetention();
+      });
+      return steps;
+    },
+    openPart: (id, path, expectedBytes) => {
+      maintenance.trackPart(id, path, expectedBytes);
+      if (maintenance.isScanCompleted() && maintenance.isOverCap(settings.user)) {
+        scheduleRetention();
+      }
+    },
+    updatePart: (id, bytes, capped) => {
+      if (maintenance.updatePart(id, bytes, settings.user, capped)) scheduleRetention();
+    },
+    partBudget: (id, routeCap) => maintenance.partBudget(id, routeCap, settings.user),
+    reserveWrite: (bytes) => maintenance.reserveWrite(bytes),
+    needsRetentionDrain: () => maintenance.needsRetentionDrain(settings.user),
+    onRetentionDrain: (listener) => {
+      drainListeners.add(listener);
+      scheduleRetention();
+      return () => {
+        drainListeners.delete(listener);
+      };
+    },
+    pin: (targets) => maintenance.pin(targets, onPinRelease),
+    pinOldestPack: async () => {
+      await store.flush();
+      let pinned: { readonly pinId: string; readonly pack: PackId } | null = null;
+      await enqueue(async () => {
+        pinned = maintenance.pinOldestPack(onPinRelease);
+      });
+      return pinned;
+    },
+    unpin: async (pinId) => {
+      let released = false;
+      await enqueue(async () => {
+        released = maintenance.unpin(pinId);
+        if (released) await runRetention();
+      });
+      return released;
+    },
+    usage: () => maintenance.usage(),
+    overCapWhileExporting: () => maintenance.blockedOverBy() !== null,
+    workMetrics: () => maintenance.workMetrics(),
+    resetWorkMetrics: () => maintenance.resetWorkMetrics(),
+    startupGateMetrics: () => maintenance.startupGateMetrics(),
     close: async () => {
       ticker?.cancel();
       ticker = null;
+      retentionTicker?.cancel();
+      retentionTicker = null;
       await store.sealAll();
+      const snapshot = maintenance.ledgerSnapshot();
+      const siteCount = await IOUtils.getChildren(at([LAYOUT.sitesDir])).then(
+        (children) => children.length,
+        () => 0,
+      );
+      await writeAtomic(
+        at([LAYOUT.ledger]),
+        JSON.stringify({
+          version: 1,
+          run,
+          clean: true,
+          bodyBytes: snapshot.bodyBytes,
+          detailBytes: snapshot.detailBytes,
+          bodyCount: snapshot.bodyCount,
+          detailCount: snapshot.detailCount,
+          siteCount,
+        }),
+        modes,
+      ).catch(() => undefined);
     },
     problems: () => problems,
     arm: (point) => {

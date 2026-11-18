@@ -23,7 +23,11 @@ export type MissingReason =
   | "upload-never-stored";
 
 /** Why a body whose first bytes are in the file has no more. */
-export type CutShortReason = "over-body-cap" | "source-error" | "over-export-window";
+export type CutShortReason =
+  | "over-body-cap"
+  | "scan-timeout"
+  | "source-error"
+  | "over-export-window";
 
 export interface PlaceCopy {
   readonly response: string;
@@ -81,6 +85,16 @@ export const MISSING_REASONS: { readonly [R in MissingReason]: MissingRow } = {
       request: "Request body not saved: writing it to disk failed.",
     },
     reportLabel: "disk write failed",
+    settings: null,
+    harState: "unavailable",
+  },
+  "scan-timeout": {
+    comment: {
+      response: "Body not saved: startup retention scan timed out before disk budget opened.",
+      request:
+        "Request body not saved: startup retention scan timed out before disk budget opened.",
+    },
+    reportLabel: "startup scan timed out",
     settings: null,
     harState: "unavailable",
   },
@@ -246,6 +260,15 @@ export const CUT_SHORT_REASONS: { readonly [R in CutShortReason]: CutShortRow } 
         "Request body incomplete: only the first {bytes} were kept. The rest passed the largest size kept for one body, a quarter of the storage limit in settings.",
     },
     reportLabel: "larger than one body may be",
+  },
+  "scan-timeout": {
+    comment: {
+      response:
+        "Body incomplete: only the first {bytes} were kept. Startup retention scan timed out before disk budget opened.",
+      request:
+        "Request body incomplete: only the first {bytes} were kept. Startup retention scan timed out before disk budget opened.",
+    },
+    reportLabel: "startup scan timed out",
   },
   "source-error": {
     comment: {

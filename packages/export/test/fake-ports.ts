@@ -44,7 +44,7 @@ export type BodySpec =
       readonly coding?: "gzip" | "deflate" | "br" | null;
       readonly chunk?: number;
       readonly failAt?: number;
-      readonly check?: "length-matched" | "sink-only" | "first-part";
+      readonly check?: "length-matched" | "sink-only" | "first-part" | "scan-timeout";
     }
   | { readonly kind: "text"; readonly slices: readonly string[]; readonly failAt?: number }
   | { readonly kind: "base64"; readonly slices: readonly string[] }

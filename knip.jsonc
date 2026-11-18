@@ -54,6 +54,8 @@
         "unshare",
         "mkfifo",
         "cc",
+        "prlimit",
+        "du",
       ],
     },
   },

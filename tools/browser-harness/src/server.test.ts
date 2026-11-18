@@ -317,6 +317,25 @@ describe("extended cost and identity fixtures", () => {
       hashBuffer(dl.body),
     );
   });
+
+  it("serves deterministic retention blobs and pauses/releases binary stream on demand", async () => {
+    const page = await readHttp(server.port, "/retention/page");
+    expect(page.status).toBe(200);
+    const blob = await readHttp(server.port, "/retention/blob?bytes=12345&tag=s01-0");
+    expect(blob.status).toBe(200);
+    expect(blob.body.length).toBe(12_345);
+    expect(server.getSequenceTruth(Number(blob.headers["x-seq"]))?.wireSha256).toBe(
+      hashBuffer(blob.body),
+    );
+
+    const paused = await readPaused(server.port, "/fixtures/binary?pauseAfterBytes=1024", 1024);
+    expect(paused.initial.length).toBeGreaterThanOrEqual(1024);
+    expect(paused.initial.length).toBeLessThan(BINARY_BYTE_LENGTH);
+    server.releasePaused();
+    const rest = await paused.finished;
+    expect(rest.length).toBe(BINARY_BYTE_LENGTH);
+    expectPinned("binary", rest);
+  });
 });
 
 function readAborted(
@@ -341,6 +360,37 @@ function readAborted(
     request.on("error", (error) => {
       if ((error as NodeJS.ErrnoException).code !== "ECONNRESET") reject(error);
     });
+    request.end();
+  });
+}
+
+function readPaused(
+  port: number,
+  path: string,
+  minBytes: number,
+): Promise<{ readonly initial: Buffer; readonly finished: Promise<Buffer> }> {
+  return new Promise((resolve, reject) => {
+    const request = NodeHttp.request({ host: "127.0.0.1", port, path }, (response) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let resolved = false;
+      let finishResolve: ((buf: Buffer) => void) | undefined;
+      const finished = new Promise<Buffer>((res) => {
+        finishResolve = res;
+      });
+      response.on("data", (chunk: Buffer) => {
+        chunks.push(chunk);
+        total += chunk.length;
+        if (!resolved && total >= minBytes) {
+          resolved = true;
+          resolve({ initial: Buffer.concat(chunks), finished });
+        }
+      });
+      response.on("end", () => {
+        finishResolve?.(Buffer.concat(chunks));
+      });
+    });
+    request.on("error", reject);
     request.end();
   });
 }

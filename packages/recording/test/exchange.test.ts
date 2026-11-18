@@ -122,6 +122,28 @@ const SETTLE_CASES: readonly SettleCase[] = [
     body: { kind: "stored", at: inFile, encoding: null, check: "first-part" },
   },
   {
+    label: "scan-timeout with kept prefix records stored scan-timeout body",
+    input: {
+      capture: fileTee,
+      stop: stopWith({ encodedBodySize: bytes(4096) }),
+      sink: { kind: "closed", bytes: bytes(1024), cappedAt: bytes(1024), cutWhy: "scan-timeout" },
+    },
+    at: inFile,
+    rule: "capped",
+    body: { kind: "stored", at: inFile, encoding: null, check: "scan-timeout" },
+  },
+  {
+    label: "scan-timeout with 0 bytes kept records incomplete scan-timeout instead of first-part",
+    input: {
+      capture: fileTee,
+      stop: stopWith({ encodedBodySize: bytes(4096) }),
+      sink: { kind: "closed", bytes: bytes(0), cappedAt: bytes(0), cutWhy: "scan-timeout" },
+    },
+    at: null,
+    rule: "capped",
+    body: { kind: "incomplete", reason: "scan-timeout" },
+  },
+  {
     label: "opus 3: a download cancelled after 1 MiB",
     input: {
       capture: fileTee,

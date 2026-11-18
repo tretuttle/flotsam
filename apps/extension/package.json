@@ -9,7 +9,7 @@
     "pack": "vp run build && node scripts/pack.ts && node scripts/check-xpi.ts",
     "screenshot:toolbar": "node scripts/screenshot-toolbar.ts",
     "test": "vp test run --config ../../vite.config.ts --dir .",
-    "typecheck": "effect-tsgo tsrs --noEmit && effect-tsgo tsrs --noEmit -p experiment",
+    "typecheck": "effect-tsgo tsrs --noEmit && effect-tsgo tsrs --noEmit -p experiment && effect-tsgo tsrs --noEmit -p experiment/tsconfig.test.json",
     "verify:browser": "node scripts/verify-browser.ts"
   },
   "dependencies": {

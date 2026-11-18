@@ -267,19 +267,28 @@ function wholeWrite(body: OpenBody, bytes: Uint8Array, ended: "end" | "failed"):
   if (ended === "failed" && bytes.length === 0) {
     return missingBody({ kind: "missing", reason: "source-error" });
   }
-  if (ended === "end" && bytes.length === 0 && body.check !== "first-part") return NO_BODY;
+  if (
+    ended === "end" &&
+    bytes.length === 0 &&
+    body.check !== "first-part" &&
+    body.check !== "scan-timeout"
+  ) {
+    return NO_BODY;
+  }
   const written = chooseEncoding(bytes, body.charset);
   const outcome =
     ended === "failed"
       ? ({ kind: "cut-short", reason: "source-error", lossy: body.lossy() } as const)
       : body.check === "first-part"
         ? ({ kind: "cut-short", reason: "over-body-cap", lossy: body.lossy() } as const)
-        : ({
-            kind: "included",
-            from: body.from,
-            unchecked: body.check === "sink-only",
-            lossy: body.lossy(),
-          } as const);
+        : body.check === "scan-timeout"
+          ? ({ kind: "cut-short", reason: "scan-timeout", lossy: body.lossy() } as const)
+          : ({
+              kind: "included",
+              from: body.from,
+              unchecked: body.check === "sink-only",
+              lossy: body.lossy(),
+            } as const);
   return {
     outcome,
     text: written.text,
@@ -397,12 +406,14 @@ async function streamLongBody(
       ? ({ kind: "cut-short", reason: "source-error", lossy: body.lossy() } as const)
       : body.check === "first-part"
         ? ({ kind: "cut-short", reason: "over-body-cap", lossy: body.lossy() } as const)
-        : ({
-            kind: "included",
-            from: body.from,
-            unchecked: body.check === "sink-only",
-            lossy: body.lossy(),
-          } as const);
+        : body.check === "scan-timeout"
+          ? ({ kind: "cut-short", reason: "scan-timeout", lossy: body.lossy() } as const)
+          : ({
+              kind: "included",
+              from: body.from,
+              unchecked: body.check === "sink-only",
+              lossy: body.lossy(),
+            } as const);
   const write: BodyWrite = {
     outcome,
     text: sentinel,
