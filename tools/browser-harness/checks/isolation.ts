@@ -1,0 +1,2048 @@
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodeHttp from "node:http";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
+import { ARCHIVE_KEY_FILE } from "@one-click-har/recording/layout";
+import { locateArchive } from "../src/archive.ts";
+import {
+  launchBrowser,
+  readExtensionId,
+  readExtensionPopupPath,
+  waitForActiveExtensionUrl,
+  type BrowserSession,
+  type Pref,
+} from "../src/browser.ts";
+import type { CheckContext, CheckResult, HarnessCheck } from "../src/checks.ts";
+import { readZipEntry } from "../src/zip.ts";
+import { judgeArchiveModes, judgeDownloads } from "../src/recording-judge.ts";
+import { callHook, HARNESS_PREFS, recordingWorkspace } from "../src/recording-session.ts";
+import {
+  judgeArchive,
+  keyDerivations,
+  type ArchiveEvidence,
+  type ExtraCheckResult,
+  type KeyEvidence,
+  type KeySources,
+} from "../fixtures/isolation/archive-oracle.ts";
+import { contentDigest, type RunNames } from "../fixtures/isolation/content.ts";
+import {
+  diffSnapshots,
+  diskProblems,
+  inProductArea,
+  pruneStructured,
+  readChangedStructured,
+  snapshotTree,
+  type DiskEvidence,
+  type DiskSnapshot,
+  type ProductArea,
+  type RunDisk,
+} from "../fixtures/isolation/disk.ts";
+import {
+  exposureProblems,
+  schemaContexts,
+  type ExposureEvidence,
+  type PageSurface,
+  type RuntimeSurface,
+} from "../fixtures/isolation/exposure.ts";
+import { identities, unitPlaces } from "../fixtures/isolation/identity.ts";
+import {
+  eachUnitVerdict,
+  judgeIsolationRun,
+  type BrowserRowReport,
+  type IsolationRunInput,
+  type SyntheticControlResult,
+  type Witness,
+} from "../fixtures/isolation/judge.ts";
+import {
+  checkKey,
+  combineWitness,
+  fileHref,
+  planTargets,
+  type CheckOutcome,
+  type Fact,
+  type PlanInput,
+  type TargetPlan,
+  type WitnessCheck,
+} from "../fixtures/isolation/targets.ts";
+import { buildStoredZip } from "../fixtures/isolation/zip.ts";
+import {
+  buildOtherExperimentXpi,
+  buildProbeExtensionXpi,
+  buildSavedPageHtml,
+  OTHER_EXPERIMENT_ID,
+  PAGE_RUNNER_JS,
+  PROBE_EXTENSION_ID,
+  PROBE_HTML,
+  PROBES_JS,
+} from "../fixtures/isolation/probe-script.ts";
+import { NO_MARIONETTE_PROBE_IDS } from "../fixtures/isolation/probe-table.ts";
+import {
+  filesThrough,
+  isWorkerSubstitution,
+  judgeSubstitutions,
+  substitutionLine,
+  WORKER_HOST,
+  type Lifecycle,
+  type Substitution,
+  type SubstitutionEvidence,
+  type Watch,
+} from "../fixtures/isolation/substitution.ts";
+import { startExport, waitForJob, ended } from "../src/export-session.ts";
+import { startIsolationServer, type IsolationReport } from "../fixtures/isolation/server.ts";
+
+const POSITION_TIMEOUT_MS = 60_000;
+const STEP_TIMEOUT_MS = 30_000;
+const KEY_WAIT_MS = 20_000;
+
+const proxyPrefs = (port: number): readonly Pref[] => [
+  { name: "network.proxy.type", value: 1 },
+  { name: "network.proxy.http", value: "127.0.0.1" },
+  { name: "network.proxy.http_port", value: port },
+  { name: "network.proxy.ssl", value: "127.0.0.1" },
+  { name: "network.proxy.ssl_port", value: 9 },
+  { name: "network.proxy.no_proxies_on", value: "127.0.0.1" },
+  { name: "network.proxy.allow_hijacking_localhost", value: false },
+  { name: "network.proxy.failover_direct", value: false },
+  { name: "network.trr.mode", value: 5 },
+  { name: "network.connectivity-service.enabled", value: false },
+  { name: "network.captive-portal-service.enabled", value: false },
+  { name: "browser.chrome.site_icons", value: false },
+  // No telemetry upload, so the browser keeps no pending pings under random names that differ between the runs.
+  { name: "datareporting.healthreport.uploadEnabled", value: false },
+  { name: "datareporting.policy.dataSubmissionEnabled", value: false },
+  { name: "datareporting.usage.uploadEnabled", value: false },
+  { name: "toolkit.telemetry.archive.enabled", value: false },
+  { name: "toolkit.telemetry.newProfilePing.enabled", value: false },
+  { name: "toolkit.telemetry.firstShutdownPing.enabled", value: false },
+  // No remote-settings sync, which lands an etag and its records only in the runs whose timer happened to fire.
+  { name: "services.settings.server", value: "data:,#remote-settings-dummy/v1" },
+  // No crash-recovery snapshot of live tabs every 15 s, which catches each run's tabs at a different moment.
+  { name: "browser.sessionstore.resume_from_crash", value: false },
+  { name: "browser.sessionstore.interval", value: 3_600_000 },
+  { name: "browser.sessionstore.max_tabs_undo", value: 0 },
+  { name: "browser.sessionstore.max_windows_undo", value: 0 },
+];
+
+type AddonInfo = {
+  readonly isActive: boolean;
+  readonly isPrivileged: boolean;
+  readonly signedState: number;
+  readonly temporarilyInstalled: boolean;
+  readonly uuid: string | null;
+};
+
+type ChromeBootstrapInfo = {
+  readonly strictFileOrigin: boolean;
+  readonly strictFileOriginUserSet: boolean;
+  readonly addons: Readonly<Record<string, AddonInfo | null>>;
+};
+
+type EnumeratedSchemes = {
+  readonly subs: readonly Substitution[];
+  readonly chrome: readonly { readonly pkg: string; readonly target: string }[];
+  /** moz-src:/// URLs named in omni.ja; the first one is the witness that the scheme serves files. */
+  readonly mozSrc: readonly string[];
+};
+
+/** What the recorder exposes, read from its policy and its installed XPI by the system principal. */
+type PackedExposure = {
+  readonly manifest: Record<string, unknown>;
+  readonly contentScripts: readonly unknown[];
+  readonly runtimeWebAccessible: readonly unknown[];
+  readonly webAccessibleQuery: string | null;
+  readonly webAccessiblePaths: readonly string[];
+  readonly schemaTexts: Readonly<Record<string, string>>;
+  readonly externalListeners: readonly string[];
+  readonly declaredPages: readonly string[];
+  /** Every page the recorder packs (each .html file) or declares, as a moz-extension URL. */
+  readonly pageUrls: readonly string[];
+  readonly files: readonly string[];
+  readonly literals: readonly string[];
+  /** The recorder's root URL as the browser installed it. */
+  readonly rootUrl: string;
+};
+
+const CHROME_INFO_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const ids = arguments[0];
+  (async () => {
+    const { AddonManager } = ChromeUtils.importESModule("resource://gre/modules/AddonManager.sys.mjs");
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      if (ids.every((id) => { const p = WebExtensionPolicy.getByID(id); return p && p.active; })) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const addons = {};
+    for (const id of ids) {
+      const a = await AddonManager.getAddonByID(id);
+      const pol = WebExtensionPolicy.getByID(id);
+      addons[id] = a ? {
+        isActive: a.isActive,
+        isPrivileged: a.isPrivileged,
+        signedState: a.signedState,
+        temporarilyInstalled: a.temporarilyInstalled,
+        uuid: pol ? pol.mozExtensionHostname : null,
+      } : null;
+    }
+    done({
+      strictFileOrigin: Services.prefs.getBoolPref("security.fileuri.strict_origin_policy"),
+      strictFileOriginUserSet: Services.prefs.prefHasUserValue("security.fileuri.strict_origin_policy"),
+      addons,
+    });
+  })().catch((e) => done({ error: String(e) }));
+`;
+
+const CHROME_EXPOSURE_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const id = arguments[0];
+  (async () => {
+    const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
+    const policy = WebExtensionPolicy.getByID(id);
+    const ext = policy.extension;
+    const jar = Services.io.newURI(ext.rootURI.spec).QueryInterface(Ci.nsIJARURI);
+    const zr = Cc["@mozilla.org/libjar/zip-reader;1"].createInstance(Ci.nsIZipReader);
+    zr.open(jar.JARFile.QueryInterface(Ci.nsIFileURL).file);
+    const read = (name) => { const s = zr.getInputStream(name); const t = NetUtil.readInputStreamToString(s, s.available(), { charset: "UTF-8" }); s.close(); return t; };
+    const files = [];
+    const literals = new Set();
+    const externalListeners = [];
+    const it = zr.findEntries(null);
+    while (it.hasMore()) {
+      const name = it.getNext();
+      if (name.endsWith("/")) continue;
+      files.push(name);
+      if (!/\\.(m?js|json|html)$/.test(name)) continue;
+      const text = read(name);
+      for (const m of text.matchAll(/["'\`]([A-Za-z0-9][A-Za-z0-9._-]{0,62})["'\`]/g)) literals.add(m[1].toLowerCase());
+      for (const m of text.matchAll(/\\b(onMessageExternal|onConnectExternal|externally_connectable)\\b/g)) externalListeners.push(name + ": " + m[1]);
+    }
+    const manifest = JSON.parse(read("manifest.json"));
+    const schemaTexts = {};
+    for (const api of Object.values(manifest.experiment_apis ?? {})) {
+      if (api && typeof api.schema === "string") { try { schemaTexts[api.schema] = read(api.schema.replace(/^\\//, "")); } catch (e) { schemaTexts[api.schema] = "unreadable: " + e; } }
+    }
+    zr.close();
+    const src = Services.io.newURI("http://attacker.example/");
+    const webAccessibleQuery = typeof policy.sourceMayAccessPath === "function" ? "sourceMayAccessPath" : typeof policy.isWebAccessiblePath === "function" ? "isWebAccessiblePath" : null;
+    const accessible = (path) => webAccessibleQuery === "sourceMayAccessPath" ? policy.sourceMayAccessPath(src, path) : webAccessibleQuery === "isWebAccessiblePath" ? policy.isWebAccessiblePath(path) : false;
+    const pageKeys = [["action", "default_popup"], ["browser_action", "default_popup"], ["page_action", "default_popup"], ["options_ui", "page"], ["sidebar_action", "default_panel"]];
+    const declaredPages = [
+      ...pageKeys.map(([k, f]) => manifest[k] && manifest[k][f]),
+      manifest.options_page, manifest.devtools_page, manifest.background && manifest.background.page,
+      ...Object.values(manifest.chrome_url_overrides ?? {}),
+    ].filter((p) => typeof p === "string").map((p) => policy.getURL(p.replace(/^\\//, "")));
+    const shape = (v) => (v && typeof v === "object" && "glob" in v ? v.glob : v && typeof v === "object" && "patterns" in v ? v.patterns.map((x) => x.pattern) : v);
+    done({
+      manifest,
+      contentScripts: policy.contentScripts.map((cs) => ({ matches: cs.matches.patterns.map((m) => m.pattern), js: cs.jsPaths })),
+      runtimeWebAccessible: JSON.parse(JSON.stringify(ext.webAccessibleResources ?? [], (k, v) => shape(v))),
+      webAccessibleQuery,
+      webAccessiblePaths: files.filter((f) => accessible("/" + f)),
+      schemaTexts,
+      externalListeners,
+      declaredPages,
+      pageUrls: [...new Set([...declaredPages, ...files.filter((f) => /\\.x?html?$/i.test(f)).map((f) => policy.getURL(f))])].sort(),
+      files: files.sort(),
+      literals: [...literals].sort(),
+      rootUrl: ext.rootURI.spec,
+    });
+  })().catch((e) => done({ error: String(e) }));
+`;
+
+/**
+ * Reads each recorder page, as the system principal in the page's own process: the listener types on its window, its
+ * frames, and anything that answers a message the page posts to itself within 500 ms. With `open`, a page no tab
+ * shows is opened in a new tab first, and left open, so the same page is read again after the probes.
+ */
+const CHROME_PAGES_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [id, urls, open] = arguments;
+  (async () => {
+    const policy = WebExtensionPolicy.getByID(id);
+    const win = Services.wm.getMostRecentWindow("navigator:browser");
+    const showing = (url) => {
+      for (const v of policy.extension.views) if (v.xulBrowser && v.xulBrowser.currentURI.spec === url) return v.xulBrowser;
+      for (const w of Services.wm.getEnumerator("navigator:browser")) for (const t of w.gBrowser.tabs) if (t.linkedBrowser.currentURI.spec === url) return t.linkedBrowser;
+      return null;
+    };
+    const pages = [];
+    for (const url of urls) {
+      let browser = showing(url);
+      if (!browser && open) browser = win.gBrowser.addTab(url, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() }).linkedBrowser;
+      if (!browser) { pages.push({ href: url, error: "no tab shows it" }); continue; }
+      // The frame script goes into the page's own process, so the tab must have switched to the page and loaded it.
+      for (let waited = 0; waited < 15000 && (browser.currentURI.spec !== url || browser.webProgress?.isLoadingDocument); waited += 100) await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 300));
+      if (!browser.messageManager) { pages.push({ href: url, error: "no message manager" }); continue; }
+      pages.push(await new Promise((resolve) => {
+        const name = "och-exposure-" + Math.random().toString(36).slice(2);
+        const mm = browser.messageManager;
+        const timer = setTimeout(() => { mm.removeMessageListener(name, listener); resolve({ href: url, error: "no answer from the page process" }); }, 20000);
+        const listener = (m) => { clearTimeout(timer); mm.removeMessageListener(name, listener); resolve(m.data); };
+        mm.addMessageListener(name, listener);
+        const body = function (name, url) {
+          const Cu = Components.utils;
+          const { setTimeout } = ChromeUtils.importESModule("resource://gre/modules/Timer.sys.mjs");
+          const els = Components.classes["@mozilla.org/eventlistenerservice;1"].getService(Components.interfaces.nsIEventListenerService);
+          const started = Date.now();
+          const read = () => {
+            if ((content.location.href !== url || content.document.readyState !== "complete") && Date.now() - started < 15000) { setTimeout(read, 100); return; }
+            // Listeners first: the echo below adds one of its own while it waits, and removes it after.
+            const windowListeners = els.getListenerInfoFor(content).map((l) => l.type + (l.capturing ? ":capture" : ""));
+            const frames = content.frames.length + content.document.querySelectorAll("iframe, frame, object, embed").length;
+            const sb = Cu.Sandbox(content.document.nodePrincipal, { sandboxPrototype: content, wantXrays: false, sameZoneAs: content });
+            Cu.evalInSandbox("var ochToken = " + JSON.stringify("och-echo-" + Math.random()) + "; var ochGot = [];" +
+              "var ochOn = function (e) { var d; try { d = JSON.stringify(e.data); } catch (x) { d = String(e.data); } if (String(d).indexOf(ochToken) < 0) ochGot.push(String(d).slice(0, 300)); };" +
+              "window.addEventListener('message', ochOn); window.postMessage({ och: ochToken }, '*');", sb);
+            setTimeout(() => {
+              Cu.evalInSandbox("window.removeEventListener('message', ochOn);", sb);
+              const got = JSON.parse(Cu.evalInSandbox("JSON.stringify(ochGot)", sb));
+              sendAsyncMessage(name, { href: content.location.href, windowListeners, frames, echo: got.length ? got.join(" | ") : "none" });
+            }, 500);
+          };
+          read();
+        };
+        mm.loadFrameScript("data:application/javascript;charset=utf-8," + encodeURIComponent("(" + body.toString() + ")(" + JSON.stringify(name) + ", " + JSON.stringify(url) + ")"), false);
+      }));
+    }
+    done(pages);
+  })().catch((e) => done([{ href: "", error: String(e) }]));
+`;
+
+/**
+ * Leaves one blank tab and closes the rest, so the session the browser writes at quit is the same in every run
+ * rather than each tab caught mid-load. With no closed-tab history kept, nothing of the closed tabs is written.
+ */
+const CHROME_QUIESCE_TABS_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const blank = win.gBrowser.addTab("about:blank", { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
+  win.gBrowser.selectedTab = blank;
+  for (const tab of [...win.gBrowser.tabs]) if (tab !== blank) win.gBrowser.removeTab(tab, { skipPermitUnload: true, animate: false });
+  done(win.gBrowser.tabs.length);
+`;
+
+/** The random id the profiles datastore names its database after, once it has made one. */
+const CHROME_STORE_ID_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  done(Services.prefs.getStringPref("toolkit.profiles.storeID", ""));
+`;
+
+/** Runs every system-principal witness check; the harness runs redirects and facts itself. */
+const CHROME_WITNESS_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const checks = arguments[0];
+  (async () => {
+    const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
+    const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+    const reg = Cc["@mozilla.org/chrome/chrome-registry;1"].getService(Ci.nsIChromeRegistry);
+    const load = (url) => new Promise((resolve) => {
+      try {
+        const ch = NetUtil.newChannel({ uri: url, loadUsingSystemPrincipal: true });
+        NetUtil.asyncFetch(ch, (stream, status) => {
+          if (!Components.isSuccessCode(status)) { resolve({ ok: false, detail: "load failed 0x" + (status >>> 0).toString(16), text: "" }); return; }
+          try {
+            const text = NetUtil.readInputStreamToString(stream, stream.available());
+            resolve({ ok: text.length > 0, detail: "loads " + text.length + " chars", text });
+          } catch (e) { resolve({ ok: false, detail: "read failed " + e, text: "" }); }
+        });
+      } catch (e) { resolve({ ok: false, detail: String(e), text: "" }); }
+    });
+    const run = async (c) => {
+      switch (c.kind) {
+        case "file": {
+          try {
+            const st = await IOUtils.stat(c.path);
+            if (st.type === "directory") { const kids = await IOUtils.getChildren(c.path); return { ok: true, detail: "directory with " + kids.length + " entries" }; }
+            const bytes = await IOUtils.read(c.path, c.mark ? {} : { maxBytes: 64 });
+            if (!c.mark) return { ok: bytes.length > 0, detail: st.type + ", " + st.size + " bytes" };
+            const marked = new TextDecoder("utf-8", { fatal: false }).decode(bytes).includes(c.mark);
+            return { ok: marked, detail: st.type + ", " + st.size + " bytes, " + (marked ? "holds the mark" : "without the mark") };
+          } catch (e) { return { ok: false, detail: e.name || String(e) }; }
+        }
+        case "load": {
+          const l = await load(c.url);
+          if (!c.mark) return { ok: l.ok, detail: l.detail };
+          const marked = l.text.includes(c.mark);
+          return { ok: l.ok && marked, detail: l.detail + (marked ? ", holds the mark" : ", without the mark") };
+        }
+        case "resource": return res.hasSubstitution(c.name) ? { ok: true, detail: "-> " + res.resolveURI(Services.io.newURI("resource://" + c.name + "/")) } : { ok: false, detail: "no substitution" };
+        case "chrome": try { return { ok: true, detail: "-> " + reg.convertChromeURL(Services.io.newURI("chrome://" + c.pkg + "/content/")).spec }; } catch (e) { return { ok: false, detail: "not registered" }; }
+        case "addon": { const p = WebExtensionPolicy.getByID(c.id); return p && p.active ? { ok: true, detail: "active, " + p.mozExtensionHostname } : { ok: false, detail: p ? "inactive" : "not installed" }; }
+        case "tab": { const win = Services.wm.getMostRecentWindow("navigator:browser"); const tab = win.gBrowser.tabs.find((t) => t.linkedBrowser.currentURI.spec === c.url); return tab ? { ok: true, detail: "a tab shows it" } : { ok: false, detail: "no tab shows it" }; }
+        case "service": {
+          if (c.name === "downloads") { const { Downloads } = ChromeUtils.importESModule("resource://gre/modules/Downloads.sys.mjs"); const all = await (await Downloads.getList(Downloads.ALL)).getAll(); return { ok: true, detail: "list answers, " + all.length + " items" }; }
+          if (c.name === "clipboard") return Services.clipboard ? { ok: true, detail: "clipboard service" } : { ok: false, detail: "no clipboard service" };
+          return Cc["@mozilla.org/alerts-service;1"] ? { ok: true, detail: "alerts service" } : { ok: false, detail: "no alerts service" };
+        }
+        default: return { ok: false, detail: "not a system-principal check: " + c.kind };
+      }
+    };
+    const out = {};
+    for (const [key, c] of Object.entries(checks)) {
+      try { out[key] = await run(c); } catch (e) { out[key] = { ok: false, detail: "threw " + e }; }
+    }
+    done(out);
+  })().catch((e) => done({ error: String(e) }));
+`;
+
+const CHROME_ENUMERATE_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const candidates = arguments[0];
+  const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
+  const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+  const reg = Cc["@mozilla.org/chrome/chrome-registry;1"].getService(Ci.nsIChromeRegistry);
+  const resNames = new Set(["", "gre", "app", ...candidates]);
+  const pkgs = new Set(candidates);
+  const jars = new Set();
+  const mozSrc = new Set();
+  for (const n of ["", "gre"]) {
+    const m = /^jar:(file:[^!]+)!/.exec(res.getSubstitution(n).spec);
+    if (m) jars.add(m[1]);
+  }
+  for (const jar of jars) {
+    const zr = Cc["@mozilla.org/libjar/zip-reader;1"].createInstance(Ci.nsIZipReader);
+    zr.open(Services.io.newURI(jar).QueryInterface(Ci.nsIFileURL).file);
+    const it = zr.findEntries(null);
+    while (it.hasMore()) {
+      const name = it.getNext();
+      if (!/\\.(m?js|jsm|manifest|x?html|css|json|xml|ftl|svg|xhtml|txt)$/.test(name)) continue;
+      let text = "";
+      try { const s = zr.getInputStream(name); text = NetUtil.readInputStreamToString(s, s.available()); s.close(); } catch { continue; }
+      for (const m of text.matchAll(/resource:\\/\\/([a-z0-9][a-z0-9._-]*)\\//gi)) resNames.add(m[1].toLowerCase());
+      for (const m of text.matchAll(/chrome:\\/\\/([a-z0-9][a-z0-9._-]*)\\/(content|skin|locale)\\//gi)) pkgs.add(m[1].toLowerCase());
+      for (const m of text.matchAll(/moz-src:\\/\\/\\/([A-Za-z0-9_\\/.-]+\\.m?js)/g)) mozSrc.add("moz-src:///" + m[1]);
+      if (name.endsWith(".manifest")) {
+        for (const line of text.split("\\n")) {
+          const w = line.trim().split(/\\s+/);
+          if (w[0] === "resource" && w[1]) resNames.add(w[1].toLowerCase());
+          if (w[0] === "content" && w[1]) pkgs.add(w[1].toLowerCase());
+        }
+      }
+    }
+    zr.close();
+  }
+  const subs = [];
+  for (const name of [...resNames].sort()) {
+    if (!res.hasSubstitution(name)) continue;
+    let resolved = "";
+    try { resolved = res.resolveURI(Services.io.newURI("resource://" + name + "/")); } catch (e) { resolved = "error " + e; }
+    let contentAccess = null;
+    try { contentAccess = res.allowContentToAccess(Services.io.newURI("resource://" + name + "/")); } catch {}
+    subs.push({ name, resolved, contentAccess });
+  }
+  const chrome = [];
+  for (const pkg of [...pkgs].sort()) {
+    try {
+      const target = reg.convertChromeURL(Services.io.newURI("chrome://" + pkg + "/content/")).spec;
+      chrome.push({ pkg, target });
+    } catch {}
+  }
+  done({ subs, chrome, mozSrc: [...mozSrc].sort() });
+`;
+
+const CHROME_READ_ARCHIVE_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const paths = arguments[0];
+  (async () => {
+    const out = { processType: Services.appinfo.processType, isSystemPrincipal: Cu.getObjectPrincipal({}).isSystemPrincipal };
+    for (const [k, p] of Object.entries(paths)) {
+      try { out[k] = await IOUtils.readUTF8(p); } catch (e) { out[k] = "error " + e; }
+    }
+    done(out);
+  })();
+`;
+
+const CHROME_OTHER_EXP_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const logPath = arguments[0];
+  (async () => {
+    Services.prefs.clearUserPref("och.otherexp.result");
+    Services.obs.notifyObservers(null, "och-other-exp-read", logPath);
+    for (let i = 0; i < 50 && !Services.prefs.prefHasUserValue("och.otherexp.result"); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    done(Services.prefs.getStringPref("och.otherexp.result", ""));
+  })();
+`;
+
+const CHROME_PLANT_RESOURCE_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const targetPath = arguments[0];
+  const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+  if (targetPath) {
+    const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+    f.initWithPath(targetPath);
+    res.setSubstitutionWithFlags("och-planted", Services.io.newFileURI(f), Ci.nsISubstitutingProtocolHandler.ALLOW_CONTENT_ACCESS);
+    done(res.getSubstitution("och-planted").spec);
+    return;
+  }
+  res.setSubstitution("och-planted", null);
+  done(res.hasSubstitution("och-planted"));
+`;
+
+/** Plants a mark in the recorder's storage.local and reads it back, as the system principal. */
+const CHROME_PLANT_STORAGE_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [id, mark] = arguments;
+  (async () => {
+    const { ExtensionStorageIDB } = ChromeUtils.importESModule("resource://gre/modules/ExtensionStorageIDB.sys.mjs");
+    const policy = WebExtensionPolicy.getByID(id);
+    const db = await ExtensionStorageIDB.open(ExtensionStorageIDB.getStoragePrincipal(policy.extension));
+    await db.set({ och_secret: mark });
+    done({ read: JSON.stringify(await db.get(null)) });
+  })().catch((e) => done({ error: String(e) }));
+`;
+
+/** Plants a mark in the recorder origin's IndexedDB from the recorder's own page and reads it back there. */
+const recorderIdbPlant = (mark: string): string => `new Promise((resolve) => {
+  const open = indexedDB.open("och-recorder", 1);
+  open.onupgradeneeded = () => open.result.createObjectStore("kv");
+  open.onerror = () => resolve("open error " + open.error);
+  open.onsuccess = () => {
+    const db = open.result;
+    const tx = db.transaction("kv", "readwrite");
+    tx.objectStore("kv").put(${JSON.stringify(mark)}, "secret");
+    tx.oncomplete = () => {
+      const rq = db.transaction("kv").objectStore("kv").get("secret");
+      rq.onsuccess = () => { db.close(); resolve("kv.secret = " + rq.result); };
+      rq.onerror = () => { db.close(); resolve("get error"); };
+    };
+  };
+})`;
+
+const CHROME_CAN_ACCESS_FILE_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [addonId, savedUrl, logUrl] = arguments;
+  const p = WebExtensionPolicy.getByID(addonId);
+  if (!p) { done(null); return; }
+  done({
+    savedPage: p.canAccessURI(Services.io.newURI(savedUrl)),
+    archiveLog: p.canAccessURI(Services.io.newURI(logUrl)),
+  });
+`;
+
+const CHROME_OPEN_TAB_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const url = arguments[0];
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const tab = win.gBrowser.addTab(url, {
+    triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+  });
+  win.gBrowser.selectedTab = tab;
+  done("ok");
+`;
+
+const CHROME_OPEN_DEVTOOLS_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const prefix = arguments[0];
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  const tab = win.gBrowser.tabs.find((t) => t.linkedBrowser.currentURI.spec.startsWith(prefix));
+  if (!tab) { done("no tab for " + prefix); return; }
+  win.gBrowser.selectedTab = tab;
+  const { DevToolsShim } = ChromeUtils.importESModule("chrome://devtools-startup/content/DevToolsShim.sys.mjs");
+  DevToolsShim.showToolboxForTab(tab, { toolId: "netmonitor" }).then(
+    (tb) => done(tb ? "open" : "null"),
+    (e) => done("error " + e),
+  );
+`;
+
+const CHROME_DOWNLOAD_TARGETS_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const { Downloads } = ChromeUtils.importESModule("resource://gre/modules/Downloads.sys.mjs");
+  Downloads.getList(Downloads.ALL).then((list) => list.getAll()).then((all) => done(all.map((d) => d.target.path)));
+`;
+
+function findFirstFile(dir: string, suffix: string): string | null {
+  if (!NodeFS.existsSync(dir)) return null;
+  const name = NodeFS.readdirSync(dir)
+    .sort()
+    .find((entry) => entry.endsWith(suffix));
+  return name === undefined ? null : NodePath.join(dir, name);
+}
+
+/** A redirect target's witness: the harness's own server answers the URL with a 302 to the planned file. */
+function redirectWitness(url: string, to: string, proxyPort: number): Promise<CheckOutcome> {
+  return new Promise((resolve) => {
+    const request = NodeHttp.request(
+      {
+        host: "127.0.0.1",
+        port: proxyPort,
+        path: url,
+        headers: { host: new NodeURL.URL(url).host },
+      },
+      (response) => {
+        response.resume();
+        const location = response.headers.location;
+        resolve({
+          ok: response.statusCode === 302 && location === to,
+          detail: `status ${String(response.statusCode)}, location ${String(location)}`,
+        });
+      },
+    );
+    request.on("error", (error) => resolve({ ok: false, detail: String(error) }));
+    request.end();
+  });
+}
+
+/** Every planned check the system principal runs, by key: all but the harness's redirects and facts. */
+function chromeWitnessChecks(plan: TargetPlan): Record<string, WitnessCheck> {
+  return Object.fromEntries(
+    Object.values(plan.checks)
+      .flat()
+      .filter((c) => c.kind !== "redirect" && c.kind !== "fact")
+      .map((c) => [checkKey(c), c] as const),
+  );
+}
+
+/** Runs every planned witness check once: the system principal's in one chrome script, then the harness's own. */
+async function runWitness(
+  session: BrowserSession,
+  plan: TargetPlan,
+  facts: Readonly<Record<Fact, CheckOutcome>>,
+  proxyPort: number,
+): Promise<{
+  readonly witness: Readonly<Record<string, Witness>>;
+  readonly results: ReadonlyMap<string, CheckOutcome>;
+}> {
+  const unique = new Map(
+    Object.values(plan.checks)
+      .flat()
+      .map((c) => [checkKey(c), c] as const),
+  );
+  const chrome = (await session.evaluateChrome(CHROME_WITNESS_SCRIPT, [
+    chromeWitnessChecks(plan),
+  ])) as Record<string, CheckOutcome> & { readonly error?: string };
+  if (typeof chrome.error === "string") throw new Error(`witness failed: ${chrome.error}`);
+  const results = new Map<string, CheckOutcome>();
+  for (const [key, c] of unique) {
+    results.set(
+      key,
+      c.kind === "fact"
+        ? facts[c.name]
+        : c.kind === "redirect"
+          ? await redirectWitness(c.url, c.to, proxyPort)
+          : (chrome[key] ?? { ok: false, detail: "no answer from the system principal" }),
+    );
+  }
+  return { witness: combineWitness(plan, results), results };
+}
+
+const keySources = (
+  profileDir: string,
+  dataHome: string,
+  addonId: string,
+  addonUuid: string,
+): KeySources => ({
+  profileDir,
+  userName: NodeOS.userInfo().username,
+  hostName: NodeOS.hostname(),
+  dataHome,
+  addonId,
+  addonUuid,
+});
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (NodeFS.existsSync(path)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return NodeFS.existsSync(path);
+}
+
+/**
+ * Records every registration call the add-on makes, with its real arguments, and every worker URL: the experiment
+ * global's `Services`, `Cc` and `ChromeWorker` are replaced, now and in each global ExtensionCommon makes after. A call
+ * is the add-on's when one of its scripts is on the stack. Proxies wrap a plain object: a WrappedNative cannot be one's target.
+ */
+const CHROME_WATCH_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [id, phase] = arguments;
+  const win = Services.wm.getMostRecentWindow("navigator:browser");
+  if (win.ochWatch) { done({ problems: ["the watcher was already installed"] }); return; }
+  const { ExtensionCommon } = ChromeUtils.importESModule("resource://gre/modules/ExtensionCommon.sys.mjs");
+  const res = Services.io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler);
+  const pol = WebExtensionPolicy.getByID(id);
+  const prefixes = pol ? [pol.extension.rootURI.spec, "moz-extension://" + pol.mozExtensionHostname + "/"] : [];
+  const watch = { phase, calls: [], workers: [], globals: [], problems: pol ? [] : ["no policy for " + id] };
+  const byProduct = () => String(new Error().stack).split("\\n").some((line) => prefixes.some((p) => line.slice(line.indexOf("@") + 1).startsWith(p)));
+  const entry = (name) => {
+    if (!res.hasSubstitution(name)) return null;
+    const u = Services.io.newURI("resource://" + name + "/");
+    let resolved = ""; try { resolved = res.resolveURI(u); } catch (e) { resolved = "error " + e; }
+    let contentAccess = null; try { contentAccess = res.allowContentToAccess(u); } catch {}
+    return { name, resolved, contentAccess };
+  };
+  const bound = (t, p) => { const v = t[p]; return typeof v === "function" ? v.bind(t) : v; };
+  const forward = (real, get) => new Proxy({}, { get: (_, p) => get(real, p), has: (_, p) => p in real, set: (_, p, v) => { real[p] = v; return true; } });
+  const handler = forward(res, (t, p) => {
+    if (p === "setSubstitution" || p === "setSubstitutionWithFlags") return (...args) => {
+      const call = { phase: watch.phase, method: p, name: String(args[0]), target: args[1] ? String(args[1].spec) : null, flags: p === "setSubstitutionWithFlags" ? Number(args[2]) : null, product: byProduct(), after: null, error: null };
+      watch.calls.push(call);
+      try { return t[p](...args); } catch (e) { call.error = String(e); throw e; } finally { call.after = entry(call.name.toLowerCase()); }
+    };
+    if (p === "QueryInterface") return (iid) => { t.QueryInterface(iid); return handler; };
+    return bound(t, p);
+  });
+  const io = forward(Services.io, (t, p) => {
+    if (p === "getProtocolHandler") return (scheme) => { const h = t.getProtocolHandler(scheme); return String(scheme).toLowerCase() === "resource" ? handler : h; };
+    if (p === "QueryInterface") return (iid) => { t.QueryInterface(iid); return io; };
+    return bound(t, p);
+  });
+  const giving = (cls, out) => forward(cls, (t, p) => {
+    if (p === "getService" || p === "createInstance") return (iid) => { t[p](iid); return out; };
+    return bound(t, p);
+  });
+  const classes = (real) => forward(real, (t, p) => {
+    const v = t[p];
+    if (/^@mozilla\\.org\\/network\\/protocol;1\\?name=resource$/i.test(String(p))) return giving(v, handler);
+    if (/^@mozilla\\.org\\/network\\/io-service;1$/i.test(String(p))) return giving(v, io);
+    return v;
+  });
+  const patch = (g, how) => {
+    try {
+      if (g.Services) { const real = g.Services; g.Services = forward(real, (t, p) => (p === "io" ? io : t[p])); }
+      if (g.Cc) g.Cc = classes(g.Cc);
+      if (g.ChromeWorker) g.ChromeWorker = new Proxy(g.ChromeWorker, { construct(t, args) { watch.workers.push({ phase: watch.phase, url: String(args[0]), product: byProduct() }); return Reflect.construct(t, args); } });
+      watch.globals.push({ phase: watch.phase, how });
+    } catch (e) { watch.problems.push(how + " global: " + e); }
+  };
+  const proto = ExtensionCommon.SchemaAPIManager.prototype;
+  const create = proto._createExtGlobal;
+  proto._createExtGlobal = function (...args) { const g = create.apply(this, args); patch(g, "created"); return g; };
+  const g = pol?.extension?.experimentAPIManager?.global;
+  if (g) patch(g, "existing");
+  win.ochWatch = { watch, entry };
+  done({ problems: watch.problems, globals: watch.globals });
+`;
+
+/** Moves the watcher to a new phase, and reads it with the table's entry for `names` and every name it saw called. */
+const CHROME_WATCH_READ_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [phase, names] = arguments;
+  const w = Services.wm.getMostRecentWindow("navigator:browser").ochWatch;
+  if (!w) { done({ calls: [], workers: [], globals: [], problems: ["no watcher in this window"], entries: [] }); return; }
+  const all = [...new Set([...names, ...w.watch.calls.map((c) => c.name.toLowerCase())])].sort();
+  const watch = JSON.parse(JSON.stringify(w.watch));
+  w.watch.phase = phase;
+  done({ ...watch, entries: all.map(w.entry).filter(Boolean) });
+`;
+
+/** Disables or enables the add-on and waits until its policy is gone or active again. */
+const CHROME_ADDON_SCRIPT = `
+  const done = arguments[arguments.length - 1];
+  const [id, action] = arguments;
+  (async () => {
+    const { AddonManager } = ChromeUtils.importESModule("resource://gre/modules/AddonManager.sys.mjs");
+    const addon = await AddonManager.getAddonByID(id);
+    if (!addon) return done("no add-on " + id);
+    const on = action === "enable";
+    await (on ? addon.enable() : addon.disable());
+    const settled = () => { const p = WebExtensionPolicy.getByID(id); return on ? Boolean(p && p.active) : !p; };
+    for (let waited = 0; waited < 10000 && !settled(); waited += 100) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 1000));
+    done(settled() ? (on ? "active" : "gone") : on ? "not active after enable" : "the add-on's policy outlived its disable");
+  })().catch((e) => done("error " + e));
+`;
+
+type WatchRead = Watch & { readonly entries: readonly Substitution[] };
+
+const readWatch = async (
+  session: BrowserSession,
+  phase: string,
+  names: readonly string[],
+): Promise<WatchRead> =>
+  (await session.evaluateChrome(CHROME_WATCH_READ_SCRIPT, [phase, names])) as WatchRead;
+
+const watchOnly = ({ calls, workers, globals, problems }: WatchRead): Watch => ({
+  calls,
+  workers,
+  globals,
+  problems,
+});
+
+type SecondProfile = {
+  readonly key: KeyEvidence["second"];
+  readonly lifecycle: Lifecycle;
+};
+
+/**
+ * A second fresh profile with the same XPI: the key it makes, what that profile exposes to a guesser, and the add-on
+ * watched from its first line: disabled, enabled again under the watcher, made to record a page and export it, which
+ * starts its file worker, and disabled. The table is read for every name the profile knows at each stop.
+ */
+async function secondProfile(
+  context: CheckContext,
+  recorderId: string,
+  server: Awaited<ReturnType<typeof startIsolationServer>>,
+  prefs: readonly Pref[],
+): Promise<SecondProfile> {
+  await using second = recordingWorkspace("isolation-second");
+  if (context.extensionPath === null)
+    return { key: { missing: "no extension" }, lifecycle: { missing: "no extension" } };
+  await using session = await second.launch({
+    binaryPath: context.binaryPath,
+    extensionPath: context.extensionPath,
+    display: context.display,
+    protocol: "marionette",
+    launchMode: "real-defaults",
+    signal: context.signal,
+    extraPrefs: prefs,
+  });
+  const info = (await session.evaluateChrome(CHROME_INFO_SCRIPT, [
+    [recorderId],
+  ])) as ChromeBootstrapInfo;
+  const keyFile = NodePath.join(second.profileDir, ARCHIVE_KEY_FILE);
+  const key: KeyEvidence["second"] = (await waitForFile(keyFile, KEY_WAIT_MS))
+    ? {
+        keyFileText: NodeFS.readFileSync(keyFile, "utf8"),
+        sources: keySources(
+          second.profileDir,
+          second.dataHome,
+          recorderId,
+          info.addons[recorderId]?.uuid ?? "",
+        ),
+      }
+    : { missing: `no ${ARCHIVE_KEY_FILE} after ${String(KEY_WAIT_MS)} ms` };
+  const packed = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [recorderId])) as {
+    readonly literals?: readonly string[];
+    readonly rootUrl?: string;
+    readonly error?: string;
+  };
+  if (packed.error !== undefined || packed.rootUrl === undefined)
+    return { key, lifecycle: { missing: `exposure read failed: ${String(packed.error)}` } };
+  const names = [...new Set([...(packed.literals ?? []), WORKER_HOST])];
+  await session.evaluateChrome(CHROME_WATCH_SCRIPT, [recorderId, "stop"]);
+  const steps: string[] = [];
+  steps.push(String(await session.evaluateChrome(CHROME_ADDON_SCRIPT, [recorderId, "disable"])));
+  const stopped = await readWatch(session, "start", names);
+  steps.push(String(await session.evaluateChrome(CHROME_ADDON_SCRIPT, [recorderId, "enable"])));
+  await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, ["http://bank.example/"]);
+  const bank = await server.waitFor(
+    (r): r is Extract<IsolationReport, { kind: "bank-done" }> => r.kind === "bank-done",
+    STEP_TIMEOUT_MS,
+  );
+  steps.push(bank === null ? "no bank page" : "bank page recorded");
+  const page = {
+    session,
+    tab: await session.openTab(
+      await waitForActiveExtensionUrl(
+        session,
+        recorderId,
+        await readExtensionPopupPath(context.extensionPath),
+      ),
+    ),
+  };
+  await readWatch(session, "export", []);
+  try {
+    const job = await startExport(page, {
+      selection: { scope: "everything", range: { kind: "everything" }, include: "all" },
+      bodies: "include",
+      redaction: "standard",
+      packaging: "har",
+      fileName: "isolation-lifecycle",
+    });
+    steps.push(`export ${(await waitForJob(page, job.id, ended)).state.kind}`);
+  } catch (error) {
+    steps.push(`export failed: ${String(error)}`);
+  }
+  const running = await readWatch(session, "disable", names);
+  steps.push(String(await session.evaluateChrome(CHROME_ADDON_SCRIPT, [recorderId, "disable"])));
+  const after = await readWatch(session, "after", names);
+  await session.quit();
+  context.log(`isolation: watched start: ${steps.join(", ")}`);
+  const failed = steps.filter(
+    (step) => !/^(?:gone|active|bank page recorded|export [\w-]+)$/u.test(step),
+  );
+  return {
+    key,
+    lifecycle:
+      failed.length > 0
+        ? { missing: failed.join("; ") }
+        : {
+            place: {
+              addonRoot: packed.rootUrl,
+              profileDir: second.profileDir,
+              dataHome: second.dataHome,
+            },
+            watch: watchOnly(after),
+            stopped: stopped.entries,
+            running: running.entries,
+            after: after.entries,
+          },
+  };
+}
+
+/**
+ * Waits until a launch has lived `minLifetimeMs` and its workspace has not changed for `quietMs`, at most `maxMs`.
+ * The browser runs late tasks once it has been idle 20 s and writes on its own after that; every run waits the same
+ * way, so each ends with that work done rather than cut off at a moment that depends on the machine's load.
+ */
+async function settle(
+  base: string,
+  options: {
+    readonly since: number;
+    readonly minLifetimeMs: number;
+    readonly quietMs: number;
+    readonly maxMs: number;
+  },
+): Promise<void> {
+  const deadline = Date.now() + options.maxMs;
+  let last = JSON.stringify(snapshotTree(base));
+  let quietSince = Date.now();
+  while (Date.now() < deadline) {
+    if (
+      Date.now() - quietSince >= options.quietMs &&
+      Date.now() - options.since >= options.minLifetimeMs
+    )
+      return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const now = JSON.stringify(snapshotTree(base));
+    if (now !== last) {
+      last = now;
+      quietSince = Date.now();
+    }
+  }
+}
+
+const SETTLE_QUIET_MS = 3000;
+const SETTLE_MAX_MS = 90_000;
+/** Past the browser's 20 s idle threshold for its late tasks, with time for them to finish. */
+const SHORT_LAUNCH_LIFETIME_MS = 40_000;
+
+async function runNoMarionetteLaunch(options: {
+  readonly position: "file-no-marionette";
+  readonly binaryPath: string;
+  readonly display: CheckContext["display"];
+  readonly profileDir: string;
+  readonly dataHome: string;
+  readonly home: string | null;
+  readonly url: string;
+  readonly extraPrefs: readonly Pref[];
+  readonly server: Awaited<ReturnType<typeof startIsolationServer>>;
+  readonly signal: AbortSignal;
+  /** The workspace folder, watched until the launch settles. */
+  readonly base: string;
+}): Promise<{ readonly problem: string | null; readonly pid: number }> {
+  const since = Date.now();
+  await using session = await launchBrowser({
+    binaryPath: options.binaryPath,
+    extensionPath: null,
+    display: options.display,
+    launchMode: "none",
+    profileDir: options.profileDir,
+    dataHome: options.dataHome,
+    ...(options.home === null ? {} : { home: options.home }),
+    urls: [options.url],
+    extraPrefs: options.extraPrefs,
+    signal: options.signal,
+  });
+  options.server.enable(options.position);
+  const done = await options.server.waitFor(
+    (r): r is Extract<IsolationReport, { kind: "position-done" }> =>
+      r.kind === "position-done" && r.position === options.position,
+    POSITION_TIMEOUT_MS,
+  );
+  await settle(options.base, {
+    since,
+    minLifetimeMs: SHORT_LAUNCH_LIFETIME_MS,
+    quietMs: SETTLE_QUIET_MS,
+    maxMs: SETTLE_MAX_MS,
+  });
+  return {
+    problem: done === null ? `${options.position}: timed out waiting for page completion` : null,
+    pid: session.spawnedPid,
+  };
+}
+
+/**
+ * The probe add-on and the other experiment, installed the same way, byte for byte, in every run. Returns what it
+ * wrote, by workspace path, so the disk rule can hold those files to the harness's own bytes.
+ */
+function installProbeAddons(profileDir: string, probeXpi: Buffer): Record<string, Buffer> {
+  const dir = NodePath.join(profileDir, "extensions");
+  NodeFS.mkdirSync(dir, { recursive: true });
+  const written = {
+    [`profile/extensions/${PROBE_EXTENSION_ID}.xpi`]: probeXpi,
+    [`profile/extensions/${OTHER_EXPERIMENT_ID}.xpi`]: buildOtherExperimentXpi(),
+  };
+  for (const [path, bytes] of Object.entries(written))
+    NodeFS.writeFileSync(NodePath.join(dir, NodePath.basename(path)), bytes);
+  return written;
+}
+
+/**
+ * Ends one run's disk record once its last browser quit: every change since before launch with its bytes digested,
+ * the entries of every file whose format can be read, and the digest of each file the harness wrote.
+ */
+function runDisk(options: {
+  readonly base: string;
+  readonly before: DiskSnapshot;
+  readonly plan: DiskSnapshot;
+  readonly probes: DiskSnapshot;
+  readonly names: RunNames;
+  readonly marker: string;
+  readonly harness: Readonly<Record<string, Buffer | string>>;
+}): RunDisk {
+  const final = diffSnapshots(
+    options.before,
+    snapshotTree(options.base, { names: options.names, marker: options.marker }),
+  );
+  return {
+    plan: diffSnapshots(options.before, options.plan),
+    probes: diffSnapshots(options.before, options.probes),
+    final,
+    structured: readChangedStructured(options.base, final, options.names, options.marker),
+    names: options.names,
+    harness: Object.fromEntries(
+      Object.entries(options.harness).map(([path, bytes]) => [
+        path,
+        contentDigest(Buffer.from(bytes), options.names),
+      ]),
+    ),
+  };
+}
+
+/**
+ * The control run's recorder: the product's own XPI, every file as packed, but each script emptied and the
+ * experiment API left out of its manifest. The browser keeps the same record of the same add-on, pages, titles and
+ * icons, and nothing of the product runs.
+ */
+async function buildStandInXpi(
+  xpiPath: string,
+  manifest: Record<string, unknown>,
+  files: readonly string[],
+): Promise<Buffer> {
+  const { experiment_apis: _experiment, ...inert } = manifest;
+  return buildStoredZip(
+    await Promise.all(
+      files.map(async (name) => ({
+        name,
+        data:
+          name === "manifest.json"
+            ? Buffer.from(JSON.stringify(inert, null, 2))
+            : /\.m?js$/u.test(name)
+              ? Buffer.alloc(0)
+              : await readZipEntry(xpiPath, name),
+      })),
+    ),
+  );
+}
+
+type PageRead = {
+  readonly href: string;
+  readonly windowListeners?: readonly string[];
+  readonly frames?: number;
+  readonly echo?: string;
+  readonly error?: string;
+};
+
+/**
+ * Reads every recorder page as it shows, from the system principal. Before the probes, `open` opens each page no tab
+ * shows yet in a tab of its own, and every page stays open through the probes, so a listener a page adds late is
+ * there when the same tabs are read again after them. A page that is no longer shown is not read, which fails.
+ */
+async function readPages(
+  session: BrowserSession,
+  recorderId: string,
+  urls: readonly string[],
+  open: boolean,
+): Promise<readonly PageSurface[]> {
+  const read = (await session.evaluateChrome(CHROME_PAGES_SCRIPT, [
+    recorderId,
+    urls,
+    open,
+  ])) as readonly PageRead[];
+  return read.flatMap((page): PageSurface[] =>
+    page.error === undefined && urls.includes(page.href)
+      ? [
+          {
+            href: page.href,
+            windowListeners: page.windowListeners ?? [],
+            frames: page.frames ?? 0,
+            echo: page.echo === undefined || page.echo === "none" ? null : page.echo,
+          },
+        ]
+      : [],
+  );
+}
+
+/** Every resource:// substitution and chrome package the enumeration found, as comparable lines. */
+const schemeLines = (
+  enumerated: EnumeratedSchemes,
+): Pick<RuntimeSurface, "substitutions" | "chromePackages"> => ({
+  substitutions: enumerated.subs.map(substitutionLine),
+  chromePackages: enumerated.chrome.map((c) => `chrome://${c.pkg}/ -> ${c.target}`),
+});
+
+/**
+ * Runs every probe position in order, then the devtools one. Returns what went wrong, and whether the probe add-on's
+ * policy, asked from the system principal, can access neither the file page nor the archive log.
+ */
+async function runPositions(
+  context: CheckContext,
+  session: BrowserSession,
+  server: Awaited<ReturnType<typeof startIsolationServer>>,
+  options: {
+    readonly savedPageUrl: string;
+    readonly probeBase: string;
+    readonly logUrl: string;
+    readonly site: string;
+  },
+): Promise<{ readonly problems: readonly string[]; readonly canAccessFileObserved: boolean }> {
+  const problems: string[] = [];
+  let canAccessFileObserved = false;
+  await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, ["http://attacker.example/probe.html"]);
+  for (const pos of ["web", "cs-web", "file", "cs-file", "ext-bg", "ext-page"] as const) {
+    if (pos === "file") {
+      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [options.savedPageUrl]);
+    } else if (pos === "ext-page") {
+      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [`${options.probeBase}page.html`]);
+    }
+    context.log(`isolation: position ${pos}`);
+    server.enable(pos);
+    if (pos === "cs-file") {
+      const canAccess = (await session.evaluateChrome(CHROME_CAN_ACCESS_FILE_SCRIPT, [
+        PROBE_EXTENSION_ID,
+        options.savedPageUrl,
+        options.logUrl,
+      ])) as { readonly savedPage: boolean; readonly archiveLog: boolean } | null;
+      canAccessFileObserved =
+        canAccess !== null && canAccess.savedPage === false && canAccess.archiveLog === false;
+      const hello = await server.waitFor(
+        (r): r is Extract<IsolationReport, { kind: "cs-hello" }> =>
+          r.kind === "cs-hello" && r.href.startsWith("file:"),
+        1500,
+      );
+      if (hello === null) continue;
+    }
+    const done = await server.waitFor(
+      (r): r is Extract<IsolationReport, { kind: "position-done" }> =>
+        r.kind === "position-done" && r.position === pos,
+      POSITION_TIMEOUT_MS,
+    );
+    if (done === null) {
+      const posRows = server.reports.filter(
+        (r): r is Extract<IsolationReport, { kind: "row" }> =>
+          r.kind === "row" && r.position === pos,
+      );
+      context.log(
+        `isolation: ${pos} timed out after ${String(posRows.length)} rows; last=${posRows.at(-1)?.probe ?? "none"}`,
+      );
+      problems.push(`position ${pos} timed out`);
+    }
+  }
+
+  context.log("isolation: opening devtools");
+  const dvOpen = (await session.evaluateChrome(CHROME_OPEN_DEVTOOLS_SCRIPT, [
+    `http://${options.site}/`,
+  ])) as string;
+  if (dvOpen !== "open") problems.push(`failed to open devtools: ${dvOpen}`);
+  server.enable("ext-devtools");
+  const dvDone = await server.waitFor(
+    (r): r is Extract<IsolationReport, { kind: "position-done" }> =>
+      r.kind === "position-done" && r.position === "ext-devtools",
+    POSITION_TIMEOUT_MS,
+  );
+  if (dvDone === null) problems.push("position ext-devtools timed out");
+  return { problems, canAccessFileObserved };
+}
+
+/** The add-on uuids and the workspace folder of one run, each replaced by its role when two runs are compared. */
+/**
+ * Names the browser chose for this run alone: the profiles datastore's random store id, and the pid of every browser
+ * the run launched, which the profile lock names while a browser holds it.
+ */
+const browserNames = (storeId: string, pids: readonly number[]): RunNames => [
+  ...(storeId === "" ? [] : [[storeId, "{profiles-store-id}"] as const]),
+  ...pids.map((pid) => [`:+${String(pid)}`, ":+{browser-pid}"] as const),
+];
+
+function runNames(
+  base: string,
+  addons: Readonly<Record<string, AddonInfo | null>>,
+  recorderId: string,
+): RunNames {
+  const roles: Readonly<Record<string, string>> = {
+    [recorderId]: "{recorder-uuid}",
+    [PROBE_EXTENSION_ID]: "{probe-uuid}",
+    [OTHER_EXPERIMENT_ID]: "{other-experiment-uuid}",
+  };
+  return [
+    [base, "{workspace}"],
+    ...Object.entries(roles).flatMap(([id, role]): (readonly [string, string])[] => {
+      const uuid = addons[id]?.uuid;
+      return uuid === null || uuid === undefined ? [] : [[uuid, role]];
+    }),
+  ];
+}
+
+/** Everything the control run repeats from the product run, with the product's own paths where a probe needs one. */
+type ControlPlan = {
+  readonly recorderId: string;
+  readonly standInXpi: Buffer;
+  readonly probeXpi: Buffer;
+  readonly popupPath: string;
+  readonly pageFiles: readonly string[];
+  readonly site: string;
+  readonly storeMark: string;
+  readonly logPath: string;
+  readonly logUrl: string;
+  readonly plantRoot: string;
+  readonly exportName: string;
+  readonly exportText: string;
+  readonly savedPageName: string;
+  readonly savedPageHtml: string;
+  readonly serverPlan: Record<string, unknown> & { readonly file: Record<string, unknown> };
+  /** The product run's own reads, repeated so the browser does the same work in both runs. */
+  readonly candidates: readonly string[];
+  /** The recorded marker, searched for in the files a run makes and removes before it ends. */
+  readonly marker: string;
+  readonly witnessChecks: Readonly<Record<string, WitnessCheck>>;
+  readonly archivePaths: Readonly<Record<string, string>>;
+  readonly extraPrefs: readonly Pref[];
+  readonly noMarionettePrefs: readonly Pref[];
+};
+
+/**
+ * The same throwaway HOME, profile, data home and Downloads, the same probe add-ons and the same actions as the
+ * product run, with an inert stand-in under the recorder's id in place of the product. What this run writes is what
+ * the browser and the harness write; the product run's writes beyond it are the product's.
+ */
+async function controlRun(
+  context: CheckContext,
+  server: Awaited<ReturnType<typeof startIsolationServer>>,
+  plan: ControlPlan,
+): Promise<{ readonly disk: RunDisk; readonly substitutions: readonly string[] }> {
+  await using workspace = recordingWorkspace("isolation-control", { ownHome: true });
+  const installed = installProbeAddons(workspace.profileDir, plan.probeXpi);
+  const standInDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "one-click-har-stand-in-"));
+  try {
+    const standInPath = NodePath.join(standInDir, "stand-in.xpi");
+    NodeFS.writeFileSync(standInPath, plan.standInXpi);
+    const before = snapshotTree(workspace.base);
+    let planSnapshot: DiskSnapshot = {};
+    let probesSnapshot: DiskSnapshot = {};
+    let names: RunNames = [];
+    let storeId = "";
+    const pids: number[] = [];
+    const substitutions: string[] = [];
+    const savedPagePath = NodePath.join(workspace.downloads, plan.savedPageName);
+    const savedPageUrl = fileHref(savedPagePath);
+    {
+      await using session = await workspace.launch({
+        binaryPath: context.binaryPath,
+        extensionPath: standInPath,
+        display: context.display,
+        protocol: "marionette",
+        launchMode: "real-defaults",
+        signal: context.signal,
+        extraPrefs: plan.extraPrefs,
+      });
+      const info = (await session.evaluateChrome(CHROME_INFO_SCRIPT, [
+        [plan.recorderId, PROBE_EXTENSION_ID, OTHER_EXPERIMENT_ID],
+      ])) as ChromeBootstrapInfo & { readonly error?: string };
+      if (info.error !== undefined) throw new Error(`control bootstrap failed: ${info.error}`);
+      names = runNames(workspace.base, info.addons, plan.recorderId);
+      const probeUuid = info.addons[PROBE_EXTENSION_ID]?.uuid;
+      if (probeUuid === null || probeUuid === undefined)
+        throw new Error("control: probe extension has no uuid");
+
+      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [`http://${plan.site}/`]);
+      await server.waitFor(
+        (r): r is Extract<IsolationReport, { kind: "bank-done" }> => r.kind === "bank-done",
+        STEP_TIMEOUT_MS,
+      );
+      const popupUrl = await waitForActiveExtensionUrl(session, plan.recorderId, plan.popupPath);
+      const popupTab = await session.openTab(popupUrl);
+      storeId = String(await session.evaluateChrome(CHROME_STORE_ID_SCRIPT));
+      pids.push(session.browserPid, session.spawnedPid);
+      planSnapshot = snapshotTree(workspace.base, { marker: plan.marker });
+      await session.evaluateChrome(CHROME_DOWNLOAD_TARGETS_SCRIPT);
+      await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [plan.recorderId]);
+
+      NodeFS.writeFileSync(NodePath.join(workspace.downloads, plan.exportName), plan.exportText, {
+        mode: 0o600,
+      });
+      await session.evaluateChrome(CHROME_READ_ARCHIVE_SCRIPT, [plan.archivePaths]);
+      await session.evaluateChrome(CHROME_OTHER_EXP_SCRIPT, [plan.logPath]);
+      await session.evaluateChrome(CHROME_PLANT_STORAGE_SCRIPT, [plan.recorderId, plan.storeMark]);
+      await session.evaluate(popupTab, recorderIdbPlant(plan.storeMark));
+      const pageUrls = plan.pageFiles.map(
+        (f) => `moz-extension://${info.addons[plan.recorderId]?.uuid ?? ""}/${f}`,
+      );
+      const atStart = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
+        plan.candidates,
+      ])) as EnumeratedSchemes;
+      substitutions.push(...atStart.subs.map(substitutionLine));
+      await readPages(session, plan.recorderId, pageUrls, true);
+      await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [plan.plantRoot]);
+      NodeFS.writeFileSync(savedPagePath, plan.savedPageHtml, "utf8");
+      await session.evaluateChrome(CHROME_WITNESS_SCRIPT, [plan.witnessChecks]);
+      server.setPlan({
+        ...plan.serverPlan,
+        file: { ...plan.serverPlan.file, savedPage: savedPageUrl },
+      });
+
+      context.log("isolation: control run positions");
+      await runPositions(context, session, server, {
+        savedPageUrl,
+        probeBase: `moz-extension://${probeUuid}/`,
+        logUrl: plan.logUrl,
+        site: plan.site,
+      });
+      await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [""]);
+      const atEnd = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
+        plan.candidates,
+      ])) as EnumeratedSchemes;
+      substitutions.push(...atEnd.subs.map(substitutionLine));
+      await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [plan.recorderId]);
+      await readPages(session, plan.recorderId, pageUrls, false);
+      probesSnapshot = snapshotTree(workspace.base, { marker: plan.marker });
+      await session.evaluateChrome(CHROME_QUIESCE_TABS_SCRIPT);
+      await settle(workspace.base, {
+        since: 0,
+        minLifetimeMs: 0,
+        quietMs: SETTLE_QUIET_MS,
+        maxMs: SETTLE_MAX_MS,
+      });
+      await session.quit();
+    }
+    const last = await runNoMarionetteLaunch({
+      position: "file-no-marionette",
+      binaryPath: context.binaryPath,
+      display: context.display,
+      profileDir: workspace.profileDir,
+      dataHome: workspace.dataHome,
+      home: workspace.home,
+      base: workspace.base,
+      url: `${savedPageUrl}?pos=file-no-marionette`,
+      extraPrefs: plan.noMarionettePrefs,
+      server,
+      signal: context.signal,
+    });
+    const disk = runDisk({
+      base: workspace.base,
+      before,
+      plan: planSnapshot,
+      probes: probesSnapshot,
+      names: [...names, ...browserNames(storeId, [...pids, last.pid])],
+      marker: plan.marker,
+      harness: {
+        ...installed,
+        [`profile/extensions/${plan.recorderId}.xpi`]: plan.standInXpi,
+        [`downloads/${plan.exportName}`]: plan.exportText,
+        [`downloads/${plan.savedPageName}`]: plan.savedPageHtml,
+      },
+    });
+    return { disk, substitutions };
+  } finally {
+    NodeFS.rmSync(standInDir, { recursive: true, force: true });
+  }
+}
+
+const check: HarnessCheck = {
+  name: "isolation",
+  description:
+    "isolation probes across web, file, and other-extension principals against the packed XPI, with targets from the written archive, and a control run without the product",
+  run: async (context: CheckContext): Promise<CheckResult> => {
+    const started = Date.now();
+    if (context.extensionPath === null) {
+      return { name: "isolation", ok: false, durationMs: 0, detail: "needs --extension" };
+    }
+
+    const recorderId = await readExtensionId(context.extensionPath);
+    const popupPath = await readExtensionPopupPath(context.extensionPath);
+    const popupScriptPath = popupPath.replace(/\.html$/u, ".js");
+    const mark = (prefix: string): string =>
+      `${prefix}_${NodeCrypto.randomBytes(8).toString("hex")}`;
+    const marker = mark("OCHMARK");
+    const warMark = mark("OCHWAR");
+    const secretMark = mark("OCHSECRET");
+    const storeMark = mark("OCHSTORE");
+    const ownMark = mark("OCHOWN");
+    const site = "bank.example";
+
+    await using server = await startIsolationServer({
+      marker,
+      probeHtml: PROBE_HTML,
+      probesJs: PROBES_JS,
+      runnerJs: PAGE_RUNNER_JS,
+    });
+
+    context.log("isolation: second fresh profile for the key oracle and the watched start");
+    const { key: secondKey, lifecycle } = await secondProfile(
+      context,
+      recorderId,
+      server,
+      proxyPrefs(server.port),
+    );
+    server.clear();
+    const lifecycleNames = "missing" in lifecycle ? [] : lifecycle.watch.calls.map((c) => c.name);
+
+    await using workspace = recordingWorkspace("isolation", { ownHome: true });
+    const probeXpi = buildProbeExtensionXpi({
+      serverOrigin: server.origin,
+      warMark,
+      secretMark,
+      ownMark,
+    });
+    const installed = installProbeAddons(workspace.profileDir, probeXpi);
+    const diskBefore = snapshotTree(workspace.base);
+    let planSnapshot: DiskSnapshot = {};
+    let probesSnapshot: DiskSnapshot = {};
+
+    const extraChecks: ExtraCheckResult[] = [];
+    const record = (
+      id: ExtraCheckResult["id"],
+      problems: readonly string[],
+      fine: string,
+    ): void => {
+      extraChecks.push({
+        id,
+        ok: problems.length === 0,
+        detail: problems.length === 0 ? fine : problems.join("; "),
+      });
+    };
+    const positionProblems: string[] = [];
+    const syntheticControls: SyntheticControlResult[] = [];
+    let canAccessFileObserved = false;
+    let targetPlan: TargetPlan = { targets: {}, checks: {} };
+    let planInput: PlanInput | null = null;
+    let witness: Readonly<Record<string, Witness>> = {};
+    let witnessResults: ReadonlyMap<string, CheckOutcome> = new Map();
+    let recUuid = "";
+    let savedPageUrl = "";
+    let plannedEntries: ReturnType<typeof workspace.entries> = [];
+    let keyEvidence: KeyEvidence | null = null;
+    let area: ProductArea | null = null;
+    let names: RunNames = [];
+    let storeId = "";
+    const pids: number[] = [];
+    let exposureEvidence: ExposureEvidence | null = null;
+    let productSchemes: Omit<SubstitutionEvidence, "control" | "lifecycle"> | null = null;
+    let controlPlan: ControlPlan | null = null;
+    const noMarionetteExtraPrefs = [...HARNESS_PREFS, ...proxyPrefs(server.port)];
+    const exportName = `${site}-2026-11-16.har`;
+    const savedPageName = "saved-page.html";
+
+    {
+      await using session: BrowserSession = await workspace.launch({
+        binaryPath: context.binaryPath,
+        extensionPath: context.extensionPath,
+        display: context.display,
+        protocol: "marionette",
+        launchMode: "real-defaults",
+        signal: context.signal,
+        extraPrefs: proxyPrefs(server.port),
+      });
+
+      const info = (await session.evaluateChrome(CHROME_INFO_SCRIPT, [
+        [recorderId, PROBE_EXTENSION_ID, OTHER_EXPERIMENT_ID],
+      ])) as ChromeBootstrapInfo & { readonly error?: string };
+      if (info.error !== undefined) throw new Error(`chrome bootstrap failed: ${info.error}`);
+      names = runNames(workspace.base, info.addons, recorderId);
+      record(
+        "strict-origin-default",
+        !info.strictFileOrigin || info.strictFileOriginUserSet
+          ? [
+              `strict_origin_policy=${String(info.strictFileOrigin)} userSet=${String(info.strictFileOriginUserSet)}`,
+            ]
+          : [],
+        "strict_origin_policy true by default",
+      );
+
+      const probeAddon = info.addons[PROBE_EXTENSION_ID];
+      const recAddon = info.addons[recorderId];
+      if (probeAddon === null || probeAddon === undefined || !probeAddon.isActive) {
+        throw new Error(`probe extension ${PROBE_EXTENSION_ID} did not activate`);
+      }
+      record(
+        "probe-extension-unprivileged",
+        probeAddon.isPrivileged || probeAddon.signedState !== 0 || probeAddon.temporarilyInstalled
+          ? [`probe extension is ${JSON.stringify(probeAddon)}`]
+          : [],
+        "permanent unsigned unprivileged sideload",
+      );
+      if (recAddon === null || recAddon === undefined || recAddon.uuid === null) {
+        throw new Error(`recorder extension ${recorderId} did not activate`);
+      }
+      recUuid = recAddon.uuid;
+      const watching = (await session.evaluateChrome(CHROME_WATCH_SCRIPT, [
+        recorderId,
+        "setup",
+      ])) as { readonly problems: readonly string[] };
+      if (watching.problems.length > 0)
+        context.log(`isolation: watcher: ${watching.problems.join("; ")}`);
+      const probeUuid = probeAddon.uuid;
+      if (probeUuid === null) throw new Error("probe extension has no uuid");
+
+      await session.evaluateChrome(CHROME_OPEN_TAB_SCRIPT, [`http://${site}/`]);
+      const bankDone = await server.waitFor(
+        (r): r is Extract<IsolationReport, { kind: "bank-done" }> => r.kind === "bank-done",
+        STEP_TIMEOUT_MS,
+      );
+      const bankMarked = bankDone !== null && bankDone.cookie.includes(marker);
+      record(
+        "bank-recorded",
+        bankMarked ? [] : ["bank fixture did not complete with the cookie marker"],
+        "bank fixture completed with the cookie marker",
+      );
+      await callHook(session, { kind: "seal" });
+
+      const popupUrl = await waitForActiveExtensionUrl(session, recorderId, popupPath);
+      const popupTab = await session.openTab(popupUrl);
+      const statusText = await session.evaluate(
+        popupTab,
+        "browser.oneClickHar.getRecordingStatus().then(JSON.stringify)",
+      );
+      const status = JSON.parse(statusText) as {
+        readonly recording: boolean;
+        readonly problems: readonly string[];
+      };
+      record(
+        "recorder-status-clean",
+        !status.recording || status.problems.length > 0 ? [`status ${JSON.stringify(status)}`] : [],
+        "recording, no problems",
+      );
+
+      const located = locateArchive(workspace.dataHome, workspace.profileDir);
+      if (located === null) throw new Error("archive key missing after seal");
+      const archiveKey = located.key;
+      const keyFilePath = NodePath.join(workspace.profileDir, ARCHIVE_KEY_FILE);
+      plannedEntries = workspace.entries();
+      keyEvidence = {
+        keyFileText: NodeFS.readFileSync(keyFilePath, "utf8"),
+        keyFileMode: NodeFS.statSync(keyFilePath).mode & 0o777,
+        appFolderNames: NodeFS.readdirSync(located.appFolder).sort(),
+        sources: keySources(workspace.profileDir, workspace.dataHome, recorderId, recUuid),
+        second: secondKey,
+      };
+      record(
+        "archive-modes",
+        judgeArchiveModes(plannedEntries, ["jsonl", "summary.json", "pack", "body"]),
+        `${String(plannedEntries.length)} entries 700/600`,
+      );
+
+      // The inventory is what the disk diff says the product wrote in its own places by now.
+      planSnapshot = snapshotTree(workspace.base, { marker });
+      storeId = String(await session.evaluateChrome(CHROME_STORE_ID_SCRIPT));
+      pids.push(session.browserPid, session.spawnedPid);
+      area = { archiveKey, keyFileName: ARCHIVE_KEY_FILE };
+      const productArea = area;
+      const written = diffSnapshots(diskBefore, planSnapshot)
+        .filter((c) => inProductArea(c, productArea))
+        .map((c) => ({
+          path: NodePath.join(workspace.base, ...c.path.split("/")),
+          directory: c.entry.kind === "directory",
+        }));
+
+      const downloadsProblem = judgeDownloads(
+        (await session.evaluateChrome(CHROME_DOWNLOAD_TARGETS_SCRIPT)) as readonly string[],
+        workspace.dataHome,
+      );
+      record(
+        "downloads-list",
+        downloadsProblem === null ? [] : [downloadsProblem],
+        "nothing under the data home",
+      );
+
+      const packed = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
+        recorderId,
+      ])) as PackedExposure & { readonly error?: string };
+      if (packed.error !== undefined) throw new Error(`exposure read failed: ${packed.error}`);
+
+      const siteDirPath = NodePath.join(located.root, "sites", site);
+      const logPath = findFirstFile(NodePath.join(siteDirPath, "log"), ".jsonl");
+      const bodyPath = findFirstFile(NodePath.join(siteDirPath, "bodies"), ".body");
+      if (logPath === null || bodyPath === null) {
+        throw new Error(`missing log (${String(logPath)}) or body (${String(bodyPath)})`);
+      }
+
+      // No export API exists yet, so the export rows read a stand-in written where an export would land.
+      const exportPath = NodePath.join(workspace.downloads, exportName);
+      const exportText = JSON.stringify({
+        log: {
+          version: "1.2",
+          creator: { name: "One-Click HAR", version: "0.1.0" },
+          entries: [
+            { request: { url: `http://${site}/` }, response: { content: { text: marker } } },
+          ],
+        },
+      });
+      NodeFS.writeFileSync(exportPath, exportText, { mode: 0o600 });
+
+      const sysRead = (await session.evaluateChrome(CHROME_READ_ARCHIVE_SCRIPT, [
+        { log: logPath, body: bodyPath },
+      ])) as {
+        readonly processType: number;
+        readonly isSystemPrincipal: boolean;
+        readonly log: string;
+        readonly body: string;
+      };
+      syntheticControls.push({
+        id: "control-system-read",
+        position: "system",
+        observed: `processType=${String(sysRead.processType)} isSystemPrincipal=${String(sysRead.isSystemPrincipal)}`,
+        reads: [sysRead.log, sysRead.body],
+      });
+
+      const osText = NodeFS.readFileSync(logPath, "utf8");
+      syntheticControls.push({
+        id: "limit-same-user-process",
+        position: "os",
+        observed: `read ${String(osText.length)} chars`,
+        reads: [osText],
+      });
+
+      const otherRaw = (await session.evaluateChrome(CHROME_OTHER_EXP_SCRIPT, [logPath])) as string;
+      const otherParsed = otherRaw
+        ? (JSON.parse(otherRaw) as { readonly text?: string; readonly error?: string })
+        : {};
+      syntheticControls.push({
+        id: "limit-other-experiment",
+        position: "otherexp",
+        observed: otherParsed.error ?? `read ${String(otherParsed.text?.length ?? 0)} chars`,
+        reads: [otherParsed.text ?? ""],
+      });
+
+      const storagePlant = (await session.evaluateChrome(CHROME_PLANT_STORAGE_SCRIPT, [
+        recorderId,
+        storeMark,
+      ])) as {
+        readonly read?: string;
+        readonly error?: string;
+      };
+      syntheticControls.push({
+        id: "planted-recorder-storage",
+        position: "system",
+        observed: storagePlant.error ?? `recorder storage.local reads ${storagePlant.read ?? ""}`,
+        reads: [storagePlant.read ?? ""],
+      });
+      const idbPlant = await session.evaluate(popupTab, recorderIdbPlant(storeMark));
+      syntheticControls.push({
+        id: "planted-recorder-idb",
+        position: "rec-page",
+        observed: `recorder page reads ${idbPlant}`,
+        reads: [idbPlant],
+      });
+
+      // The running surface before any probe: scheme names, web-accessible resources and every page.
+      const setupWatch = await readWatch(session, "setup", []);
+      const candidates = [
+        ...new Set([
+          ...packed.literals,
+          ...lifecycleNames,
+          ...setupWatch.calls.map((c) => c.name.toLowerCase()),
+          recorderId,
+          recUuid,
+          archiveKey,
+          WORKER_HOST,
+          "oneclickhar",
+        ]),
+      ];
+      const enumerated = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
+        candidates,
+      ])) as EnumeratedSchemes;
+      context.log("isolation: reading the recorder's pages before the probes");
+      const pagesAtStart = await readPages(session, recorderId, packed.pageUrls, true);
+      const start: RuntimeSurface = {
+        webAccessibleResources: packed.runtimeWebAccessible,
+        webAccessiblePaths: [
+          ...packed.webAccessiblePaths,
+          ...(packed.webAccessibleQuery === null
+            ? ["(the policy offers no web-accessible query)"]
+            : []),
+        ],
+        ...schemeLines(enumerated),
+        pages: pagesAtStart,
+      };
+
+      await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [located.root]);
+
+      const savedPagePath = NodePath.join(workspace.downloads, savedPageName);
+      const savedPageHtml = buildSavedPageHtml(server.origin);
+      NodeFS.writeFileSync(savedPagePath, savedPageHtml, "utf8");
+      savedPageUrl = fileHref(savedPagePath);
+
+      const plantedLog = `resource://och-planted/sites/${site}/log/${NodePath.basename(logPath)}`;
+      const recBase = `moz-extension://${recUuid}/`;
+      const probeBase = `moz-extension://${probeUuid}/`;
+      const wrRedirect = "http://attacker.example/wr-redirect";
+      const filePlan = {
+        root: fileHref(located.appFolder, true),
+        log: fileHref(logPath),
+        export: fileHref(exportPath),
+        savedPage: savedPageUrl,
+      };
+      const experiment = Object.values(
+        (packed.manifest["experiment_apis"] ?? {}) as Record<
+          string,
+          { readonly schema?: unknown; readonly parent?: { readonly script?: unknown } }
+        >,
+      )[0];
+      planInput = {
+        marker,
+        file: {
+          appFolder: located.appFolder,
+          keyFolder: located.root,
+          log: logPath,
+          body: bodyPath,
+          export: exportPath,
+          siteDir: siteDirPath,
+        },
+        inventory: written,
+        guessedKeyFolders: keyDerivations(
+          keySources(workspace.profileDir, workspace.dataHome, recorderId, recUuid),
+        ).map((g) => NodePath.join(located.appFolder, g.key)),
+        redirectToLog: `http://attacker.example/redir?to=${encodeURIComponent(filePlan.log)}`,
+        wrRedirect,
+        rec: {
+          id: recorderId,
+          base: recBase,
+          popupPath,
+          popupScriptPath,
+          parentScript: String(experiment?.parent?.script ?? "").replace(/^\//u, ""),
+          schema: String(experiment?.schema ?? "").replace(/^\//u, ""),
+          files: packed.files,
+        },
+        probe: { base: probeBase, warMark, secretMark },
+        randomUuid: NodeCrypto.randomUUID(),
+        randomId: `not-installed-${NodeCrypto.randomBytes(4).toString("hex")}@test`,
+        plantedResource: {
+          hit: plantedLog,
+          miss: plantedLog.replace(/[^/]+$/u, "missing.jsonl"),
+        },
+        resourceNames: enumerated.subs
+          .map((s) => s.name)
+          .filter((n) => n.length > 0 && n !== "och-planted"),
+        // Every packed file through each name the product registered by now, or that maps into its own files.
+        productResourceFiles: [
+          ...new Set(
+            enumerated.subs
+              .filter(
+                (s) =>
+                  s.resolved.startsWith(packed.rootUrl) ||
+                  [...lifecycleNames, ...setupWatch.calls.map((c) => c.name)].includes(s.name),
+              )
+              .flatMap((s) => filesThrough(s.name, s.resolved, packed.rootUrl, packed.files)),
+          ),
+        ].sort(),
+        chromePackages: enumerated.chrome.map((c) => c.pkg),
+        mozSrc: enumerated.mozSrc[0] ?? null,
+        binDir: NodePath.dirname(context.binaryPath),
+      };
+      targetPlan = planTargets(planInput);
+
+      context.log("isolation: witnessing every planned target");
+      const outcome = (ok: boolean, detail: string): CheckOutcome => ({ ok, detail });
+      ({ witness, results: witnessResults } = await runWitness(
+        session,
+        targetPlan,
+        {
+          "recorder-api": outcome(
+            typeof status.recording === "boolean",
+            `recorder page: ${statusText}`,
+          ),
+          "recorder-storage": outcome(
+            (storagePlant.read ?? "").includes(storeMark),
+            `system principal reads ${storagePlant.read ?? storagePlant.error ?? ""}`,
+          ),
+          "recorder-idb": outcome(idbPlant.includes(storeMark), `recorder page reads ${idbPlant}`),
+          "bank-traffic": outcome(
+            bankMarked,
+            bankMarked ? "bank cookie carries the marker" : "no marked bank traffic",
+          ),
+        },
+        server.port,
+      ));
+
+      const serverPlan = {
+        browser: context.binaryPath,
+        server: server.origin,
+        file: filePlan,
+        webProbeUrl: "http://attacker.example/probe.html",
+        victimUrl: "http://attacker.example/victim.html",
+        wrRedirect,
+        targets: targetPlan.targets,
+        noMarionetteProbes: NO_MARIONETTE_PROBE_IDS,
+      };
+      server.setPlan(serverPlan);
+
+      context.log("isolation: opening web probe tab");
+      await readWatch(session, "probes", []);
+      const positions = await runPositions(context, session, server, {
+        savedPageUrl,
+        probeBase,
+        logUrl: filePlan.log,
+        site,
+      });
+      positionProblems.push(...positions.problems);
+      canAccessFileObserved = positions.canAccessFileObserved;
+
+      const stillPlanted = (await session.evaluateChrome(CHROME_PLANT_RESOURCE_SCRIPT, [
+        "",
+      ])) as boolean;
+      record(
+        "planted-resource-removed",
+        stillPlanted ? ["resource://och-planted/ remained"] : [],
+        "removed",
+      );
+
+      // The same surface after every probe ran, with the harness's own planted name gone again.
+      context.log("isolation: reading the recorder's surface after the probes");
+      const runWatch = await readWatch(session, "after", []);
+      const enumeratedAtEnd = (await session.evaluateChrome(CHROME_ENUMERATE_SCRIPT, [
+        [...new Set([...candidates, ...runWatch.calls.map((c) => c.name.toLowerCase())])],
+      ])) as EnumeratedSchemes;
+      const atEnd = (await session.evaluateChrome(CHROME_EXPOSURE_SCRIPT, [
+        recorderId,
+      ])) as PackedExposure & { readonly error?: string };
+      if (atEnd.error !== undefined) throw new Error(`exposure read failed: ${atEnd.error}`);
+      const pagesAtEnd = await readPages(session, recorderId, packed.pageUrls, false);
+      const end: RuntimeSurface = {
+        webAccessibleResources: atEnd.runtimeWebAccessible,
+        webAccessiblePaths: [
+          ...atEnd.webAccessiblePaths,
+          ...(atEnd.webAccessibleQuery === null
+            ? ["(the policy offers no web-accessible query)"]
+            : []),
+        ],
+        ...schemeLines(enumeratedAtEnd),
+        pages: pagesAtEnd,
+      };
+      const inside = (target: string): boolean =>
+        target.includes(workspace.profileDir) || target.includes(workspace.dataHome);
+      // The worker name into the add-on's own files is the one allowed; the substitution rows hold it.
+      const worker = new Set(
+        [...enumerated.subs, ...enumeratedAtEnd.subs]
+          .filter((sub) => isWorkerSubstitution(sub, packed.rootUrl))
+          .map(substitutionLine),
+      );
+      record(
+        "no-scheme-into-profile-or-data-home",
+        [
+          ...new Set(
+            [
+              ...start.substitutions,
+              ...start.chromePackages,
+              ...end.substitutions,
+              ...end.chromePackages,
+            ].filter((line) => !worker.has(line) && inside(line.slice(line.indexOf(" -> ") + 4))),
+          ),
+        ],
+        `${String(enumerated.subs.length)} substitutions and ${String(enumerated.chrome.length)} packages outside, before and after the probes`,
+      );
+      productSchemes = {
+        place: {
+          addonRoot: packed.rootUrl,
+          profileDir: workspace.profileDir,
+          dataHome: workspace.dataHome,
+        },
+        packedFiles: packed.files,
+        start: enumerated.subs,
+        end: enumeratedAtEnd.subs,
+        run: watchOnly(runWatch),
+      };
+      exposureEvidence = {
+        manifestKeys: Object.keys(packed.manifest),
+        experimentApis: (packed.manifest["experiment_apis"] ?? {}) as Record<string, unknown>,
+        schemaContexts: Object.entries(packed.schemaTexts).flatMap(([file, text]) => {
+          try {
+            return schemaContexts(JSON.parse(text)).map((c) => `${file}: ${c}`);
+          } catch {
+            return [`${file}: unreadable schema ${text.slice(0, 100)}`];
+          }
+        }),
+        contentScripts: packed.contentScripts,
+        background: packed.manifest["background"] ?? null,
+        declaredWebAccessible: (packed.manifest["web_accessible_resources"] ?? []) as unknown[],
+        externalListeners: packed.externalListeners,
+        pageUrls: packed.pageUrls,
+        start,
+        end,
+      };
+
+      controlPlan = {
+        recorderId,
+        standInXpi: await buildStandInXpi(context.extensionPath, packed.manifest, packed.files),
+        probeXpi,
+        popupPath,
+        pageFiles: packed.pageUrls.map((u) => u.slice(recBase.length)),
+        site,
+        storeMark,
+        logPath,
+        logUrl: filePlan.log,
+        plantRoot: located.root,
+        exportName,
+        exportText,
+        savedPageName,
+        savedPageHtml,
+        serverPlan,
+        candidates,
+        marker,
+        witnessChecks: chromeWitnessChecks(targetPlan),
+        archivePaths: { log: logPath, body: bodyPath },
+        extraPrefs: proxyPrefs(server.port),
+        noMarionettePrefs: noMarionetteExtraPrefs,
+      };
+
+      probesSnapshot = snapshotTree(workspace.base, { marker });
+      await session.evaluateChrome(CHROME_QUIESCE_TABS_SCRIPT);
+      await settle(workspace.base, {
+        since: 0,
+        minLifetimeMs: 0,
+        quietMs: SETTLE_QUIET_MS,
+        maxMs: SETTLE_MAX_MS,
+      });
+      context.log("isolation: quitting marionette session");
+      await session.quit();
+    }
+
+    context.log("isolation: file-no-marionette");
+    const last = await runNoMarionetteLaunch({
+      position: "file-no-marionette",
+      binaryPath: context.binaryPath,
+      display: context.display,
+      profileDir: workspace.profileDir,
+      dataHome: workspace.dataHome,
+      home: workspace.home,
+      base: workspace.base,
+      url: `${savedPageUrl}?pos=file-no-marionette`,
+      extraPrefs: noMarionetteExtraPrefs,
+      server,
+      signal: context.signal,
+    });
+    if (last.problem !== null) positionProblems.push(last.problem);
+    record("positions-completed", positionProblems, "every position reported done");
+
+    const productRun = runDisk({
+      base: workspace.base,
+      before: diskBefore,
+      plan: planSnapshot,
+      probes: probesSnapshot,
+      names: [...names, ...browserNames(storeId, [...pids, last.pid])],
+      marker,
+      harness: {
+        ...installed,
+        [`profile/extensions/${recorderId}.xpi`]: NodeFS.readFileSync(context.extensionPath),
+        [`downloads/${exportName}`]: controlPlan?.exportText ?? "",
+        [`downloads/${savedPageName}`]: controlPlan?.savedPageHtml ?? "",
+      },
+    });
+    if (area === null || planInput === null || controlPlan === null)
+      throw new Error("the run never planned");
+    const productReports = [...server.reports];
+
+    // Two control runs: what differs between them is the browser's own noise.
+    const controls: RunDisk[] = [];
+    const controlSubstitutions: string[] = [];
+    for (const round of [1, 2]) {
+      context.log(`isolation: control run ${String(round)} without the product`);
+      server.clear();
+      const control = await controlRun(context, server, controlPlan);
+      controls.push(control.disk);
+      controlSubstitutions.push(...control.substitutions);
+    }
+    const [product, firstControl, secondControl] = pruneStructured(
+      productRun,
+      controls as [RunDisk, RunDisk],
+    );
+    const diskEvidence: DiskEvidence = {
+      product,
+      controls: [firstControl, secondControl],
+      area,
+      probed: planInput.inventory.map((w) =>
+        NodePath.relative(workspace.base, w.path).split(NodePath.sep).join("/"),
+      ),
+    };
+    record(
+      "disk-writes-allowed",
+      diskProblems(diskEvidence),
+      `${String(productRun.final.length)} paths the product run changed, held by path, bytes and entry against two control runs (${String(firstControl.final.length)} and ${String(secondControl.final.length)}); every write beyond them is in the product's places, private, with one link`,
+    );
+    if (exposureEvidence === null) throw new Error("no exposure evidence was read");
+    record(
+      "exposure-allowed",
+      exposureProblems(exposureEvidence),
+      `${String(exposureEvidence.start.pages.length)} pages and ${String(exposureEvidence.manifestKeys.length)} manifest keys, all allowed, the same before and after the probes`,
+    );
+
+    if (keyEvidence === null) throw new Error("no key evidence was read");
+    const archiveEvidence: ArchiveEvidence = {
+      ...keyEvidence,
+      planned: plannedEntries,
+      final: workspace.entries(),
+    };
+    extraChecks.push(...judgeArchive(archiveEvidence));
+
+    const input: IsolationRunInput = {
+      context: {
+        marker,
+        warMark,
+        secretMark,
+        storeMark,
+        ownMark,
+        recId: recorderId,
+        recUuid,
+        webSandboxBlocksArchive: process.platform === "linux",
+      },
+      browserRows: productReports.filter((r): r is BrowserRowReport => r.kind === "row"),
+      targets: targetPlan.targets,
+      witness,
+      identity: identities(planInput),
+      places: unitPlaces(targetPlan.targets, planInput),
+      syntheticControls,
+      csFileInjected: productReports.some(
+        (r) => r.kind === "cs-hello" && r.href.startsWith("file:"),
+      ),
+      canAccessFileObserved,
+      csArchiveInjectedDocs: productReports
+        .filter(
+          (r): r is Extract<IsolationReport, { kind: "cs-file-doc" }> =>
+            r.kind === "cs-file-doc" && r.inArchive,
+        )
+        .map((r) => ({ href: r.href, text: r.text })),
+      extraChecks,
+    };
+    if (productSchemes === null) throw new Error("no substitutions were read");
+    const substitutionEvidence: SubstitutionEvidence = {
+      ...productSchemes,
+      control: [...new Set(controlSubstitutions)].sort(),
+      lifecycle,
+    };
+    extraChecks.push(
+      ...judgeSubstitutions(
+        substitutionEvidence,
+        (probe, url, position) => eachUnitVerdict(input, probe, position, url),
+        input.csFileInjected,
+      ),
+    );
+    const judgment = judgeIsolationRun(input);
+
+    const summary = `${String(judgment.rows.length)} probes: ${String(judgment.counts.BLOCKED)} BLOCKED, ${String(judgment.counts.READ)} READ, ${String(judgment.counts["LEAKS-EXISTENCE"])} LEAKS-EXISTENCE, ${String(judgment.counts["NO-RESULT"])} NO-RESULT; ${String(extraChecks.filter((c) => c.ok).length)} of ${String(extraChecks.length)} extra checks hold`;
+    return {
+      name: "isolation",
+      ok: judgment.ok,
+      durationMs: Date.now() - started,
+      detail: judgment.ok ? summary : `${summary}; failures: ${judgment.mismatches.join("; ")}`,
+      // Everything the pure judges read, so a recorded run can be judged again by a mutated judge.
+      data: {
+        judgment,
+        input,
+        archiveEvidence,
+        exposureEvidence,
+        diskEvidence,
+        substitutionEvidence,
+        planInput,
+        witnessResults: [...witnessResults],
+      },
+    };
+  },
+};
+
+/** @discovered-check */
+export default check;

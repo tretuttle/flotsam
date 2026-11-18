@@ -315,8 +315,20 @@ type CommonLaunchRequest = {
    * user's data folder; a relaunch that must find the same archive passes the same folder.
    */
   readonly dataHome?: string;
+  /** HOME and its XDG config, cache and state folders for the browser, so a check can see everything it writes. */
+  readonly home?: string;
   readonly signal: AbortSignal;
 };
+
+const homeEnv = (home: string | undefined): NodeJS.ProcessEnv =>
+  home === undefined
+    ? {}
+    : {
+        HOME: home,
+        XDG_CONFIG_HOME: NodePath.join(home, ".config"),
+        XDG_CACHE_HOME: NodePath.join(home, ".cache"),
+        XDG_STATE_HOME: NodePath.join(home, ".local", "state"),
+      };
 
 export function resolveBrowserSpawnCommand(
   binaryPath: string,
@@ -418,6 +430,7 @@ export async function launchBrowser(
         MOZ_CRASHREPORTER_DISABLE: "1",
         MOZ_DISABLE_AUTO_UPDATE: "1",
         XDG_DATA_HOME: dataHome,
+        ...homeEnv(untouchedRequest.home),
       },
       profileDir: directory,
       suppressCoreDumps: untouchedRequest.suppressCoreDumps,
@@ -470,6 +483,7 @@ export async function launchBrowser(
     MOZ_CRASHREPORTER_DISABLE: "1",
     MOZ_DISABLE_AUTO_UPDATE: "1",
     XDG_DATA_HOME: dataHome,
+    ...homeEnv(remoteRequest.home),
     ...(remoteRequest.allowSystemAccess === true ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}),
   };
   const { spawned, watcher } = spawnLeasedBrowser(remoteRequest.binaryPath, args, lease, {

@@ -55,6 +55,10 @@ export async function callHook(
 
 /** A folder for one check: its profile, its data home and its downloads, removed at dispose. */
 export type RecordingWorkspace = AsyncDisposable & {
+  /** The folder holding everything below; removed at dispose. */
+  readonly base: string;
+  /** The browser's HOME when the workspace was made with `ownHome`, else null and the browser keeps the real one. */
+  readonly home: string | null;
   readonly profileDir: string;
   readonly dataHome: string;
   readonly downloads: string;
@@ -70,18 +74,26 @@ export type RecordingWorkspace = AsyncDisposable & {
   readonly entries: () => ReturnType<typeof listArchive>;
 };
 
-export function recordingWorkspace(name: string): RecordingWorkspace {
+export function recordingWorkspace(
+  name: string,
+  options: { readonly ownHome?: boolean } = {},
+): RecordingWorkspace {
   const base = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), `one-click-har-${name}-`));
   const profileDir = NodePath.join(base, "profile");
   const dataHome = NodePath.join(base, "data");
   const downloads = NodePath.join(base, "downloads");
-  for (const dir of [profileDir, dataHome, downloads]) NodeFS.mkdirSync(dir, { mode: 0o700 });
+  const home = options.ownHome === true ? NodePath.join(base, "home") : null;
+  for (const dir of [profileDir, dataHome, downloads, ...(home === null ? [] : [home])]) {
+    NodeFS.mkdirSync(dir, { mode: 0o700 });
+  }
   const location = () => {
     const found = locateArchive(dataHome, profileDir);
     if (found === null) throw new Error(`no archive key in ${profileDir}`);
     return found;
   };
   return {
+    base,
+    home,
     profileDir,
     dataHome,
     downloads,
@@ -90,6 +102,7 @@ export function recordingWorkspace(name: string): RecordingWorkspace {
         ...request,
         profileDir,
         dataHome: request.dataHome ?? dataHome,
+        ...(home === null ? {} : { home }),
         allowSystemAccess: true,
         extraPrefs: [...HARNESS_PREFS, ...downloadPrefs(downloads), ...(request.extraPrefs ?? [])],
       }),

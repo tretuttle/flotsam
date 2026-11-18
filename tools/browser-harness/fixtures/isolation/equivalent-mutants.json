@@ -1,0 +1,5 @@
+{
+  "archive-oracle.ts kindOf number: 1 -> 0": "Takes the whole extension match (\".jsonl\") in place of its capture group (\"jsonl\"), for planned and final paths alike, so every comparison of two kinds comes out the same; kinds are compared, never printed.",
+  "probe-table.ts PROBE_TABLE property: kind: \"never\" -> (removed)": "A denial without a kind matches no case in denies(), which then returns undefined, the same falsy answer the never case gives; the control row still needs its planted mark to pass.",
+  "probe-table.ts PROBE_TABLE property: kind: \"never\" -> (removed) #2": "A denial without a kind matches no case in denies(), which then returns undefined, the same falsy answer the never case gives; the control row still needs its planted mark to pass."
+}

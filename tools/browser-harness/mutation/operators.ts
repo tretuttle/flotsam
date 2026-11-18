@@ -192,7 +192,9 @@ function splicesFor(node: AstNode, parent: AstNode | null, source: string): Spli
     }
     const property = callee?.type === "MemberExpression" ? nodeAt(callee, "property") : null;
     const method = property?.type === "Identifier" ? String(property.name) : null;
-    const swapped = method === null ? undefined : METHOD_SWAPS[method];
+    // Own keys only: a method named like an Object.prototype member (toString) has no swap.
+    const swapped =
+      method === null || !Object.hasOwn(METHOD_SWAPS, method) ? undefined : METHOD_SWAPS[method];
     if (property !== null && swapped !== undefined)
       splices.push(replace("method", property, swapped));
   }
